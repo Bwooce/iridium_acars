@@ -122,6 +122,41 @@ This is the baseline implementation for the project.
 
 This split ensures that detection latency (930 μs) does not block the time-critical USB DMA ingestion. The 4MB PSRAM buffer allows the detector to run slightly "behind" real-time without losing signal starts.
 
+### 11a.4 Roof-Mount Install: Lightning & Surge
+
+All electronics live in a single rooftop enclosure (LNA at the antenna, SDR + ESP32-P4 in the box). Output is via WiFi (ESP32-C6 companion) — no metallic data cable leaves the roof. The protection scheme is built around the enclosure as the single point of ground reference.
+
+**RF chain placement:**
+
+```
+Antenna → SAWbird+ LNA (sacrificial) → ARRESTOR (at enclosure wall) → SDR → ESP32-P4
+```
+
+- **Coax arrestor:** gas-discharge-tube type (Polyphaser IS-50UX-MA, NexTek IS-LP-G-MA, or equivalent), mounted through the enclosure wall *after* the LNA, before the SDR.
+- **LNA placement:** at the antenna (short coax) — accepts the LNA as a sacrificial component in a direct strike. Putting the arrestor before the LNA degrades system NF and is the wrong trade for amateur work.
+
+**Bonding (the load-bearing part):**
+
+- Enclosure body → ground rod via short, straight #6 AWG copper strap. No loops, no sharp bends.
+- Antenna mast → same ground rod, separately bonded.
+- Single-point ground discipline: enclosure, mast, and building electrical earth all meet at one busbar. Multiple separate grounds are worse than no ground.
+- 1.8 m copper-clad ground rod, driven into damp earth, as direct a path from enclosure as possible.
+
+**Power line protection:**
+
+- DC surge suppressor at enclosure power entry (Phoenix Contact / Citel DIN-rail unit, or equivalent in-line TVS network).
+- MOV-style mains protector on the AC outlet feeding the 12V supply at the building end.
+
+**Cable discipline:**
+
+- Antenna coax and ground strap perpendicular where they cross — never parallel runs.
+- Drip loops below cable entries to the enclosure.
+- Connector weatherproofing: self-amalgamating tape (Scotch 23) under vinyl tape on every outdoor joint.
+
+**Annual inspection:** GDT cartridges degrade after firing. Polyphaser IS-series uses a serviceable replaceable cartridge.
+
+**Cost:** ~$60 arrestor + ~$25 DC suppressor + ~$15 ground rod + heavy strap ≈ **$100** to insure a $500+ rooftop install.
+
 ---
 
 ## 12. Conclusion

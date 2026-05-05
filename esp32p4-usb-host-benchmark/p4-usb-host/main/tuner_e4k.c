@@ -372,7 +372,7 @@ static const struct pll_settings pll_vars[] = {
     {KHZ(667000), (0 << 3) | 2, 6},
     {KHZ(1200000), (0 << 3) | 1, 4}};
 
-static int is_fvco_valid(uint32_t fvco_z)
+static int __attribute__((unused)) is_fvco_valid(uint32_t fvco_z)
 {
     /* check if the resulting fosc is valid */
     if (fvco_z / 1000 < E4K_FVCO_MIN_KHZ ||
@@ -396,7 +396,7 @@ static int is_fosc_valid(uint32_t fosc)
     return 1;
 }
 
-static int is_z_valid(uint32_t z)
+static int __attribute__((unused)) is_z_valid(uint32_t z)
 {
     if (z > 255)
     {
@@ -408,7 +408,7 @@ static int is_z_valid(uint32_t z)
 }
 
 /*! \brief Determine if 3-phase mixing shall be used or not */
-static int use_3ph_mixing(uint32_t flo)
+static int __attribute__((unused)) use_3ph_mixing(uint32_t flo)
 {
     /* this is a magic number somewhre between VHF and UHF */
     if (flo < MHZ(350))

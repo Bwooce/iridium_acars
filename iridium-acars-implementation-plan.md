@@ -53,3 +53,32 @@ Merging USB ingestion with the DSP detection pipeline in a dual-core architectur
 *Requires: 1620 MHz QFH/Patch Antenna, Nooelec SAWbird+ IR.*
 - [ ] Connect RTL-SDR v4 + LNA + Antenna.
 - [ ] Run live decoding stack on P4 and verify real-world frame reception.
+
+---
+
+## Hardware Notes
+
+### USB Host VBUS on Waveshare ESP32-P4-Nano: not a GPIO
+
+Verified against the Waveshare ESP32-P4-NANO schematic
+(`files.waveshare.com/wiki/ESP32-P4-NANO/ESP32-P4-NANO-schematic.pdf`):
+
+- The USB Type-A host port (J2) VBUS is fed through **U2 (DIO7003HEST5 load
+  switch)** from the always-on **VCC_5V** rail. U2's EN pin is held active
+  by board-level pulls — there is **no GPIO that turns USB host VBUS on/off**.
+- **GPIO 45** is **SD-card power enable** on the Nano (drives Q1 AO3401
+  P-MOSFET gate controlling `SD1_VDD`). It has nothing to do with USB.
+- **GPIO 54** is just a breakout pin on header P1; no USB role.
+- Same conclusion on the Waveshare ESP32-P4-Pico (verified separately):
+  Picoblade P1 pin 1 (VBUS) is hardwired to VCC_5V, and GPIO 45 there is
+  also SD-card power.
+
+**Implication for firmware:** do not drive any GPIO as a phantom VBUS_EN on
+these boards. An earlier iteration drove GPIO 45/54 low under that mistaken
+assumption — at best ineffective, at worst actively toggling SD-card power.
+Phase 2's 5.12 MB/s success was achieved without any VBUS GPIO code, which
+is consistent with USB host VBUS being always-on.
+
+There is no software path to VBUS-cycle the host port on this hardware.
+Power-cycling an attached USB device (e.g. RTL-SDR) requires physical
+unplug/replug of the device or of the Nano's USB-C feed.

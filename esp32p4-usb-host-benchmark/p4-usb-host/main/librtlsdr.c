@@ -1,3 +1,4 @@
+static const char *TAG_ADSB = "ADSB";
 /*
  * rtl-sdr, turns your Realtek RTL2832 based DVB dongle into a SDR receiver
  * Copyright (C) 2012-2014 by Steve Markgraf <steve@steve-m.de>
@@ -247,7 +248,7 @@ int r820t_set_freq(void *dev, uint32_t freq)
 
 int r820t_set_bw(void *dev, int bw)
 {
-    int r;
+    int r; (void)r;
     rtlsdr_dev_t *devt = (rtlsdr_dev_t *)dev;
 
     r = r82xx_set_bandwidth(&devt->r82xx_p, bw, devt->rate);
@@ -554,7 +555,7 @@ void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val)
 
 void rtlsdr_set_gpio_output(rtlsdr_dev_t *dev, uint8_t gpio)
 {
-    int r;
+    int r; (void)r;
     gpio = 1 << gpio;
 
     r = rtlsdr_read_reg(dev, SYSB, GPD, 1);
@@ -685,7 +686,7 @@ static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
     uint32_t rtl_xtal;
     int32_t if_freq;
     uint8_t tmp;
-    int r;
+    int r; (void)r;
 
     if (!dev)
         return -1;
@@ -1294,7 +1295,7 @@ int rtlsdr_get_offset_tuning(rtlsdr_dev_t *dev)
     return (dev->offs_freq) ? 1 : 0;
 }
 
-static rtlsdr_dongle_t *find_known_device(uint16_t vid, uint16_t pid)
+static rtlsdr_dongle_t *__attribute__((unused)) find_known_device(uint16_t vid, uint16_t pid)
 {
     unsigned int i;
     rtlsdr_dongle_t *device = NULL;
@@ -1322,7 +1323,7 @@ void esp_action_get_dev_desc(rtlsdr_dev_t *dev)
 
 int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t client_hdl)
 {
-    int r;
+    int r; (void)r;
     rtlsdr_dev_t *dev = NULL;
     uint8_t reg;
 

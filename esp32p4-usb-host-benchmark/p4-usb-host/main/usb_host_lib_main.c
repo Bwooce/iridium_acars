@@ -8,7 +8,9 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "esp_intr_alloc.h"
+#include "esp_timer.h"
 #include "usb/usb_host.h"
 
 #define DAEMON_TASK_PRIORITY 4
@@ -17,6 +19,12 @@
 extern void class_driver_task(void *arg);
 
 static const char *TAG = "DAEMON";
+
+// Note on VBUS for ESP32-P4-Pico (Waveshare):
+// The native USB OTG (Picoblade P1) pin 1 is hardwired to VCC_5V — no GPIO enable.
+// Earlier code drove GPIO 45 / 54 thinking they were VBUS_EN; per the schematic
+// netlist, GPIO 45 controls SD-card power (Q1 SI2301CDS), and GPIO 54 is just a
+// breakout pin (header GP00). Neither has anything to do with USB VBUS.
 
 static void host_lib_daemon_task(void *arg)
 {
@@ -28,6 +36,7 @@ static void host_lib_daemon_task(void *arg)
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
     };
     ESP_ERROR_CHECK(usb_host_install(&host_config));
+    ESP_LOGI(TAG, "USB Host Library installed; waiting for device events...");
 
     // Signal to the class driver task that the host library is installed
     xSemaphoreGive(signaling_sem);
@@ -35,10 +44,22 @@ static void host_lib_daemon_task(void *arg)
 
     bool has_clients = true;
     bool has_devices = true;
+    int64_t last_idle_log = esp_timer_get_time();
     while (has_clients || has_devices)
     {
-        uint32_t event_flags;
-        ESP_ERROR_CHECK(usb_host_lib_handle_events(portMAX_DELAY, &event_flags));
+        uint32_t event_flags = 0;
+        esp_err_t r = usb_host_lib_handle_events(pdMS_TO_TICKS(2000), &event_flags);
+        if (r != ESP_OK && r != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "usb_host_lib_handle_events returned 0x%x (%s)", r, esp_err_to_name(r));
+        }
+        if (event_flags) {
+            ESP_LOGI(TAG, "Host lib event_flags=0x%08lx", (unsigned long)event_flags);
+        }
+        int64_t now = esp_timer_get_time();
+        if (now - last_idle_log >= 5 * 1000000) {
+            ESP_LOGI(TAG, "Host lib idle (no NEW_DEV yet — check D+/D- polarity on Picoblade pigtail, VBUS at device)");
+            last_idle_log = now;
+        }
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
         {
             has_clients = false;

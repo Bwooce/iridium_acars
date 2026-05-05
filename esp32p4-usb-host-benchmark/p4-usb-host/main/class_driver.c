@@ -139,10 +139,21 @@ void class_driver_task(void *arg)
     uint64_t dsp_total_time_us = 0;
     uint32_t dsp_frame_count = 0;
     size_t min_free_rb = 512 * 1024;
+    int64_t last_idle_log = esp_timer_get_time();
 
     while (1)
     {
-        usb_host_client_handle_events(s_driver_obj.client_hdl, 0);
+        usb_host_client_handle_events(s_driver_obj.client_hdl, 10);
+
+        // Periodic status while no device is open — helps diagnose enumeration failure.
+        if (s_driver_obj.dev_addr == 0) {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_idle_log >= 5 * 1000000) {
+                ESP_LOGI(TAG, "class_driver waiting: dev_addr=%u actions=0x%02lx (no device enumerated yet)",
+                         s_driver_obj.dev_addr, (unsigned long)s_driver_obj.actions);
+                last_idle_log = now_us;
+            }
+        }
 
         if (s_driver_obj.actions & ACTION_OPEN_DEV) action_open_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_START_STREAM) action_start_stream(&s_driver_obj);
@@ -167,9 +178,6 @@ void class_driver_task(void *arg)
             size_t free_rb, total_rb;
             esp_libusb_get_ringbuffer_info(&free_rb, &total_rb);
             if (free_rb < min_free_rb) min_free_rb = free_rb;
-        } else {
-            // No data read, yield to prevent tight spin starvation
-            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
         int64_t now = esp_timer_get_time();

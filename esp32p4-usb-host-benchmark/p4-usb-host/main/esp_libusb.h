@@ -44,7 +44,6 @@ typedef struct
     bool streaming;
 } class_adsb_dev;
 
-static const char *TAG_ADSB = "ADSB";
 void init_adsb_dev();
 void bulk_transfer_read_cb(usb_transfer_t *transfer);
 void stream_transfer_cb(usb_transfer_t *transfer);
