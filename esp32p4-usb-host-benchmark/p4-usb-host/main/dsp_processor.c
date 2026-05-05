@@ -144,13 +144,20 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
             current_burst.active = false;
         }
 
-        // 5. Baseline update
+        // 5. Baseline update — exponential moving average:
+        //   baseline = (1 - α) · baseline + α · magnitudes
+        // The scalar loop measured ~1.5 ms/frame on P4 (50%+ of DSP time).
+        // esp-dsp has no _arp4 (PIE) variant for these f32 ops on P4, only
+        // the ANSI fallback, but the calls still let the compiler unroll
+        // tighter and avoid a couple of redundant loads vs the inline loop.
+        // window_temp_f32 is reused as a scratch buffer (it's only used at
+        // init time to compute the Blackman window, then unused).
         if (!frame_has_signal) {
             float alpha = (frame_count < PRIMING_FRAMES * 2) ? 0.5f : (1.0f / HISTORY_SIZE);
             float beta = 1.0f - alpha;
-            for (int i = 0; i < FFT_SIZE; i++) {
-                baseline[i] = beta * baseline[i] + alpha * magnitudes[i];
-            }
+            dsps_mulc_f32(baseline,   baseline,         FFT_SIZE, beta,  1, 1);
+            dsps_mulc_f32(magnitudes, window_temp_f32,  FFT_SIZE, alpha, 1, 1);
+            dsps_add_f32 (baseline,   window_temp_f32,  baseline, FFT_SIZE, 1, 1, 1);
         }
         int64_t t5 = esp_timer_get_time();
 

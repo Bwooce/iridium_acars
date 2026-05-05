@@ -75,11 +75,18 @@ static int16_t resample_coeffs[RESAMPLE_TAPS * RESAMPLE_INTERP] __attribute__((a
 static int16_t resample_delay_i[RESAMPLE_TAPS * RESAMPLE_INTERP] __attribute__((aligned(16)));
 static int16_t resample_delay_q[RESAMPLE_TAPS * RESAMPLE_INTERP] __attribute__((aligned(16)));
 
+// Frequency-centring phasor generator. Pre-allocate the sin LUT once and
+// reuse the cplx_sig_t across bursts via dsps_cplx_gen_freq_set(), instead
+// of init+free per burst (each cplx_gen_init call mallocs ~2 KB internally,
+// which dominated the worker time at ~10 ms/burst).
+#define PHASOR_LUT_LEN 1024
+static cplx_sig_t s_phasor_gen;
+static int16_t    s_phasor_lut[PHASOR_LUT_LEN] __attribute__((aligned(16)));
+
 void worker_task(void *arg)
 {
     ESP_LOGI(TAG, "Worker Task started on Core %d", xPortGetCoreID());
     detected_burst_t burst;
-    cplx_sig_t phasor_gen;
 
     while (1) {
         if (xQueueReceive(burst_queue, &burst, portMAX_DELAY)) {
@@ -126,9 +133,11 @@ void worker_task(void *arg)
             float gen_freq = norm_freq * 2.0f;
             if (gen_freq >= 1.0f)  gen_freq = 0.999f;
             if (gen_freq <= -1.0f) gen_freq = -0.999f;
-            dsps_cplx_gen_init(&phasor_gen, S16_FIXED, NULL, 1024, gen_freq, 0);
-            dsps_cplx_gen(&phasor_gen, phasor_buf, burst.length_samples);
-            cplx_gen_free(&phasor_gen);
+            // Reuse the pre-initialised generator (LUT allocated once at init).
+            // Switching frequency on an already-initialised generator avoids
+            // the per-burst malloc that was costing ~10 ms on the previous path.
+            dsps_cplx_gen_freq_set(&s_phasor_gen, gen_freq);
+            dsps_cplx_gen(&s_phasor_gen, phasor_buf, burst.length_samples);
 
             for (uint32_t i = 0; i < burst.length_samples; i++) {
                 int32_t x_re = extract_buf[i * 2 + 0];
@@ -298,6 +307,21 @@ esp_err_t worker_core1_init()
                                              RESAMPLE_INTERP, RESAMPLE_DECIM, 0, 15);
     if (r_init_i != ESP_OK || r_init_q != ESP_OK) {
         ESP_LOGE(TAG, "Stage 2 resampler init failed: i=%d q=%d", r_init_i, r_init_q);
+        return ESP_FAIL;
+    }
+
+    // Pre-populate the phasor sin LUT (Q15) and init the generator once.
+    // dsps_cplx_gen_init only fills the LUT when called with lut==NULL, so
+    // we do the population manually to match what the library would have
+    // generated. After this, dsps_cplx_gen_freq_set() is enough per burst.
+    for (int i = 0; i < PHASOR_LUT_LEN; i++) {
+        float term = (2.0f * (float)M_PI) * ((float)i / (float)PHASOR_LUT_LEN);
+        s_phasor_lut[i] = (int16_t)(sinf(term) * 32767.0f);
+    }
+    esp_err_t pg = dsps_cplx_gen_init(&s_phasor_gen, S16_FIXED, s_phasor_lut,
+                                      PHASOR_LUT_LEN, 0.0f, 0.0f);
+    if (pg != ESP_OK) {
+        ESP_LOGE(TAG, "Phasor generator init failed: %d", pg);
         return ESP_FAIL;
     }
 
