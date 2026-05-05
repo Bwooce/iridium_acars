@@ -45,6 +45,10 @@ Merging USB ingestion with the DSP detection pipeline in a dual-core architectur
 
 ---
 
+## Phase 4: Maintenance & Documentation (TODO)
+- [ ] Add a comprehensive **README.md** with build instructions and architecture overview.
+- [ ] Implement automated CI/CD for firmware builds.
+
 ## Phase 1a: Lite Node RF Validation (Blocked)
 *Requires: 1620 MHz QFH/Patch Antenna, Nooelec SAWbird+ IR.*
 - [ ] Connect RTL-SDR v4 + LNA + Antenna.
