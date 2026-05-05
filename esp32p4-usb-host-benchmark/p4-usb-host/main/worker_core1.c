@@ -29,10 +29,18 @@ static QueueHandle_t burst_queue = NULL;
 
 // Buffer for burst extraction (max 50ms = 128k complex samples)
 #define MAX_EXTRACT_SAMPLES (128 * 1024)
+// Padding for arp4 assembly kernels (32 bytes = 16 int16_t elements)
+#define DSP_PADDING_ELEMS 16
+
 static int16_t *extract_buf = NULL;
 static int16_t *phasor_buf = NULL;
 static int16_t *decim_buf = NULL; // 80 kHz buffer
 static int16_t *resample_buf = NULL; // 50 kHz buffer
+
+// Pre-allocated stage buffers to avoid runtime fragmentation
+static int16_t *stage1_in_i = NULL;
+static int16_t *stage1_in_q = NULL;
+static int16_t *demod_interleaved = NULL;
 
 static fir_s16_t fir_i, fir_q;
 static int16_t coeffs[FIR_TAPS] __attribute__((aligned(16)));
@@ -60,6 +68,12 @@ void worker_task(void *arg)
         if (xQueueReceive(burst_queue, &burst, portMAX_DELAY)) {
             ESP_LOGI(TAG, "Worker processing burst: Start:%lu Len:%lu Bin:%d SNR:%.2f dB",
                      burst.start_sample_idx, burst.length_samples, burst.peak_bin, burst.peak_snr_db);
+
+            // Minimum length guard: need enough samples to survive 32x decimation and filter delay
+            if (burst.length_samples < 128) {
+                ESP_LOGW(TAG, "Burst too short (%lu samples) — dropping", burst.length_samples);
+                continue;
+            }
 
             if (burst.length_samples > MAX_EXTRACT_SAMPLES) {
                 burst.length_samples = MAX_EXTRACT_SAMPLES;
@@ -109,62 +123,66 @@ void worker_task(void *arg)
             fir_i.d_pos = 0;
             fir_q.d_pos = 0;
 
-            int16_t *in_i = malloc(burst.length_samples * sizeof(int16_t));
-            int16_t *in_q = malloc(burst.length_samples * sizeof(int16_t));
             for (uint32_t i = 0; i < burst.length_samples; i++) {
-                in_i[i] = extract_buf[i * 2 + 0];
-                in_q[i] = extract_buf[i * 2 + 1];
+                stage1_in_i[i] = extract_buf[i * 2 + 0];
+                stage1_in_q[i] = extract_buf[i * 2 + 1];
             }
 
-            int out_samples_80k = dsps_fird_s16_arp4(&fir_i, in_i, &decim_buf[0], burst.length_samples);
-            dsps_fird_s16_arp4(&fir_q, in_q, &decim_buf[MAX_EXTRACT_SAMPLES], burst.length_samples);
+            int out_samples_80k = dsps_fird_s16_arp4(&fir_i, stage1_in_i, &decim_buf[0], burst.length_samples);
+            dsps_fird_s16_arp4(&fir_q, stage1_in_q, &decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], burst.length_samples);
 
-            free(in_i);
-            free(in_q);
+            if (out_samples_80k <= 0) {
+                ESP_LOGD(TAG, "Stage 1 produced %d samples (input %lu) — too short, dropping",
+                         out_samples_80k, burst.length_samples);
+                continue;
+            }
 
             // 4. Resample Stage 2 (80k -> 50k via interp=5, decim=8)
             int out_samples_50k = dsps_firmr_s16(&resampler_i, &decim_buf[0], &resample_buf[0], out_samples_80k);
-            dsps_firmr_s16(&resampler_q, &decim_buf[MAX_EXTRACT_SAMPLES], &resample_buf[MAX_EXTRACT_SAMPLES], out_samples_80k);
+            dsps_firmr_s16(&resampler_q, &decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], &resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], out_samples_80k);
 
-            ESP_LOGI(TAG, "Burst processed. Output samples (2sps): %d", out_samples_50k);
-            
+            ESP_LOGI(TAG, "Burst processed: 80k=%d 50k=%d (input len=%lu)",
+                     out_samples_80k, out_samples_50k, burst.length_samples);
+
+            if (out_samples_50k <= 0) {
+                ESP_LOGD(TAG, "Stage 2 produced 0 samples — skipping demod");
+                continue;
+            }
+
             // 5. QPSK Demodulation
             decoded_frame_t frame;
             // Pack I and Q back into interleaved for demod
-            int16_t *interleaved_2sps = malloc(out_samples_50k * 2 * sizeof(int16_t));
-            if (interleaved_2sps) {
-                for (int i = 0; i < out_samples_50k; i++) {
-                    interleaved_2sps[i * 2 + 0] = resample_buf[i];
-                    interleaved_2sps[i * 2 + 1] = resample_buf[MAX_EXTRACT_SAMPLES + i];
-                }
+            for (int i = 0; i < out_samples_50k; i++) {
+                demod_interleaved[i * 2 + 0] = resample_buf[i];
+                demod_interleaved[i * 2 + 1] = resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS + i];
+            }
 
-                if (qpsk_demod_process(interleaved_2sps, out_samples_50k * 2, &frame)) {
-                    // Successfully demodulated!
-                    ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)", 
-                             (frame.direction == DIR_DOWNLINK) ? "DL" : "UL", frame.n_bits);
+            // Note: n_samples parameter in qpsk_demod_process is number of int16_t values
+            if (qpsk_demod_process(demod_interleaved, out_samples_50k * 2, &frame)) {
+                // Successfully demodulated!
+                ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)", 
+                         (frame.direction == DIR_DOWNLINK) ? "DL" : "UL", frame.n_bits);
+                
+                // 6. BCH Decoding / De-interleaving
+                if (frame.n_bits >= 24 + 64) {
+                    const uint8_t *payload = frame.bits + 24;
+                    uint8_t block1[32], block2[32];
+                    uint8_t data1[21], data2[21];
                     
-                    // 6. BCH Decoding / De-interleaving
-                    if (frame.n_bits >= 24 + 64) {
-                        const uint8_t *payload = frame.bits + 24;
-                        uint8_t block1[32], block2[32];
-                        uint8_t data1[21], data2[21];
-                        
-                        iridium_deinterleave(payload, block1, block2);
-                        int e1 = bch_decode_block(block1, data1);
-                        int e2 = bch_decode_block(block2, data2);
-                        
-                        if (e1 >= 0 && e2 >= 0) {
-                            ESP_LOGI(TAG, "BCH DECODE SUCCESS! Errors: %d, %d", e1, e2);
-                            // Log first few bits as binary for quick check
-                            char bin_str[22] = {0};
-                            for (int i = 0; i < 21; i++) bin_str[i] = data1[i] ? '1' : '0';
-                            ESP_LOGI(TAG, "Block1 Data: %s", bin_str);
-                        }
+                    iridium_deinterleave(payload, block1, block2);
+                    int e1 = bch_decode_block(block1, data1);
+                    int e2 = bch_decode_block(block2, data2);
+                    
+                    if (e1 >= 0 && e2 >= 0) {
+                        ESP_LOGI(TAG, "BCH DECODE SUCCESS! Errors: %d, %d", e1, e2);
+                        // Log first few bits as binary for quick check
+                        char bin_str[22] = {0};
+                        for (int i = 0; i < 21; i++) bin_str[i] = data1[i] ? '1' : '0';
+                        ESP_LOGI(TAG, "Block1 Data: %s", bin_str);
                     }
-                    
-                    free(frame.bits);
                 }
-                free(interleaved_2sps);
+                
+                free(frame.bits);
             }
         }
     }
@@ -175,11 +193,21 @@ esp_err_t worker_core1_init()
     burst_queue = xQueueCreate(16, sizeof(detected_burst_t));
     if (!burst_queue) return ESP_ERR_NO_MEM;
 
-    extract_buf = heap_caps_malloc(MAX_EXTRACT_SAMPLES * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    phasor_buf = heap_caps_malloc(MAX_EXTRACT_SAMPLES * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    decim_buf = heap_caps_malloc(MAX_EXTRACT_SAMPLES * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    resample_buf = heap_caps_malloc(MAX_EXTRACT_SAMPLES * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    if (!extract_buf || !phasor_buf || !decim_buf || !resample_buf) return ESP_ERR_NO_MEM;
+    // Allocate all buffers in PSRAM with padding for arp4 kernels
+    size_t buf_size = (MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS) * 2 * sizeof(int16_t);
+    extract_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    phasor_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    decim_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    resample_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    
+    stage1_in_i = heap_caps_malloc((MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS) * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    stage1_in_q = heap_caps_malloc((MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS) * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    demod_interleaved = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+
+    if (!extract_buf || !phasor_buf || !decim_buf || !resample_buf || 
+        !stage1_in_i || !stage1_in_q || !demod_interleaved) {
+        return ESP_ERR_NO_MEM;
+    }
 
     // Stage 1 Coefficients (LPF)
     float coeffs_f32[FIR_TAPS];
