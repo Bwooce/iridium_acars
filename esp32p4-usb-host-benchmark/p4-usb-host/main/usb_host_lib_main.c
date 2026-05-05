@@ -11,7 +11,7 @@
 #include "esp_intr_alloc.h"
 #include "usb/usb_host.h"
 
-#define DAEMON_TASK_PRIORITY 2
+#define DAEMON_TASK_PRIORITY 4
 #define CLASS_TASK_PRIORITY 3
 
 extern void class_driver_task(void *arg);

@@ -153,30 +153,62 @@ void stream_transfer_cb(usb_transfer_t *transfer)
     }
 }
 
+void esp_libusb_set_dev_hdl(usb_device_handle_t hdl)
+{
+    if (adsbdev) {
+        adsbdev->dev_hdl = hdl;
+        ESP_LOGI("LIBUSB", "Permanent device handle set: %p", hdl);
+    }
+}
+
 int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
 {
     class_adsb_dev *dev = adsbdev;
-    dev->ringbuf = xRingbufferCreate(512 * 1024, RINGBUF_TYPE_BYTEBUF);
+    if (!dev) return -1;
+
+    usb_device_handle_t dev_hdl = driver_obj->dev_hdl ? driver_obj->dev_hdl : dev->dev_hdl;
+    if (!dev_hdl) {
+        ESP_LOGE("LIBUSB", "Cannot start stream: NULL device handle");
+        return -1;
+    }
+
+    dev->ringbuf = xRingbufferCreateWithCaps(512 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     if (dev->ringbuf == NULL) {
+        ESP_LOGE("LIBUSB", "Failed to create stream ringbuffer in PSRAM");
         return -1;
     }
 
     dev->streaming = true;
     for (int i = 0; i < ASYNC_TRANSFER_COUNT; i++) {
-        usb_host_transfer_alloc(ASYNC_TRANSFER_SIZE, 0, &dev->transfers[i]);
-        dev->transfers[i]->device_handle = driver_obj->dev_hdl;
+        esp_err_t r = usb_host_transfer_alloc(ASYNC_TRANSFER_SIZE, 0, &dev->transfers[i]);
+        if (r != ESP_OK || dev->transfers[i] == NULL) {
+            ESP_LOGE("LIBUSB", "Failed to alloc async transfer %d", i);
+            return -1;
+        }
+        dev->transfers[i]->device_handle = dev_hdl;
         dev->transfers[i]->bEndpointAddress = endpoint;
         dev->transfers[i]->callback = stream_transfer_cb;
         dev->transfers[i]->context = (void *)driver_obj;
         dev->transfers[i]->num_bytes = ASYNC_TRANSFER_SIZE;
-        usb_host_transfer_submit(dev->transfers[i]);
+        
+        r = usb_host_transfer_submit(dev->transfers[i]);
+        if (r != ESP_OK) {
+            ESP_LOGE("LIBUSB", "Failed to submit async transfer %d: %d", i, r);
+            return -1;
+        }
     }
+    ESP_LOGI("LIBUSB", "Started async stream on handle %p", dev_hdl);
     return 0;
 }
 
 int esp_libusb_read_stream(uint8_t *buffer, size_t length, size_t *received, TickType_t timeout)
 {
     class_adsb_dev *dev = adsbdev;
+    if (!dev || !dev->ringbuf) {
+        *received = 0;
+        return -1;
+    }
+    
     size_t item_size;
     uint8_t *item = xRingbufferReceiveUpTo(dev->ringbuf, &item_size, timeout, length);
     if (item != NULL) {

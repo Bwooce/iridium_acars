@@ -39,6 +39,7 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
     switch (event_msg->event)
     {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
+        ESP_LOGI(TAG, "New USB device connected at address %d", event_msg->new_dev.address);
         if (driver_obj->dev_addr == 0)
         {
             driver_obj->dev_addr = event_msg->new_dev.address;
@@ -46,12 +47,14 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
         }
         break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
+        ESP_LOGI(TAG, "USB device gone");
         if (driver_obj->dev_hdl != NULL)
         {
             driver_obj->actions |= ACTION_CLOSE_DEV;
         }
         break;
     default:
+        ESP_LOGI(TAG, "Unknown USB client event: %d", event_msg->event);
         break;
     }
 }
@@ -139,7 +142,7 @@ void class_driver_task(void *arg)
 
     while (1)
     {
-        usb_host_client_handle_events(s_driver_obj.client_hdl, 1);
+        usb_host_client_handle_events(s_driver_obj.client_hdl, 0);
 
         if (s_driver_obj.actions & ACTION_OPEN_DEV) action_open_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_START_STREAM) action_start_stream(&s_driver_obj);
@@ -164,6 +167,9 @@ void class_driver_task(void *arg)
             size_t free_rb, total_rb;
             esp_libusb_get_ringbuffer_info(&free_rb, &total_rb);
             if (free_rb < min_free_rb) min_free_rb = free_rb;
+        } else {
+            // No data read, yield to prevent tight spin starvation
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
         int64_t now = esp_timer_get_time();

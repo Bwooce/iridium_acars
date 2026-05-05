@@ -55,4 +55,5 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint);
 int esp_libusb_read_stream(uint8_t *buffer, size_t length, size_t *received, TickType_t timeout);
 void esp_libusb_get_ringbuffer_info(size_t *free, size_t *max_free);
 usb_device_handle_t esp_libusb_get_dev_hdl();
+void esp_libusb_set_dev_hdl(usb_device_handle_t hdl);
 void esp_libusb_get_string_descriptor_ascii(const usb_str_desc_t *str_desc, char *str);
