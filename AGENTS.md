@@ -63,6 +63,9 @@ Worker-stages: extract/freq/fir/resamp/demod/bch (us per processed burst)
 These are bugs and conventions discovered during integration that aren't
 obvious from reading the code:
 
+- **RTL-SDR v4 (R828D) XTAL is 28.8 MHz.** Unlike some R828D implementations that use 16 MHz, the Blog v4 shares the 28.8 MHz clock from the RTL2832U. Setting this incorrectly in `tuner_r82xx.h` prevents PLL lock.
+- **Tuner PLL needs settle delays.** The R82XX PLL requires ~10ms to lock. Our port needs explicit `esp_rom_delay_us()` calls between setting dividers and checking the lock bit, as the original `usleep` calls were missing/commented.
+- **DSP buffers need 32-byte padding.** The `arp4` (PIE) assembly kernels in `esp-dsp` have a vector look-ahead bug. All processing buffers must be padded by at least 16 `int16_t` elements (`DSP_PADDING_ELEMS`) to avoid `CHIP_LP_WDT_RESET` or memory faults.
 - **`dsps_fird_s16`** takes its `len` as the *output* length (input/decim),
   not the input length. Sibling `dsps_firmr_s16` takes input length. Don't
   confuse them.

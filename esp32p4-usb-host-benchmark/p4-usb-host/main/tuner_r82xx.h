@@ -27,7 +27,13 @@
 
 #define R820T_I2C_ADDR 0x34
 #define R828D_I2C_ADDR 0x74
-#define R828D_XTAL_FREQ 16000000
+// On the RTL-SDR Blog v4 the R828D shares the RTL2832U's 28.8 MHz reference
+// crystal (one chip, one clock). Older R828D-based DVB-T2 sticks had their
+// own dedicated 16 MHz crystal — that's the value upstream librtlsdr uses
+// by default and the reason this constant was 16 MHz in the original port.
+// Setting this incorrectly produces wrong PLL dividers and prevents lock.
+// Change back to 16000000 if this code is ever run on a non-v4 R828D stick.
+#define R828D_XTAL_FREQ 28800000
 
 #define R82XX_CHECK_ADDR 0x00
 #define R82XX_CHECK_VAL 0x69
