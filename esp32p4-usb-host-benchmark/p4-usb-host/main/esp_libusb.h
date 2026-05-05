@@ -56,3 +56,21 @@ void esp_libusb_get_ringbuffer_info(size_t *free, size_t *max_free);
 usb_device_handle_t esp_libusb_get_dev_hdl();
 void esp_libusb_set_dev_hdl(usb_device_handle_t hdl);
 void esp_libusb_get_string_descriptor_ascii(const usb_str_desc_t *str_desc, char *str);
+
+// Diagnostic stats for the streaming bulk-IN endpoint. Read & reset by the
+// caller. Useful for distinguishing between:
+//   - device sending short packets (actual_bytes < requested_bytes)
+//   - host stack throttling (rb_full_drops > 0)
+//   - underlying USB errors (status_errors > 0, broken down by status code)
+typedef struct {
+    uint32_t completed;           // transfers that completed normally (status==COMPLETED)
+    uint32_t status_errors;       // transfers with non-COMPLETED status
+    uint32_t resubmit_errors;     // failed to resubmit transfer
+    uint32_t rb_full_drops;       // transfer payload couldn't fit in ringbuffer
+    uint32_t short_xfers;         // completed but actual_num_bytes < num_bytes
+    uint64_t total_actual_bytes;  // sum of actual_num_bytes from completed transfers
+    uint64_t total_requested_bytes; // sum of num_bytes from completed transfers
+    uint8_t  last_error_status;   // last non-COMPLETED status seen
+} usb_stream_stats_t;
+
+void esp_libusb_get_stream_stats(usb_stream_stats_t *out);

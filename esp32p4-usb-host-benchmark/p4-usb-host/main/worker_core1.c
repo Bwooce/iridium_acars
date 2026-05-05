@@ -9,6 +9,7 @@
 #include "dsps_fir.h"
 #include "dsps_resampler.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "worker_core1.h"
 #include "signal_buffer.h"
 #include "qpsk_demod.h"
@@ -17,6 +18,22 @@
 static const char *TAG = "WORKER1";
 
 static QueueHandle_t burst_queue = NULL;
+
+// Diagnostic counters. Read & reset by worker_core1_get_stats().
+static volatile uint32_t s_bursts_queued = 0;     // pushed to queue (incl. dropped)
+static volatile uint32_t s_bursts_dropped = 0;    // queue full when push attempted
+static volatile uint32_t s_bursts_processed = 0;  // ran end-to-end through the worker
+static volatile uint32_t s_bursts_skipped = 0;    // hit edge/length/zero-output guard
+static volatile uint32_t s_queue_high_water = 0;  // peak observed depth
+static volatile uint64_t s_burst_total_us = 0;    // sum of wall-clock per processed burst
+
+// Per-stage timing accumulators, summed over processed bursts only.
+static volatile uint64_t s_t_extract_us = 0;
+static volatile uint64_t s_t_freq_center_us = 0;
+static volatile uint64_t s_t_fir_decim_us = 0;
+static volatile uint64_t s_t_resample_us = 0;
+static volatile uint64_t s_t_demod_us = 0;
+static volatile uint64_t s_t_bch_us = 0;
 
 // Decimation factor 32: 2.56 MHz -> 80 kHz
 #define DECIM_FACTOR 32
@@ -66,12 +83,14 @@ void worker_task(void *arg)
 
     while (1) {
         if (xQueueReceive(burst_queue, &burst, portMAX_DELAY)) {
+            int64_t burst_t0 = esp_timer_get_time();
             ESP_LOGI(TAG, "Worker processing burst: Start:%lu Len:%lu Bin:%d SNR:%.2f dB",
                      burst.start_sample_idx, burst.length_samples, burst.peak_bin, burst.peak_snr_db);
 
             // Minimum length guard: need enough samples to survive 32x decimation and filter delay
             if (burst.length_samples < 128) {
                 ESP_LOGW(TAG, "Burst too short (%lu samples) — dropping", burst.length_samples);
+                s_bursts_skipped++;
                 continue;
             }
 
@@ -90,11 +109,14 @@ void worker_task(void *arg)
                 burst.peak_bin >= (2048 - BIN_EDGE_GUARD) ||
                 burst.peak_bin == 1024) {
                 ESP_LOGW(TAG, "Skipping burst at edge/DC bin %d (likely artefact)", burst.peak_bin);
+                s_bursts_skipped++;
                 continue;
             }
 
             // 1. Extract from Circular Buffer
+            int64_t ts = esp_timer_get_time();
             signal_buffer_extract(burst.start_sample_idx, burst.length_samples, extract_buf);
+            int64_t t_extract = esp_timer_get_time();
 
             // 2. Frequency Centering
             float freq_offset = (burst.peak_bin - 1024) * 1250.0f;
@@ -116,6 +138,7 @@ void worker_task(void *arg)
                 extract_buf[i * 2 + 0] = (int16_t)((x_re * p_re - x_im * p_im) >> 15);
                 extract_buf[i * 2 + 1] = (int16_t)((x_re * p_im + x_im * p_re) >> 15);
             }
+            int64_t t_freq = esp_timer_get_time();
 
             // 3. FIR Decimation (32x) Stage 1 (2.56M -> 80k)
             memset(delay_i, 0, sizeof(delay_i));
@@ -131,16 +154,18 @@ void worker_task(void *arg)
             // dsps_fird_s16's length parameter is the OUTPUT length (input/decim).
             // Passing the input length would cause a massive out-of-bounds read.
             int expected_out_80k = burst.length_samples / DECIM_FACTOR;
-            
-            // Note: dsps_fird_s16_arp4 on P4 has a bug where it returns an uninitialized 
+
+            // Note: dsps_fird_s16_arp4 on P4 has a bug where it returns an uninitialized
             // register (a6) instead of the output count. We use the expected count.
             dsps_fird_s16_arp4(&fir_i, stage1_in_i, &decim_buf[0], expected_out_80k);
             dsps_fird_s16_arp4(&fir_q, stage1_in_q, &decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], expected_out_80k);
             int out_samples_80k = expected_out_80k;
+            int64_t t_fir = esp_timer_get_time();
 
             if (out_samples_80k <= 2) {
                 ESP_LOGD(TAG, "Stage 1 produced %d samples (input %lu) — too short, dropping",
                          out_samples_80k, burst.length_samples);
+                s_bursts_skipped++;
                 continue;
             }
 
@@ -148,11 +173,13 @@ void worker_task(void *arg)
             // Note: dsps_firmr_s16's length parameter is the INPUT length.
             int out_samples_50k = dsps_firmr_s16(&resampler_i, &decim_buf[0], &resample_buf[0], out_samples_80k);
             dsps_firmr_s16(&resampler_q, &decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], &resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], out_samples_80k);
+            int64_t t_resamp = esp_timer_get_time();
 
             // Group delay guard: polyphase resampler takes some samples to fill its taps.
             // Drop bursts where resampler didn't have enough samples to emit data.
             if (out_samples_50k <= (RESAMPLE_TAPS / RESAMPLE_DECIM)) {
                 ESP_LOGD(TAG, "Stage 2 produced %d samples — too short for demod, skipping", out_samples_50k);
+                s_bursts_skipped++;
                 continue;
             }
 
@@ -168,32 +195,44 @@ void worker_task(void *arg)
             }
 
             // Note: n_samples parameter in qpsk_demod_process is number of int16_t values
-            if (qpsk_demod_process(demod_interleaved, out_samples_50k * 2, &frame)) {
+            bool demod_ok = qpsk_demod_process(demod_interleaved, out_samples_50k * 2, &frame);
+            int64_t t_demod = esp_timer_get_time();
+            int64_t t_bch = t_demod;
+            if (demod_ok) {
                 // Successfully demodulated!
-                ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)", 
+                ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)",
                          (frame.direction == DIR_DOWNLINK) ? "DL" : "UL", frame.n_bits);
-                
+
                 // 6. BCH Decoding / De-interleaving
                 if (frame.n_bits >= 24 + 64) {
                     const uint8_t *payload = frame.bits + 24;
                     uint8_t block1[32], block2[32];
                     uint8_t data1[21], data2[21];
-                    
+
                     iridium_deinterleave(payload, block1, block2);
                     int e1 = bch_decode_block(block1, data1);
                     int e2 = bch_decode_block(block2, data2);
-                    
+
                     if (e1 >= 0 && e2 >= 0) {
                         ESP_LOGI(TAG, "BCH DECODE SUCCESS! Errors: %d, %d", e1, e2);
-                        // Log first few bits as binary for quick check
                         char bin_str[22] = {0};
                         for (int i = 0; i < 21; i++) bin_str[i] = data1[i] ? '1' : '0';
                         ESP_LOGI(TAG, "Block1 Data: %s", bin_str);
                     }
                 }
-                
+                t_bch = esp_timer_get_time();
+
                 free(frame.bits);
             }
+
+            s_bursts_processed++;
+            s_burst_total_us  += (uint64_t)(esp_timer_get_time() - burst_t0);
+            s_t_extract_us    += (uint64_t)(t_extract - ts);
+            s_t_freq_center_us+= (uint64_t)(t_freq - t_extract);
+            s_t_fir_decim_us  += (uint64_t)(t_fir - t_freq);
+            s_t_resample_us   += (uint64_t)(t_resamp - t_fir);
+            s_t_demod_us      += (uint64_t)(t_demod - t_resamp);
+            s_t_bch_us        += (uint64_t)(t_bch - t_demod);
         }
     }
 }
@@ -269,6 +308,43 @@ esp_err_t worker_core1_init()
 void worker_core1_push_burst(const detected_burst_t *burst)
 {
     if (burst_queue) {
-        xQueueSend(burst_queue, burst, 0);
+        s_bursts_queued++;
+        UBaseType_t depth = uxQueueMessagesWaiting(burst_queue);
+        if (depth > s_queue_high_water) s_queue_high_water = depth;
+        if (xQueueSend(burst_queue, burst, 0) != pdTRUE) {
+            s_bursts_dropped++;
+        }
     }
+}
+
+void worker_core1_get_stats(worker_stats_t *out)
+{
+    uint32_t n = s_bursts_processed;
+    out->bursts_queued    = s_bursts_queued;
+    out->bursts_dropped   = s_bursts_dropped;
+    out->bursts_processed = n;
+    out->bursts_skipped   = s_bursts_skipped;
+    out->queue_high_water = s_queue_high_water;
+    if (n > 0) {
+        float fn = (float)n;
+        out->avg_burst_us    = (float)s_burst_total_us / fn;
+        out->extract_us      = (float)s_t_extract_us / fn;
+        out->freq_center_us  = (float)s_t_freq_center_us / fn;
+        out->fir_decim_us    = (float)s_t_fir_decim_us / fn;
+        out->resample_us     = (float)s_t_resample_us / fn;
+        out->demod_us        = (float)s_t_demod_us / fn;
+        out->bch_us          = (float)s_t_bch_us / fn;
+    } else {
+        out->avg_burst_us = out->extract_us = out->freq_center_us =
+            out->fir_decim_us = out->resample_us = out->demod_us =
+            out->bch_us = 0.0f;
+    }
+    s_bursts_queued = 0;
+    s_bursts_dropped = 0;
+    s_bursts_processed = 0;
+    s_bursts_skipped = 0;
+    s_queue_high_water = 0;
+    s_burst_total_us = 0;
+    s_t_extract_us = s_t_freq_center_us = s_t_fir_decim_us =
+        s_t_resample_us = s_t_demod_us = s_t_bch_us = 0;
 }

@@ -4,6 +4,18 @@
 
 static class_adsb_dev *adsbdev;
 
+// Streaming bulk-IN diagnostic counters. Read & reset by
+// esp_libusb_get_stream_stats(). volatile because they're written from the
+// USB host task (transfer callback) and read from the class_driver task.
+static volatile uint32_t s_xfer_completed = 0;
+static volatile uint32_t s_xfer_status_errors = 0;
+static volatile uint32_t s_xfer_resubmit_errors = 0;
+static volatile uint32_t s_xfer_rb_full_drops = 0;
+static volatile uint32_t s_xfer_short = 0;
+static volatile uint64_t s_xfer_actual_bytes = 0;
+static volatile uint64_t s_xfer_requested_bytes = 0;
+static volatile uint8_t  s_xfer_last_error = 0;
+
 void init_adsb_dev()
 {
     adsbdev = calloc(1, sizeof(class_adsb_dev));
@@ -144,13 +156,47 @@ void stream_transfer_cb(usb_transfer_t *transfer)
     }
 
     if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
-        if (transfer->actual_num_bytes > 0) {
-            xRingbufferSend(dev->ringbuf, transfer->data_buffer, transfer->actual_num_bytes, 0);
+        s_xfer_completed++;
+        s_xfer_actual_bytes    += (uint32_t)transfer->actual_num_bytes;
+        s_xfer_requested_bytes += (uint32_t)transfer->num_bytes;
+        if (transfer->actual_num_bytes < transfer->num_bytes) {
+            s_xfer_short++;
         }
-        usb_host_transfer_submit(transfer);
+        if (transfer->actual_num_bytes > 0) {
+            BaseType_t ok = xRingbufferSend(dev->ringbuf, transfer->data_buffer,
+                                            transfer->actual_num_bytes, 0);
+            if (ok != pdTRUE) {
+                s_xfer_rb_full_drops++;
+            }
+        }
     } else {
-        usb_host_transfer_submit(transfer);
+        s_xfer_status_errors++;
+        s_xfer_last_error = (uint8_t)transfer->status;
     }
+
+    if (usb_host_transfer_submit(transfer) != ESP_OK) {
+        s_xfer_resubmit_errors++;
+    }
+}
+
+void esp_libusb_get_stream_stats(usb_stream_stats_t *out)
+{
+    out->completed             = s_xfer_completed;
+    out->status_errors         = s_xfer_status_errors;
+    out->resubmit_errors       = s_xfer_resubmit_errors;
+    out->rb_full_drops         = s_xfer_rb_full_drops;
+    out->short_xfers           = s_xfer_short;
+    out->total_actual_bytes    = s_xfer_actual_bytes;
+    out->total_requested_bytes = s_xfer_requested_bytes;
+    out->last_error_status     = s_xfer_last_error;
+    s_xfer_completed = 0;
+    s_xfer_status_errors = 0;
+    s_xfer_resubmit_errors = 0;
+    s_xfer_rb_full_drops = 0;
+    s_xfer_short = 0;
+    s_xfer_actual_bytes = 0;
+    s_xfer_requested_bytes = 0;
+    s_xfer_last_error = 0;
 }
 
 void esp_libusb_set_dev_hdl(usb_device_handle_t hdl)

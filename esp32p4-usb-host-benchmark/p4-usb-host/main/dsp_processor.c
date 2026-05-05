@@ -32,6 +32,15 @@ static float threshold_lin;
 static int total_bursts = 0;
 static burst_detected_cb_t burst_cb = NULL;
 
+// Per-stage timing accumulators (sum of microseconds across frames since
+// last reset). Reset by dsp_processor_get_stage_stats().
+static volatile uint64_t s_acc_wind_us = 0;
+static volatile uint64_t s_acc_fft_us = 0;
+static volatile uint64_t s_acc_mag_us = 0;
+static volatile uint64_t s_acc_detect_us = 0;
+static volatile uint64_t s_acc_baseline_us = 0;
+static volatile uint32_t s_acc_frames = 0;
+
 esp_err_t dsp_processor_init(burst_detected_cb_t cb)
 {
     ESP_LOGI(TAG, "Initializing FFT Detector (Size:%d)...", FFT_SIZE);
@@ -63,15 +72,18 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
     
     for (int f = 0; f < n_frames; f++) {
         const int16_t *frame_ptr = &samples[f * FFT_SIZE * 2];
-        
+        int64_t t0 = esp_timer_get_time();
+
         // 1. Window
         for (int i = 0; i < FFT_SIZE * 2; i++) {
             fft_in[i] = (int16_t)(((int32_t)frame_ptr[i] * window_cplx[i]) >> 15);
         }
+        int64_t t1 = esp_timer_get_time();
 
         // 2. FFT
         dsps_fft2r_sc16_arp4(fft_in, FFT_SIZE);
         dsps_bit_rev_sc16_ansi(fft_in, FFT_SIZE);
+        int64_t t2 = esp_timer_get_time();
 
         // 3. Magnitude Squared (with shift)
         float norm = 1.0f / (FFT_SIZE * FFT_SIZE);
@@ -81,6 +93,7 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
             float im = (float)fft_in[i * 2 + 1];
             magnitudes[shift_idx] = (re * re + im * im) * norm;
         }
+        int64_t t3 = esp_timer_get_time();
 
         // 4. Detection
         bool frame_has_signal = false;
@@ -100,6 +113,7 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
                 }
             }
         }
+        int64_t t4 = esp_timer_get_time();
 
         if (frame_has_signal) {
             if (!current_burst.active) {
@@ -138,7 +152,39 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
                 baseline[i] = beta * baseline[i] + alpha * magnitudes[i];
             }
         }
-        
+        int64_t t5 = esp_timer_get_time();
+
+        // Accumulate stage timings for diagnostic reporting.
+        s_acc_wind_us     += (uint64_t)(t1 - t0);
+        s_acc_fft_us      += (uint64_t)(t2 - t1);
+        s_acc_mag_us      += (uint64_t)(t3 - t2);
+        s_acc_detect_us   += (uint64_t)(t4 - t3);
+        s_acc_baseline_us += (uint64_t)(t5 - t4);
+        s_acc_frames++;
+
         frame_count++;
     }
+}
+
+void dsp_processor_get_stage_stats(dsp_stage_stats_t *out)
+{
+    uint32_t n = s_acc_frames;
+    if (n == 0) {
+        out->frames = 0;
+        out->wind_us = out->fft_us = out->mag_us = out->detect_us =
+            out->baseline_us = out->total_us = 0;
+        return;
+    }
+    float fn = (float)n;
+    out->frames      = n;
+    out->wind_us     = (float)s_acc_wind_us / fn;
+    out->fft_us      = (float)s_acc_fft_us / fn;
+    out->mag_us      = (float)s_acc_mag_us / fn;
+    out->detect_us   = (float)s_acc_detect_us / fn;
+    out->baseline_us = (float)s_acc_baseline_us / fn;
+    out->total_us    = out->wind_us + out->fft_us + out->mag_us +
+                       out->detect_us + out->baseline_us;
+    s_acc_wind_us = s_acc_fft_us = s_acc_mag_us = s_acc_detect_us =
+        s_acc_baseline_us = 0;
+    s_acc_frames = 0;
 }

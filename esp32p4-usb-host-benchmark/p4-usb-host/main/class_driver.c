@@ -136,8 +136,11 @@ void class_driver_task(void *arg)
     int64_t start_time = esp_timer_get_time();
     int64_t last_report = start_time;
 
-    uint64_t dsp_total_time_us = 0;
-    uint32_t dsp_frame_count = 0;
+    // Per-window counters for diagnostic reporting (reset each 1s window).
+    uint64_t bytes_window = 0;          // USB bytes received in this window
+    uint32_t feed_calls_window = 0;     // dsp_processor_feed calls in this window
+    uint64_t dsp_total_time_us = 0;     // sum of dsp_processor_feed wall time
+    uint32_t dsp_frame_count = 0;       // FFT frames processed in this window
     size_t min_free_rb = 512 * 1024;
     int64_t last_idle_log = esp_timer_get_time();
     int64_t last_recovery_us = esp_timer_get_time();
@@ -190,16 +193,18 @@ void class_driver_task(void *arg)
         size_t n_read = 0;
         if (esp_libusb_read_stream(buffer, out_block_size, &n_read, 0) == 0) {
             total_bytes += n_read;
+            bytes_window += n_read;
             for (int i = 0; i < n_read; i++) {
                 convert_buf[i] = ((int16_t)buffer[i] - 128) << 8;
             }
-            
+
             signal_buffer_push(convert_buf, n_read / 2);
 
             int64_t dsp_start = esp_timer_get_time();
             dsp_processor_feed(convert_buf, n_read / 2);
             dsp_total_time_us += (esp_timer_get_time() - dsp_start);
-            dsp_frame_count += (n_read / 2) / 2048; 
+            dsp_frame_count += (n_read / 2) / 2048;
+            feed_calls_window++;
 
             size_t free_rb, total_rb;
             esp_libusb_get_ringbuffer_info(&free_rb, &total_rb);
@@ -208,16 +213,61 @@ void class_driver_task(void *arg)
 
         int64_t now = esp_timer_get_time();
         if (now - last_report >= 1000000) {
-            double elapsed = (now - start_time) / 1000000.0;
-            double rate = (total_bytes / (1024.0 * 1024.0)) / elapsed;
-            
-            float avg_dsp_us = (dsp_frame_count > 0) ? (float)dsp_total_time_us / dsp_frame_count : 0;
+            double window_s = (now - last_report) / 1000000.0;
+            double elapsed_s = (now - start_time) / 1000000.0;
+            double rate_inst = (bytes_window / (1024.0 * 1024.0)) / window_s;
+            double rate_avg  = (total_bytes / (1024.0 * 1024.0)) / elapsed_s;
+
+            float avg_dsp_us = (dsp_frame_count > 0)
+                ? (float)dsp_total_time_us / dsp_frame_count : 0;
+            float feed_us_avg = (feed_calls_window > 0)
+                ? (float)dsp_total_time_us / feed_calls_window : 0;
             float rb_usage = 100.0f * (1.0f - (float)min_free_rb / (512 * 1024));
 
-            ESP_LOGI(TAG, "Rate:%.2fMB/s | DSP:%.0fus | RB-HWM:%.1f%% | PSRAM:%d", 
-                     rate, avg_dsp_us, rb_usage, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            
+            // Pull diagnostic snapshots — every getter resets its accumulators.
+            dsp_stage_stats_t dsp_st;
+            dsp_processor_get_stage_stats(&dsp_st);
+            worker_stats_t ws;
+            worker_core1_get_stats(&ws);
+            usb_stream_stats_t us;
+            esp_libusb_get_stream_stats(&us);
+
+            // USB transfer-level fill ratio (actual / requested) reveals device-side
+            // throttling (short transfers) vs host-side back-pressure (rb_full_drops).
+            float xfer_fill = (us.total_requested_bytes > 0)
+                ? (100.0f * (float)us.total_actual_bytes / (float)us.total_requested_bytes)
+                : 0.0f;
+
+            ESP_LOGI(TAG, "USB: rate_inst=%.2f MB/s rate_avg=%.2f MB/s feed_calls=%u "
+                          "(avg_per_call=%.0f us) RB-HWM=%.1f%% PSRAM_free=%d",
+                     rate_inst, rate_avg, feed_calls_window, feed_us_avg,
+                     rb_usage, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+            ESP_LOGI(TAG, "USB-XFR: completed=%u short=%u (fill=%.1f%%) "
+                          "rb_full_drops=%u status_err=%u resubmit_err=%u last_err=0x%02x",
+                     us.completed, us.short_xfers, xfer_fill,
+                     us.rb_full_drops, us.status_errors, us.resubmit_errors,
+                     us.last_error_status);
+
+            ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame "
+                          "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
+                     dsp_frame_count, avg_dsp_us,
+                     dsp_st.wind_us, dsp_st.fft_us, dsp_st.mag_us,
+                     dsp_st.detect_us, dsp_st.baseline_us);
+
+            ESP_LOGI(TAG, "Worker: queued=%u dropped=%u processed=%u skipped=%u "
+                          "qmax=%u avg_burst=%.0f us",
+                     ws.bursts_queued, ws.bursts_dropped, ws.bursts_processed,
+                     ws.bursts_skipped, ws.queue_high_water, ws.avg_burst_us);
+
+            ESP_LOGI(TAG, "Worker-stages (us): extract=%.0f freq=%.0f fir=%.0f "
+                          "resamp=%.0f demod=%.0f bch=%.0f",
+                     ws.extract_us, ws.freq_center_us, ws.fir_decim_us,
+                     ws.resample_us, ws.demod_us, ws.bch_us);
+
             last_report = now;
+            bytes_window = 0;
+            feed_calls_window = 0;
             dsp_total_time_us = 0;
             dsp_frame_count = 0;
             min_free_rb = 512 * 1024;
