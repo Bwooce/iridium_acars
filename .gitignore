@@ -1,0 +1,24 @@
+# Dependencies
+esp-idf/
+
+# Build artifacts
+**/build/
+**/managed_components/
+**/sdkconfig
+**/sdkconfig.old
+**/bootloader/
+**/partition_table/
+*.elf
+*.bin
+*.map
+
+# Logs
+*.log
+
+# Editor/OS specific
+.DS_Store
+.claude/
+.vscode/
+
+# Project specific
+p4_performance.log
