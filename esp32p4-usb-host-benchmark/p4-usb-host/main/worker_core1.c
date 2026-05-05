@@ -128,35 +128,36 @@ void worker_task(void *arg)
                 stage1_in_q[i] = extract_buf[i * 2 + 1];
             }
 
-            // dsps_fird_s16's len parameter is OUTPUT length (= input / decim),
-            // see comment in dsps_fird_s16_ansi.c: "len is already a length of
-            // the *output array, calculated as (length of the input array / decimation)".
-            // The assembly variant (_arp4) additionally has a bug: it returns
-            // register a6 (uninitialised garbage, observed as -256) instead of
-            // the output count. So we pass the correct output length AND compute
-            // the count ourselves rather than trust the return value.
-            const int32_t expected_out_80k = burst.length_samples / DECIM_FACTOR;
+            // dsps_fird_s16's length parameter is the OUTPUT length (input/decim).
+            // Passing the input length would cause a massive out-of-bounds read.
+            int expected_out_80k = burst.length_samples / DECIM_FACTOR;
+            
+            // Note: dsps_fird_s16_arp4 on P4 has a bug where it returns an uninitialized 
+            // register (a6) instead of the output count. We use the expected count.
             dsps_fird_s16_arp4(&fir_i, stage1_in_i, &decim_buf[0], expected_out_80k);
             dsps_fird_s16_arp4(&fir_q, stage1_in_q, &decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], expected_out_80k);
             int out_samples_80k = expected_out_80k;
 
-            if (out_samples_80k <= 0) {
-                ESP_LOGW(TAG, "Stage 1 produced %d samples (input %lu) — dropping",
+            if (out_samples_80k <= 2) {
+                ESP_LOGD(TAG, "Stage 1 produced %d samples (input %lu) — too short, dropping",
                          out_samples_80k, burst.length_samples);
                 continue;
             }
 
             // 4. Resample Stage 2 (80k -> 50k via interp=5, decim=8)
+            // Note: dsps_firmr_s16's length parameter is the INPUT length.
             int out_samples_50k = dsps_firmr_s16(&resampler_i, &decim_buf[0], &resample_buf[0], out_samples_80k);
             dsps_firmr_s16(&resampler_q, &decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], &resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], out_samples_80k);
 
-            ESP_LOGI(TAG, "Burst processed: 80k=%d 50k=%d (input len=%lu)",
-                     out_samples_80k, out_samples_50k, burst.length_samples);
-
-            if (out_samples_50k <= 0) {
-                ESP_LOGD(TAG, "Stage 2 produced 0 samples — skipping demod");
+            // Group delay guard: polyphase resampler takes some samples to fill its taps.
+            // Drop bursts where resampler didn't have enough samples to emit data.
+            if (out_samples_50k <= (RESAMPLE_TAPS / RESAMPLE_DECIM)) {
+                ESP_LOGD(TAG, "Stage 2 produced %d samples — too short for demod, skipping", out_samples_50k);
                 continue;
             }
+
+            ESP_LOGI(TAG, "Burst processed: 80k=%d 50k=%d (input len=%lu)",
+                     out_samples_80k, out_samples_50k, burst.length_samples);
 
             // 5. QPSK Demodulation
             decoded_frame_t frame;
