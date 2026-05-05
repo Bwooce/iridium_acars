@@ -122,6 +122,17 @@ This is the baseline implementation for the project.
 
 This split ensures that detection latency (930 μs) does not block the time-critical USB DMA ingestion. The 4MB PSRAM buffer allows the detector to run slightly "behind" real-time without losing signal starts.
 
+**Integration status (Phase 3 complete):** the full pipeline runs end-to-end against a live RTL-SDR v4 stream with no crashes. Stage 1 FIR (32× decimation) and Stage 2 polyphase resample (5/8) produce the expected sample counts (`input/32` and `input × 5/8` respectively). 177 bursts processed in 14 s of indoor testing with no panics. Real-RF validation against actual Iridium signals is pending antenna hardware (Phase 4).
+
+### 11a.3a USB Stuck-Device Recovery (software-only)
+
+VBUS to the host port is hardwired-on through U2 — no GPIO controls it. Despite this, software recovery from stuck-device states works without physical unplug:
+
+- Boot with `usb_host_config_t.root_port_unpowered = true`, then call `usb_host_lib_set_root_port_power(true)` after install. This forces a fresh USB attach sequence on every reset.
+- Recovery watchdog in the class driver task: if no device enumerates within 6 s, cycle root port power (`false → 500 ms → true`), up to 3 times.
+
+The controller-side disconnect/reconnect is enough to recover most stuck states even though physical VBUS doesn't drop. The watchdog has been observed firing and successfully recovering an RTL-SDR that was left stuck by an unclean prior reset.
+
 ### 11a.4 Roof-Mount Install: Lightning & Surge
 
 All electronics live in a single rooftop enclosure (LNA at the antenna, SDR + ESP32-P4 in the box). Output is via WiFi (ESP32-C6 companion) — no metallic data cable leaves the roof. The protection scheme is built around the enclosure as the single point of ground reference.
@@ -161,4 +172,6 @@ Antenna → SAWbird+ LNA (sacrificial) → ARRESTOR (at enclosure wall) → SDR 
 
 ## 12. Conclusion
 
-The ESP32-P4 architecture for Iridium ACARS is proven. By leveraging PIE-optimized fixed-point math and Octal PSRAM, we have successfully implemented a real-time baseband pipeline capable of sustained 5.12 MB/s ingestion and decoding. While the 2048-pt FFT pushes Core 0 to its limit at 2.56 MSPS, the Dual-Core offloading and PSRAM buffering provide the necessary stability for reliable frame recovery.
+The ESP32-P4 architecture for Iridium ACARS is firmware-complete on the integration side. PIE-optimised fixed-point DSP plus Octal PSRAM gives a real-time baseband pipeline that sustains 5.12 MB/s USB ingestion and runs all stages (detect → extract → freq-centre → decimate → resample → DQPSK → BCH) end-to-end against a live RTL-SDR v4 with no crashes. The 2048-pt FFT pushes Core 0 to ~91% of budget at 2.56 MSPS, with the 4 MB PSRAM lookback absorbing transient deficits. USB stuck-device recovery is fully software-driven via root-port-power cycling — physical unplug is no longer needed.
+
+What remains is **live RF validation** (Phase 4): the indoor pipeline has only seen RFI and harmonics, not real Iridium bursts. Decoding a real ACARS frame is gated on the antenna + LNA hardware (Scan QFH + SAWbird+ IR) plus the lightning protection described in §11a.4.
