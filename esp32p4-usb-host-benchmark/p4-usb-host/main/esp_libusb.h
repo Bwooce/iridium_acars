@@ -71,6 +71,11 @@ typedef struct {
     uint64_t total_actual_bytes;  // sum of actual_num_bytes from completed transfers
     uint64_t total_requested_bytes; // sum of num_bytes from completed transfers
     uint8_t  last_error_status;   // last non-COMPLETED status seen
+    // Producer-side ringbuffer fill tracking — sampled inside the USB callback
+    // so we see the *peak* fill, not the post-drain residual the consumer sees.
+    size_t   producer_rb_max_used; // peak bytes-in-ringbuffer observed at send time
+    size_t   producer_rb_used_at_drop; // bytes-used when xRingbufferSend failed
+    uint32_t producer_samples;     // number of producer-side fill samples taken
 } usb_stream_stats_t;
 
 void esp_libusb_get_stream_stats(usb_stream_stats_t *out);

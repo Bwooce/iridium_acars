@@ -19,17 +19,17 @@ if [ ! -f "${APP_DIR}/CMakeLists.txt" ]; then
     exit 1
 fi
 
-# Source the IDF environment if not already active.
-if [ -z "${IDF_PATH:-}" ]; then
-    IDF_EXPORT="${IDF_EXPORT:-/home/bruce/dev/iridium_acars/esp-idf/export.sh}"
-    if [ ! -f "${IDF_EXPORT}" ]; then
-        echo "error: IDF_EXPORT not found at ${IDF_EXPORT}" >&2
-        echo "  set IDF_EXPORT=/path/to/esp-idf/export.sh or source it manually" >&2
-        exit 1
-    fi
-    # shellcheck disable=SC1090
-    source "${IDF_EXPORT}" > /dev/null
+# Source the project's vendored IDF environment. We deliberately do NOT
+# trust a pre-existing IDF_PATH — this project requires v6.1 at ./esp-idf/
+# and the user may have a different system-installed IDF on PATH.
+IDF_EXPORT="${IDF_EXPORT:-${REPO_DIR}/../esp-idf/export.sh}"
+if [ ! -f "${IDF_EXPORT}" ]; then
+    echo "error: vendored IDF export.sh not found at ${IDF_EXPORT}" >&2
+    echo "  expected at <repo>/esp-idf/export.sh; set IDF_EXPORT to override" >&2
+    exit 1
 fi
+# shellcheck disable=SC1090
+source "${IDF_EXPORT}" > /dev/null
 
 cd "${APP_DIR}"
 

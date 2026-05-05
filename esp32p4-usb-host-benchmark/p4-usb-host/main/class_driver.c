@@ -141,7 +141,13 @@ void class_driver_task(void *arg)
     uint32_t feed_calls_window = 0;     // dsp_processor_feed calls in this window
     uint64_t dsp_total_time_us = 0;     // sum of dsp_processor_feed wall time
     uint32_t dsp_frame_count = 0;       // FFT frames processed in this window
-    size_t min_free_rb = 512 * 1024;
+    size_t max_used_rb = 0;             // peak buffer fill observed (consumer-side)
+    // Consumer-cycle stage breakdown (sum of microseconds in each stage).
+    // Per-cycle = (read_us + convert_us + push_us + feed_us). Helps locate
+    // which stage is the throughput bottleneck.
+    uint64_t cycle_read_us = 0;
+    uint64_t cycle_convert_us = 0;
+    uint64_t cycle_push_us = 0;
     int64_t last_idle_log = esp_timer_get_time();
     int64_t last_recovery_us = esp_timer_get_time();
     int recovery_attempts = 0;
@@ -191,24 +197,35 @@ void class_driver_task(void *arg)
 
         // If streaming, process data
         size_t n_read = 0;
-        if (esp_libusb_read_stream(buffer, out_block_size, &n_read, 0) == 0) {
+        int64_t t_read_start = esp_timer_get_time();
+        int read_ok = esp_libusb_read_stream(buffer, out_block_size, &n_read, 0);
+        int64_t t_read_end = esp_timer_get_time();
+        if (read_ok == 0) {
+            cycle_read_us += (uint64_t)(t_read_end - t_read_start);
             total_bytes += n_read;
             bytes_window += n_read;
+
             for (int i = 0; i < n_read; i++) {
                 convert_buf[i] = ((int16_t)buffer[i] - 128) << 8;
             }
+            int64_t t_convert = esp_timer_get_time();
+            cycle_convert_us += (uint64_t)(t_convert - t_read_end);
 
             signal_buffer_push(convert_buf, n_read / 2);
+            int64_t t_push = esp_timer_get_time();
+            cycle_push_us += (uint64_t)(t_push - t_convert);
 
-            int64_t dsp_start = esp_timer_get_time();
             dsp_processor_feed(convert_buf, n_read / 2);
-            dsp_total_time_us += (esp_timer_get_time() - dsp_start);
+            dsp_total_time_us += (esp_timer_get_time() - t_push);
             dsp_frame_count += (n_read / 2) / 2048;
             feed_calls_window++;
 
-            size_t free_rb, total_rb;
-            esp_libusb_get_ringbuffer_info(&free_rb, &total_rb);
-            if (free_rb < min_free_rb) min_free_rb = free_rb;
+            // Sample ringbuffer fill AFTER read drained 16 KB. This is
+            // a low-water-mark-ish view; the producer-side max in
+            // usb_stream_stats_t is the authoritative peak.
+            size_t used_rb, total_rb;
+            esp_libusb_get_ringbuffer_info(&used_rb, &total_rb);
+            if (used_rb > max_used_rb) max_used_rb = used_rb;
         }
 
         int64_t now = esp_timer_get_time();
@@ -222,7 +239,11 @@ void class_driver_task(void *arg)
                 ? (float)dsp_total_time_us / dsp_frame_count : 0;
             float feed_us_avg = (feed_calls_window > 0)
                 ? (float)dsp_total_time_us / feed_calls_window : 0;
-            float rb_usage = 100.0f * (1.0f - (float)min_free_rb / (512 * 1024));
+            // Consumer-side ringbuffer fill peak (% of 512 KB), sampled
+            // immediately after each read. Will under-report relative to
+            // the producer-side peak because consumer reads precisely the
+            // moments that drain the buffer.
+            float consumer_peak_pct = 100.0f * (float)max_used_rb / (512.0f * 1024.0f);
 
             // Pull diagnostic snapshots — every getter resets its accumulators.
             dsp_stage_stats_t dsp_st;
@@ -238,16 +259,34 @@ void class_driver_task(void *arg)
                 ? (100.0f * (float)us.total_actual_bytes / (float)us.total_requested_bytes)
                 : 0.0f;
 
+            // Consumer-cycle stage means (per call to dsp_processor_feed).
+            float feed_n = (feed_calls_window > 0) ? (float)feed_calls_window : 1.0f;
+            float read_us_avg    = (float)cycle_read_us    / feed_n;
+            float convert_us_avg = (float)cycle_convert_us / feed_n;
+            float push_us_avg    = (float)cycle_push_us    / feed_n;
+
+            // Producer-side ringbuffer peak, in % of 512 KB.
+            float producer_peak_pct = 100.0f * (float)us.producer_rb_max_used / (512.0f * 1024.0f);
+            float drop_fill_pct     = 100.0f * (float)us.producer_rb_used_at_drop / (512.0f * 1024.0f);
+
             ESP_LOGI(TAG, "USB: rate_inst=%.2f MB/s rate_avg=%.2f MB/s feed_calls=%u "
-                          "(avg_per_call=%.0f us) RB-HWM=%.1f%% PSRAM_free=%d",
+                          "(avg_per_call=%.0f us) RB-fill_consumer=%.1f%% PSRAM_free=%d",
                      rate_inst, rate_avg, feed_calls_window, feed_us_avg,
-                     rb_usage, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                     consumer_peak_pct, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
             ESP_LOGI(TAG, "USB-XFR: completed=%u short=%u (fill=%.1f%%) "
                           "rb_full_drops=%u status_err=%u resubmit_err=%u last_err=0x%02x",
                      us.completed, us.short_xfers, xfer_fill,
                      us.rb_full_drops, us.status_errors, us.resubmit_errors,
                      us.last_error_status);
+
+            ESP_LOGI(TAG, "USB-RB:  producer_peak_fill=%.1f%% drop_fill=%.1f%% "
+                          "(producer_samples=%u, consumer_peak_fill=%.1f%%)",
+                     producer_peak_pct, drop_fill_pct, us.producer_samples,
+                     consumer_peak_pct);
+
+            ESP_LOGI(TAG, "Consumer-cycle (us avg): read=%.0f convert=%.0f push=%.0f feed=%.0f",
+                     read_us_avg, convert_us_avg, push_us_avg, feed_us_avg);
 
             ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame "
                           "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
@@ -270,7 +309,10 @@ void class_driver_task(void *arg)
             feed_calls_window = 0;
             dsp_total_time_us = 0;
             dsp_frame_count = 0;
-            min_free_rb = 512 * 1024;
+            max_used_rb = 0;
+            cycle_read_us = 0;
+            cycle_convert_us = 0;
+            cycle_push_us = 0;
         }
     }
 

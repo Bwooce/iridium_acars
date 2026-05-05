@@ -15,6 +15,12 @@ static volatile uint32_t s_xfer_short = 0;
 static volatile uint64_t s_xfer_actual_bytes = 0;
 static volatile uint64_t s_xfer_requested_bytes = 0;
 static volatile uint8_t  s_xfer_last_error = 0;
+// Producer-side ringbuffer fill tracking. The class_driver consumer measures
+// HWM after each read which biases towards 0; these are sampled in the USB
+// callback (the producer) so we capture the actual peak fills.
+static volatile size_t   s_producer_rb_max_used = 0;
+static volatile size_t   s_producer_rb_used_at_drop = 0;
+static volatile uint32_t s_producer_samples = 0;
 
 void init_adsb_dev()
 {
@@ -163,10 +169,20 @@ void stream_transfer_cb(usb_transfer_t *transfer)
             s_xfer_short++;
         }
         if (transfer->actual_num_bytes > 0) {
+            // Sample fill BEFORE the send. vRingbufferGetInfo's last arg is
+            // uxItemsWaiting which IS the used-byte count for a byte buffer
+            // (not free bytes — earlier code had this inverted).
+            UBaseType_t items_waiting = 0;
+            vRingbufferGetInfo(dev->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
+            size_t used_bytes = (size_t)items_waiting;
+            if (used_bytes > s_producer_rb_max_used) s_producer_rb_max_used = used_bytes;
+            s_producer_samples++;
+
             BaseType_t ok = xRingbufferSend(dev->ringbuf, transfer->data_buffer,
                                             transfer->actual_num_bytes, 0);
             if (ok != pdTRUE) {
                 s_xfer_rb_full_drops++;
+                s_producer_rb_used_at_drop = used_bytes;
             }
         }
     } else {
@@ -189,6 +205,9 @@ void esp_libusb_get_stream_stats(usb_stream_stats_t *out)
     out->total_actual_bytes    = s_xfer_actual_bytes;
     out->total_requested_bytes = s_xfer_requested_bytes;
     out->last_error_status     = s_xfer_last_error;
+    out->producer_rb_max_used  = s_producer_rb_max_used;
+    out->producer_rb_used_at_drop = s_producer_rb_used_at_drop;
+    out->producer_samples      = s_producer_samples;
     s_xfer_completed = 0;
     s_xfer_status_errors = 0;
     s_xfer_resubmit_errors = 0;
@@ -197,6 +216,9 @@ void esp_libusb_get_stream_stats(usb_stream_stats_t *out)
     s_xfer_actual_bytes = 0;
     s_xfer_requested_bytes = 0;
     s_xfer_last_error = 0;
+    s_producer_rb_max_used = 0;
+    s_producer_rb_used_at_drop = 0;
+    s_producer_samples = 0;
 }
 
 void esp_libusb_set_dev_hdl(usb_device_handle_t hdl)
@@ -267,14 +289,20 @@ int esp_libusb_read_stream(uint8_t *buffer, size_t length, size_t *received, Tic
     return -1;
 }
 
-void esp_libusb_get_ringbuffer_info(size_t *free, size_t *max_free)
+void esp_libusb_get_ringbuffer_info(size_t *used, size_t *capacity)
 {
     if (adsbdev && adsbdev->ringbuf) {
-        vRingbufferGetInfo(adsbdev->ringbuf, NULL, NULL, NULL, NULL, free);
-        *max_free = 512 * 1024; 
+        // vRingbufferGetInfo's last arg is uxItemsWaiting which for a
+        // RINGBUF_TYPE_BYTEBUF is the number of pending bytes (= used).
+        // Earlier code passed this into a variable called `free` and then
+        // computed (1 - free/total) as "usage", which was inverted.
+        UBaseType_t items_waiting = 0;
+        vRingbufferGetInfo(adsbdev->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
+        *used = (size_t)items_waiting;
+        *capacity = 512 * 1024;
     } else {
-        *free = 0;
-        *max_free = 0;
+        *used = 0;
+        *capacity = 0;
     }
 }
 
