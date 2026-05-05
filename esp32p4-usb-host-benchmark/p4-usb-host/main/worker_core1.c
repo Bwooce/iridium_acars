@@ -39,8 +39,16 @@ static int16_t coeffs[FIR_TAPS] __attribute__((aligned(16)));
 static int16_t delay_i[FIR_TAPS] __attribute__((aligned(16)));
 static int16_t delay_q[FIR_TAPS] __attribute__((aligned(16)));
 
-static dsps_resample_mr_t resampler_i, resample_q;
+// Stage 2: 80 kHz -> 50 kHz polyphase resample (interp 5, decim 8). We use the
+// lower-level dsps_firmr_* directly because dsps_resampler_mr_init() rejects
+// samplerate_factor < 1 (i.e. it can only upsample), and silently leaves the
+// struct uninitialised when called for downsampling — leading to a NULL deref
+// inside _exec(). dsps_firmr_init_s16 takes interp/decim directly and works
+// for both directions.
+static fir_s16_t resampler_i, resampler_q;
 static int16_t resample_coeffs[RESAMPLE_TAPS * RESAMPLE_INTERP] __attribute__((aligned(16)));
+static int16_t resample_delay_i[RESAMPLE_TAPS * RESAMPLE_INTERP] __attribute__((aligned(16)));
+static int16_t resample_delay_q[RESAMPLE_TAPS * RESAMPLE_INTERP] __attribute__((aligned(16)));
 
 void worker_task(void *arg)
 {
@@ -57,13 +65,32 @@ void worker_task(void *arg)
                 burst.length_samples = MAX_EXTRACT_SAMPLES;
             }
 
+            // Reject extreme/invalid bins. peak_bin range is 0..2047 with bin 1024 = DC.
+            // The phasor frequency math below produces |norm * 2| -> 1.0 at bins 0 and 2047,
+            // which is exactly out of dsps_cplx_gen's (-1, 1) valid range and previously
+            // caused a Core 1 fault. Drop bursts within a guard band of the spectrum edges
+            // and at DC itself (bin 1024) — DC bursts are usually direct-sampling artefacts,
+            // not real Iridium signals.
+            #define BIN_EDGE_GUARD 4
+            if (burst.peak_bin < BIN_EDGE_GUARD ||
+                burst.peak_bin >= (2048 - BIN_EDGE_GUARD) ||
+                burst.peak_bin == 1024) {
+                ESP_LOGW(TAG, "Skipping burst at edge/DC bin %d (likely artefact)", burst.peak_bin);
+                continue;
+            }
+
             // 1. Extract from Circular Buffer
             signal_buffer_extract(burst.start_sample_idx, burst.length_samples, extract_buf);
 
             // 2. Frequency Centering
             float freq_offset = (burst.peak_bin - 1024) * 1250.0f;
             float norm_freq = -freq_offset / 2560000.0f;
-            dsps_cplx_gen_init(&phasor_gen, S16_FIXED, NULL, 1024, norm_freq * 2.0f, 0);
+            // dsps_cplx_gen accepts normalised frequency in (-1, 1) exclusive.
+            // Clamp defensively in case detector ever emits an unusual peak_bin.
+            float gen_freq = norm_freq * 2.0f;
+            if (gen_freq >= 1.0f)  gen_freq = 0.999f;
+            if (gen_freq <= -1.0f) gen_freq = -0.999f;
+            dsps_cplx_gen_init(&phasor_gen, S16_FIXED, NULL, 1024, gen_freq, 0);
             dsps_cplx_gen(&phasor_gen, phasor_buf, burst.length_samples);
             cplx_gen_free(&phasor_gen);
 
@@ -95,9 +122,9 @@ void worker_task(void *arg)
             free(in_i);
             free(in_q);
 
-            // 4. Resample Stage 2 (80k -> 50k)
-            int out_samples_50k = dsps_resampler_mr_exec(&resampler_i, &decim_buf[0], &resample_buf[0], out_samples_80k, 0);
-            dsps_resampler_mr_exec(&resample_q, &decim_buf[MAX_EXTRACT_SAMPLES], &resample_buf[MAX_EXTRACT_SAMPLES], out_samples_80k, 0);
+            // 4. Resample Stage 2 (80k -> 50k via interp=5, decim=8)
+            int out_samples_50k = dsps_firmr_s16(&resampler_i, &decim_buf[0], &resample_buf[0], out_samples_80k);
+            dsps_firmr_s16(&resampler_q, &decim_buf[MAX_EXTRACT_SAMPLES], &resample_buf[MAX_EXTRACT_SAMPLES], out_samples_80k);
 
             ESP_LOGI(TAG, "Burst processed. Output samples (2sps): %d", out_samples_50k);
             
@@ -183,8 +210,19 @@ esp_err_t worker_core1_init()
     for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) sum += rcoeffs_f32[i];
     for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) resample_coeffs[i] = (int16_t)(rcoeffs_f32[i] / sum * 32767.0f);
 
-    dsps_resampler_mr_init(&resampler_i, resample_coeffs, RESAMPLE_TAPS, RESAMPLE_INTERP, 1.0f / 1.6f, 1, 15);
-    dsps_resampler_mr_init(&resample_q, resample_coeffs, RESAMPLE_TAPS, RESAMPLE_INTERP, 1.0f / 1.6f, 1, 15);
+    // Multi-rate FIR with interp=5, decim=8 → 5/8 ratio, 80 kHz → 50 kHz.
+    // length here is the total filter length (taps × interp = 64 × 5 = 320),
+    // matching the size of resample_coeffs and the per-channel delay arrays.
+    esp_err_t r_init_i = dsps_firmr_init_s16(&resampler_i, resample_coeffs, resample_delay_i,
+                                             RESAMPLE_TAPS * RESAMPLE_INTERP,
+                                             RESAMPLE_INTERP, RESAMPLE_DECIM, 0, 15);
+    esp_err_t r_init_q = dsps_firmr_init_s16(&resampler_q, resample_coeffs, resample_delay_q,
+                                             RESAMPLE_TAPS * RESAMPLE_INTERP,
+                                             RESAMPLE_INTERP, RESAMPLE_DECIM, 0, 15);
+    if (r_init_i != ESP_OK || r_init_q != ESP_OK) {
+        ESP_LOGE(TAG, "Stage 2 resampler init failed: i=%d q=%d", r_init_i, r_init_q);
+        return ESP_FAIL;
+    }
 
     xTaskCreatePinnedToCore(worker_task, "worker_core1", 16384, NULL, 5, NULL, 1);
     return ESP_OK;

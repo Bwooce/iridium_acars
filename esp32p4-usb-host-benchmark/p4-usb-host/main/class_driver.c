@@ -140,12 +140,16 @@ void class_driver_task(void *arg)
     uint32_t dsp_frame_count = 0;
     size_t min_free_rb = 512 * 1024;
     int64_t last_idle_log = esp_timer_get_time();
+    int64_t last_recovery_us = esp_timer_get_time();
+    int recovery_attempts = 0;
+    const int MAX_RECOVERY_ATTEMPTS = 3;
+    const int64_t RECOVERY_INTERVAL_US = 6 * 1000000;
 
     while (1)
     {
         usb_host_client_handle_events(s_driver_obj.client_hdl, 10);
 
-        // Periodic status while no device is open — helps diagnose enumeration failure.
+        // Periodic status / recovery watchdog while no device is open.
         if (s_driver_obj.dev_addr == 0) {
             int64_t now_us = esp_timer_get_time();
             if (now_us - last_idle_log >= 5 * 1000000) {
@@ -153,6 +157,28 @@ void class_driver_task(void *arg)
                          s_driver_obj.dev_addr, (unsigned long)s_driver_obj.actions);
                 last_idle_log = now_us;
             }
+            // If nothing has enumerated for RECOVERY_INTERVAL_US, cycle root port power.
+            // This forces SOFs to stop and re-evaluates attach state, which recovers
+            // most stuck-device cases without requiring physical unplug. Capped at
+            // MAX_RECOVERY_ATTEMPTS so we don't loop forever if the hardware is
+            // genuinely broken.
+            if (recovery_attempts < MAX_RECOVERY_ATTEMPTS &&
+                now_us - last_recovery_us >= RECOVERY_INTERVAL_US) {
+                ESP_LOGW(TAG, "Recovery: cycling root port power (attempt %d/%d)",
+                         recovery_attempts + 1, MAX_RECOVERY_ATTEMPTS);
+                esp_err_t r = usb_host_lib_set_root_port_power(false);
+                ESP_LOGW(TAG, "  power(false) -> 0x%x (%s)", r, esp_err_to_name(r));
+                vTaskDelay(pdMS_TO_TICKS(500));
+                r = usb_host_lib_set_root_port_power(true);
+                ESP_LOGW(TAG, "  power(true)  -> 0x%x (%s)", r, esp_err_to_name(r));
+                recovery_attempts++;
+                last_recovery_us = esp_timer_get_time();
+            }
+        } else {
+            // Reset the recovery counter on successful enumeration so we can
+            // recover again from a future hot-disconnect.
+            recovery_attempts = 0;
+            last_recovery_us = esp_timer_get_time();
         }
 
         if (s_driver_obj.actions & ACTION_OPEN_DEV) action_open_dev(&s_driver_obj);

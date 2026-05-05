@@ -1375,23 +1375,23 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     // }
 
     reg = rtlsdr_i2c_read_reg(dev, R820T_I2C_ADDR, R82XX_CHECK_ADDR);
-    ESP_LOGI(TAG_ADSB, "rtl device number %d", reg);
-    fprintf(stderr, "rtlsdr_i2c_read_reg R82XX_CHECK_ADDR setting done\n");
+    ESP_LOGI(TAG_ADSB, "R820T probe @0x%02x: 0x%02x", R820T_I2C_ADDR, reg);
     if (reg == R82XX_CHECK_VAL)
     {
-        fprintf(stderr, "Found Rafael Micro R820T tuner\n");
+        ESP_LOGI(TAG_ADSB, "Found Rafael Micro R820T tuner");
         dev->tuner_type = RTLSDR_TUNER_R820T;
         goto found;
     }
 
-    // reg = rtlsdr_i2c_read_reg(dev, R828D_I2C_ADDR, R82XX_CHECK_ADDR);
-    // fprintf(stderr, "rtlsdr_i2c_read_reg R828D_I2C_ADDR setting done\n");
-    // if (reg == R82XX_CHECK_VAL)
-    // {
-    //     fprintf(stderr, "Found Rafael Micro R828D tuner\n");
-    //     dev->tuner_type = RTLSDR_TUNER_R828D;
-    //     goto found;
-    // }
+    // RTL-SDR Blog v4 uses R828D at I2C address 0x74 (R820T variants use 0x34).
+    reg = rtlsdr_i2c_read_reg(dev, R828D_I2C_ADDR, R82XX_CHECK_ADDR);
+    ESP_LOGI(TAG_ADSB, "R828D probe @0x%02x: 0x%02x", R828D_I2C_ADDR, reg);
+    if (reg == R82XX_CHECK_VAL)
+    {
+        ESP_LOGI(TAG_ADSB, "Found Rafael Micro R828D tuner (RTL-SDR v4)");
+        dev->tuner_type = RTLSDR_TUNER_R828D;
+        goto found;
+    }
 
     // /* initialise GPIOs */
     // rtlsdr_set_gpio_output(dev, 4);

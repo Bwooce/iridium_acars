@@ -31,12 +31,27 @@ static void host_lib_daemon_task(void *arg)
     SemaphoreHandle_t signaling_sem = (SemaphoreHandle_t)arg;
 
     ESP_LOGI(TAG, "Installing USB Host Library");
+    // root_port_unpowered=true: the root port starts powered OFF, so we must
+    // explicitly power it ON below. This guarantees a fresh USB attach
+    // sequence on every boot — important because on the Nano VBUS to the
+    // RTL-SDR is hardwired-on (U2 EN held active), so the device otherwise
+    // never sees a power cycle across ESP32 resets and can get stuck after
+    // an unclean shutdown. Toggling root port power forces SOFs to stop and
+    // re-evaluates attach, which recovers most stuck states without a physical
+    // unplug.
     usb_host_config_t host_config = {
         .skip_phy_setup = false,
+        .root_port_unpowered = true,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
     };
     ESP_ERROR_CHECK(usb_host_install(&host_config));
-    ESP_LOGI(TAG, "USB Host Library installed; waiting for device events...");
+    ESP_LOGI(TAG, "USB Host Library installed; powering root port ON");
+    esp_err_t pwr_r = usb_host_lib_set_root_port_power(true);
+    if (pwr_r != ESP_OK) {
+        ESP_LOGW(TAG, "set_root_port_power(true) returned 0x%x (%s)",
+                 pwr_r, esp_err_to_name(pwr_r));
+    }
+    ESP_LOGI(TAG, "Root port powered, waiting for device events...");
 
     // Signal to the class driver task that the host library is installed
     xSemaphoreGive(signaling_sem);
