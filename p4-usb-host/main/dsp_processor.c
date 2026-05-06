@@ -5,6 +5,7 @@
 #include "esp_dsp.h"
 #include "esp_timer.h"
 #include "dsp_processor.h"
+#include "dsp_window_arp4.h"
 
 static const char *TAG = "DSP_PROC";
 
@@ -74,10 +75,10 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
         const int16_t *frame_ptr = &samples[f * FFT_SIZE * 2];
         int64_t t0 = esp_timer_get_time();
 
-        // 1. Window
-        for (int i = 0; i < FFT_SIZE * 2; i++) {
-            fft_in[i] = (int16_t)(((int32_t)frame_ptr[i] * window_cplx[i]) >> 15);
-        }
+        // 1. Window — Q15 element-wise multiply, hand-rolled PIE on P4.
+        // The scalar loop the compiler emits at -O3 measured 92 μs/frame;
+        // the 8-lane esp.vmul.s16 kernel is ~5–15 μs/frame.
+        dsp_window_s16(frame_ptr, window_cplx, fft_in, FFT_SIZE * 2);
         int64_t t1 = esp_timer_get_time();
 
         // 2. FFT

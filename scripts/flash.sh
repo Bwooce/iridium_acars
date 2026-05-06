@@ -34,7 +34,7 @@ fi
 
 # Source the project's vendored IDF environment unconditionally — see
 # build.sh for rationale.
-IDF_EXPORT="${IDF_EXPORT:-${REPO_DIR}/../esp-idf/export.sh}"
+IDF_EXPORT="${IDF_EXPORT:-${REPO_DIR}/esp-idf/export.sh}"
 if [ ! -f "${IDF_EXPORT}" ]; then
     echo "error: vendored IDF export.sh not found at ${IDF_EXPORT}" >&2
     exit 1

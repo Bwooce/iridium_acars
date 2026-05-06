@@ -4,16 +4,19 @@ project(p4_usb_host_tests C)
 set(CMAKE_C_STANDARD 11)
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -O2 -g)
 
-# Pull production sources directly from main/ so the host tests exercise
-# the exact code that runs on the target. No file moves required.
-set(MAIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
+# Pull production sources directly from common/iridium_decoder/ so the
+# host tests exercise the exact code that runs on the target. The
+# decoder lives in common/ so it can be shared with the future worker
+# P4 firmware; the tests don't need to know about that layout — they
+# just compile the same files with a host toolchain.
+set(COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/iridium_decoder)
 
 # bch_decoder is pure C with no IDF deps — compile it as-is.
 add_executable(test_bch
     test_bch.c
-    ${MAIN_DIR}/bch_decoder.c
+    ${COMMON_DIR}/bch_decoder.c
 )
-target_include_directories(test_bch PRIVATE ${MAIN_DIR})
+target_include_directories(test_bch PRIVATE ${COMMON_DIR})
 
 # qpsk_demod includes "esp_log.h"; tests/host/esp_log.h shadows it on
 # the host with a no-op stub. Adding tests/host/ first on the include
@@ -21,22 +24,22 @@ target_include_directories(test_bch PRIVATE ${MAIN_DIR})
 # production source.
 add_executable(test_qpsk
     test_qpsk.c
-    ${MAIN_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/qpsk_demod.c
 )
 target_include_directories(test_qpsk PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}   # esp_log.h stub
-    ${MAIN_DIR}
+    ${COMMON_DIR}
 )
 target_link_libraries(test_qpsk PRIVATE m)
 
 add_executable(test_demod_corpus
     test_demod_corpus.c
-    ${MAIN_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/qpsk_demod.c
 )
 target_include_directories(test_demod_corpus PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures       # generated headers
-    ${MAIN_DIR}
+    ${COMMON_DIR}
 )
 target_link_libraries(test_demod_corpus PRIVATE m)
 

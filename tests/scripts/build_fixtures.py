@@ -21,11 +21,9 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import resample_poly
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CORPUS_DIR = REPO_ROOT / "test_corpus"
-FIXTURE_DIR = (
-    REPO_ROOT / "esp32p4-usb-host-benchmark" / "tests" / "fixtures"
-)
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures"
 
 
 def load_sigmf() -> tuple[np.ndarray, dict]:

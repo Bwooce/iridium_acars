@@ -36,7 +36,7 @@ fi
 if ! python3 -c "import serial" 2>/dev/null; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-    IDF_EXPORT="${IDF_EXPORT:-${REPO_DIR}/../esp-idf/export.sh}"
+    IDF_EXPORT="${IDF_EXPORT:-${REPO_DIR}/esp-idf/export.sh}"
     if [ ! -f "${IDF_EXPORT}" ]; then
         echo "error: pyserial unavailable and IDF export.sh not found" >&2
         exit 1
