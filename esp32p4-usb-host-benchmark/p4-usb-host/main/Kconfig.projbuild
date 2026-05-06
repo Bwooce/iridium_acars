@@ -1,0 +1,34 @@
+menu "Iridium ACARS app options"
+
+config SMOKE_TEST_MODE
+    bool "Run target-side smoke test instead of USB streaming"
+    default n
+    help
+        When enabled, app_main runs smoke_test_run() instead of starting
+        the USB host daemon and class_driver tasks. The smoke test feeds
+        a synthetic noise/tone/noise IQ stream through the production
+        ingest -> dsp_processor path and asserts the FFT detector raises
+        a burst at the expected bin with high SNR.
+
+        Use for functional regression checks before/after changes that
+        touch the convert, signal_buffer, ingest_core1, or dsp_processor
+        code. No USB device needs to be attached.
+
+config SMOKE_TEST_CORPUS
+    bool "Use the test_corpus fixture (real Iridium burst) instead of a synthetic tone"
+    depends on SMOKE_TEST_MODE
+    default n
+    help
+        When enabled, the smoke test uses tests/fixtures/fixture_corpus_uint8.h
+        as the signal source — a real Iridium burst from
+        test_corpus/prbs15-2M-20dB.sigmf-data, resampled to 2.56 MSPS and
+        quantised to uint8 IQ. The detector should fire on the burst's
+        carrier (FFT bin near DC since the corpus carrier is at the SDR
+        center frequency).
+
+        The fixture must be regenerated via tests/scripts/build_fixtures.py
+        if the corpus or resampling parameters change. Without this flag,
+        the smoke test uses a synthetic tone at FFT bin 200 (semantic
+        regression check, not a corpus regression).
+
+endmenu

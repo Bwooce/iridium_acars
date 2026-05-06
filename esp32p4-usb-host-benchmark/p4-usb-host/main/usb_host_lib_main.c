@@ -12,6 +12,11 @@
 #include "esp_intr_alloc.h"
 #include "esp_timer.h"
 #include "usb/usb_host.h"
+#include "sdkconfig.h"
+
+#if CONFIG_SMOKE_TEST_MODE
+#include "smoke_test.h"
+#endif
 
 #define DAEMON_TASK_PRIORITY 4
 #define CLASS_TASK_PRIORITY 3
@@ -95,6 +100,15 @@ static void host_lib_daemon_task(void *arg)
 
 void app_main(void)
 {
+#if CONFIG_SMOKE_TEST_MODE
+    // Smoke test mode: bypass the USB stack entirely and run the
+    // synthetic-IQ regression test on a single Core 0 task. The smoke
+    // test never returns (parks the CPU after logging the result).
+    xTaskCreatePinnedToCore((TaskFunction_t)smoke_test_run,
+                            "smoke", 8192, NULL, 5, NULL, 0);
+    return;
+#endif
+
     SemaphoreHandle_t signaling_sem = xSemaphoreCreateBinary();
 
     TaskHandle_t daemon_task_hdl;

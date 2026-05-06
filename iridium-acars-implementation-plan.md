@@ -3,13 +3,19 @@
 This document tracks the concrete implementation steps for the [Iridium ACARS Decoding Stack Design](./iridium-acars-decoding-stack-design.md).
 
 ## Current Status
-- **Target:** Phase 4 (Live RF validation).
-- **Status:** Phases 0, 2, 3.1, 3.2, 3.3 are COMPLETE. End-to-end DSP pipeline
-  runs against a real RTL-SDR v4 with no crashes; bursts flow through
-  detect → extract → freq-centre → decimate → resample → demod → BCH cleanly.
-  USB host recovers from stuck-device states without physical unplug.
-- **Blocker:** Phase 4 needs antenna + LNA hardware (Scan QFH + SAWbird+ IR).
-- **Immediate Goal:** Acquire the RF frontend; first real Iridium decode.
+- **Target:** Phase 4 (Live RF validation), gated by Phase 3.5 (throughput).
+- **Status:** Phases 0, 2, 3.1–3.4 COMPLETE. End-to-end DSP pipeline runs
+  against a real RTL-SDR v4 with no crashes; bursts flow through
+  detect → extract → freq-centre → decimate → resample → demod → BCH
+  cleanly. USB host recovers from stuck-device states without physical
+  unplug.
+- **Phase 3.5 (in progress):** integrated throughput optimization. Currently
+  3.20 MB/s = **66% of the 4.85 MB/s real-time target** with `rb_full_drops`
+  ~32%. Steps 1, 2, 4, 4b, 5 done; Step 3 (PIE/Q15 baseline EMA) is the
+  remaining lever projected to close most of the gap.
+- **Blocker (Phase 4):** antenna + LNA hardware (Scan QFH + SAWbird+ IR).
+- **Immediate Goal:** complete Step 3 + functional regression tests, then
+  acquire the RF frontend.
 
 ---
 
@@ -76,6 +82,86 @@ benchmark phase:
   in the worker with PSRAM buffers allocated once in `worker_core1_init`,
   with `DSP_PADDING_ELEMS` padding around the per-channel halves to keep
   `arp4` vector loads from running off the end.
+
+---
+
+## Phase 3.5: Integrated Throughput Optimization (IN PROGRESS)
+
+When the tuner+DSP pipeline was integrated end-to-end against a live RTL-SDR
+v4, sustained throughput dropped from the dry benchmark's 5.12 MB/s to
+1.22 MB/s = 25% of real-time. Investigation found a chain of bugs and
+contention sources. Real-time at 2.56 MSPS / int8 IQ = **4.85 MB/s** at the
+current 16 KB transfer size (~3300 μs/cycle). Progress:
+
+| Phase | Throughput | % of target | Notes |
+|---|---|---|---|
+| Pre-fix (broken PLL → PSRAM thrash from RFI) | 1.22 MB/s | 25% | |
+| **PLL fix** (XTAL 28.8 MHz, I2C array memcpy, init array vs upstream) | 2.38 MB/s | 49% | RTL-SDR v4 finally locks |
+| **Step 1** (sdkconfig: L2=256 KB, WDT cfg, malloc reserve, FreeRTOS trace) | 2.49 MB/s | 51% | |
+| **Step 2** (`signal_buffer_push` → AXI-GDMA via `esp_async_memcpy`) | 2.82 MB/s | 58% | Architectural win — moves CPU off the AXI master bus |
+| **Step 4b** (USB Host daemon + ISR pinned to Core 1) | 2.84 MB/s | 59% | DWC OTG ISR off Core 0's hot loop |
+| **Step 4** (vectorise convert loop, 4× unrolled 32-bit loads) | 2.91 MB/s | 60% | |
+| **Step 5** (convert + push moved to Core 1 via internal-SRAM ping-pong) | 3.20 MB/s | 66% | Core 0 cycle drops 4859 → 4374 μs; `consumer_waits=0` |
+| **Step 6** (`CONFIG_COMPILER_OPTIMIZATION_PERF=y`, `-Og` → `-O2`) | **4.61 MB/s** | **95%** | Single biggest win in the arc. The whole prior path had been benchmarked under `-Og` (debug). Per-frame DSP 1050 → 645 μs; `rb_full_drops` 32% → 2.3% |
+
+### Critical bugs found during 3.5 (each had silent failure modes)
+
+- **`rtlsdr_read_array` / `rtlsdr_write_array` were single-byte-truncated.**
+  The original port did `*array = data[0]`, copying only the first byte of
+  every multi-byte I2C transaction and silently corrupting all R828D init
+  writes. Fixed with `memcpy(array, data, len)`. This was the underlying
+  cause of every prior "PLL won't lock" symptom.
+- **`R828D_XTAL_FREQ` was 16 MHz** (DVB-T2 default) but RTL-SDR v4 shares
+  the 28.8 MHz clock from the RTL2832U. Wrong divider arithmetic → no lock.
+- **`r82xx_init_array` had 14 of 27 registers wrong vs upstream librtlsdr.**
+- **PLL settle delays (`usleep_range`) were commented out.** PLL needs ~10 ms
+  to lock before reading the lock bit.
+- **Daemon task on Core 0 was preempting DSP feed** with ~300 ISR/s. Pinning
+  to Core 1 measurably reduced jitter.
+
+### Open work
+
+- [ ] **Step 3 — PIE/Q15 baseline EMA** (next, biggest remaining lever).
+  Audit (5-min grep against esp-dsp 1.8.1 sources, confirmed 2026-05-06):
+  on RISC-V P4 the only `_arp4` (PIE-optimised) primitives are
+  `fft2r_{sc16,fc32}`, `fft4r_fc32`, `fird_{s16,f32}`, `dotprod_{s16,f32}`,
+  `biquad_{f32,sf32}`. **No PIE variants exist for windowing, magnitude,
+  multi-rate FIR, complex generator, mulc, add, or bit-reverse.** Step 3
+  therefore can't be done by function-call swap — it requires hand-rolled
+  PIE intrinsics on a Q15-converted pipeline. Projected ~−800 μs/cycle →
+  ~4.6 MB/s = 95% of target.
+- [ ] **Step 2.5 — pre-Step-3 instrumentation.** DMA queue depth, L2 cache
+  hit/miss counters, Core 1 busy %, synthetic burst injection, so we can
+  attribute Step 3's effect to inner-loop time vs bus contention.
+- [ ] **Functional regression tests** (new, blocking Step 3). Q15
+  conversion will quietly change numerical output unless gated on a
+  fixture-based comparison. Two layers:
+  - Target-side smoke test: synthetic IQ → `signal_buffer` → DSP detector
+    asserts the burst fires on the right FFT bin.
+  - Host unit tests: `bch_decoder` + `qpsk_demod` (both essentially
+    IDF-free) built with native gcc, run against the `test_corpus/`
+    fixtures.
+- [ ] **Step 9 — zero-copy USB pointer passing** (deferred). ~3-5% gain,
+  ~2-3 days work; defer until we're closer to budget.
+
+### Architecture changes already in place
+
+- **Ping-pong ingest on Core 1** (`ingest_core1.c`): two cache-aligned
+  internal-SRAM slots, per-slot `s_free`/`s_ready` semaphores. Class
+  driver does USB read → dispatch → DSP feed; the ingest task on Core 1
+  does convert (uint8 → int16 Q15) → `signal_buffer_push`. Slot ownership
+  protocol: only `class_driver` takes/gives `s_free` — the ingest task
+  must never `take(s_free)` (deadlock; was a bug during initial Step 5).
+- **AXI-GDMA push** (`signal_buffer.c`): `esp_async_memcpy_install_gdma_axi`
+  + per-buffer `esp_cache_msync(M2C|INVALIDATE)` for coherency. Removes
+  CPU stalls on the AXI master.
+
+### Deferred refactor (post-3.5)
+
+When throughput is at-budget, move shared C files (`qpsk_demod`,
+`bch_decoder`, `dsp_processor`, etc.) into a `common/` sibling directory
+so future child-processor P4 boards can re-use them. Until then,
+`p4-usb-host/main/` holds everything.
 
 ---
 

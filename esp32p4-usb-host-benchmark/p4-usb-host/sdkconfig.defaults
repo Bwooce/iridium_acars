@@ -2,6 +2,17 @@ CONFIG_IDF_TARGET="esp32p4"
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP32P4_REV_MIN_100=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+
+# Build with -O2. Default IDF target picks "Debug" (-Og) which is awful for
+# scalar DSP loops — the windowing, magnitude, and EMA loops measured 4×
+# slower under -Og than the same code at -O2. Cost: a slightly larger
+# binary (still well within the 1 MB app partition) and slightly worse
+# stepping behaviour in gdb. Worth it.
+# (IDF v6.1 only exposes Debug/Size/Performance/None as choices; no LTO
+# option in Kconfig. Per-file aggressive flags are applied via the main
+# CMakeLists.txt for the DSP hot files.)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_TYPE_OCTAL=y
 CONFIG_SPIRAM_SPEED_200M=y

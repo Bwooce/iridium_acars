@@ -107,14 +107,24 @@ This is the baseline implementation for the project.
 
 ### 11a.2 Performance Envelope
 
-| Factor | Baseline (RTL-SDR v4) |
-|---|---|
-| Sample rate | 2.56 MSPS (Tested) / 2.0 MSPS (Safe) |
-| USB data rate | 5.12 MB/s (Bit-perfect achieved) |
-| FFT detector | 2048-pt sc16, ~1250 frames/sec |
-| Core 0 budget (2.56) | 800 μs (930 μs actual — **Tight**) |
-| Core 0 budget (2.0) | 1024 μs (930 μs actual — **Safe**) |
-| PSRAM Slack | ~400ms @ 5.12 MB/s |
+| Factor | Baseline (RTL-SDR v4) | Status |
+|---|---|---|
+| Sample rate | 2.56 MSPS (target) / 2.0 MSPS (fallback) | |
+| USB data rate (target, 2.56 MSPS, int8 IQ) | **4.85 MB/s** real-time at 16 KB transfers | |
+| USB data rate (dry benchmark, no DSP load) | 5.12 MB/s | achieved Phase 2 |
+| **USB data rate (integrated, with DSP)** | **3.20 MB/s = 66% of target** | as of 2026-05-06, post-Step 5 |
+| FFT detector | 2048-pt sc16, ~1250 frames/sec | |
+| Core 0 budget (2.56) | 800 μs / FFT frame (930 μs actual) | **Tight** |
+| Core 0 cycle (per 16 KB USB transfer) | 4374 μs (need ≤3300 for real-time) | **Over** |
+| PSRAM Slack | ~400 ms @ 5.12 MB/s, ~32% drops at integrated rate | |
+
+**Note on the "5.12 MB/s achieved" claim from Phase 2:** that was the dry
+benchmark — USB streaming with no tuner-driving I2C, no DSP feed, and a
+broken PLL that happened to make the buffer easier to drain. After
+integrating tuner control and the live DSP pipeline, throughput dropped to
+1.22 MB/s and has been climbing back through Phase 3.5 optimisation steps.
+Current integrated number is 3.20 MB/s; Step 3 (PIE/Q15 baseline EMA) is
+projected to close most of the remaining gap.
 
 ### 11a.3 Dual-Core Split
 - **Core 0:** USB Ingestion (DMA) + Circular Buffering + FFT Energy Detection.
@@ -172,6 +182,29 @@ Antenna → SAWbird+ LNA (sacrificial) → ARRESTOR (at enclosure wall) → SDR 
 
 ## 12. Conclusion
 
-The ESP32-P4 architecture for Iridium ACARS is firmware-complete on the integration side. PIE-optimised fixed-point DSP plus Octal PSRAM gives a real-time baseband pipeline that sustains 5.12 MB/s USB ingestion and runs all stages (detect → extract → freq-centre → decimate → resample → DQPSK → BCH) end-to-end against a live RTL-SDR v4 with no crashes. The 2048-pt FFT pushes Core 0 to ~91% of budget at 2.56 MSPS, with the 4 MB PSRAM lookback absorbing transient deficits. USB stuck-device recovery is fully software-driven via root-port-power cycling — physical unplug is no longer needed.
+The ESP32-P4 architecture for Iridium ACARS is firmware-complete on the
+integration side: detect → extract → freq-centre → decimate → resample →
+DQPSK → BCH runs end-to-end against a live RTL-SDR v4 with no crashes,
+and USB stuck-device recovery is fully software-driven via root-port-power
+cycling. Two open work items remain before live RF validation can begin
+(§11a.4):
 
-What remains is **live RF validation** (Phase 4): the indoor pipeline has only seen RFI and harmonics, not real Iridium bursts. Decoding a real ACARS frame is gated on the antenna + LNA hardware (Scan QFH + SAWbird+ IR) plus the lightning protection described in §11a.4.
+1. **Throughput optimization (Phase 3.5).** Integrated throughput is
+   currently 3.20 MB/s — 66% of the 4.85 MB/s real-time target at
+   2.56 MSPS — losing ~32% of samples to ringbuffer overflow.
+   Architecture changes already landed: AXI-GDMA `signal_buffer_push`,
+   USB daemon+ISR pinned to Core 1, ping-pong `convert+push` on Core 1.
+   The remaining lever is hand-rolled PIE Q15 inner loops for the DSP
+   feed (`dsp_processor.c`'s windowing, magnitude, baseline EMA), which
+   esp-dsp does not provide as ready-made `_arp4` kernels — see
+   AGENTS.md for the audited list.
+2. **Functional regression tests.** Numerical correctness has been
+   evaluated only at integration time. Before the Q15 conversion lands,
+   target-side smoke + host unit tests will be added so silent
+   regressions can be caught.
+
+After 3.5 closes, the remaining work is **live RF validation** (Phase 4):
+the indoor pipeline has only seen RFI and harmonics, not real Iridium
+bursts. Decoding a real ACARS frame is gated on the antenna + LNA
+hardware (Scan QFH + SAWbird+ IR) plus the lightning protection
+described in §11a.4.
