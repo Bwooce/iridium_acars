@@ -6,6 +6,7 @@
 #include "esp_timer.h"
 #include "dsp_processor.h"
 #include "dsp_window_arp4.h"
+#include "dsp_mag_arp4.h"
 
 static const char *TAG = "DSP_PROC";
 
@@ -53,6 +54,10 @@ __attribute__((aligned(16))) static int16_t  window_cplx[FFT_SIZE * 2 + 16];
 __attribute__((aligned(16))) static float    window_temp_f32[FFT_SIZE + 16];
 __attribute__((aligned(16))) static uint32_t magnitudes[FFT_SIZE + 16];
 __attribute__((aligned(16))) static uint32_t baseline[FFT_SIZE + 16];
+
+// (PIE int magnitude kernel attempted in Step 7c — see dsp_mag_arp4.S
+// for the documented findings. Currently unused; production path uses
+// the scalar magnitude inline in dsp_mag_arp4.h's dsp_mag_sq_s16().)
 
 typedef struct {
     bool active;
@@ -121,16 +126,13 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
         dsps_bit_rev_sc16_ansi(fft_in, FFT_SIZE);
         int64_t t2 = esp_timer_get_time();
 
-        // 3. Magnitude Squared — uint32 sum-of-squares, linear write.
-        // Output is re² + im² (no normalisation; baseline tracks the
-        // same scale). With re,im in [-32768, 32767], each squared
-        // term ≤ 2^30 and the sum ≤ 2^31, fits comfortably in uint32.
-        // No fftshift here — applied at burst-report only.
-        for (int i = 0; i < FFT_SIZE; i++) {
-            int32_t re = fft_in[i * 2 + 0];
-            int32_t im = fft_in[i * 2 + 1];
-            magnitudes[i] = (uint32_t)(re * re + im * im);
-        }
+        // 3. Magnitude Squared — scalar uint32 sum-of-squares.
+        // Step 7c attempted PIE here (see dsp_mag_arp4.S for the
+        // detailed findings). Three different PIE recipes produced
+        // either lossy or memory-bandwidth-bound results; scalar
+        // remains the fastest path for this specific workload on
+        // ESP32-P4's PIE.
+        dsp_mag_sq_s16(fft_in, magnitudes, FFT_SIZE);
         int64_t t3 = esp_timer_get_time();
 
         // 4. Detection — uint32 multiply, no uint64. baseline×40 wraps
