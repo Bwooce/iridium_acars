@@ -99,15 +99,21 @@ void app_main(void)
 
     TaskHandle_t daemon_task_hdl;
     TaskHandle_t class_driver_task_hdl;
-    // Create daemon task
+    // Daemon pinned to Core 1. usb_host_install runs from this task and
+    // registers the USB DWC OTG ISR on whichever core executed it — putting
+    // it on Core 1 means transfer-complete interrupts (~300/sec) fire on
+    // Core 1 (which is mostly idle while no bursts are active) rather than
+    // preempting Core 0's hot DSP loop. Saves the ISR-induced jitter on
+    // every consumer cycle. Reverts to Core 0 if cross-core overhead with
+    // the class_driver client (still on Core 0) ends up worse.
     xTaskCreatePinnedToCore(host_lib_daemon_task,
                             "daemon",
                             4096,
                             (void *)signaling_sem,
                             DAEMON_TASK_PRIORITY,
                             &daemon_task_hdl,
-                            0);
-    // Create the class driver task
+                            1);
+    // class_driver stays on Core 0 — that's where the DSP feed runs.
     xTaskCreatePinnedToCore(class_driver_task,
                             "class",
                             4096,
