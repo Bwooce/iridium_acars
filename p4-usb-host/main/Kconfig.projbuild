@@ -1,5 +1,20 @@
 menu "Iridium ACARS app options"
 
+config DIAG_TASK_DUMP
+    bool "Emit per-task CPU/stack dump every 5 s"
+    default n
+    help
+        When enabled, class_driver_task calls uxTaskGetSystemState every
+        5 s and emits one ESP_LOGI line per FreeRTOS task. Useful for
+        diagnosing which task is hot on which core, but the call is
+        expensive: malloc + N-task snapshot + N+1 log lines, all on the
+        Core 0 hot path. Measured to cause a ~5-10 ms consumer stall
+        once per 5 s, which lets the USB ringbuffer fill past 480 KB
+        and produces clustered rb_full_drops at the 5 s boundary.
+
+        Default off — re-enable temporarily (idf.py menuconfig) when
+        actively debugging task-affinity or runtime-distribution issues.
+
 config SMOKE_TEST_MODE
     bool "Run target-side smoke test instead of USB streaming"
     default n

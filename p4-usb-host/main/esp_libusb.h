@@ -1,3 +1,6 @@
+#ifndef ESP_LIBUSB_H
+#define ESP_LIBUSB_H
+
 #include "usb/usb_host.h"
 
 #include "freertos/ringbuf.h"
@@ -79,3 +82,4 @@ typedef struct {
 } usb_stream_stats_t;
 
 void esp_libusb_get_stream_stats(usb_stream_stats_t *out);
+#endif // ESP_LIBUSB_H

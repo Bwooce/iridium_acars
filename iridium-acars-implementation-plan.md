@@ -102,7 +102,10 @@ current 16 KB transfer size (~3300 μs/cycle). Progress:
 | **Step 4b** (USB Host daemon + ISR pinned to Core 1) | 2.84 MB/s | 59% | DWC OTG ISR off Core 0's hot loop |
 | **Step 4** (vectorise convert loop, 4× unrolled 32-bit loads) | 2.91 MB/s | 60% | |
 | **Step 5** (convert + push moved to Core 1 via internal-SRAM ping-pong) | 3.20 MB/s | 66% | Core 0 cycle drops 4859 → 4374 μs; `consumer_waits=0` |
-| **Step 6** (`CONFIG_COMPILER_OPTIMIZATION_PERF=y`, `-Og` → `-O2`) | **4.61 MB/s** | **95%** | Single biggest win in the arc. The whole prior path had been benchmarked under `-Og` (debug). Per-frame DSP 1050 → 645 μs; `rb_full_drops` 32% → 2.3% |
+| **Step 6** (`CONFIG_COMPILER_OPTIMIZATION_PERF=y`, `-Og` → `-O2`) | 4.61 MB/s | 95% | Single biggest win in the arc. The whole prior path had been benchmarked under `-Og` (debug). Per-frame DSP 1050 → 645 μs; `rb_full_drops` 32% → 2.3% |
+| **Step 7** (per-file `-O3 -funroll-loops` on dsp_processor.c, ingest_core1.c) | 4.61 MB/s | 95% | DSP/frame 645 → 570 μs; cycle 2581 → 2280 μs. Throughput device-capped (drops still 2.3%). |
+| **Step 3a** (hand-rolled PIE Q15 windowing kernel) | 4.61 MB/s | 95% | Wind 92 → 16 μs (5.75×); DSP/frame 570 → 493 μs. Throughput still device-capped through drops. |
+| **Step 6.5** (status logger offloaded to Core 1 task) | **4.88 MB/s** | **100.5%** | Drops collapsed 7/303 → 0/313. Per-second status formatting on Core 0 had been stalling the consumer ~5–10 ms/sec, filling the USB ringbuffer past 480 KB. Moving the printf work to a Core 1 task closes the last gap. |
 
 ### Critical bugs found during 3.5 (each had silent failure modes)
 

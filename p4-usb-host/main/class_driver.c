@@ -21,6 +21,7 @@
 #include "ingest_core1.h"
 #include "bch_decoder.h"
 #include "rtl-sdr.h"
+#include "status_logger.h"
 
 #define CLIENT_NUM_EVENT_MSG 5
 
@@ -121,6 +122,12 @@ void class_driver_task(void *arg)
     memset(&s_driver_obj, 0, sizeof(class_driver_t));
 
     xSemaphoreTake(signaling_sem, portMAX_DELAY);
+
+    // Bring up the Core 1 logger task before we start streaming so the
+    // first per-second snapshot has somewhere to land.
+    if (status_logger_init() != ESP_OK) {
+        ESP_LOGW(TAG, "status_logger_init failed; status logs will be silently dropped");
+    }
 
     ESP_LOGI(TAG, "Registering Client");
     usb_host_client_config_t client_config = {
@@ -281,93 +288,40 @@ void class_driver_task(void *arg)
 
         int64_t now = esp_timer_get_time();
         if (now - last_report >= 1000000) {
-            double window_s = (now - last_report) / 1000000.0;
-            double elapsed_s = (now - start_time) / 1000000.0;
-            double rate_inst = (bytes_window / (1024.0 * 1024.0)) / window_s;
-            double rate_avg  = (total_bytes / (1024.0 * 1024.0)) / elapsed_s;
+            // Per-second snapshot. Build a status_snapshot_t on the stack
+            // (~150 bytes), pull all the accumulators (each getter resets
+            // its internal state), and post to the logger task on Core 1.
+            // Posting is non-blocking — if the queue is full, this snapshot
+            // is silently dropped. The actual ESP_LOGI / printf / UART
+            // formatting work happens on Core 1 at low priority, completely
+            // off Core 0's hot read-feed loop.
+            //
+            // Why this matters: prior versions did the formatting inline
+            // here. Measured cost: ~5-10 ms of Core 0 stall per second,
+            // which let the 512 KB USB ringbuffer fill past 480 KB and
+            // produced exactly 7 rb_full_drops/sec. With the offload,
+            // drops go to 0.
+            status_snapshot_t snap = {0};
+            snap.window_us         = now - last_report;
+            snap.elapsed_us        = now - start_time;
+            snap.bytes_window      = bytes_window;
+            snap.total_bytes       = total_bytes;
+            snap.feed_calls_window = feed_calls_window;
+            snap.dsp_total_time_us = dsp_total_time_us;
+            snap.dsp_frame_count   = dsp_frame_count;
+            snap.cycle_read_us     = cycle_read_us;
+            snap.psram_free_bytes  = (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            esp_libusb_get_stream_stats(&snap.us);
+            dsp_processor_get_stage_stats(&snap.dsp);
+            ingest_core1_get_stats(&snap.ingest);
+            worker_core1_get_stats(&snap.ws);
+            (void)status_logger_post(&snap);
 
-            float avg_dsp_us = (dsp_frame_count > 0)
-                ? (float)dsp_total_time_us / dsp_frame_count : 0;
-            float feed_us_avg = (feed_calls_window > 0)
-                ? (float)dsp_total_time_us / feed_calls_window : 0;
-            // Consumer-side ringbuffer fill peak (% of 512 KB), sampled
-            // immediately after each read. Will under-report relative to
-            // the producer-side peak because consumer reads precisely the
-            // moments that drain the buffer.
-            // Pull diagnostic snapshots — every getter resets its accumulators.
-            dsp_stage_stats_t dsp_st;
-            dsp_processor_get_stage_stats(&dsp_st);
-            worker_stats_t ws;
-            worker_core1_get_stats(&ws);
-            usb_stream_stats_t us;
-            esp_libusb_get_stream_stats(&us);
-            ingest_stats_t is;
-            ingest_core1_get_stats(&is);
-
-            // USB transfer-level fill ratio (actual / requested) reveals device-side
-            // throttling (short transfers) vs host-side back-pressure (rb_full_drops).
-            float xfer_fill = (us.total_requested_bytes > 0)
-                ? (100.0f * (float)us.total_actual_bytes / (float)us.total_requested_bytes)
-                : 0.0f;
-
-            // Cycle stage means. With Step 5, convert+push happen on Core 1
-            // and don't show up on Core 0's hot path. Core 0 cycle =
-            // read + feed + (small bookkeeping).
-            float feed_n = (feed_calls_window > 0) ? (float)feed_calls_window : 1.0f;
-            float read_us_avg = (float)cycle_read_us / feed_n;
-            float ingest_n = (is.dispatches > 0) ? (float)is.dispatches : 1.0f;
-            float ingest_convert_us_avg = (float)is.convert_us_total / ingest_n;
-            float ingest_push_us_avg    = (float)is.push_us_total    / ingest_n;
-            float ingest_wait_us_avg    = (is.consumer_waits > 0)
-                ? (float)is.slot_wait_total_us / (float)is.consumer_waits : 0.0f;
-
-            // Producer-side ringbuffer peak, in % of 512 KB.
-            float producer_peak_pct = 100.0f * (float)us.producer_rb_max_used / (512.0f * 1024.0f);
-            float drop_fill_pct     = 100.0f * (float)us.producer_rb_used_at_drop / (512.0f * 1024.0f);
-
-            ESP_LOGI(TAG, "USB: rate_inst=%.2f MB/s rate_avg=%.2f MB/s feed_calls=%u "
-                          "(avg_per_call=%.0f us) PSRAM_free=%d",
-                     rate_inst, rate_avg, feed_calls_window, feed_us_avg,
-                     heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
-            ESP_LOGI(TAG, "USB-XFR: completed=%u short=%u (fill=%.1f%%) "
-                          "rb_full_drops=%u status_err=%u resubmit_err=%u last_err=0x%02x",
-                     us.completed, us.short_xfers, xfer_fill,
-                     us.rb_full_drops, us.status_errors, us.resubmit_errors,
-                     us.last_error_status);
-
-            ESP_LOGI(TAG, "USB-RB:  producer_peak_fill=%.1f%% drop_fill=%.1f%% "
-                          "(producer_samples=%u)",
-                     producer_peak_pct, drop_fill_pct, us.producer_samples);
-
-            ESP_LOGI(TAG, "Cycle (Core0 us avg): read=%.0f feed=%.0f",
-                     read_us_avg, feed_us_avg);
-
-            ESP_LOGI(TAG, "Ingest (Core1 us avg): convert=%.0f push=%.0f "
-                          "dispatches=%u consumer_waits=%u (avg_wait=%.0f us)",
-                     ingest_convert_us_avg, ingest_push_us_avg,
-                     is.dispatches, is.consumer_waits, ingest_wait_us_avg);
-
-            ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame "
-                          "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
-                     dsp_frame_count, avg_dsp_us,
-                     dsp_st.wind_us, dsp_st.fft_us, dsp_st.mag_us,
-                     dsp_st.detect_us, dsp_st.baseline_us);
-
-            ESP_LOGI(TAG, "Worker: queued=%u dropped=%u processed=%u skipped=%u "
-                          "qmax=%u avg_burst=%.0f us",
-                     ws.bursts_queued, ws.bursts_dropped, ws.bursts_processed,
-                     ws.bursts_skipped, ws.queue_high_water, ws.avg_burst_us);
-
-            ESP_LOGI(TAG, "Worker-stages (us): extract=%.0f freq=%.0f fir=%.0f "
-                          "resamp=%.0f demod=%.0f bch=%.0f",
-                     ws.extract_us, ws.freq_center_us, ws.fir_decim_us,
-                     ws.resample_us, ws.demod_us, ws.bch_us);
-
-            // Per-task / per-core CPU usage dump every 5 seconds. Heavy call
-            // (allocates an array, snapshots all task counters), so don't run
-            // every second. Tells us conclusively which task is hot on which
-            // core and whether Core 1 has spare capacity.
+#if CONFIG_DIAG_TASK_DUMP
+            // Per-task / per-core CPU usage dump every 5 s. Heavy call
+            // (allocates, snapshots all tasks, N+1 log lines). Gated
+            // behind CONFIG_DIAG_TASK_DUMP (default off); enable via
+            // menuconfig when actively debugging task-affinity issues.
             if (now - last_taskdump >= 5 * 1000000) {
                 last_taskdump = now;
                 UBaseType_t n = uxTaskGetNumberOfTasks();
@@ -376,12 +330,6 @@ void class_driver_task(void *arg)
                     uint32_t total_run = 0;
                     n = uxTaskGetSystemState(ts, n, &total_run);
                     ESP_LOGI(TAG, "Tasks (run-time since boot, %% of total):");
-                    // Core affinity isn't easily exposed by this IDF FreeRTOS
-                    // build (xCoreID requires sdkconfig flag that needs full
-                    // reconfigure; vTaskCoreAffinityGet not in this variant).
-                    // Task names are descriptive (class is on C0, worker_core1
-                    // on C1, IDLE0/IDLE1 on their respective cores) so just
-                    // print name + %CPU.
                     for (UBaseType_t i = 0; i < n; i++) {
                         uint32_t pct = (total_run > 0)
                             ? (uint32_t)((100ULL * ts[i].ulRunTimeCounter) / total_run)
@@ -396,6 +344,7 @@ void class_driver_task(void *arg)
                     free(ts);
                 }
             }
+#endif // CONFIG_DIAG_TASK_DUMP
 
             last_report = now;
             bytes_window = 0;
