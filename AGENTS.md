@@ -139,36 +139,52 @@ obvious from reading the code:
   fixed-point, not just slotting in a different function call. This is
   what Step 3 (in the implementation plan) is.
 
-## Throughput status (as of 2026-05-06)
+## Throughput status — DONE (Phase 3.5 closed 2026-05-06)
 
-We're in a focused throughput optimization arc, integrating a working
-tuner+DSP pipeline up to real-time. Real-time at 2.56 MSPS / int8 IQ is
-**4.85 MB/s** at 16 KB transfers (≈3300 μs/cycle). Progress so far:
+The optimisation arc is complete. We're at the RTL-SDR v4's actual
+streaming rate with zero packet loss.
 
-| Phase | Throughput | % of target |
-|---|---|---|
-| Pre-fix (broken PLL → PSRAM thrash from RFI) | 1.22 MB/s | 25% |
-| PLL fix (XTAL + I2C memcpy + init array) | 2.38 MB/s | 49% |
-| Step 1 (sdkconfig: L2=256 KB, WDT, malloc reserve) | 2.49 MB/s | 51% |
-| Step 2 (AXI-GDMA `signal_buffer_push`) | 2.82 MB/s | 58% |
-| Step 4b (USB daemon + ISR pinned to Core 1) | 2.84 MB/s | 59% |
-| Step 4 (vectorise convert loop) | 2.91 MB/s | 60% |
-| **Step 5 (ping-pong convert+push to Core 1)** | **3.20 MB/s** | **66%** |
+  - Throughput: **4.88 MB/s = 100.5% of the 4.85 MB/s real-time target**
+  - rb_full_drops: **0** (steady state; was 32% pre-fix)
+  - Core 0 cycle headroom: ~35% (cycle 1972 μs vs 3300 μs budget)
+  - Functional regression: bit-perfect against gr-iridium ground truth
 
-`rb_full_drops` is still ~32% in steady state — we're losing samples, not
-just delayed. The remaining gap is `feed=4200 μs` (Core 0 DSP cycle), which
-Step 3 (PIE/Q15 baseline EMA) is the path to closing.
+| Phase | Throughput | % of target | Drops |
+|---|---|---|---|
+| Pre-fix (broken PLL) | 1.22 MB/s | 25% | thrashing |
+| PLL fix | 2.38 MB/s | 49% | high |
+| Step 1 (sdkconfig L2=256 KB, WDT, malloc reserve) | 2.49 MB/s | 51% | high |
+| Step 2 (AXI-GDMA `signal_buffer_push`) | 2.82 MB/s | 58% | high |
+| Step 4b (USB daemon + ISR Core 1) | 2.84 MB/s | 59% | high |
+| Step 4 (convert loop vectorise) | 2.91 MB/s | 60% | high |
+| Step 5 (ping-pong convert+push to Core 1) | 3.20 MB/s | 66% | 32% |
+| Step 6 (`-Og` → `-O2`) | 4.61 MB/s | 95% | 2.3% |
+| Step 7 (per-file `-O3` on hot files) | 4.61 MB/s | 95% | 2.3% |
+| Step 3a (hand-rolled PIE Q15 windowing kernel) | 4.61 MB/s | 95% | 2.3% |
+| **Step 6.5 (status logger to Core 1 task)** | **4.88 MB/s** | **100.5%** | **0** |
 
-**Open optimization tasks:**
-- Step 3: convert DSP pipeline to Q15, use esp-dsp `*_s16_arp4` PIE kernels.
-  Projected: 3.2 → ~4.6 MB/s. This is the big remaining lever.
-- Step 2.5: pre-Step-3 instrumentation (DMA latency, L2 cache counters,
-  Core 1 busy %, synthetic burst injection) so we can tell what changed.
-- Functional regression tests (target-side smoke + host unit tests for
-  qpsk_demod / bch_decoder). Risk: Q15 conversion silently breaks
-  numerical correctness; we need a deterministic fixture-based check.
-- Step 9: zero-copy USB pointer passing. Deferred (~3-5% gain, 2-3 days
-  work — defer until we're closer to budget).
+The "Step 6 = biggest single win" lesson lives in
+`memory/feedback_o2_for_optimization.md`: the prior arc had been measured
+at `-Og` the whole time; flipping to `-O2` gave more than all five
+architectural changes combined. Memorialised so future-me checks the
+optimisation level before any throughput tuning.
+
+**Headroom-only work, paused (not blocking anything today):**
+- Step 3b — PIE Q15 magnitude squared. ~6–10 h, ~50 μs/frame saving
+  (DSP/frame 493→443). Needs PIE qacc int32 extraction idiom + invasive
+  numeric-format change. Worth doing when we want more channels, deeper
+  DSP, or to bump sample rate.
+- Step 3c — PIE Q31 baseline EMA. Similar effort + risk profile,
+  ~100 μs/frame saving.
+- Step 9 (revised) — single-memcpy USB via shared URB/ingest buffers
+  (~2–4 days). True zero-copy is harder (~2–3 weeks forking
+  espressif__usb); the agent's pragmatic single-memcpy version uses the
+  existing `usb_host_transfer_alloc` API. Useful for forthcoming
+  higher-rate / multi-channel modes; NOT useful at our current
+  100.5% / 0-drop steady state.
+- Worker-side PIE kernels (FIR, freq-shift, resampler) — burst
+  extraction is well within budget. Would need new per-stage host
+  tests before touching.
 
 **Cross-board sharing:** `bch_decoder.{c,h}` and `qpsk_demod.{c,h}` live
 in `esp32p4-usb-host-benchmark/common/iridium_decoder/` as a standalone
@@ -261,7 +277,7 @@ iridium_acars/                   # repo root
       fixture_ground_truth.h     # gr-iridium expected bits
     scripts/build_fixtures.py    # rebuilds the headers from test_corpus
   test_corpus/                   # canonical IQ + ground-truth artefacts
-  esp32p4-dsp-harness/           # earlier offline DSP harness (Phase 0)
+  librtlsdr/                     # vendored librtlsdr (reference)
   gr-iridium/, iridium-toolkit/, # upstream reference impls (read-only)
   iridium-sniffer/, libacars/
   iridium-acars-decoding-stack-design.md
@@ -269,8 +285,10 @@ iridium_acars/                   # repo root
 ```
 
 (The previous nested `esp32p4-usb-host-benchmark/` parent has been
-flattened — `p4-usb-host`, `common`, `tests`, `scripts`, `librtlsdr`,
-and `esp32-rtl-sdr` are now repo-root-level. Future P4 boards
-(worker variant) will live as siblings of `p4-usb-host/` and share
-`common/iridium_decoder/` via the same `EXTRA_COMPONENT_DIRS ../common`
-line in their top-level CMakeLists.)
+flattened — `p4-usb-host`, `common`, `tests`, `scripts`, `librtlsdr`
+are now repo-root-level. Two stale benchmark dirs (`esp32-rtl-sdr/`,
+`esp32p4-dsp-harness/`) were removed once the optimisation arc closed
+and they were no longer referenced. Future P4 boards (worker variant)
+will live as siblings of `p4-usb-host/` and share `common/iridium_decoder/`
+via the same `EXTRA_COMPONENT_DIRS ../common` line in their top-level
+CMakeLists.)
