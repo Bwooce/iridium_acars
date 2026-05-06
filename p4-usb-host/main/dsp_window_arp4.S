@@ -16,6 +16,16 @@
 // 360 MHz, measured 92 μs end-to-end including memory pressure).
 // Expected: 1 cycle per 8-element vector iter ≈ 512 cycles ≈ 1.4 μs core,
 // realistically 5-15 μs end-to-end after L1 cache + memory fill.
+//
+// Future-headroom option (NOT NEEDED today — wind is 4% of DSP frame):
+//   `esp.vmul.s16.ld.incp q_load, addr, q_dst, q_a, q_b` is a fused
+//   multiply + concurrent load mnemonic listed in xesppie.S. Could
+//   collapse the per-iter [vld, vmul] pair into one instruction,
+//   saving ~6 μs/frame on this stage. Caveat: no production esp-dsp /
+//   esp-nn / esp-dl code uses `.ld.incp` (only `.ld.ip` and `.ld.xp`),
+//   so the operand semantics are unverified. If you ever try this,
+//   add a scalar-vs-PIE diff diagnostic to catch surprises (similar
+//   to what we used during Step 7c development).
 
 #include "sdkconfig.h"
 

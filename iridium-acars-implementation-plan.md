@@ -3,19 +3,20 @@
 This document tracks the concrete implementation steps for the [Iridium ACARS Decoding Stack Design](./iridium-acars-decoding-stack-design.md).
 
 ## Current Status
-- **Target:** Phase 4 (Live RF validation), gated by Phase 3.5 (throughput).
-- **Status:** Phases 0, 2, 3.1–3.4 COMPLETE. End-to-end DSP pipeline runs
-  against a real RTL-SDR v4 with no crashes; bursts flow through
-  detect → extract → freq-centre → decimate → resample → demod → BCH
-  cleanly. USB host recovers from stuck-device states without physical
-  unplug.
-- **Phase 3.5 (in progress):** integrated throughput optimization. Currently
-  3.20 MB/s = **66% of the 4.85 MB/s real-time target** with `rb_full_drops`
-  ~32%. Steps 1, 2, 4, 4b, 5 done; Step 3 (PIE/Q15 baseline EMA) is the
-  remaining lever projected to close most of the gap.
-- **Blocker (Phase 4):** antenna + LNA hardware (Scan QFH + SAWbird+ IR).
-- **Immediate Goal:** complete Step 3 + functional regression tests, then
-  acquire the RF frontend.
+- **Target:** Phase 4 (Live RF validation).
+- **Status:** Phases 0, 2, 3.1–3.5 COMPLETE. End-to-end DSP pipeline
+  runs against a real RTL-SDR v4 at the device's full streaming rate
+  with zero packet loss. Bursts flow through detect → extract →
+  freq-centre → decimate → resample → demod → BCH cleanly. USB host
+  recovers from stuck-device states without physical unplug.
+- **Throughput:** 4.88 MB/s = 100.5% of the 4.85 MB/s real-time
+  target; rb_full_drops = 0; Core 0 cycle headroom ~35%.
+- **Functional regression tests:** all green (target smoke + 4 host
+  tests including bit-level corpus comparison vs upstream gr-iridium).
+- **Blocker (Phase 4):** antenna + LNA hardware (Scan QFH +
+  SAWbird+ IR).
+- **Immediate Goal:** acquire the RF frontend; switch tuner to
+  manual gain at ~35 dB; first successful real Iridium decode.
 
 ---
 
@@ -107,6 +108,8 @@ current 16 KB transfer size (~3300 μs/cycle). Progress:
 | **Step 3a** (hand-rolled PIE Q15 windowing kernel) | 4.61 MB/s | 95% | Wind 92 → 16 μs (5.75×); DSP/frame 570 → 493 μs. Throughput still device-capped through drops. |
 | **Step 6.5** (status logger offloaded to Core 1 task) | **4.88 MB/s** | **100.5%** | Drops collapsed 7/303 → 0/313. Per-second status formatting on Core 0 had been stalling the consumer ~5–10 ms/sec, filling the USB ringbuffer past 480 KB. Moving the printf work to a Core 1 task closes the last gap. |
 | **Step 7a** (linear-write magnitude, fftshift at report only) | **4.88 MB/s** | **100.5%** | Throughput device-capped already; this is pure CPU headroom. DSP/frame 447 → 422 μs (−5.6%). The mag loop's prior `magnitudes[(i+N/2) % N] = …` pattern was two write-streams that triggered write-allocate cache evictions in L1 D. Linear write + apply fftshift only at the burst-callback boundary. Per-stage detail below. |
+| **Step 7b** (eradicate floats — `magnitudes[]`/`baseline[]`/threshold all uint32) | **4.88 MB/s** | **100.5%** | DSP/frame 422 → 407 μs (−3.6%). Magnitudes hold `re² + im²` directly (no normalisation); detection threshold is integer 40× (within 0.02 dB of prior float setpoint); EMA is `b = (β·b + α·m) >> 15` with Q15 weights. Mag −24%, detect −30%, base +9% (uint64 mul). Net win plus integer substrate for any future PIE work. |
+| **Step 7c** (PIE int magnitude — research only, no perf win) | **4.88 MB/s** | **100.5%** | Four PIE recipes tried (qacc 4-quadrant, fused mul+load, deinterleave-first, vmul.s32.s16xs16). Best kernel mag was 32 μs (−18% vs scalar 39 μs), but every variant traded the savings back in EMA-stage L1 D-cache pressure from the int32 scratch buffer (16–32 KB) evicting the EMA's working set. Scalar mag stays in production. The kernel is preserved in `dsp_mag_arp4.S` with documented findings: qacc int64-spaced layout, `vmul.s32.s16xs16` is Q15-shifted (lossy), Xhwlp / lp.setup with PIE store at body-end works fine on P4 (Espressif's ACE customisation). |
 
 ### Step 7a per-stage delta (synthetic-tone smoke)
 

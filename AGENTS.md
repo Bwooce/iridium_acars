@@ -163,12 +163,16 @@ streaming rate with zero packet loss.
 | Step 3a (hand-rolled PIE Q15 windowing kernel) | 4.61 MB/s | 95% | 2.3% |
 | Step 6.5 (status logger to Core 1 task) | 4.88 MB/s | 100.5% | 0 |
 | Step 7a (linear-write magnitude + cache hygiene) | 4.88 MB/s | 100.5% | 0 |
-| **Step 7b (eradicate floats from dsp_processor)** | **4.88 MB/s** | **100.5%** | **0** |
+| Step 7b (eradicate floats from dsp_processor) | 4.88 MB/s | 100.5% | 0 |
+| Step 7c (PIE int magnitude — research, no perf win) | 4.88 MB/s | 100.5% | 0 |
 
-(Steps 7a + 7b are pure CPU-headroom: DSP/frame 447 → 422 → 407 μs.
-Throughput already device-capped; these give more slack for future
-feature work and an integer substrate enabling future PIE work on the
-mag and EMA loops.)
+DSP/frame progression: 447 → 422 → 407 μs (Steps 6.5 → 7a → 7b).
+Step 7c left it at 407 (scalar mag stays in production after four PIE
+recipes were investigated; details in `p4-usb-host/main/dsp_mag_arp4.S`).
+
+Throughput is device-capped at 4.88 MB/s with zero drops. Further
+DSP-frame headroom is **pure feature runway**, not a throughput lever
+— useful when we add channels, bump sample rate, or stack more DSP.
 
 The "Step 6 = biggest single win" lesson lives in
 `memory/feedback_o2_for_optimization.md`: the prior arc had been measured
@@ -176,26 +180,37 @@ at `-Og` the whole time; flipping to `-O2` gave more than all five
 architectural changes combined. Memorialised so future-me checks the
 optimisation level before any throughput tuning.
 
+**Step 7c outcome (closed):** PIE int magnitude squared investigated
+thoroughly. Four variants tried: qacc 4-quadrant, fused mul+load,
+deinterleave-first, `vmul.s32.s16xs16`. Best kernel mag stage 39→32 μs
+(−18% on the kernel itself); but every variant traded the savings back
+in EMA-stage L1 D-cache pressure from the int32 scratch buffer evicting
+the EMA's working set. Scalar mag stays in production. Working PIE
+kernel preserved in `dsp_mag_arp4.S` with discovered semantics: qacc
+int64-spaced layout (8 lanes, low32 holds value, high32 = 0), 
+`vmul.s32.s16xs16` is Q15-shifted output (lossy), Xhwlp / `lp.setup`
+with PIE store at body-end works fine on P4 (Espressif's ACE
+customisation handles the AndesCore D45 caveat). Real reference value
+for the next person investigating P4 PIE.
+
 **Headroom-only work, paused (not blocking anything today):**
-- Step 3b — PIE Q15 magnitude squared. ~6–10 h, ~50 μs/frame saving
-  (DSP/frame 493→443). Needs PIE qacc int32 extraction idiom + invasive
-  numeric-format change. Worth doing when we want more channels, deeper
-  DSP, or to bump sample rate.
-- Step 3c — PIE Q31 baseline EMA. Similar effort + risk profile,
-  ~100 μs/frame saving.
-- Step 9 (revised) — single-memcpy USB via shared URB/ingest buffers
-  (~2–4 days). True zero-copy is harder (~2–3 weeks forking
-  espressif__usb); the agent's pragmatic single-memcpy version uses the
-  existing `usb_host_transfer_alloc` API. Useful for forthcoming
-  higher-rate / multi-channel modes; NOT useful at our current
+- PIE EMA. Blocked at the silicon ISA level — P4 has no s32×s32 vector
+  multiply, no horizontal pair-add for s32, no f32 vector ops in PIE.
+  Would need a complete reformulation (e.g., 16-bit baseline at the
+  cost of dynamic range). Future ESP32 chip with RVV would unblock.
+- Single-memcpy USB via shared URB/ingest buffers (~2–4 days). True
+  zero-copy needs forking `espressif__usb` (~2–3 weeks). Useful for
+  higher-rate / multi-channel modes; not useful at our current
   100.5% / 0-drop steady state.
-- Worker-side PIE kernels (FIR, freq-shift, resampler) — burst
-  extraction is well within budget. Would need new per-stage host
-  tests before touching.
+- Worker-side PIE kernels (FIR, freq-shift, resampler). Burst
+  extraction is within budget. Would need new per-stage host tests
+  before touching.
+- `esp.vmul.s16.ld.incp` fused mul+load in `dsp_window_arp4.S` —
+  ~6 μs/frame saving on a stage already at 16 μs. Documented inline.
 
 **Cross-board sharing:** `bch_decoder.{c,h}` and `qpsk_demod.{c,h}` live
-in `esp32p4-usb-host-benchmark/common/iridium_decoder/` as a standalone
-IDF component. The host firmware pulls them in via `EXTRA_COMPONENT_DIRS
+in `common/iridium_decoder/` as a standalone IDF component. The host
+firmware pulls them in via `EXTRA_COMPONENT_DIRS
 ${CMAKE_CURRENT_LIST_DIR}/../common` in its top-level `CMakeLists.txt`
 plus `PRIV_REQUIRES iridium_decoder` in `main/CMakeLists.txt`. A future
 worker-board P4 firmware (sibling directory of `p4-usb-host/`) will

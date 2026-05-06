@@ -182,28 +182,31 @@ Antenna → SAWbird+ LNA (sacrificial) → ARRESTOR (at enclosure wall) → SDR 
 
 ## 12. Conclusion
 
-The ESP32-P4 architecture for Iridium ACARS is firmware-complete on the
-integration side: detect → extract → freq-centre → decimate → resample →
-DQPSK → BCH runs end-to-end against a live RTL-SDR v4 with no crashes,
-and USB stuck-device recovery is fully software-driven via root-port-power
-cycling. Two open work items remain before live RF validation can begin
-(§11a.4):
+The ESP32-P4 architecture for Iridium ACARS is firmware-complete and
+runs at full real-time throughput. detect → extract → freq-centre →
+decimate → resample → DQPSK → BCH runs end-to-end against a live
+RTL-SDR v4. USB stuck-device recovery is fully software-driven via
+root-port-power cycling.
 
-1. **Throughput optimization (Phase 3.5).** Integrated throughput is
-   currently 3.20 MB/s — 66% of the 4.85 MB/s real-time target at
-   2.56 MSPS — losing ~32% of samples to ringbuffer overflow.
-   Architecture changes already landed: AXI-GDMA `signal_buffer_push`,
-   USB daemon+ISR pinned to Core 1, ping-pong `convert+push` on Core 1.
-   The remaining lever is hand-rolled PIE Q15 inner loops for the DSP
-   feed (`dsp_processor.c`'s windowing, magnitude, baseline EMA), which
-   esp-dsp does not provide as ready-made `_arp4` kernels — see
-   AGENTS.md for the audited list.
-2. **Functional regression tests.** Numerical correctness has been
-   evaluated only at integration time. Before the Q15 conversion lands,
-   target-side smoke + host unit tests will be added so silent
-   regressions can be caught.
+**Throughput status (Phase 3.5 closed):** 4.88 MB/s = 100.5% of the
+4.85 MB/s real-time target at 2.56 MSPS, with `rb_full_drops = 0`.
+Core 0 cycle headroom ~35%. The arc went from 1.22 MB/s (broken PLL)
+through 11 incremental steps to 4.88 MB/s — see
+[`iridium-acars-implementation-plan.md`](./iridium-acars-implementation-plan.md)
+for the per-step breakdown. Single biggest win: switching from
+`-Og` to `-O2` (Step 6, 3.20 → 4.61 MB/s), which dwarfs every
+architectural change. Recorded as a memory rule so we never measure
+performance under `-Og` again.
 
-After 3.5 closes, the remaining work is **live RF validation** (Phase 4):
+**Functional regression tests (closed):** five test layers gate every
+numerical change — target smoke (synthetic + real-corpus IQ), host
+unit tests for `bch_decoder` and `qpsk_demod`, and a bit-level corpus
+regression that compares qpsk_demod output to upstream gr-iridium
+ground truth (currently 0/382 bit differences). Plus a synthetic
+low-SNR (~10 dB) variant to catch demod-margin regressions invisible
+on the high-SNR corpus.
+
+The remaining work is **live RF validation** (Phase 4):
 the indoor pipeline has only seen RFI and harmonics, not real Iridium
 bursts. Decoding a real ACARS frame is gated on the antenna + LNA
 hardware (Scan QFH + SAWbird+ IR) plus the lightning protection
