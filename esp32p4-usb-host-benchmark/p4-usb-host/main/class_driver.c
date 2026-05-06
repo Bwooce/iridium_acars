@@ -18,6 +18,7 @@
 #include "dsp_processor.h"
 #include "signal_buffer.h"
 #include "worker_core1.h"
+#include "ingest_core1.h"
 #include "bch_decoder.h"
 #include "rtl-sdr.h"
 
@@ -89,6 +90,7 @@ static void action_start_stream(class_driver_t *driver_obj)
     ESP_LOGI(TAG, "Initializing System Buffers...");
     signal_buffer_init();
     worker_core1_init();
+    ingest_core1_init();
     bch_decoder_init();
 
     ESP_LOGI(TAG, "Initializing DSP...");
@@ -141,11 +143,15 @@ void class_driver_task(void *arg)
     }
 
     uint32_t out_block_size = 16 * 1024;
-    uint8_t *buffer = malloc(out_block_size);
-    // convert_buf is the source for the AXI-GDMA push into PSRAM. Allocate
-    // in DMA-capable internal SRAM with 64-byte cache-line alignment.
-    int16_t *convert_buf = heap_caps_aligned_alloc(64, out_block_size * sizeof(int16_t),
-                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    // The raw + converted buffers are owned by ingest_core1 (ping-pong on
+    // Core 1). class_driver acquires raw buffers via ingest_core1_acquire_raw
+    // and consumes converted buffers via ingest_core1_take_converted.
+
+    // Ping-pong steady-state book-keeping. We start by reading into slot 0;
+    // the matching DSP feed for slot 0 happens AFTER slot 1 has been
+    // dispatched (one-cycle pipeline). prev_dsp_slot tracks which slot the
+    // DSP should next consume; it's -1 on the very first iteration.
+    int prev_dsp_slot = -1;
     
     uint64_t total_bytes = 0;
     int64_t start_time = esp_timer_get_time();
@@ -156,13 +162,9 @@ void class_driver_task(void *arg)
     uint32_t feed_calls_window = 0;     // dsp_processor_feed calls in this window
     uint64_t dsp_total_time_us = 0;     // sum of dsp_processor_feed wall time
     uint32_t dsp_frame_count = 0;       // FFT frames processed in this window
-    size_t max_used_rb = 0;             // peak buffer fill observed (consumer-side)
-    // Consumer-cycle stage breakdown (sum of microseconds in each stage).
-    // Per-cycle = (read_us + convert_us + push_us + feed_us). Helps locate
-    // which stage is the throughput bottleneck.
+    // Core 0 cycle stage breakdown. Convert and push happen on Core 1
+    // (ingest task) post-Step 5; only read and feed live here now.
     uint64_t cycle_read_us = 0;
-    uint64_t cycle_convert_us = 0;
-    uint64_t cycle_push_us = 0;
     int64_t last_idle_log = esp_timer_get_time();
     int64_t last_taskdump = esp_timer_get_time();
     int64_t last_recovery_us = esp_timer_get_time();
@@ -216,59 +218,66 @@ void class_driver_task(void *arg)
         if (s_driver_obj.actions & ACTION_CLOSE_DEV) action_close_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_EXIT) break;
 
-        // If streaming, process data
+        // The ping-pong infrastructure (ingest task, semaphores, slot
+        // buffers) is only created in action_start_stream. Skip the
+        // ping-pong path until streaming is active so we don't take a
+        // NULL semaphore.
+        if (s_driver_obj.dev_addr == 0 || rtldev == NULL) {
+            continue;
+        }
+
+        // Ping-pong path: read USB into a Core-1-owned raw buffer, dispatch
+        // it to the ingest task for convert+push, then consume the previous
+        // cycle's converted slot via DSP. Core 1 (ingest) and Core 0 (DSP
+        // feed) overlap, which collapses the per-cycle wall time on Core 0
+        // from "read + convert + push + feed" to "read + feed".
+        int slot_for_read;
+        uint8_t *raw = ingest_core1_acquire_raw(&slot_for_read);
+
         size_t n_read = 0;
         int64_t t_read_start = esp_timer_get_time();
-        int read_ok = esp_libusb_read_stream(buffer, out_block_size, &n_read, 0);
+        int read_ok = esp_libusb_read_stream(raw, out_block_size, &n_read, 0);
         int64_t t_read_end = esp_timer_get_time();
+
         if (read_ok == 0) {
             cycle_read_us += (uint64_t)(t_read_end - t_read_start);
             total_bytes += n_read;
             bytes_window += n_read;
 
-            // Convert RTL-SDR uint8 (DC=128) -> int16 Q15 (DC=0).
-            // Original: out[i] = ((int16_t)b[i] - 128) << 8
-            // Simplified algebraically (identical for all 0..255):
-            //          out[i] = (int16_t)((b[i] << 8) ^ 0x8000)
-            // Manually unrolled 4x and reading 32 bits at a time so the
-            // compiler can combine into wider loads/stores. buffer and
-            // convert_buf are both 64-byte aligned (DMA-capable internal SRAM)
-            // so the wide loads are safe.
-            const uint8_t  *__restrict src = buffer;
-            int16_t        *__restrict dst = convert_buf;
-            size_t i = 0;
-            // Round n_read down to a multiple of 4; n_read is always 16384
-            // in our setup but tail loop is kept for safety.
-            size_t n4 = n_read & ~(size_t)3;
-            for (; i < n4; i += 4) {
-                uint32_t b4 = *(const uint32_t *)(src + i);
-                dst[i + 0] = (int16_t)((((b4 >>  0) & 0xff) << 8) ^ 0x8000);
-                dst[i + 1] = (int16_t)((((b4 >>  8) & 0xff) << 8) ^ 0x8000);
-                dst[i + 2] = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
-                dst[i + 3] = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
+            // Hand the freshly-filled raw buffer to ingest on Core 1.
+            // Convert + push happen there; we don't block on completion.
+            ingest_core1_dispatch(slot_for_read, n_read);
+
+            // If we have a previous slot in flight, consume it now via DSP.
+            // Wait for Core 1's ingest to mark it ready (typically immediate
+            // — ingest is faster than feed, so by the time we need the data
+            // it's already been converted + signal_buffer_pushed).
+            if (prev_dsp_slot >= 0) {
+                size_t n_int16 = 0;
+                int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
+                int64_t t_pre_feed = esp_timer_get_time();
+
+                dsp_processor_feed(converted, n_int16 / 2);
+                int64_t t_post_feed = esp_timer_get_time();
+                dsp_total_time_us += (uint64_t)(t_post_feed - t_pre_feed);
+                dsp_frame_count += (n_int16 / 2) / 2048;
+                feed_calls_window++;
+
+                // Mark the slot free so ingest can reuse it next cycle.
+                ingest_core1_release(prev_dsp_slot);
             }
-            for (; i < n_read; i++) {
-                dst[i] = (int16_t)(((src[i] << 8) ^ 0x8000));
-            }
-            int64_t t_convert = esp_timer_get_time();
-            cycle_convert_us += (uint64_t)(t_convert - t_read_end);
 
-            signal_buffer_push(convert_buf, n_read / 2);
-            int64_t t_push = esp_timer_get_time();
-            cycle_push_us += (uint64_t)(t_push - t_convert);
-
-            dsp_processor_feed(convert_buf, n_read / 2);
-            dsp_total_time_us += (esp_timer_get_time() - t_push);
-            dsp_frame_count += (n_read / 2) / 2048;
-            feed_calls_window++;
-
-            // Sample ringbuffer fill AFTER read drained 16 KB. This is
-            // a low-water-mark-ish view; the producer-side max in
-            // usb_stream_stats_t is the authoritative peak.
-            size_t used_rb, total_rb;
-            esp_libusb_get_ringbuffer_info(&used_rb, &total_rb);
-            if (used_rb > max_used_rb) max_used_rb = used_rb;
+            prev_dsp_slot = slot_for_read;
+        } else {
+            // No data this iteration. Release the slot we just acquired so
+            // ingest can reuse it (we never dispatched).
+            ingest_core1_release(slot_for_read);
         }
+
+        // Producer-side ringbuffer fill is tracked inside esp_libusb's
+        // streaming callback (USB-RB log line). The consumer-side HWM
+        // sampled here previously was biased low (taken right after a
+        // read drained 16 KB) so it has been removed.
 
         int64_t now = esp_timer_get_time();
         if (now - last_report >= 1000000) {
@@ -285,8 +294,6 @@ void class_driver_task(void *arg)
             // immediately after each read. Will under-report relative to
             // the producer-side peak because consumer reads precisely the
             // moments that drain the buffer.
-            float consumer_peak_pct = 100.0f * (float)max_used_rb / (512.0f * 1024.0f);
-
             // Pull diagnostic snapshots — every getter resets its accumulators.
             dsp_stage_stats_t dsp_st;
             dsp_processor_get_stage_stats(&dsp_st);
@@ -294,6 +301,8 @@ void class_driver_task(void *arg)
             worker_core1_get_stats(&ws);
             usb_stream_stats_t us;
             esp_libusb_get_stream_stats(&us);
+            ingest_stats_t is;
+            ingest_core1_get_stats(&is);
 
             // USB transfer-level fill ratio (actual / requested) reveals device-side
             // throttling (short transfers) vs host-side back-pressure (rb_full_drops).
@@ -301,20 +310,25 @@ void class_driver_task(void *arg)
                 ? (100.0f * (float)us.total_actual_bytes / (float)us.total_requested_bytes)
                 : 0.0f;
 
-            // Consumer-cycle stage means (per call to dsp_processor_feed).
+            // Cycle stage means. With Step 5, convert+push happen on Core 1
+            // and don't show up on Core 0's hot path. Core 0 cycle =
+            // read + feed + (small bookkeeping).
             float feed_n = (feed_calls_window > 0) ? (float)feed_calls_window : 1.0f;
-            float read_us_avg    = (float)cycle_read_us    / feed_n;
-            float convert_us_avg = (float)cycle_convert_us / feed_n;
-            float push_us_avg    = (float)cycle_push_us    / feed_n;
+            float read_us_avg = (float)cycle_read_us / feed_n;
+            float ingest_n = (is.dispatches > 0) ? (float)is.dispatches : 1.0f;
+            float ingest_convert_us_avg = (float)is.convert_us_total / ingest_n;
+            float ingest_push_us_avg    = (float)is.push_us_total    / ingest_n;
+            float ingest_wait_us_avg    = (is.consumer_waits > 0)
+                ? (float)is.slot_wait_total_us / (float)is.consumer_waits : 0.0f;
 
             // Producer-side ringbuffer peak, in % of 512 KB.
             float producer_peak_pct = 100.0f * (float)us.producer_rb_max_used / (512.0f * 1024.0f);
             float drop_fill_pct     = 100.0f * (float)us.producer_rb_used_at_drop / (512.0f * 1024.0f);
 
             ESP_LOGI(TAG, "USB: rate_inst=%.2f MB/s rate_avg=%.2f MB/s feed_calls=%u "
-                          "(avg_per_call=%.0f us) RB-fill_consumer=%.1f%% PSRAM_free=%d",
+                          "(avg_per_call=%.0f us) PSRAM_free=%d",
                      rate_inst, rate_avg, feed_calls_window, feed_us_avg,
-                     consumer_peak_pct, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                     heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
             ESP_LOGI(TAG, "USB-XFR: completed=%u short=%u (fill=%.1f%%) "
                           "rb_full_drops=%u status_err=%u resubmit_err=%u last_err=0x%02x",
@@ -323,12 +337,16 @@ void class_driver_task(void *arg)
                      us.last_error_status);
 
             ESP_LOGI(TAG, "USB-RB:  producer_peak_fill=%.1f%% drop_fill=%.1f%% "
-                          "(producer_samples=%u, consumer_peak_fill=%.1f%%)",
-                     producer_peak_pct, drop_fill_pct, us.producer_samples,
-                     consumer_peak_pct);
+                          "(producer_samples=%u)",
+                     producer_peak_pct, drop_fill_pct, us.producer_samples);
 
-            ESP_LOGI(TAG, "Consumer-cycle (us avg): read=%.0f convert=%.0f push=%.0f feed=%.0f",
-                     read_us_avg, convert_us_avg, push_us_avg, feed_us_avg);
+            ESP_LOGI(TAG, "Cycle (Core0 us avg): read=%.0f feed=%.0f",
+                     read_us_avg, feed_us_avg);
+
+            ESP_LOGI(TAG, "Ingest (Core1 us avg): convert=%.0f push=%.0f "
+                          "dispatches=%u consumer_waits=%u (avg_wait=%.0f us)",
+                     ingest_convert_us_avg, ingest_push_us_avg,
+                     is.dispatches, is.consumer_waits, ingest_wait_us_avg);
 
             ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame "
                           "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
@@ -384,10 +402,7 @@ void class_driver_task(void *arg)
             feed_calls_window = 0;
             dsp_total_time_us = 0;
             dsp_frame_count = 0;
-            max_used_rb = 0;
             cycle_read_us = 0;
-            cycle_convert_us = 0;
-            cycle_push_us = 0;
         }
     }
 
