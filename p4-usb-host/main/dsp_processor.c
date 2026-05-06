@@ -55,9 +55,10 @@ __attribute__((aligned(16))) static float    window_temp_f32[FFT_SIZE + 16];
 __attribute__((aligned(16))) static uint32_t magnitudes[FFT_SIZE + 16];
 __attribute__((aligned(16))) static uint32_t baseline[FFT_SIZE + 16];
 
-// (PIE int magnitude kernel attempted in Step 7c — see dsp_mag_arp4.S
-// for the documented findings. Currently unused; production path uses
-// the scalar magnitude inline in dsp_mag_arp4.h's dsp_mag_sq_s16().)
+// PIE mag kernel scratch — used only when the PIE path is enabled.
+// Currently NOT used (production path is scalar). Sized to fit the
+// deinterleave-first variant's 8 int32 slots per 4-complex iter.
+__attribute__((aligned(16))) int32_t dsp_mag_scratch[FFT_SIZE * 2];
 
 typedef struct {
     bool active;
