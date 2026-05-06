@@ -225,19 +225,19 @@ sharing requirements are clear. Don't pre-emptively move them.
 ## File organisation
 
 ```
-esp-idf/                         # ESP-IDF v6.1 (vendored)
-esp32p4-usb-host-benchmark/
-  scripts/
+iridium_acars/                   # repo root
+  esp-idf/                       # ESP-IDF v6.1 (vendored)
+  scripts/                       # repo-level dev-loop tools
     build.sh                     # ninja-direct, idf.py fallback
     flash.sh                     # idf.py flash with port auto-detect
     monitor.sh                   # non-interactive serial monitor
-  common/
-    iridium_decoder/             # shared IDF component, cross-board
-      bch_decoder.{c,h}          # BCH(31,21) t=2
-      qpsk_demod.{c,h}           # DQPSK + PLL phase tracking
+  common/                        # shared IDF components (cross-board)
+    iridium_decoder/             # BCH + DQPSK demod
+      bch_decoder.{c,h}
+      qpsk_demod.{c,h}
       CMakeLists.txt
-  p4-usb-host/
-    main/                        # firmware sources (host-board-specific)
+  p4-usb-host/                   # host-board P4 firmware (this app)
+    main/                        # board-specific sources
       class_driver.c             # USB host client task, periodic stats
       dsp_processor.c/h          # FFT + burst detection (Core 0)
       esp_libusb.c/h             # async USB streaming + transfer stats
@@ -260,10 +260,17 @@ esp32p4-usb-host-benchmark/
       fixture_corpus_uint8.h     # resampled burst @ 2.56 MSPS uint8
       fixture_ground_truth.h     # gr-iridium expected bits
     scripts/build_fixtures.py    # rebuilds the headers from test_corpus
-esp32p4-dsp-harness/             # earlier offline DSP harness (Phase 0)
-gr-iridium/, iridium-toolkit/,   # upstream reference impls (read-only)
+  test_corpus/                   # canonical IQ + ground-truth artefacts
+  esp32p4-dsp-harness/           # earlier offline DSP harness (Phase 0)
+  gr-iridium/, iridium-toolkit/, # upstream reference impls (read-only)
   iridium-sniffer/, libacars/
-test_corpus/                     # canonical IQ + ground-truth artefacts
-iridium-acars-decoding-stack-design.md
-iridium-acars-implementation-plan.md
+  iridium-acars-decoding-stack-design.md
+  iridium-acars-implementation-plan.md
 ```
+
+(The previous nested `esp32p4-usb-host-benchmark/` parent has been
+flattened — `p4-usb-host`, `common`, `tests`, `scripts`, `librtlsdr`,
+and `esp32-rtl-sdr` are now repo-root-level. Future P4 boards
+(worker variant) will live as siblings of `p4-usb-host/` and share
+`common/iridium_decoder/` via the same `EXTRA_COMPONENT_DIRS ../common`
+line in their top-level CMakeLists.)
