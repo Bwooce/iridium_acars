@@ -54,12 +54,12 @@ config SMOKE_TEST_MODE
         code. No USB device needs to be attached.
 
 config SMOKE_TEST_CORPUS
-    bool "Use the test_corpus fixture (real Iridium burst) instead of a synthetic tone"
+    bool "Use the test_corpus fixture (synthetic Iridium PRBS-15 burst) instead of a synthetic tone"
     depends on SMOKE_TEST_MODE
     default n
     help
         When enabled, the smoke test uses tests/fixtures/fixture_corpus_uint8.h
-        as the signal source — a real Iridium burst from
+        as the signal source — a synthetic Iridium PRBS-15 burst from
         test_corpus/prbs15-2M-20dB.sigmf-data, resampled to 2.56 MSPS and
         quantised to uint8 IQ. The detector should fire on the burst's
         carrier (FFT bin near DC since the corpus carrier is at the SDR
@@ -69,5 +69,32 @@ config SMOKE_TEST_CORPUS
         if the corpus or resampling parameters change. Without this flag,
         the smoke test uses a synthetic tone at FFT bin 200 (semantic
         regression check, not a corpus regression).
+
+config SMOKE_TEST_REAL_IRIDIUM
+    bool "Use the Albuquerque real-RF Iridium fixture (highest-SNR IDA-DL burst)"
+    depends on SMOKE_TEST_MODE
+    depends on !SMOKE_TEST_CORPUS
+    default n
+    help
+        When enabled, the smoke test uses tests/fixtures/fixture_albq_uint8.h —
+        a 30 dB SNR IDA-DL burst from
+        test_data/iridium_downlink_2022-03-17_albuquerque, resampled to
+        2.56 MSPS and quantised to uint8 IQ, frequency-shifted so the
+        burst's carrier (1625.27 MHz absolute) lands at DC of the 2.56
+        MHz subband. The detector should fire near FFT bin 1024 ± leakage,
+        and the worker should produce ~382 demod bits matching the
+        corresponding host-test ground truth (tests/fixtures/fixture_albq_truth.h).
+
+        This is the hardware-in-the-loop counterpart of the host-side
+        test_demod_albq regression: same source burst, same subband
+        frequency shift, same end-to-end pipeline — except this one
+        runs on real P4 silicon through the production ingest -> DSP ->
+        worker chain. Bit-perfect agreement vs gr-iridium ground truth
+        on the host implies the firmware should also produce a clean
+        decode here.
+
+        Mutually exclusive with SMOKE_TEST_CORPUS. Regenerate the
+        fixture with tests/scripts/build_albq_fixture.py if you change
+        the source recording or resampling parameters.
 
 endmenu

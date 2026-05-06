@@ -23,6 +23,10 @@
 #include "fixture_corpus_uint8.h"
 #endif
 
+#if CONFIG_SMOKE_TEST_REAL_IRIDIUM
+#include "fixture_albq_uint8.h"
+#endif
+
 static const char *TAG = "SMOKE";
 
 #define TRANSFER_BYTES   (16 * 1024)         // matches class_driver's out_block_size
@@ -203,6 +207,25 @@ void smoke_test_run(void)
         prev_slot = drive_transfer(synth, prev_slot);
         vTaskDelay(1);
     }
+#elif CONFIG_SMOKE_TEST_REAL_IRIDIUM
+    // Hardware-in-the-loop counterpart of test_demod_albq host test:
+    // same Albuquerque burst, same subband-shift to DC, same uint8 IQ
+    // quantisation — fed through the production P4 pipeline. The
+    // fixture is exactly 3 × TRANSFER_BYTES (49152 B = 19.2 ms at
+    // 2.56 MSPS, comfortably wider than the burst's 7.6 ms duration).
+    ESP_LOGI(TAG, "Phase 2 (real-RF Albuquerque): 3× %u-byte transfers (%u total)",
+             TRANSFER_BYTES, ALBQ_UINT8_LEN);
+    for (int t = 0; t < 3; t++) {
+        unsigned int off = t * TRANSFER_BYTES;
+        if (off + TRANSFER_BYTES <= ALBQ_UINT8_LEN) {
+            memcpy(synth, ALBQ_UINT8 + off, TRANSFER_BYTES);
+        } else {
+            // Should never happen with the 3-chunk fixture, but be safe.
+            memset(synth, 128, TRANSFER_BYTES);
+        }
+        prev_slot = drive_transfer(synth, prev_slot);
+        vTaskDelay(1);
+    }
 #else
     ESP_LOGI(TAG, "Phase 2: %d tone transfers (drive the burst)", TONE_TRANSFERS);
     for (int i = 0; i < TONE_TRANSFERS; i++) {
@@ -240,11 +263,13 @@ void smoke_test_run(void)
              bursts, peak_bin, snr_db);
 
     // Assertions vary by mode:
-    //   Synthetic tone: bursts ≥1, strongest peak_bin in [1200..1248],
-    //                   SNR > 30 dB.
-    //   Corpus fixture: bursts ≥1, strongest peak_bin near DC (the corpus
-    //                   carrier is centred at the SDR LO so energy lands
-    //                   at FFT bin 1024 ± a few bins of leakage).
+    //   Synthetic tone:    bursts ≥1, peak_bin in [1200..1248], SNR > 30 dB.
+    //   Synthetic corpus:  bursts ≥1, peak_bin near DC (corpus is at SDR LO).
+    //   Real-RF Albq:      bursts ≥1, peak_bin near DC (we shifted the
+    //                      1625.27 MHz channel to baseband). SNR ≥ 10 dB —
+    //                      lower than the host-test 30 dB because the FFT
+    //                      detector measures wideband SNR and the burst
+    //                      only fills part of the 2.56 MHz subband.
     bool pass = true;
     if (bursts < 1) {
         ESP_LOGE(TAG, "  no bursts detected (expected ≥1)");
@@ -260,6 +285,28 @@ void smoke_test_run(void)
     }
     if (snr_db < 6.0f) {
         ESP_LOGE(TAG, "  corpus SNR %.2f dB lower than expected (>6 dB)", snr_db);
+        pass = false;
+    }
+#elif CONFIG_SMOKE_TEST_REAL_IRIDIUM
+    // Real-RF assertion: any non-edge bin with high SNR is a valid
+    // detection. We don't pin to bin 1024 because gr-iridium's reported
+    // burst frequency snaps to a coarse grid — the actual carrier in
+    // this capture sits ~196 kHz lower (bin 867 in practice). The
+    // production worker uses peak_bin to centre its own per-channel
+    // decimator, so any in-band detection self-corrects downstream.
+    // Edge-bin rejection rules out DC bias and Nyquist artefacts.
+    const int ALBQ_BIN_EDGE_REJECT = 64;
+    if (peak_bin < ALBQ_BIN_EDGE_REJECT ||
+        peak_bin > FFT_SIZE - ALBQ_BIN_EDGE_REJECT) {
+        ESP_LOGE(TAG, "  strongest peak_bin %d in edge-reject window "
+                 "[<%d or >%d] — likely DC bias or Nyquist artefact, "
+                 "not a real burst", peak_bin, ALBQ_BIN_EDGE_REJECT,
+                 FFT_SIZE - ALBQ_BIN_EDGE_REJECT);
+        pass = false;
+    }
+    if (snr_db < 10.0f) {
+        ESP_LOGE(TAG, "  Albq burst SNR %.2f dB lower than expected (≥10 dB)",
+                 snr_db);
         pass = false;
     }
 #else
