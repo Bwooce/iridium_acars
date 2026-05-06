@@ -8,8 +8,11 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
 #include "usb/usb_host.h"
 #include "esp_libusb.h"
 #include "dsp_processor.h"
@@ -128,6 +131,15 @@ void class_driver_task(void *arg)
     };
     ESP_ERROR_CHECK(usb_host_client_register(&client_config, &s_driver_obj.client_hdl));
 
+    // Subscribe this task to the task watchdog. The class_driver loop is
+    // intentionally hot — the ringbuffer is constantly draining and we don't
+    // want to add an arbitrary vTaskDelay just to keep IDLE0 alive. Reset
+    // the watchdog explicitly each iteration instead.
+    esp_err_t wdt_rc = esp_task_wdt_add(NULL);
+    if (wdt_rc != ESP_OK && wdt_rc != ESP_ERR_INVALID_ARG) {
+        ESP_LOGW(TAG, "esp_task_wdt_add returned %d (%s)", wdt_rc, esp_err_to_name(wdt_rc));
+    }
+
     uint32_t out_block_size = 16 * 1024;
     uint8_t *buffer = malloc(out_block_size);
     int16_t *convert_buf = malloc(out_block_size * sizeof(int16_t));
@@ -149,6 +161,7 @@ void class_driver_task(void *arg)
     uint64_t cycle_convert_us = 0;
     uint64_t cycle_push_us = 0;
     int64_t last_idle_log = esp_timer_get_time();
+    int64_t last_taskdump = esp_timer_get_time();
     int64_t last_recovery_us = esp_timer_get_time();
     int recovery_attempts = 0;
     const int MAX_RECOVERY_ATTEMPTS = 3;
@@ -156,6 +169,11 @@ void class_driver_task(void *arg)
 
     while (1)
     {
+        // Reset task watchdog. The loop runs hot (no vTaskDelay) because the
+        // ringbuffer is constantly draining; without this reset the IDLE0
+        // task would never get to run and TWDT would trigger every 5 s.
+        esp_task_wdt_reset();
+
         usb_host_client_handle_events(s_driver_obj.client_hdl, 10);
 
         // Periodic status / recovery watchdog while no device is open.
@@ -303,6 +321,39 @@ void class_driver_task(void *arg)
                           "resamp=%.0f demod=%.0f bch=%.0f",
                      ws.extract_us, ws.freq_center_us, ws.fir_decim_us,
                      ws.resample_us, ws.demod_us, ws.bch_us);
+
+            // Per-task / per-core CPU usage dump every 5 seconds. Heavy call
+            // (allocates an array, snapshots all task counters), so don't run
+            // every second. Tells us conclusively which task is hot on which
+            // core and whether Core 1 has spare capacity.
+            if (now - last_taskdump >= 5 * 1000000) {
+                last_taskdump = now;
+                UBaseType_t n = uxTaskGetNumberOfTasks();
+                TaskStatus_t *ts = malloc(n * sizeof(TaskStatus_t));
+                if (ts) {
+                    uint32_t total_run = 0;
+                    n = uxTaskGetSystemState(ts, n, &total_run);
+                    ESP_LOGI(TAG, "Tasks (run-time since boot, %% of total):");
+                    // Core affinity isn't easily exposed by this IDF FreeRTOS
+                    // build (xCoreID requires sdkconfig flag that needs full
+                    // reconfigure; vTaskCoreAffinityGet not in this variant).
+                    // Task names are descriptive (class is on C0, worker_core1
+                    // on C1, IDLE0/IDLE1 on their respective cores) so just
+                    // print name + %CPU.
+                    for (UBaseType_t i = 0; i < n; i++) {
+                        uint32_t pct = (total_run > 0)
+                            ? (uint32_t)((100ULL * ts[i].ulRunTimeCounter) / total_run)
+                            : 0;
+                        ESP_LOGI(TAG, "  %-16s pri=%u state=%d run=%lu (%lu%%) stack_hwm=%lu",
+                                 ts[i].pcTaskName, (unsigned)ts[i].uxCurrentPriority,
+                                 (int)ts[i].eCurrentState,
+                                 (unsigned long)ts[i].ulRunTimeCounter,
+                                 (unsigned long)pct,
+                                 (unsigned long)ts[i].usStackHighWaterMark);
+                    }
+                    free(ts);
+                }
+            }
 
             last_report = now;
             bytes_window = 0;
