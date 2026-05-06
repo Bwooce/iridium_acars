@@ -44,10 +44,8 @@ int main(void)
     for (unsigned int i = 0; i < ALBQ_FRAME_CORPUS_LEN; i++) {
         const albq_frame_corpus_entry_t *e = &ALBQ_FRAME_CORPUS[i];
         iridium_frame_t f = { 0 };
-        // We don't yet recover direction from gr-iridium's RAW: line —
-        // assume DL (the corpus is downlink-only).
         int rc = iridium_frame_classify(e->bits, e->n_bits,
-                                        IR_FRM_DIR_DOWNLINK, &f);
+                                        e->expected_direction, &f);
         if (rc != 0) {
             printf("  entry %u (%s): classify rc=%d\n",
                    i, e->parser_class, rc);

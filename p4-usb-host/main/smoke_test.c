@@ -25,6 +25,24 @@
 
 #if CONFIG_SMOKE_TEST_REAL_IRIDIUM
 #include "fixture_albq_stripes.h"
+#include "frame_decoder.h"
+#include "worker_core1.h"
+#include "bch_decoder.h"
+#include "qpsk_demod.h"
+#endif
+
+#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
+#include "fixture_albq_raw.h"
+#include "frame_decoder.h"
+#include "worker_core1.h"
+#include "bch_decoder.h"
+#include "qpsk_demod.h"
+#endif
+
+#if CONFIG_SMOKE_TEST_FRAME_DECODER
+#include "fixture_albq_frames_corpus.h"
+#include "frame_decoder.h"
+#include "qpsk_demod.h"
 #endif
 
 static const char *TAG = "SMOKE";
@@ -81,6 +99,19 @@ static void on_burst(const detected_burst_t *burst)
              (unsigned long)burst->length_samples,
              length_ms);
 }
+
+#if CONFIG_SMOKE_TEST_REAL_IRIDIUM || CONFIG_SMOKE_TEST_RAW_IRIDIUM
+// Hybrid burst callback for full-stack smoke: counts the burst (so the
+// existing detector-side assertions still work) AND forwards to
+// worker_core1 so the burst gets demodulated, BCH-decoded, and
+// classified by frame_decoder. Mirrors the production class_driver
+// flow where dsp_processor's callback is worker_core1_push_burst.
+static void on_burst_full_chain(const detected_burst_t *burst)
+{
+    on_burst(burst);
+    worker_core1_push_burst(burst);
+}
+#endif
 
 // Fill a TRANSFER_BYTES uint8 buffer with low-amplitude noise centred at
 // 128 (the offset our convert path expects). Uses the hardware RNG so
@@ -148,8 +179,123 @@ static int drive_transfer(uint8_t *src, int prev_slot)
     return slot;
 }
 
+#if CONFIG_SMOKE_TEST_FRAME_DECODER
+// Frame_decoder smoke path: bypasses USB / ingest / DSP entirely, pushes
+// canned post-demod bits into frame_decoder_push() and verifies the
+// classifier's per-class counts on real silicon. Catches regressions in
+// the queue + classifier integration that wouldn't show up in host tests.
+static void smoke_test_run_frame_decoder(void)
+{
+    ESP_LOGI(TAG, "=== Smoke test start (frame_decoder mode) ===");
+    if (frame_decoder_init() != ESP_OK) {
+        ESP_LOGE(TAG, "frame_decoder_init failed -> SMOKE_FAIL");
+        return;
+    }
+    // Snapshot per-class counts before injection (the decoder may have
+    // already classified zero frames; subtract baseline).
+    frame_decoder_class_counts_t before, after;
+    frame_decoder_get_class_counts(&before);
+    ESP_LOGI(TAG, "Pushing %u corpus frames -> frame_decoder...",
+             ALBQ_FRAME_CORPUS_LEN);
+    int pushed_ok = 0, push_drops = 0;
+    for (unsigned int i = 0; i < ALBQ_FRAME_CORPUS_LEN; i++) {
+        const albq_frame_corpus_entry_t *e = &ALBQ_FRAME_CORPUS[i];
+        // Use the per-entry expected_direction so UL frames in the
+        // corpus are classified with the right UW (matches host
+        // test_iridium_frame_corpus 100% agreement).
+        ir_direction_t qdir = (e->expected_direction == IR_FRM_DIR_UPLINK)
+                              ? DIR_UPLINK : DIR_DOWNLINK;
+        // Retry-on-drop with bounded backoff. The decoder task runs at
+        // ~10 ms/frame (one tick of vTaskDelay + classify), so we wait
+        // at most a few ticks per push. Up to 100 attempts = 1 s
+        // before giving up; far longer than realistic for this corpus.
+        bool ok = false;
+        for (int attempt = 0; attempt < 100; attempt++) {
+            ok = frame_decoder_push(e->bits, e->n_bits, qdir,
+                                    e->freq_hz, 0, e->snr_db);
+            if (ok) break;
+            vTaskDelay(1);   // one tick = drain a bit, then retry
+        }
+        if (ok) pushed_ok++;
+        else    push_drops++;
+    }
+    // Wait for the decoder task to drain. 100 ms × 30 = up to 3 s.
+    for (int i = 0; i < 30 && frame_decoder_queue_count() > 0; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    frame_decoder_get_class_counts(&after);
+    uint64_t got_unknown  = after.unknown  - before.unknown;
+    uint64_t got_ms       = after.ms       - before.ms;
+    uint64_t got_tl       = after.tl       - before.tl;
+    uint64_t got_bc       = after.bc       - before.bc;
+    uint64_t got_lw_da    = after.lw_da    - before.lw_da;
+    uint64_t got_lw_other = after.lw_other - before.lw_other;
+    uint64_t got_total    = got_unknown + got_ms + got_tl + got_bc
+                          + got_lw_da + got_lw_other;
+
+    ESP_LOGI(TAG, "Pushed: %d ok / %d dropped (corpus size %u)",
+             pushed_ok, push_drops, ALBQ_FRAME_CORPUS_LEN);
+    ESP_LOGI(TAG, "Decoder counts: UNKNOWN=%llu MS=%llu TL=%llu BC=%llu "
+             "LW.DA=%llu LW.other=%llu (total processed=%llu)",
+             (unsigned long long)got_unknown, (unsigned long long)got_ms,
+             (unsigned long long)got_tl,      (unsigned long long)got_bc,
+             (unsigned long long)got_lw_da,   (unsigned long long)got_lw_other,
+             (unsigned long long)got_total);
+
+    bool pass = true;
+    if (push_drops > 0) {
+        ESP_LOGE(TAG, "  %d push drops — queue too small or decoder too slow",
+                 push_drops);
+        pass = false;
+    }
+    if (got_total != (uint64_t)pushed_ok) {
+        ESP_LOGE(TAG, "  decoder consumed %llu vs %d pushed",
+                 (unsigned long long)got_total, pushed_ok);
+        pass = false;
+    }
+    // Reference numbers from host test_iridium_frame_corpus on the
+    // 82-entry Albuquerque corpus: 1 TL + 11 BC + 6 LW.DA + 55 LW.other
+    // (the LW count breaks down by ft); 9 UNKNOWN. Allow ±2 slack for
+    // any classifier-tuning drift between host (gcc) and target (riscv32).
+    const int EXP_TL       = 1;
+    const int EXP_BC       = 11;
+    const int EXP_LW_TOTAL = 61;   // matches host: 14 BC + 61 LW + 1 TL etc.
+    if ((int)got_tl < EXP_TL - 2 || (int)got_tl > EXP_TL + 2) {
+        ESP_LOGE(TAG, "  TL count %llu out of range [%d..%d]",
+                 (unsigned long long)got_tl, EXP_TL - 2, EXP_TL + 2);
+        pass = false;
+    }
+    if ((int)got_bc < EXP_BC - 2 || (int)got_bc > EXP_BC + 2) {
+        ESP_LOGE(TAG, "  BC count %llu out of range [%d..%d]",
+                 (unsigned long long)got_bc, EXP_BC - 2, EXP_BC + 2);
+        pass = false;
+    }
+    int lw_total = (int)(got_lw_da + got_lw_other);
+    if (lw_total < EXP_LW_TOTAL - 2 || lw_total > EXP_LW_TOTAL + 2) {
+        ESP_LOGE(TAG, "  LW total %d out of range [%d..%d]",
+                 lw_total, EXP_LW_TOTAL - 2, EXP_LW_TOTAL + 2);
+        pass = false;
+    }
+    if (pass) ESP_LOGI(TAG, "===== SMOKE_PASS =====");
+    else      ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
+
+    // Park here — smoke task is supposed to never return.
+    // (The frame_decoder task on Core 1 stays running so we can keep
+    // observing its log lines during manual debug.)
+    vTaskSuspend(NULL);
+}
+#endif
+
 void smoke_test_run(void)
 {
+#if CONFIG_SMOKE_TEST_FRAME_DECODER
+    smoke_test_run_frame_decoder();
+    // Should not return; if smoke_test_run_frame_decoder ever does,
+    // park here so we don't fall off the task.
+    vTaskSuspend(NULL);
+    return;
+#endif
+
     ESP_LOGI(TAG, "=== Smoke test start ===");
     ESP_LOGI(TAG, "Injecting tone at FFT bin %d (post-shift bin %d), "
              "expecting detection in [%d..%d]",
@@ -162,10 +308,26 @@ void smoke_test_run(void)
         ESP_LOGE(TAG, "signal_buffer_init failed -> SMOKE_FAIL");
         return;
     }
+#if CONFIG_SMOKE_TEST_REAL_IRIDIUM || CONFIG_SMOKE_TEST_RAW_IRIDIUM
+    // Full-stack mode: bring up the worker chain (qpsk_demod + BCH +
+    // legacy MS decode) and the frame_decoder task so detected bursts
+    // get classified, not just counted.
+    worker_core1_init();
+    bch_decoder_init();
+    if (frame_decoder_init() != ESP_OK) {
+        ESP_LOGE(TAG, "frame_decoder_init failed -> SMOKE_FAIL");
+        return;
+    }
+    if (dsp_processor_init(on_burst_full_chain) != ESP_OK) {
+        ESP_LOGE(TAG, "dsp_processor_init failed -> SMOKE_FAIL");
+        return;
+    }
+#else
     if (dsp_processor_init(on_burst) != ESP_OK) {
         ESP_LOGE(TAG, "dsp_processor_init failed -> SMOKE_FAIL");
         return;
     }
+#endif
     if (ingest_core1_init() != ESP_OK) {
         ESP_LOGE(TAG, "ingest_core1_init failed -> SMOKE_FAIL");
         return;
@@ -204,6 +366,23 @@ void smoke_test_run(void)
     // Repeat 2 more times so the burst's 9 ms duration spans enough FFT
     // frames (4 frames per 16 KB transfer × 3 = 12 frames covers ~10 ms).
     for (int i = 0; i < 2; i++) {
+        prev_slot = drive_transfer(synth, prev_slot);
+        vTaskDelay(1);
+    }
+#elif CONFIG_SMOKE_TEST_RAW_IRIDIUM
+    // End-to-end raw-mode test: a single fixture representing what an
+    // SDR tuned to ALBQ_RAW_LO_HZ would actually emit. Bursts at their
+    // natural offsets in the 2.56 MHz subband, no per-burst pre-shift,
+    // so worker_core1's peak_bin -> freq-centre chain can demod them.
+    ESP_LOGI(TAG, "Phase 2 (raw-mode @ %u Hz): 3× %u-byte transfers (%u expected bursts)",
+             ALBQ_RAW_LO_HZ, TRANSFER_BYTES, ALBQ_RAW_EXPECTED_BURSTS);
+    for (int t = 0; t < 3; t++) {
+        unsigned int off = t * TRANSFER_BYTES;
+        if (off + TRANSFER_BYTES <= ALBQ_RAW_UINT8_LEN) {
+            memcpy(synth, ALBQ_RAW_UINT8 + off, TRANSFER_BYTES);
+        } else {
+            memset(synth, 128, TRANSFER_BYTES);
+        }
         prev_slot = drive_transfer(synth, prev_slot);
         vTaskDelay(1);
     }
@@ -309,7 +488,36 @@ void smoke_test_run(void)
         ESP_LOGE(TAG, "  no bursts detected (expected ≥1)");
         pass = false;
     }
-#if CONFIG_SMOKE_TEST_CORPUS
+#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
+    // Raw-mode end-to-end assertion: the worker chain should demod
+    // at least one burst (since bursts are at their natural offsets
+    // in the 2.56 MHz subband, peak_bin is correct for freq centring).
+    // Wait for queues to drain, then check frame_decoder counts.
+    ESP_LOGI(TAG, "Waiting up to 2 s for worker + frame_decoder to drain...");
+    for (int i = 0; i < 20; i++) {
+        if (frame_decoder_queue_count() == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    frame_decoder_class_counts_t fc;
+    frame_decoder_get_class_counts(&fc);
+    uint64_t total_classified = fc.unknown + fc.ms + fc.tl + fc.bc
+                              + fc.lw_da + fc.lw_other;
+    ESP_LOGI(TAG, "Frame-decoder counts: UNKNOWN=%llu MS=%llu TL=%llu BC=%llu "
+             "LW.DA=%llu LW.other=%llu (total=%llu, expected=%d)",
+             (unsigned long long)fc.unknown, (unsigned long long)fc.ms,
+             (unsigned long long)fc.tl,      (unsigned long long)fc.bc,
+             (unsigned long long)fc.lw_da,   (unsigned long long)fc.lw_other,
+             (unsigned long long)total_classified, ALBQ_RAW_EXPECTED_BURSTS);
+    if (total_classified < 1) {
+        ESP_LOGE(TAG, "  no bursts reached the classifier — worker chain broken");
+        pass = false;
+    }
+    if (snr_db < 10.0f) {
+        ESP_LOGE(TAG, "  strongest burst SNR %.2f dB lower than expected (≥10 dB)",
+                 snr_db);
+        pass = false;
+    }
+#elif CONFIG_SMOKE_TEST_CORPUS
     const int CORPUS_BIN_LO = 1014;
     const int CORPUS_BIN_HI = 1034;
     if (peak_bin < CORPUS_BIN_LO || peak_bin > CORPUS_BIN_HI) {
@@ -362,6 +570,43 @@ void smoke_test_run(void)
                  snr_db);
         pass = false;
     }
+
+    // Full-stack post-check: wait for worker + frame_decoder to drain
+    // any queued bursts, then report what got classified.
+    //
+    // ARCHITECTURE NOTE (why no hard assertion on classifier counts):
+    // The 8-stripe IQ fixture is FREQUENCY-SHIFTED at fixture-build
+    // time so each stripe puts its 2.56 MHz subband at baseband DC.
+    // That's the right shape for the FFT detector test (peak_bin
+    // lands near DC). But the WORKER expects raw SDR IQ and does its
+    // OWN freq-shift driven by detector-reported peak_bin to centre
+    // each channel before demod. Feeding a pre-shifted fixture
+    // through the worker means it shifts the wrong amount and
+    // demod fails. So qpsk_demod returns false, frame_decoder_push
+    // is never called, and classifier counts stay 0.
+    //
+    // True end-to-end IQ -> ACARS smoke tests need raw (unshifted)
+    // 2.56 MSPS IQ at the SDR LO frequency. We don't have a fixture
+    // for that yet — comes with the antenna in Phase 4. Until then,
+    // use CONFIG_SMOKE_TEST_FRAME_DECODER for upper-chain regression
+    // (post-demod bits -> classifier directly).
+    ESP_LOGI(TAG, "Waiting up to 2 s for worker + frame_decoder to drain...");
+    for (int i = 0; i < 20; i++) {
+        if (frame_decoder_queue_count() == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    frame_decoder_class_counts_t fc;
+    frame_decoder_get_class_counts(&fc);
+    ESP_LOGI(TAG, "Frame-decoder counts: UNKNOWN=%llu MS=%llu TL=%llu BC=%llu "
+             "LW.DA=%llu LW.other=%llu",
+             (unsigned long long)fc.unknown, (unsigned long long)fc.ms,
+             (unsigned long long)fc.tl,      (unsigned long long)fc.bc,
+             (unsigned long long)fc.lw_da,   (unsigned long long)fc.lw_other);
+    ESP_LOGI(TAG, "Frame-decoder queue: pushed=%llu popped=%llu dropped=%llu",
+             (unsigned long long)frame_decoder_pushed(),
+             (unsigned long long)frame_decoder_popped(),
+             (unsigned long long)frame_decoder_dropped());
+    // No hard assertion — see ARCHITECTURE NOTE above.
 #else
     if (peak_bin < EXPECTED_BIN_LO || peak_bin > EXPECTED_BIN_HI) {
         ESP_LOGE(TAG, "  strongest peak_bin %d outside expected window [%d..%d]",

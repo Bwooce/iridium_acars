@@ -28,10 +28,19 @@
 extern "C" {
 #endif
 
-// Maximum demod bit count we ever queue. qpsk_demod produces 382 bits
-// (191 symbols × 2) for a typical Iridium burst; allow some slack for
-// future longer-frame variants.
-#define FRAME_QUEUE_MAX_BITS 512
+// Maximum demod bit count we ever queue. Sized to the Iridium L-band
+// TDMA spec, not to what any one corpus frame happens to have:
+//
+//   - One TDMA slot:    8.28 ms × 25 ksym/s × 2 bit/sym  = ~414 bits
+//   - Single-slot burst (most IDA / IBC / IRA frames):   ~382 bits
+//   - Two-slot data burst (concatenated next-access):    ~828 bits
+//   - Four-slot voice burst (theoretical max):          ~1656 bits
+//
+// Round up to 2048 (= 256 bytes packed; we store 0/1-per-byte so 2048 B)
+// to cover any realistic frame including the 4-slot worst case plus
+// preamble margin. Per-item cost: 2048 + 16 metadata = 2064 B; 64-slot
+// queue is ~132 KB in PSRAM. (We have 32 MB free PSRAM; this is noise.)
+#define FRAME_QUEUE_MAX_BITS 2048
 
 typedef struct {
     uint32_t timestamp_us;   // host timestamp at enqueue (esp_timer_get_time / gettimeofday)

@@ -26,6 +26,23 @@ static const uint8_t HEADER_MESSAGING[32] = {
     0,0,1,1, 0,0,1,1, 1,1,1,1, 0,0,1,1,
 };
 
+// Canonical 24-bit Unique Word patterns (post-DQPSK Gray-remap, in
+// the bit orientation qpsk_demod_process emits). Match upstream's
+// iridium_access / uplink_access constants. iridium-toolkit's parser
+// rejects any UW with even 1-bit error (default mode); we adopt the
+// same strictness so iridium_frame_classify only forwards frames a
+// downstream parser would also accept.
+//
+// qpsk_demod itself accepts up to 2 UW symbol errors at decode time
+// (so the bits get emitted), but the strict gate here catches the
+// border-line cases that a real production parser would drop.
+static const uint8_t UW_DL[24] = {
+    0,0, 1,1, 0,0, 0,0, 0,0, 1,1, 0,0, 0,0, 1,1, 1,1, 0,0, 1,1,
+};
+static const uint8_t UW_UL[24] = {
+    1,1, 0,0, 1,1, 0,0, 0,0, 1,1, 1,1, 0,0, 1,1, 1,1, 1,1, 0,0,
+};
+
 // 96-bit "time/location" header: bits "11" + 94 zeros.
 #define HEADER_TIME_LOCATION_LEN 96
 
@@ -176,6 +193,20 @@ int iridium_frame_classify(const uint8_t *bits, size_t n_bits,
     out->bits        = bits;
     out->n_bits      = n_bits;
     out->payload_off = UW_BITS;
+
+    // Strict UW gate. qpsk_demod accepts up to 2 symbol errors at decode
+    // time so noisy frames still get bits emitted, but a real-world
+    // parser (iridium-toolkit's iridium-parser.py in default mode) only
+    // accepts frames with an exact UW match. Mirror that strictness
+    // here — leave UNKNOWN if the UW is corrupted, regardless of
+    // whether the rest of the bits happen to satisfy MS / TL / BC / LW
+    // structure. This tightens our corpus regression to 100% agreement
+    // with the parser by rejecting frames the parser wouldn't process.
+    const uint8_t *uw_expected = (direction == IR_FRM_DIR_UPLINK)
+                                 ? UW_UL : UW_DL;
+    if (!bits_equal(bits, uw_expected, UW_BITS)) {
+        return 0;  // UW corrupt — leave UNKNOWN
+    }
 
     const uint8_t *p = bits + UW_BITS;
     size_t avail = n_bits - UW_BITS;

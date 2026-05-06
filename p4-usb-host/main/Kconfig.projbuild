@@ -70,6 +70,51 @@ config SMOKE_TEST_CORPUS
         the smoke test uses a synthetic tone at FFT bin 200 (semantic
         regression check, not a corpus regression).
 
+config SMOKE_TEST_FRAME_DECODER
+    bool "Drive the frame_decoder task with canned post-demod bits from the Albuquerque corpus"
+    depends on SMOKE_TEST_MODE
+    depends on !SMOKE_TEST_CORPUS
+    depends on !SMOKE_TEST_REAL_IRIDIUM
+    default n
+    help
+        Target-side smoke test for the Phase D frame_decoder pipeline
+        (frame_queue -> classifier -> [later: LCW extractor / SBD
+        reassembler / libacars]). Bypasses USB ingest, ingest_core1,
+        and dsp_processor; iterates over the 82 entries of
+        tests/fixtures/fixture_albq_frames_corpus.h and pushes each
+        directly into frame_decoder_push(). Useful for verifying that
+        the on-target classifier produces the same per-class counts as
+        the host regression (97.6% agreement against gr-iridium).
+
+        Mutually exclusive with SMOKE_TEST_CORPUS and SMOKE_TEST_REAL_IRIDIUM.
+        Asserts on-target counts vs the parser-expected counts embedded
+        in fixture_albq_frames_corpus.h. PASS criteria:
+          - All 82 frames consumed by the decoder task
+          - Per-class counts (UNKNOWN / MS / TL / BC / LW.DA / LW.other)
+            within ±2 of host expected (real-RF noise margin).
+
+config SMOKE_TEST_RAW_IRIDIUM
+    bool "End-to-end IQ -> ACARS smoke test using the raw-LO Albuquerque fixture"
+    depends on SMOKE_TEST_MODE
+    depends on !SMOKE_TEST_CORPUS
+    depends on !SMOKE_TEST_FRAME_DECODER
+    depends on !SMOKE_TEST_REAL_IRIDIUM
+    default n
+    help
+        Drives the full pipeline (USB-emulated ingest -> dsp_processor
+        -> worker_core1 -> qpsk_demod + BCH -> frame_decoder ->
+        classifier) using a 'raw-mode' fixture: the Albuquerque cf32
+        decimated to 2.56 MSPS at a fixed LO (1618.5 MHz) with NO
+        per-burst pre-shift. Bursts appear at their natural frequency
+        offsets in the 2.56 MHz subband, so the worker's
+        peak_bin -> freq-centre chain works correctly and qpsk_demod
+        can demodulate.
+
+        Mutually exclusive with the other SMOKE_TEST_* fixture modes.
+        On PASS reports per-class frame_decoder counts driven entirely
+        by demod from raw IQ — closes the loop for hardware-in-the-
+        loop validation without needing the antenna installed.
+
 config SMOKE_TEST_REAL_IRIDIUM
     bool "Use the Albuquerque real-RF Iridium fixture (highest-SNR IDA-DL burst)"
     depends on SMOKE_TEST_MODE
