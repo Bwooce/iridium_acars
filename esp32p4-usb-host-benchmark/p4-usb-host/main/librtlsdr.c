@@ -407,21 +407,37 @@ enum blocks
 
 int rtlsdr_read_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t *array, uint8_t len)
 {
+    // Earlier version did `*array = data[0]` — copying only the first
+    // byte of any read regardless of len. That broke every multi-byte
+    // R82XX read (chip ID was correct because it sits at byte 0; lock
+    // status at byte 2 always returned stale buffer values), which is
+    // why the PLL appeared not to lock — we were never actually reading
+    // the post-program status.
     uint16_t index = (block << 8);
     unsigned char *data = calloc(len, sizeof(char));
+    if (!data) return -1;
     int ret = esp_libusb_control_transfer(dev->driver_obj, CTRL_IN, 0, addr, index, data, len, CTRL_TIMEOUT);
-    // ESP_LOGI(TAG_ADSB, "rtlsdr_read_array here %d %d", ret, data[0]);
-    *array = data[0];
+    if (ret >= 0) {
+        memcpy(array, data, len);
+    }
+    free(data);
     return ret;
 }
 
 int rtlsdr_write_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t *array, uint8_t len)
 {
+    // Earlier version did `data[0] = *array` and sent the calloc-zeroed
+    // remainder. Every multi-byte write therefore sent [reg, 0, 0, ...]
+    // instead of [reg, val, ...], silently writing 0 to every R82XX
+    // register the init code tried to program. That's why init_array
+    // didn't take effect and PLL programming sent all-zero divider
+    // values — the chip was operating with whatever register state it
+    // booted in, not what we tried to configure.
     uint16_t index = (block << 8) | 0x10;
     unsigned char *data = calloc(len, sizeof(char));
-    data[0] = *array;
+    if (!data) return -1;
+    memcpy(data, array, len);
     int ret = esp_libusb_control_transfer(dev->driver_obj, CTRL_OUT, 0, addr, index, data, len, CTRL_TIMEOUT);
-    // ESP_LOGI(TAG_ADSB, "rtlsdr_write_array here %d", ret);
     free(data);
     return ret;
 }

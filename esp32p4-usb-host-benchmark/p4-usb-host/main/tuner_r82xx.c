@@ -378,18 +378,16 @@ static int r82xx_read(struct r82xx_priv *priv, uint8_t reg, uint8_t *val, int le
     int rc, i;
     uint8_t *p = &priv->buf[1];
 
-    priv->buf[0] = reg;
-
-    rc = rtlsdr_i2c_write_fn(priv->rtl_dev, priv->cfg->i2c_addr, priv->buf, 1);
-
-    if (rc != 1)
-    {
-        fprintf(stderr, "%s: i2c wr failed=%d reg=%02x len=%d\n",
-                __FUNCTION__, rc, reg, 1);
-        if (rc < 0)
-            return rc;
-        return -1;
-    }
+    /* The R82XX always returns registers starting from 0x00 on read; the
+     * `reg` parameter is documentation only. Upstream librtlsdr does NOT
+     * issue a separate I2C write to set the address — see
+     * librtlsdr/src/tuner_r82xx.c:669-690. Our earlier port did a 1-byte
+     * write of `reg` before the read, which the chip can interpret as a
+     * malformed write transaction (one byte = register-pointer update
+     * with no following data) and may have been disturbing its I2C state
+     * machine, causing reads to return stale/identical bytes. The fix is
+     * to remove that write and just read directly. */
+    priv->buf[0] = reg;  /* kept for parity with upstream; not transmitted */
 
     rc = rtlsdr_i2c_read_fn(priv->rtl_dev, priv->cfg->i2c_addr, p, len);
 
