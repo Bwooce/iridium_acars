@@ -65,9 +65,29 @@ target_include_directories(test_demod_albq PRIVATE
 )
 target_link_libraries(test_demod_albq PRIVATE m)
 
+# iridium_frame: top-level frame classifier (Phase A — MS/TL match).
+# Pure C, no IDF deps, builds straight from common/.
+add_executable(test_iridium_frame
+    test_iridium_frame.c
+    ${COMMON_DIR}/iridium_frame.c
+)
+target_include_directories(test_iridium_frame PRIVATE ${COMMON_DIR})
+
+# Frame classifier vs Albuquerque corpus (regression).
+add_executable(test_iridium_frame_corpus
+    test_iridium_frame_corpus.c
+    ${COMMON_DIR}/iridium_frame.c
+)
+target_include_directories(test_iridium_frame_corpus PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+
 enable_testing()
-add_test(NAME bch            COMMAND test_bch)
-add_test(NAME qpsk           COMMAND test_qpsk)
-add_test(NAME demod_corpus   COMMAND test_demod_corpus)
-add_test(NAME demod_low_snr  COMMAND test_demod_low_snr)
-add_test(NAME demod_albq     COMMAND test_demod_albq)
+add_test(NAME bch                  COMMAND test_bch)
+add_test(NAME qpsk                 COMMAND test_qpsk)
+add_test(NAME demod_corpus         COMMAND test_demod_corpus)
+add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)
+add_test(NAME demod_albq           COMMAND test_demod_albq)
+add_test(NAME iridium_frame        COMMAND test_iridium_frame)
+add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
