@@ -17,6 +17,8 @@ idf_component_register(
         "iridium_frame.c"
         # Phase D queue between worker and frame_decoder task.
         "frame_queue.c"
+        # Phase D part 4: IDA frame post-LCW decoder (de-interleave + BCH).
+        "ida_decode.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board

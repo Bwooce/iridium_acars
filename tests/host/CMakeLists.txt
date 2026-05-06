@@ -108,6 +108,18 @@ add_executable(test_frame_queue
 target_include_directories(test_frame_queue PRIVATE ${COMMON_DIR})
 target_link_libraries(test_frame_queue PRIVATE pthread)
 
+# Phase D part 4: ida_decode (LW.DA -> 10×BCH(31,21) -> ~26 byte payload).
+add_executable(test_ida_decode_corpus
+    test_ida_decode_corpus.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+)
+target_include_directories(test_ida_decode_corpus PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+
 # test_libacars_link — smoke test that the same minimum source-set the
 # IDF component (common/libacars_idf/) compiles also links + runs on a
 # host (glibc) toolchain. Catches missing files in the SRCS list and
@@ -164,4 +176,5 @@ add_test(NAME iridium_frame        COMMAND test_iridium_frame)
 add_test(NAME iridium_frame_phaseB COMMAND test_iridium_frame_phaseB)
 add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
 add_test(NAME frame_queue          COMMAND test_frame_queue)
+add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
