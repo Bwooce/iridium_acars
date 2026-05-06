@@ -140,6 +140,21 @@ def emit_bits_header(name: str, bits: str, direction: str, source_note: str) -> 
     return "\n".join(lines) + "\n"
 
 
+STRIPE_CENTERS_HZ = [
+    1_617_000_000,    # covers 1615.72 - 1618.28 MHz
+    1_618_280_000,
+    1_619_560_000,
+    1_620_840_000,
+    1_622_120_000,
+    1_623_400_000,
+    1_624_680_000,
+    1_625_960_000,    # covers 1624.68 - 1627.24 MHz
+]
+# Each stripe is 2.56 MHz wide; consecutive centers differ by 1.28 MHz =
+# 50% overlap. Together they cover 1615.72 - 1627.24 MHz, which fully
+# spans the Iridium downlink (1616 - 1626.5 MHz) with margin.
+
+
 def main() -> int:
     meta = load_meta()
     src_rate = float(meta["global"]["core:sample_rate"])     # 12_000_000
@@ -239,77 +254,112 @@ def main() -> int:
     ))
     print(f"wrote {truth_out}")
 
-    # ---- Target-side fixture: same burst, resampled to 2.56 MSPS uint8 IQ
-    # (RTL-SDR convention) for the P4 smoke test. Frequency-shifted so
-    # the burst lands at DC of the 2.56 MHz subband (peak_bin near 1024
-    # in our 2048-pt FFT). Sized to 3× TRANSFER_BYTES = 48 KB so the
-    # smoke test can drive 3 consecutive 16 KB transfers covering the
-    # whole ~7.6 ms burst plus margin.
+    # ---- Target-side fixtures: 8 stripes covering 1615.72-1627.24 MHz at
+    # 2.56 MSPS uint8 IQ (50% overlap). Each stripe shifts a different 2.56
+    # MHz subband to baseband, then resamples + quantises. The smoke test
+    # iterates through all 8 stripes, asserting that *some* in-band burst
+    # is detected on each (most stripes catch ≥1 burst from the active
+    # 1149-1159 ms window).
     target_rate = 2_560_000
-    # Slightly different time window: smoke test wants the burst at the
-    # *start* of the slice (no leading noise — that comes from the
-    # smoke test's PRIMING_TRANSFERS). Tail margin + a bit of pre-burst
-    # so the FFT detector has settled energy by the time the burst
-    # appears.
+    TARGET_BYTES = 3 * 16384       # 49152 = 3 × 16 KB transfers = 9.6 ms
+    # Use the same time anchor as the host fixture (centred on the gr-
+    # iridium-selected high-SNR burst). Many other concurrent bursts at
+    # other freqs land in the same 9.6 ms window.
     target_pre_ms  = 1.0
-    target_post_ms = 5.5    # 7.64 ms burst - 1 ms head + 5.5 ms tail
-                            #   = 12.14 ms total ≈ 31 KB at 2.56 MSPS
+    target_post_ms = 8.6           # widen tail to 9.6 ms total slice
     t_start = int(round((burst_time_s - target_pre_ms/1000.0) * src_rate))
-    t_end   = int(round((burst_time_s + burst_dur_s + target_post_ms/1000.0) * src_rate))
+    t_end   = int(round((burst_time_s + target_post_ms/1000.0) * src_rate))
     t_start = max(0, t_start)
     t_end   = min(len(cf32), t_end)
     target_slice = cf32[t_start:t_end].astype(np.complex64)
 
-    # Reuse the same +shift_hz frequency offset (burst -> DC) from the
-    # earlier section.
-    n2 = np.arange(len(target_slice), dtype=np.float64)
-    target_phasor = np.exp(-2j * np.pi * (-shift_hz) / src_rate * n2).astype(np.complex64)
-    target_shifted = target_slice * target_phasor
-
-    # Resample 12 MSPS -> 2.56 MSPS = ratio 16/75 (lowest terms).
     from math import gcd
     g = gcd(int(src_rate), target_rate)
     up_t = target_rate // g
     down_t = int(src_rate) // g
-    target_dec = resample_poly(target_shifted, up=up_t, down=down_t).astype(np.complex64)
-    print(f"target resample {up_t}/{down_t} -> {target_rate/1e6:g} MSPS "
-          f"({len(target_dec)} complex samples = "
-          f"{len(target_dec)/target_rate*1000:.2f} ms)")
 
-    # Quantise to uint8 IQ (RTL-SDR convention: 0..255 with 128 = zero).
-    # Scale so peak burst magnitude ≈ 100 LSB above midpoint, leaving
-    # ~25 LSB headroom for noise.
-    target_scale = 100.0 / max(0.5, float(np.max(np.abs(target_dec))))
-    re = np.clip(np.real(target_dec) * target_scale + 128.5, 0, 255).astype(np.uint8)
-    im = np.clip(np.imag(target_dec) * target_scale + 128.5, 0, 255).astype(np.uint8)
-    n_complex = len(target_dec)
-    target_uint8 = np.zeros(2 * n_complex, dtype=np.uint8)
-    target_uint8[0::2] = re
-    target_uint8[1::2] = im
+    # For each stripe: compute relative shift, apply phasor, resample,
+    # quantise, emit one C header. Also collect per-stripe expected-burst
+    # counts (gr-iridium bursts in the 9.6 ms window whose freq lies in
+    # the stripe's ±1.28 MHz half-bandwidth).
+    win_lo_ms = (burst_time_s - target_pre_ms/1000.0) * 1000.0
+    win_hi_ms = (burst_time_s + target_post_ms/1000.0) * 1000.0
+    stripe_meta = []
+    for stripe_idx, stripe_center in enumerate(STRIPE_CENTERS_HZ):
+        rel_shift_hz = center_freq - stripe_center      # bring stripe -> DC
+        n2 = np.arange(len(target_slice), dtype=np.float64)
+        ph = np.exp(-2j * np.pi * (-rel_shift_hz) / src_rate * n2).astype(np.complex64)
+        shifted = (target_slice * ph).astype(np.complex64)
+        dec = resample_poly(shifted, up=up_t, down=down_t).astype(np.complex64)
+        scale = 100.0 / max(0.5, float(np.max(np.abs(dec))))
+        re = np.clip(np.real(dec) * scale + 128.5, 0, 255).astype(np.uint8)
+        im = np.clip(np.imag(dec) * scale + 128.5, 0, 255).astype(np.uint8)
+        bytes_iq = np.zeros(2 * len(dec), dtype=np.uint8)
+        bytes_iq[0::2] = re
+        bytes_iq[1::2] = im
+        if len(bytes_iq) >= TARGET_BYTES:
+            bytes_iq = bytes_iq[:TARGET_BYTES]
+        else:
+            pad = np.full(TARGET_BYTES - len(bytes_iq), 128, dtype=np.uint8)
+            bytes_iq = np.concatenate([bytes_iq, pad])
 
-    # Trim to exactly 3 × TRANSFER_BYTES (3 × 16384 = 49152 bytes) so it
-    # maps cleanly to 3 smoke-test transfers. If too short, pad with
-    # mid-scale (0x80) bytes; if too long, truncate.
-    TARGET_BYTES = 3 * 16384
-    if len(target_uint8) >= TARGET_BYTES:
-        target_uint8 = target_uint8[:TARGET_BYTES]
-        print(f"trimmed target fixture to {TARGET_BYTES} bytes "
-              f"(={TARGET_BYTES // 16384} × 16 KB transfers)")
-    else:
-        pad = np.full(TARGET_BYTES - len(target_uint8), 128, dtype=np.uint8)
-        target_uint8 = np.concatenate([target_uint8, pad])
-        print(f"padded target fixture from {len(target_dec)*2} to "
-              f"{TARGET_BYTES} bytes with 0x80")
+        # Bursts in time window AND within stripe ±1.28 MHz
+        in_stripe = [
+            b for b in bursts
+            if win_lo_ms <= b["time_ms"] <= win_hi_ms
+            and abs(b["freq_hz"] - stripe_center) <= 1_280_000
+        ]
+        sym_var = f"ALBQ_STRIPE_{stripe_idx}_UINT8"
+        out = FIXTURE_DIR / f"fixture_albq_stripe_{stripe_idx}.h"
+        out.write_text(emit_uint8_iq_header(
+            sym_var, bytes_iq,
+            f"Albuquerque cf32, stripe {stripe_idx} center "
+            f"{stripe_center/1e6:.3f} MHz, time window "
+            f"{win_lo_ms:.2f}..{win_hi_ms:.2f} ms, "
+            f"{len(in_stripe)} gr-iridium bursts in stripe band"
+        ))
+        stripe_meta.append({
+            "idx": stripe_idx,
+            "center_hz": stripe_center,
+            "expected_bursts": len(in_stripe),
+            "filename": out.name,
+        })
+        print(f"stripe {stripe_idx}: center={stripe_center/1e6:.3f} MHz, "
+              f"{len(in_stripe)} expected bursts, wrote {out.name}")
 
-    target_out = FIXTURE_DIR / "fixture_albq_uint8.h"
-    target_out.write_text(emit_uint8_iq_header(
-        "ALBQ_UINT8", target_uint8,
-        "test_data/iridium_downlink_2022-03-17_albuquerque/iridium_cf32.sigmf-data, "
-        f"burst at t={best['time_ms']:.2f} ms, f={best['freq_hz']/1e6:.4f} MHz, "
-        "freq-shifted to DC, resampled 12 MSPS -> 2.56 MSPS, quantised to uint8 IQ "
-        "(RTL-SDR convention)"
-    ))
-    print(f"wrote {target_out}")
+    # Generate the master include header that brings them all together.
+    meta_lines = [
+        "// Auto-generated by tests/scripts/build_albq_fixture.py — do not edit by hand.",
+        "// Master index for the Albuquerque multi-stripe fixtures.",
+        "#pragma once",
+        "#include <stdint.h>",
+    ]
+    for s in stripe_meta:
+        meta_lines.append(f'#include "fixture_albq_stripe_{s["idx"]}.h"')
+    meta_lines.append("")
+    meta_lines.append(f"#define ALBQ_NUM_STRIPES {len(stripe_meta)}")
+    meta_lines.append("")
+    meta_lines.append("typedef struct {")
+    meta_lines.append("    const uint8_t   *data;")
+    meta_lines.append("    unsigned int     len;")
+    meta_lines.append("    uint32_t         center_hz;")
+    meta_lines.append("    int              expected_bursts;")
+    meta_lines.append("} albq_stripe_t;")
+    meta_lines.append("")
+    meta_lines.append(f"static const albq_stripe_t ALBQ_STRIPES[ALBQ_NUM_STRIPES] = {{")
+    for s in stripe_meta:
+        meta_lines.append(
+            f'    {{ ALBQ_STRIPE_{s["idx"]}_UINT8, ALBQ_STRIPE_{s["idx"]}_UINT8_LEN, '
+            f'{s["center_hz"]}u, {s["expected_bursts"]} }},'
+        )
+    meta_lines.append("};")
+    meta_path = FIXTURE_DIR / "fixture_albq_stripes.h"
+    meta_path.write_text("\n".join(meta_lines) + "\n")
+    print(f"wrote master index {meta_path}")
+
+    total_expected = sum(s["expected_bursts"] for s in stripe_meta)
+    print(f"total expected bursts across all stripes (with overlap double-counting): "
+          f"{total_expected}")
 
     return 0
 

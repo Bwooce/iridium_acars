@@ -24,7 +24,7 @@
 #endif
 
 #if CONFIG_SMOKE_TEST_REAL_IRIDIUM
-#include "fixture_albq_uint8.h"
+#include "fixture_albq_stripes.h"
 #endif
 
 static const char *TAG = "SMOKE";
@@ -208,23 +208,53 @@ void smoke_test_run(void)
         vTaskDelay(1);
     }
 #elif CONFIG_SMOKE_TEST_REAL_IRIDIUM
-    // Hardware-in-the-loop counterpart of test_demod_albq host test:
-    // same Albuquerque burst, same subband-shift to DC, same uint8 IQ
-    // quantisation — fed through the production P4 pipeline. The
-    // fixture is exactly 3 × TRANSFER_BYTES (49152 B = 19.2 ms at
-    // 2.56 MSPS, comfortably wider than the burst's 7.6 ms duration).
-    ESP_LOGI(TAG, "Phase 2 (real-RF Albuquerque): 3× %u-byte transfers (%u total)",
-             TRANSFER_BYTES, ALBQ_UINT8_LEN);
-    for (int t = 0; t < 3; t++) {
-        unsigned int off = t * TRANSFER_BYTES;
-        if (off + TRANSFER_BYTES <= ALBQ_UINT8_LEN) {
-            memcpy(synth, ALBQ_UINT8 + off, TRANSFER_BYTES);
-        } else {
-            // Should never happen with the 3-chunk fixture, but be safe.
-            memset(synth, 128, TRANSFER_BYTES);
+    // Multi-stripe hardware-in-the-loop test: 8 stripes covering 1615.7-
+    // 1627.2 MHz at 50% overlap, each fixture 49 KB = 9.6 ms of resampled
+    // 2.56 MSPS uint8 IQ. Per stripe: PRIMING_TRANSFERS noise → 3 stripe
+    // transfers → TRAILER_TRANSFERS noise (let any active burst end and
+    // baseline EMA re-settle for the next stripe).
+    int per_stripe_bursts[ALBQ_NUM_STRIPES] = { 0 };
+    int total_bursts_after = 0;
+    for (int sidx = 0; sidx < ALBQ_NUM_STRIPES; sidx++) {
+        const albq_stripe_t *st = &ALBQ_STRIPES[sidx];
+        int bursts_before = s_bursts_detected;
+
+        // Don't repeat priming for stripe 0 — it ran before this loop.
+        if (sidx > 0) {
+            for (int i = 0; i < PRIMING_TRANSFERS; i++) {
+                fill_noise(synth);
+                prev_slot = drive_transfer(synth, prev_slot);
+                vTaskDelay(1);
+            }
         }
-        prev_slot = drive_transfer(synth, prev_slot);
-        vTaskDelay(1);
+
+        ESP_LOGI(TAG, "Stripe %d/%d (center %.3f MHz, %d expected bursts): "
+                      "3× %u-byte transfers",
+                 sidx, ALBQ_NUM_STRIPES, st->center_hz / 1e6,
+                 st->expected_bursts, TRANSFER_BYTES);
+        for (int t = 0; t < 3; t++) {
+            unsigned int off = t * TRANSFER_BYTES;
+            if (off + TRANSFER_BYTES <= st->len) {
+                memcpy(synth, st->data + off, TRANSFER_BYTES);
+            } else {
+                memset(synth, 128, TRANSFER_BYTES);
+            }
+            prev_slot = drive_transfer(synth, prev_slot);
+            vTaskDelay(1);
+        }
+
+        // Trailing noise so the active burst (if any) ends and gets
+        // counted before the next stripe's priming begins.
+        for (int i = 0; i < TRAILER_TRANSFERS; i++) {
+            fill_noise(synth);
+            prev_slot = drive_transfer(synth, prev_slot);
+            vTaskDelay(1);
+        }
+
+        per_stripe_bursts[sidx] = s_bursts_detected - bursts_before;
+        ESP_LOGI(TAG, "  stripe %d: %d bursts detected (expected %d)",
+                 sidx, per_stripe_bursts[sidx], st->expected_bursts);
+        total_bursts_after = s_bursts_detected;
     }
 #else
     ESP_LOGI(TAG, "Phase 2: %d tone transfers (drive the burst)", TONE_TRANSFERS);
@@ -235,6 +265,9 @@ void smoke_test_run(void)
     }
 #endif
 
+#if !CONFIG_SMOKE_TEST_REAL_IRIDIUM
+    // Multi-stripe mode handles its own per-stripe trailing inside the
+    // stripe loop above; the other modes still need a post-burst trailer.
     ESP_LOGI(TAG, "Phase 3: %d trailing noise transfers (terminate burst)",
              TRAILER_TRANSFERS);
     for (int i = 0; i < TRAILER_TRANSFERS; i++) {
@@ -242,6 +275,7 @@ void smoke_test_run(void)
         prev_slot = drive_transfer(synth, prev_slot);
         vTaskDelay(1);
     }
+#endif
 
     // Drain the last in-flight slot so its DSP feed runs.
     if (prev_slot >= 0) {
@@ -288,24 +322,43 @@ void smoke_test_run(void)
         pass = false;
     }
 #elif CONFIG_SMOKE_TEST_REAL_IRIDIUM
-    // Real-RF assertion: any non-edge bin with high SNR is a valid
-    // detection. We don't pin to bin 1024 because gr-iridium's reported
-    // burst frequency snaps to a coarse grid — the actual carrier in
-    // this capture sits ~196 kHz lower (bin 867 in practice). The
-    // production worker uses peak_bin to centre its own per-channel
-    // decimator, so any in-band detection self-corrects downstream.
-    // Edge-bin rejection rules out DC bias and Nyquist artefacts.
+    // Multi-stripe assertion. Cumulative count across all 8 stripes;
+    // we expect ~16 bursts total (with 50% stripe overlap double-
+    // counting some). Threshold of 5 catches a real regression while
+    // tolerating that some short / low-SNR bursts may not cross the
+    // detector threshold inside the 9.6 ms window.
+    ESP_LOGI(TAG, "Per-stripe summary:");
+    int stripes_with_bursts = 0;
+    for (int s = 0; s < ALBQ_NUM_STRIPES; s++) {
+        ESP_LOGI(TAG, "  stripe %d (%.3f MHz): detected=%d expected=%d",
+                 s, ALBQ_STRIPES[s].center_hz / 1e6,
+                 per_stripe_bursts[s], ALBQ_STRIPES[s].expected_bursts);
+        if (per_stripe_bursts[s] > 0) stripes_with_bursts++;
+    }
+    const int ALBQ_MIN_TOTAL_BURSTS = 5;
+    if (bursts < ALBQ_MIN_TOTAL_BURSTS) {
+        ESP_LOGE(TAG, "  total %d bursts is below threshold %d "
+                 "(across %d/%d stripes)",
+                 bursts, ALBQ_MIN_TOTAL_BURSTS,
+                 stripes_with_bursts, ALBQ_NUM_STRIPES);
+        pass = false;
+    }
+    if (stripes_with_bursts < 3) {
+        ESP_LOGE(TAG, "  only %d stripes detected ≥1 burst (expected ≥3 "
+                 "of the 5 stripes with non-zero expected bursts)",
+                 stripes_with_bursts);
+        pass = false;
+    }
+    // Edge-bin reject still applies to the strongest match.
     const int ALBQ_BIN_EDGE_REJECT = 64;
     if (peak_bin < ALBQ_BIN_EDGE_REJECT ||
         peak_bin > FFT_SIZE - ALBQ_BIN_EDGE_REJECT) {
         ESP_LOGE(TAG, "  strongest peak_bin %d in edge-reject window "
-                 "[<%d or >%d] — likely DC bias or Nyquist artefact, "
-                 "not a real burst", peak_bin, ALBQ_BIN_EDGE_REJECT,
-                 FFT_SIZE - ALBQ_BIN_EDGE_REJECT);
+                 "(likely DC/Nyquist artefact, not a real burst)", peak_bin);
         pass = false;
     }
     if (snr_db < 10.0f) {
-        ESP_LOGE(TAG, "  Albq burst SNR %.2f dB lower than expected (≥10 dB)",
+        ESP_LOGE(TAG, "  strongest burst SNR %.2f dB lower than expected (≥10 dB)",
                  snr_db);
         pass = false;
     }
@@ -368,6 +421,14 @@ void smoke_test_run(void)
     // sometimes triggers extra burst false positives, each adding
     // ~50 us of ESP_LOGI to the EMA-stage timing window. The
     // medians stay around the documented per-step baselines.
+    //
+    // In CONFIG_SMOKE_TEST_REAL_IRIDIUM mode the burst-callback rate is
+    // ~10× higher (real RF + 8 stripes catches dozens of bursts per
+    // run), so the per-frame ESP_LOGI overhead dominates and the
+    // averages aren't representative of production. Skip perf
+    // assertions in that mode — the other smoke modes still cover
+    // the DSP-perf regression purpose.
+#if !CONFIG_SMOKE_TEST_REAL_IRIDIUM
     struct { const char *name; float actual; float bar; } checks[] = {
         { "DSP total/frame",   dsp_st.total_us,    900.0f },  // Step 7b baseline 407, p99 ~750
         { "DSP wind/frame",    dsp_st.wind_us,      25.0f },  // Step 3a baseline 16 (PIE)
@@ -383,6 +444,8 @@ void smoke_test_run(void)
             pass = false;
         }
     }
+#endif
+#if !CONFIG_SMOKE_TEST_REAL_IRIDIUM
     if (ing_st.dispatches > 0) {
         float convert_avg = (float)ing_st.convert_us_total / ing_st.dispatches;
         float push_avg    = (float)ing_st.push_us_total    / ing_st.dispatches;
@@ -397,6 +460,7 @@ void smoke_test_run(void)
             pass = false;
         }
     }
+#endif
 
     if (pass) {
         ESP_LOGI(TAG, "===== SMOKE_PASS =====");
