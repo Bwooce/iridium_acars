@@ -39,15 +39,42 @@
  * Static constants
  */
 
-/* Those initial values start from REG_SHADOW_START */
+/* Those initial values start from REG_SHADOW_START.
+ * These values come directly from upstream librtlsdr (see
+ * esp32p4-usb-host-benchmark/librtlsdr/src/tuner_r82xx.c:327-364). The
+ * earlier port had ~14 of 27 registers different from upstream, including
+ * reg 0x11 (PLL charge-pump current = 0x83 vs upstream 0xbb) which is a
+ * load-bearing setting for PLL lock dynamics. Bringing them back in line
+ * is required before any other PLL debugging makes sense. */
+#define DEFAULT_IF_VGA_VAL 11
 static const uint8_t r82xx_init_array[NUM_REGS] = {
-    0x83, 0x32, 0x75,       /* 05 to 07 */
-    0xc0, 0x40, 0xd6, 0x6c, /* 08 to 0b */
-    0xf5, 0x63, 0x75, 0x68, /* 0c to 0f */
-    0x6c, 0x83, 0x80, 0x00, /* 10 to 13 */
-    0x0f, 0x00, 0xc0, 0x30, /* 14 to 17 */
-    0x48, 0xcc, 0x60, 0x00, /* 18 to 1b */
-    0x54, 0xae, 0x4a, 0xc0  /* 1c to 1f */
+    0x80,                       /* Reg 0x05 */
+    0x13,                       /* Reg 0x06 */
+    0x70,                       /* Reg 0x07 */
+    0xc0,                       /* Reg 0x08 */
+    0x40,                       /* Reg 0x09 */
+    0xdb,                       /* Reg 0x0a */
+    0x6b,                       /* Reg 0x0b */
+    0xe0 | DEFAULT_IF_VGA_VAL,  /* Reg 0x0c — VGA gain */
+    0x53,                       /* Reg 0x0d */
+    0x75,                       /* Reg 0x0e */
+    0x68,                       /* Reg 0x0f */
+    0x6c,                       /* Reg 0x10 */
+    0xbb,                       /* Reg 0x11 — PLL charge-pump current (was 0x83) */
+    0x80,                       /* Reg 0x12 */
+    VER_NUM & 0x3f,             /* Reg 0x13 */
+    0x0f,                       /* Reg 0x14 */
+    0x00,                       /* Reg 0x15 */
+    0xc0,                       /* Reg 0x16 */
+    0x30,                       /* Reg 0x17 */
+    0x48,                       /* Reg 0x18 */
+    0xec,                       /* Reg 0x19 */
+    0x60,                       /* Reg 0x1a */
+    0x00,                       /* Reg 0x1b */
+    0x24,                       /* Reg 0x1c */
+    0xdd,                       /* Reg 0x1d */
+    0x0e,                       /* Reg 0x1e */
+    0x40,                       /* Reg 0x1f */
 };
 
 /* Tuner frequency ranges */
@@ -568,6 +595,13 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
     if (rc < 0)
         return rc;
 
+    // Diagnostic: log what we're trying to lock to. Helps tell whether the
+    // divider math is sane (mix_div / nint / vco_fra all reasonable) before
+    // worrying about hardware behaviour.
+    fprintf(stderr, "[R82XX] set_pll freq=%lu xtal=%u mix_div=%u nint=%u si=%u vco_fra_kHz=%u sdm=%u\n",
+            (unsigned long)freq, (unsigned)pll_ref, (unsigned)mix_div,
+            (unsigned)nint, (unsigned)si, (unsigned)vco_fra, (unsigned)sdm);
+
     for (i = 0; i < 2; i++)
     {
         // Linux: usleep_range(sleep_time, sleep_time + 1000)
@@ -581,6 +615,12 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
         rc = r82xx_read(priv, 0x00, data, 3);
         if (rc < 0)
             return rc;
+        // Diagnostic: print the full status bytes so we can see whether the
+        // lock bit is just-not-set (data[2] & 0x40 == 0) or something else
+        // is wrong (e.g. data is all zero -> read failure, or data[2] has
+        // an unexpected bit pattern).
+        fprintf(stderr, "[R82XX] lock-check try=%d data=%02x %02x %02x (lock_bit=%d)\n",
+                i, data[0], data[1], data[2], (data[2] & 0x40) ? 1 : 0);
         if (data[2] & 0x40)
             break;
 
