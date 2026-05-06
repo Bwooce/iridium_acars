@@ -161,7 +161,11 @@ streaming rate with zero packet loss.
 | Step 6 (`-Og` → `-O2`) | 4.61 MB/s | 95% | 2.3% |
 | Step 7 (per-file `-O3` on hot files) | 4.61 MB/s | 95% | 2.3% |
 | Step 3a (hand-rolled PIE Q15 windowing kernel) | 4.61 MB/s | 95% | 2.3% |
-| **Step 6.5 (status logger to Core 1 task)** | **4.88 MB/s** | **100.5%** | **0** |
+| Step 6.5 (status logger to Core 1 task) | 4.88 MB/s | 100.5% | 0 |
+| **Step 7a (linear-write magnitude + cache hygiene)** | **4.88 MB/s** | **100.5%** | **0** |
+
+(Step 7a is pure CPU-headroom: DSP/frame 447→422 μs, −5.6%. Throughput
+already device-capped; this gives more slack for future feature work.)
 
 The "Step 6 = biggest single win" lesson lives in
 `memory/feedback_o2_for_optimization.md`: the prior arc had been measured

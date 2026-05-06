@@ -13,7 +13,16 @@ static const char *TAG = "DSP_PROC";
 #define HISTORY_SIZE 128
 #define PRIMING_FRAMES 16
 
-/* Buffers - Aligned for PIE, padded for overrun bug */
+/* Buffers - Aligned for PIE, padded for overrun bug.
+ *
+ * Tried aligning everything to 64 bytes (the P4 L1 D-cache line size)
+ * to remove the head/tail line-share between adjacent buffers — but
+ * with five 8 KB buffers (each = 128 lines = 2 way-fills in a 64-set
+ * 8-way L1 D), identical 64-byte alignment puts them all at the same
+ * cache-set offsets and the EMA stage regressed by ~170 us/frame
+ * from set-conflict thrashing. The linker's natural placement (each
+ * buffer 16-byte aligned but at varying mod-64 offsets) scatters them
+ * across L1 sets and is empirically faster. Keep aligned(16). */
 __attribute__((aligned(16))) static int16_t fft_in[FFT_SIZE * 2 + 16];
 __attribute__((aligned(16))) static int16_t window_cplx[FFT_SIZE * 2 + 16];
 __attribute__((aligned(16))) static float window_temp_f32[FFT_SIZE + 16];
@@ -86,13 +95,20 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
         dsps_bit_rev_sc16_ansi(fft_in, FFT_SIZE);
         int64_t t2 = esp_timer_get_time();
 
-        // 3. Magnitude Squared (with shift)
+        // 3. Magnitude Squared — linear write, no fftshift here.
+        // Previously this loop did `magnitudes[(i + N/2) % N] = ...`,
+        // which produced two cache-unfriendly write streams (one to
+        // each half of magnitudes[]). Writing linearly keeps the access
+        // pattern sequential — input fft_in is also read sequentially,
+        // so the whole loop is one streaming-read + one streaming-write.
+        // The fftshift transformation is applied below in the detect /
+        // report path so the worker still sees the conventional
+        // bin 1024 = DC convention.
         float norm = 1.0f / (FFT_SIZE * FFT_SIZE);
         for (int i = 0; i < FFT_SIZE; i++) {
-            int shift_idx = (i + FFT_SIZE / 2) % FFT_SIZE;
             float re = (float)fft_in[i * 2 + 0];
             float im = (float)fft_in[i * 2 + 1];
-            magnitudes[shift_idx] = (re * re + im * im) * norm;
+            magnitudes[i] = (re * re + im * im) * norm;
         }
         int64_t t3 = esp_timer_get_time();
 
@@ -128,19 +144,25 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
             }
         } else if (current_burst.active) {
             float snr_db = 10.0f * log10f(current_burst.max_snr);
+            // The detection / EMA path now tracks bins in linear FFT
+            // order (no fftshift in the magnitude loop). Apply the
+            // shift here at the API boundary so the log line and the
+            // worker callback still get the conventional fftshifted
+            // index where bin 1024 = DC, bin > 1024 = positive freq.
+            int shifted_bin = (current_burst.max_bin + FFT_SIZE / 2) & (FFT_SIZE - 1);
             ESP_LOGI(TAG, "BURST DETECTED! Frame:%lu Bin:%d SNR:%.2f dB",
-                     current_burst.start_frame, current_burst.max_bin, snr_db);
-            
+                     current_burst.start_frame, shifted_bin, snr_db);
+
             if (burst_cb) {
                 detected_burst_t burst = {
                     .start_sample_idx = current_burst.start_frame * FFT_SIZE,
                     .length_samples = (frame_count - current_burst.start_frame) * FFT_SIZE,
-                    .peak_bin = current_burst.max_bin,
+                    .peak_bin = shifted_bin,
                     .peak_snr_db = snr_db
                 };
                 burst_cb(&burst);
             }
-            
+
             total_bursts++;
             current_burst.active = false;
         }

@@ -282,6 +282,8 @@ void smoke_test_run(void)
     //     convert=191  push=86 (us)
     //   Step 3a (+ PIE Q15 windowing kernel dsp_window_arp4.S):
     //     wind=16  fft=199  mag=74  detect=58  base=146  total=493
+    //   Step 7a (+ linear-write magnitude, no fftshift in mag loop):
+    //     wind=15  fft=200  mag=51  detect=47  base=109  total=422
     //
     // If you intentionally optimise something further, lower the bar
     // (don't just raise it). If you intentionally regress for a feature
@@ -303,10 +305,10 @@ void smoke_test_run(void)
     }
 
     struct { const char *name; float actual; float bar; } checks[] = {
-        { "DSP total/frame",   dsp_st.total_us,    700.0f },  // Step 3a baseline 493
+        { "DSP total/frame",   dsp_st.total_us,    600.0f },  // Step 7a baseline 422
         { "DSP wind/frame",    dsp_st.wind_us,      25.0f },  // Step 3a baseline 16 (PIE)
         { "DSP fft/frame",     dsp_st.fft_us,      280.0f },
-        { "DSP mag/frame",     dsp_st.mag_us,      110.0f },
+        { "DSP mag/frame",     dsp_st.mag_us,       80.0f },  // Step 7a baseline 51 (linear)
         { "DSP detect/frame",  dsp_st.detect_us,    90.0f },
         { "DSP base/frame",    dsp_st.baseline_us, 200.0f },
     };

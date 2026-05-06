@@ -106,6 +106,36 @@ current 16 KB transfer size (~3300 μs/cycle). Progress:
 | **Step 7** (per-file `-O3 -funroll-loops` on dsp_processor.c, ingest_core1.c) | 4.61 MB/s | 95% | DSP/frame 645 → 570 μs; cycle 2581 → 2280 μs. Throughput device-capped (drops still 2.3%). |
 | **Step 3a** (hand-rolled PIE Q15 windowing kernel) | 4.61 MB/s | 95% | Wind 92 → 16 μs (5.75×); DSP/frame 570 → 493 μs. Throughput still device-capped through drops. |
 | **Step 6.5** (status logger offloaded to Core 1 task) | **4.88 MB/s** | **100.5%** | Drops collapsed 7/303 → 0/313. Per-second status formatting on Core 0 had been stalling the consumer ~5–10 ms/sec, filling the USB ringbuffer past 480 KB. Moving the printf work to a Core 1 task closes the last gap. |
+| **Step 7a** (linear-write magnitude, fftshift at report only) | **4.88 MB/s** | **100.5%** | Throughput device-capped already; this is pure CPU headroom. DSP/frame 447 → 422 μs (−5.6%). The mag loop's prior `magnitudes[(i+N/2) % N] = …` pattern was two write-streams that triggered write-allocate cache evictions in L1 D. Linear write + apply fftshift only at the burst-callback boundary. Per-stage detail below. |
+
+### Step 7a per-stage delta (synthetic-tone smoke)
+
+| Stage | Step 6.5 | **Step 7a** | Δ |
+|---|---|---|---|
+| wind   | 16  | 15  | flat |
+| fft    | 199 | 200 | flat (already PIE) |
+| mag    | 74  | **51** | **−31%** |
+| detect | 46  | 47  | flat |
+| base   | 111 | 109 | flat |
+| **DSP total/frame** | **447 μs** | **422 μs** | **−5.6%** |
+
+The cache audit also recommended bumping `aligned(16) → aligned(64)` on
+the five hot DSP buffers. Tried it; **regressed** the EMA stage by
+~170 μs/frame — five 8 KB buffers all aligned to the same 64-byte
+boundary land at the same L1 D cache-set offsets and conflict-thrash a
+64-set 8-way L1 D. The linker's natural placement (16-byte-aligned at
+varying mod-64 offsets) scatters them across sets and is empirically
+faster. Kept aligned(16). Recorded as a comment in `dsp_processor.c`
+so nobody re-tries this.
+
+The cache audit also flagged that **`esp.vmul.f32` / `esp.vadd.f32` do
+not exist on ESP32-P4** (verified by enumerating `xesppie.S` — PIE on
+P4 covers s8/s16/s32 and complex variants but not generic f32 vector
+arithmetic; the only f32-PIE kernels in esp-dsp are the FFT and
+biquad, which are full-algorithm units, not vector primitives). This
+means a "drop-in" PIE EMA that keeps `baseline[]` as f32 isn't
+possible. Step 3c (PIE EMA) requires the same Q31 conversion path as
+Step 3b — staying on the headroom-only list.
 
 ### Critical bugs found during 3.5 (each had silent failure modes)
 
