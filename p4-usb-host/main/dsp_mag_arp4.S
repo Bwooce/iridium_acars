@@ -13,9 +13,37 @@
 // ESP32-P4 uses. The xesppie mnemonics appear to be a
 // pre-RVV-standardization SIMD that Espressif customized further.
 //
-// So when looking for reference implementations: check esp-dsp,
-// esp-nn, esp-dl. The Andes libs (despite running on AndesCore
-// silicon) target a different ISA path.
+// So when looking for reference implementations: check
+//   - esp-dsp (modules/.../*_arp4.S)         — DSP primitives
+//   - esp-nn  (src/.../*_esp32p4.{c,S})       — neural-net ops
+//   - esp-dl  (dl/base/isa/esp32p4/*.S, 50 kernels for ML ops;
+//              dl/vision/image/isa/esp32p4/*.S, 33 kernels for
+//              image format conversion)
+// The Andes libs (despite running on AndesCore silicon) target a
+// different ISA path (standard RVV / RV-DSP), not Espressif's PIE.
+//
+// The closest production analogue to our magnitude-squared is
+// esp-dl's dl_esp32p4_s16_mul.S — uses
+//   esp.vmulas.s16.qacc.ld.ip q0, a1, 16, q0, q1   ; fused mul+load
+//   esp32p4_s16_128b_vector_shift_result q2, a5    ; srcmb output → int16
+//   esp.vst.128.ip q2, a0, 16
+// — but that pattern saturates the output to int16, which loses
+// precision for our int32-fitting squared values. Production
+// ML kernels don't need full int32 mag because their downstream
+// activation/quantization clips anyway. Our threshold detector
+// needs the precision, hence the slower qacc-quadrant-store path.
+//
+// PIE assembler conventions evolve across IDF versions. Example
+// from dl_esp32p4_color_common.S:
+//   #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5,5,2)
+//       esp.vsld.8 qd, qs, q_tmp
+//   #else
+//       esp.vsld.8 qd, qs, q_tmp, trunc
+//   #endif
+// — IDF 5.5.2 added an explicit "trunc" operand to vsld.8. So while
+// the underlying silicon is fixed, the assembler/operand grammar
+// can change, and PIE asm should be checked against the current IDF
+// when using older code samples as a starting point.
 //
 // What's empirically observed about PIE behaviour, not in any
 // public spec:
