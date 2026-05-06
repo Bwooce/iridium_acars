@@ -109,29 +109,40 @@ iridium_acars/
 
 ## Reading the runtime diagnostics
 
-The firmware logs a status block once per second:
+By default the firmware emits a single short health line per second
+plus an extra warning line only when an anomaly counter is nonzero:
 
 ```
-USB:           rate_inst=4.88 MB/s rate_avg=...   feed_calls=313 (avg_per_call=us)
-USB-XFR:       completed=313 short=0 (fill=100.0%) rb_full_drops=0 status_err=0 ...
-USB-RB:        producer_peak_fill=18.8% drop_fill=0.0%
-Cycle (Core0): read=us  feed=us
-Ingest (Core1): convert=us  push=us  dispatches=N  consumer_waits=N
-DSP:           N frames, total=us/frame  [wind=… fft=… mag=… detect=… base=…]
-Worker:        queued/dropped/processed/skipped  qmax  avg_burst_us
-Worker-stages: extract/freq/fir/resamp/demod/bch  (us per processed burst)
+STATUS: rate=4.88 MB/s frames=1252 processed=0 drops=0
+STATUS-ERR: rb_full_drops=N status_err=N resubmit_err=N worker_dropped=N last_err=0xNN  # only when something's wrong
 ```
+
+Plus burst/decode events at their source (always logged):
+
+```
+BURST DETECTED! Frame:N Bin:N SNR:Y dB
+Worker processing burst: ...
+DEMOD SUCCESS: DL frame (N bits)
+BCH DECODE SUCCESS! Errors: e1, e2
+Block1 Data: <bits>
+```
+
+To get the full per-second telemetry block (USB / USB-XFR / USB-RB /
+Cycle / Ingest / DSP / Worker / Worker-stages), enable
+`CONFIG_STATUS_LOG_VERBOSE=y` via `idf.py menuconfig` → "Iridium ACARS
+app options" → "Emit the full 8-line per-second status block". Useful
+while tuning throughput; off by default to keep long unattended
+captures readable.
 
 Healthy operational signs:
-- `rate_inst` ≈ 4.88 MB/s and stable (= the device's actual streaming rate)
-- `rb_full_drops = 0`
-- `consumer_waits = 0` (Core 1 ingest never blocks Core 0)
-- `Worker:` will show `processed > 0` once real Iridium bursts are detected
+- `rate=4.88 MB/s` stable (= the device's actual streaming rate)
+- `drops=0`, no `STATUS-ERR:` line
+- `processed > 0` lines appear once real Iridium bursts are detected
 
 When something's wrong:
-- `rb_full_drops > 0` → consumer is falling behind (samples lost, not just delayed)
-- `status_err`, `resubmit_err` → USB host issues
-- `Worker dropped > 0` → burst queue overflow
+- `STATUS-ERR: rb_full_drops > 0` → consumer is falling behind (samples lost, not just delayed)
+- `STATUS-ERR: status_err / resubmit_err` → USB host issues
+- `STATUS-ERR: worker_dropped > 0` → burst queue overflow
 
 ## Capturing real bursts (when the antenna is hooked up)
 

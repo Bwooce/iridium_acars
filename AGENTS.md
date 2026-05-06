@@ -284,7 +284,7 @@ iridium_acars/                   # repo root
       signal_buffer.c/h          # 4MB PSRAM lookback ring (AXI-GDMA)
       librtlsdr.c                # RTL-SDR control (R820T + R828D probes)
       smoke_test.c/h             # target-side functional+perf regression
-      Kconfig.projbuild          # smoke test mode toggle
+      Kconfig.projbuild          # STATUS_LOG_VERBOSE / smoke test / DIAG_TASK_DUMP toggles
     CMakeLists.txt               # adds ../common to EXTRA_COMPONENT_DIRS
     sdkconfig.defaults           # PSRAM Octal, USB host bias, -O2, etc.
   tests/

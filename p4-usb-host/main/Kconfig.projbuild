@@ -1,5 +1,29 @@
 menu "Iridium ACARS app options"
 
+config STATUS_LOG_VERBOSE
+    bool "Emit the full 8-line per-second status block"
+    default n
+    help
+        When enabled, status_logger emits the full per-second telemetry
+        block:
+            USB / USB-XFR / USB-RB / Cycle / Ingest / DSP / Worker /
+            Worker-stages
+        Useful while tuning throughput, the DSP pipeline, or the worker
+        stages — gives a complete view in one place.
+
+        When disabled (default for production), status_logger emits one
+        short line per second:
+            STATUS: rate=X.XX MB/s frames=N processed=N drops=N
+        plus a separate WARN line if any anomaly counter is nonzero
+        (rb_full_drops, status_err, resubmit_err, worker dropped). Real
+        burst/decode events (BURST DETECTED, DEMOD SUCCESS, BCH DECODE
+        SUCCESS, Block1 Data) are unaffected — they always log.
+
+        Cost of the verbose block: ~3 KB/s of serial bandwidth (~250
+        MB/day on a continuous capture log) and ~2 ms of UART time per
+        second on Core 1. Off by default to keep long unattended
+        captures readable.
+
 config DIAG_TASK_DUMP
     bool "Emit per-task CPU/stack dump every 5 s"
     default n

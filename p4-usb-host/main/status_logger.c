@@ -6,6 +6,7 @@
 // xQueueReceive forever; class_driver posts a snapshot once per second.
 
 #include <stdio.h>
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -19,11 +20,13 @@ static QueueHandle_t s_queue;
 static void emit(const status_snapshot_t *s)
 {
     double window_s  = s->window_us  / 1000000.0;
-    double elapsed_s = s->elapsed_us / 1000000.0;
     if (window_s <= 0)  window_s = 1.0;
-    if (elapsed_s <= 0) elapsed_s = 1.0;
 
     double rate_inst = (s->bytes_window / (1024.0 * 1024.0)) / window_s;
+
+#if CONFIG_STATUS_LOG_VERBOSE
+    double elapsed_s = s->elapsed_us / 1000000.0;
+    if (elapsed_s <= 0) elapsed_s = 1.0;
     double rate_avg  = (s->total_bytes  / (1024.0 * 1024.0)) / elapsed_s;
 
     float avg_dsp_us = (s->dsp_frame_count > 0)
@@ -85,6 +88,24 @@ static void emit(const status_snapshot_t *s)
                   "resamp=%.0f demod=%.0f bch=%.0f",
              s->ws.extract_us, s->ws.freq_center_us, s->ws.fir_decim_us,
              s->ws.resample_us, s->ws.demod_us, s->ws.bch_us);
+#else
+    // Quiet mode: one line of essential health, plus a separate WARN line
+    // only when an anomaly counter is nonzero. Real burst/decode events
+    // (BURST DETECTED, DEMOD SUCCESS, BCH DECODE SUCCESS, Block1 Data:)
+    // are unaffected — they log at their source regardless of this flag.
+    ESP_LOGI(TAG, "STATUS: rate=%.2f MB/s frames=%u processed=%u drops=%u",
+             rate_inst, s->dsp_frame_count,
+             s->ws.bursts_processed, s->us.rb_full_drops);
+
+    if (s->us.rb_full_drops    || s->us.status_errors ||
+        s->us.resubmit_errors  || s->ws.bursts_dropped) {
+        ESP_LOGW(TAG, "STATUS-ERR: rb_full_drops=%u status_err=%u resubmit_err=%u "
+                      "worker_dropped=%u last_err=0x%02x",
+                 s->us.rb_full_drops, s->us.status_errors,
+                 s->us.resubmit_errors, s->ws.bursts_dropped,
+                 s->us.last_error_status);
+    }
+#endif
 }
 
 static void logger_task(void *arg)
