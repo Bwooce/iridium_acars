@@ -100,6 +100,14 @@ add_executable(test_iridium_frame_phaseB
 )
 target_include_directories(test_iridium_frame_phaseB PRIVATE ${COMMON_DIR})
 
+# Phase D queue between worker and frame_decoder task.
+add_executable(test_frame_queue
+    test_frame_queue.c
+    ${COMMON_DIR}/frame_queue.c
+)
+target_include_directories(test_frame_queue PRIVATE ${COMMON_DIR})
+target_link_libraries(test_frame_queue PRIVATE pthread)
+
 # test_libacars_link — smoke test that the same minimum source-set the
 # IDF component (common/libacars_idf/) compiles also links + runs on a
 # host (glibc) toolchain. Catches missing files in the SRCS list and
@@ -155,4 +163,5 @@ add_test(NAME iridium_bch          COMMAND test_iridium_bch)
 add_test(NAME iridium_frame        COMMAND test_iridium_frame)
 add_test(NAME iridium_frame_phaseB COMMAND test_iridium_frame_phaseB)
 add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
+add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME libacars_link        COMMAND test_libacars_link)

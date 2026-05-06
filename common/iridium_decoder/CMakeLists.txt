@@ -12,10 +12,17 @@ idf_component_register(
     SRCS
         "bch_decoder.c"
         "qpsk_demod.c"
+        # Phase A/B frame classifier and BCH polynomial helpers.
+        "iridium_bch.c"
+        "iridium_frame.c"
+        # Phase D queue between worker and frame_decoder task.
+        "frame_queue.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board
     # depending on iridium_decoder transitively gets the upstream ACARS
     # decoder for free.
     REQUIRES libacars_idf
+    # frame_queue uses heap_caps_calloc with MALLOC_CAP_SPIRAM.
+    PRIV_REQUIRES esp_mm
 )
