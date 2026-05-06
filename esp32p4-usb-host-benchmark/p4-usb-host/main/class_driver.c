@@ -226,8 +226,29 @@ void class_driver_task(void *arg)
             total_bytes += n_read;
             bytes_window += n_read;
 
-            for (int i = 0; i < n_read; i++) {
-                convert_buf[i] = ((int16_t)buffer[i] - 128) << 8;
+            // Convert RTL-SDR uint8 (DC=128) -> int16 Q15 (DC=0).
+            // Original: out[i] = ((int16_t)b[i] - 128) << 8
+            // Simplified algebraically (identical for all 0..255):
+            //          out[i] = (int16_t)((b[i] << 8) ^ 0x8000)
+            // Manually unrolled 4x and reading 32 bits at a time so the
+            // compiler can combine into wider loads/stores. buffer and
+            // convert_buf are both 64-byte aligned (DMA-capable internal SRAM)
+            // so the wide loads are safe.
+            const uint8_t  *__restrict src = buffer;
+            int16_t        *__restrict dst = convert_buf;
+            size_t i = 0;
+            // Round n_read down to a multiple of 4; n_read is always 16384
+            // in our setup but tail loop is kept for safety.
+            size_t n4 = n_read & ~(size_t)3;
+            for (; i < n4; i += 4) {
+                uint32_t b4 = *(const uint32_t *)(src + i);
+                dst[i + 0] = (int16_t)((((b4 >>  0) & 0xff) << 8) ^ 0x8000);
+                dst[i + 1] = (int16_t)((((b4 >>  8) & 0xff) << 8) ^ 0x8000);
+                dst[i + 2] = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
+                dst[i + 3] = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
+            }
+            for (; i < n_read; i++) {
+                dst[i] = (int16_t)(((src[i] << 8) ^ 0x8000));
             }
             int64_t t_convert = esp_timer_get_time();
             cycle_convert_us += (uint64_t)(t_convert - t_read_end);
