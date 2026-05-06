@@ -70,6 +70,7 @@ target_link_libraries(test_demod_albq PRIVATE m)
 add_executable(test_iridium_frame
     test_iridium_frame.c
     ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
 )
 target_include_directories(test_iridium_frame PRIVATE ${COMMON_DIR})
 
@@ -77,11 +78,27 @@ target_include_directories(test_iridium_frame PRIVATE ${COMMON_DIR})
 add_executable(test_iridium_frame_corpus
     test_iridium_frame_corpus.c
     ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
 )
 target_include_directories(test_iridium_frame_corpus PRIVATE
     ${COMMON_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
+
+# BCH polynomial-division + 1-bit ECC repair primitives (Phase B).
+add_executable(test_iridium_bch
+    test_iridium_bch.c
+    ${COMMON_DIR}/iridium_bch.c
+)
+target_include_directories(test_iridium_bch PRIVATE ${COMMON_DIR})
+
+# Phase B synthetic frame tests (BC + LW dispatch + LW subtypes).
+add_executable(test_iridium_frame_phaseB
+    test_iridium_frame_phaseB.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+)
+target_include_directories(test_iridium_frame_phaseB PRIVATE ${COMMON_DIR})
 
 # test_libacars_link — smoke test that the same minimum source-set the
 # IDF component (common/libacars_idf/) compiles also links + runs on a
@@ -134,6 +151,8 @@ add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
 add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)
 add_test(NAME demod_albq           COMMAND test_demod_albq)
+add_test(NAME iridium_bch          COMMAND test_iridium_bch)
 add_test(NAME iridium_frame        COMMAND test_iridium_frame)
+add_test(NAME iridium_frame_phaseB COMMAND test_iridium_frame_phaseB)
 add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
