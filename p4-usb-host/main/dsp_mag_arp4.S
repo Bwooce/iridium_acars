@@ -1,18 +1,51 @@
 // PIE int magnitude-squared kernel — REFERENCE / DOCUMENTATION ONLY.
 //
-// This file documents two real ESP32-P4 PIE discoveries that aren't
-// in any public Espressif source:
+// Context for future maintainers
+// ------------------------------
+// ESP32-P4's "PIE" (the `esp.*` mnemonics in IDF's
+// components/esp_gdbstub/test_gdbstub_host/rv_decode/xesppie.S) is
+// **Espressif's customization**, distinct from any documented Andes
+// extension. Cross-referenced: Andes's public DSP/Vec libraries
+// (github.com/andestech/libdsp, libvec, libnn) target standard
+// RISC-V P-extension (DSP) and V-extension (RVV) plus their
+// AndeStar V5 RVV additions (XAndesVQMac, XAndesVDot, etc.) — NONE
+// of those use the q0-q7 / qacc / xacc / `esp.*` namespace that
+// ESP32-P4 uses. The xesppie mnemonics appear to be a
+// pre-RVV-standardization SIMD that Espressif customized further.
 //
-// 1. **qacc holds 8 INT64 lanes**, not 8 int32. After
-//    `vmulas.s16.qacc q0, q0` with int16 inputs producing
-//    int32-fitting squared products, each qacc lane holds the int32
-//    value zero-extended to int64. Extraction via
-//    `esp.st.qacc.{l|h}.{l|h}.128.ip` writes 16 bytes = 2 int64
-//    lanes = 4 int32 slots. Of those 4 int32 slots, only slots 0 and
-//    2 contain meaningful values; slots 1 and 3 are int64 high32 = 0.
-//    To read all 8 magnitudes from one iteration's output, the
-//    consumer must use offsets `[i*4]` (low32 of int64 lane i) — NOT
-//    contiguous int32 indexing.
+// So when looking for reference implementations: check esp-dsp,
+// esp-nn, esp-dl. The Andes libs (despite running on AndesCore
+// silicon) target a different ISA path.
+//
+// What's empirically observed about PIE behaviour, not in any
+// public spec:
+//
+// 1. **For `vmulas.s16.qacc`, results land at every-other int32 slot
+//    of the qacc store output, with intervening slots = 0.**
+//    Empirical observation only: for inputs (-22,-18,-6,-13, ...),
+//    a 2-quadrant store (l.l + l.h, 8 int32 slots) produced
+//    [484, 0, 324, 0, 36, 0, 169, 0] = [r0², 0, i0², 0, r1², 0, i1², 0].
+//    The intervening zeros are consistent with int64 lane spacing
+//    (each squared value zero-extended to int64; high32 always 0
+//    since our s16²-summed result fits int31), but I have no public
+//    Espressif documentation confirming the underlying register
+//    structure. The s8 case in esp-nn writes 16 int32 results across
+//    all 4 quadrants of qacc, which is also consistent with
+//    multiple physical-layout hypotheses.
+//    Practical consequence: for 4 complex inputs (8 s16 lanes
+//    squared = 8 results), 2 quadrant stores (l.l + l.h, 8 int32
+//    slots) give only 4 of the 8 results — the first 4 squared
+//    values (r0², i0², r1², i1²) at slots [0, 2, 4, 6]. To extract
+//    all 8 results, do all 4 quadrant stores (16 int32 slots);
+//    pair-sum reads scratch[i*4] + scratch[i*4 + 2] per complex
+//    sample. So per 4-complex iter:
+//      - 16 int32 slots written (= 8 squared values × 2 slots
+//        each, with high32 zeros)
+//      - 8 useful int32 reads per iter
+//      - 4 magnitudes computed
+//    The 4× write-vs-read amplification is why this kernel is
+//    bandwidth-bound and slower than scalar despite the SIMD
+//    multiply.
 //
 // 2. **`esp.vmul.s32.s16xs16 q_lo, q_hi, q_a, q_b` outputs `(a*b) >> 16`**
 //    (Q15.16 fixed-point — the upper 16 bits of the int32 product).
