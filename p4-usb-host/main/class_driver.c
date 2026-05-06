@@ -16,6 +16,7 @@
 #include "usb/usb_host.h"
 #include "esp_libusb.h"
 #include "dsp_processor.h"
+#include "frame_decoder.h"
 #include "signal_buffer.h"
 #include "worker_core1.h"
 #include "ingest_core1.h"
@@ -93,6 +94,10 @@ static void action_start_stream(class_driver_t *driver_obj)
     worker_core1_init();
     ingest_core1_init();
     bch_decoder_init();
+    if (frame_decoder_init() != ESP_OK) {
+        ESP_LOGW(TAG, "frame_decoder_init failed; higher-layer "
+                 "classification will be silently skipped");
+    }
 
     ESP_LOGI(TAG, "Initializing DSP...");
     dsp_processor_init(worker_core1_push_burst);

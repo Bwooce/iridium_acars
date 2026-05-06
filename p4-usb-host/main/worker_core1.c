@@ -14,6 +14,7 @@
 #include "signal_buffer.h"
 #include "qpsk_demod.h"
 #include "bch_decoder.h"
+#include "frame_decoder.h"
 
 static const char *TAG = "WORKER1";
 
@@ -230,6 +231,17 @@ void worker_task(void *arg)
                     }
                 }
                 t_bch = esp_timer_get_time();
+
+                // Hand the demodulated bits to the higher-layer
+                // decoder via the PSRAM queue. Non-blocking — the
+                // decoder runs in its own task on Core 1 and reports
+                // drops via per-second status. We pass freq_hz=0 (the
+                // worker doesn't know the absolute LO from inside its
+                // task; peak_bin carries the relative offset which is
+                // what the classifier and reassembler care about).
+                frame_decoder_push(frame.bits, frame.n_bits,
+                                   frame.direction, 0u,
+                                   burst.peak_bin, burst.peak_snr_db);
 
                 free(frame.bits);
             }
