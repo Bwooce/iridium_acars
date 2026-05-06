@@ -170,10 +170,18 @@ Step 3 (PIE/Q15 baseline EMA) is the path to closing.
 - Step 9: zero-copy USB pointer passing. Deferred (~3-5% gain, 2-3 days
   work — defer until we're closer to budget).
 
-**Deferred refactor:** when the optimization arc settles, move shared C
-files (qpsk_demod, bch_decoder, dsp_processor, etc.) into a `common/`
-sibling directory so future child-processor P4 boards can re-use them.
-Until then, `p4-usb-host/main/` holds everything.
+**Cross-board sharing:** `bch_decoder.{c,h}` and `qpsk_demod.{c,h}` live
+in `esp32p4-usb-host-benchmark/common/iridium_decoder/` as a standalone
+IDF component. The host firmware pulls them in via `EXTRA_COMPONENT_DIRS
+${CMAKE_CURRENT_LIST_DIR}/../common` in its top-level `CMakeLists.txt`
+plus `PRIV_REQUIRES iridium_decoder` in `main/CMakeLists.txt`. A future
+worker-board P4 firmware (sibling directory of `p4-usb-host/`) will
+share the same component the same way.
+
+Other DSP files (`dsp_processor.c`, `signal_buffer.c`, `worker_core1.c`,
+`ingest_core1.c`) are board-specific in their current form and stay in
+`p4-usb-host/main/` until the worker-board variant exists and the actual
+sharing requirements are clear. Don't pre-emptively move them.
 
 ## What I (any assistant) should and shouldn't do
 
@@ -222,14 +230,36 @@ esp32p4-usb-host-benchmark/
   scripts/
     build.sh                     # ninja-direct, idf.py fallback
     flash.sh                     # idf.py flash with port auto-detect
+    monitor.sh                   # non-interactive serial monitor
+  common/
+    iridium_decoder/             # shared IDF component, cross-board
+      bch_decoder.{c,h}          # BCH(31,21) t=2
+      qpsk_demod.{c,h}           # DQPSK + PLL phase tracking
+      CMakeLists.txt
   p4-usb-host/
-    main/                        # firmware sources
+    main/                        # firmware sources (host-board-specific)
       class_driver.c             # USB host client task, periodic stats
       dsp_processor.c/h          # FFT + burst detection (Core 0)
       esp_libusb.c/h             # async USB streaming + transfer stats
-      worker_core1.c/h           # extract → demod → BCH (Core 1)
+      worker_core1.c/h           # extract → freq → resample (Core 1)
+      ingest_core1.c/h           # ping-pong USB ingest (Core 1)
+      signal_buffer.c/h          # 4MB PSRAM lookback ring (AXI-GDMA)
       librtlsdr.c                # RTL-SDR control (R820T + R828D probes)
-    sdkconfig.defaults           # PSRAM Octal, USB host bias, etc.
+      smoke_test.c/h             # target-side functional+perf regression
+      Kconfig.projbuild          # smoke test mode toggle
+    CMakeLists.txt               # adds ../common to EXTRA_COMPONENT_DIRS
+    sdkconfig.defaults           # PSRAM Octal, USB host bias, -O2, etc.
+  tests/
+    host/                        # native gcc unit tests
+      test_bch.c                 # synthetic BCH(31,21) codewords
+      test_qpsk.c                # synthetic UW + shape checks
+      test_demod_corpus.c        # bit-level vs upstream gr-iridium truth
+      CMakeLists.txt             # native build, not an IDF project
+    fixtures/                    # generated C arrays from test_corpus
+      fixture_corpus_2sps.h      # decimated burst @ 50 ksps int16
+      fixture_corpus_uint8.h     # resampled burst @ 2.56 MSPS uint8
+      fixture_ground_truth.h     # gr-iridium expected bits
+    scripts/build_fixtures.py    # rebuilds the headers from test_corpus
 esp32p4-dsp-harness/             # earlier offline DSP harness (Phase 0)
 gr-iridium/, iridium-toolkit/,   # upstream reference impls (read-only)
   iridium-sniffer/, libacars/
