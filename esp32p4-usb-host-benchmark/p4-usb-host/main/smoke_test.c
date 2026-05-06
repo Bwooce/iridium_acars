@@ -267,6 +267,69 @@ void smoke_test_run(void)
     }
 #endif
 
+    // ----------- Performance regression assertions -----------
+    //
+    // Catch silent regressions that change measured timings without
+    // breaking detection (e.g., an accidental -Og rebuild, a cache-miss
+    // pessimisation, a new buffer landing in PSRAM). Bars are set ~25%
+    // above the latest measured baseline so normal compiler-version
+    // jitter doesn't trip them, but a regression that costs us back
+    // any of the Step 6/7 wins will fail the test.
+    //
+    // Baseline (Step 7, -O2 + per-file -O3 -funroll-loops on
+    // dsp_processor.c + ingest_core1.c, ESP-IDF v6.1, ESP32-P4 @360 MHz,
+    // synthetic tone smoke test): wind=92  fft=199  mag=74  detect=58
+    // base=146  total=570  convert=191  push=86 (all microseconds).
+    //
+    // If you intentionally optimise something further, lower the bar
+    // (don't just raise it). If you intentionally regress for a feature
+    // (e.g., adding a stage), update the comment + the bar together.
+    dsp_stage_stats_t dsp_st;
+    dsp_processor_get_stage_stats(&dsp_st);
+    ingest_stats_t ing_st;
+    ingest_core1_get_stats(&ing_st);
+
+    ESP_LOGI(TAG, "Perf check (averaged over %lu DSP frames):", dsp_st.frames);
+    ESP_LOGI(TAG, "  DSP/frame: total=%.0f wind=%.0f fft=%.0f mag=%.0f "
+             "detect=%.0f base=%.0f us",
+             dsp_st.total_us, dsp_st.wind_us, dsp_st.fft_us,
+             dsp_st.mag_us, dsp_st.detect_us, dsp_st.baseline_us);
+    if (ing_st.dispatches > 0) {
+        ESP_LOGI(TAG, "  Ingest/dispatch: convert=%llu push=%llu us",
+                 (unsigned long long)(ing_st.convert_us_total / ing_st.dispatches),
+                 (unsigned long long)(ing_st.push_us_total / ing_st.dispatches));
+    }
+
+    struct { const char *name; float actual; float bar; } checks[] = {
+        { "DSP total/frame",   dsp_st.total_us,    800.0f },
+        { "DSP wind/frame",    dsp_st.wind_us,     130.0f },
+        { "DSP fft/frame",     dsp_st.fft_us,      280.0f },
+        { "DSP mag/frame",     dsp_st.mag_us,      110.0f },
+        { "DSP detect/frame",  dsp_st.detect_us,    90.0f },
+        { "DSP base/frame",    dsp_st.baseline_us, 200.0f },
+    };
+    for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+        if (checks[i].actual > checks[i].bar) {
+            ESP_LOGE(TAG, "  PERF REGRESSION: %s = %.0f us > bar %.0f us",
+                     checks[i].name, checks[i].actual, checks[i].bar);
+            pass = false;
+        }
+    }
+    if (ing_st.dispatches > 0) {
+        float convert_avg = (float)ing_st.convert_us_total / ing_st.dispatches;
+        float push_avg    = (float)ing_st.push_us_total    / ing_st.dispatches;
+        if (convert_avg > 280.0f) {
+            ESP_LOGE(TAG, "  PERF REGRESSION: convert/dispatch %.0f us > bar 280 us",
+                     convert_avg);
+            pass = false;
+        }
+        if (push_avg > 130.0f) {
+            ESP_LOGE(TAG, "  PERF REGRESSION: push/dispatch %.0f us > bar 130 us",
+                     push_avg);
+            pass = false;
+        }
+    }
+
     if (pass) {
         ESP_LOGI(TAG, "===== SMOKE_PASS =====");
     } else {
