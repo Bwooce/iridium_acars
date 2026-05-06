@@ -142,7 +142,10 @@ void class_driver_task(void *arg)
 
     uint32_t out_block_size = 16 * 1024;
     uint8_t *buffer = malloc(out_block_size);
-    int16_t *convert_buf = malloc(out_block_size * sizeof(int16_t));
+    // convert_buf is the source for the AXI-GDMA push into PSRAM. Allocate
+    // in DMA-capable internal SRAM with 64-byte cache-line alignment.
+    int16_t *convert_buf = heap_caps_aligned_alloc(64, out_block_size * sizeof(int16_t),
+                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     
     uint64_t total_bytes = 0;
     int64_t start_time = esp_timer_get_time();

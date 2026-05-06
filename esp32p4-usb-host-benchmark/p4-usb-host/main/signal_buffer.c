@@ -1,45 +1,136 @@
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_attr.h"
+#include "esp_async_memcpy.h"
+#include "esp_cache.h"
 #include "signal_buffer.h"
 
 static const char *TAG = "SIG_BUF";
 
-// Store as bytes for easy circular wrapping, but manage as int16
+// 4 MB circular buffer in PSRAM. int16 IQ pairs:
+//   circular_buf[head*2 + 0] = I
+//   circular_buf[head*2 + 1] = Q
 static int16_t *circular_buf = NULL;
-static uint32_t head = 0; // In complex samples (I+Q)
+static uint32_t head = 0;        // in complex samples
+
+// AXI-GDMA async memcpy. signal_buffer_push fires PSRAM writes off to this
+// channel so Core 0 doesn't block on the ~800 us PSRAM transfer per cycle.
+// AXI master is the right choice here: USB DWC OTG-HS sits on AHB; using
+// a separate AXI channel for PSRAM avoids cross-traffic on the AHB master.
+static async_memcpy_handle_t s_dma = NULL;
+
+// Binary semaphore given by the completion ISR. Pre-given at init so the
+// very first push doesn't block. Each push takes the semaphore (waits for
+// previous DMA done) before submitting; the second segment of a wrap
+// transfer carries the give-back callback.
+static SemaphoreHandle_t s_dma_done = NULL;
+
+static IRAM_ATTR bool dma_done_cb(async_memcpy_handle_t mcp,
+                                  async_memcpy_event_t *evt, void *arg)
+{
+    BaseType_t hp_woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_dma_done, &hp_woken);
+    return hp_woken == pdTRUE;
+}
 
 esp_err_t signal_buffer_init()
 {
-    ESP_LOGI(TAG, "Allocating 4MB Signal Buffer in PSRAM...");
-    circular_buf = heap_caps_malloc(SIGNAL_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "Allocating 4MB Signal Buffer in PSRAM (DMA-aligned)...");
+    // 64-byte cache-line alignment for the DMA destination.
+    circular_buf = heap_caps_aligned_alloc(64, SIGNAL_BUF_SIZE,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!circular_buf) return ESP_ERR_NO_MEM;
-    
     memset(circular_buf, 0, SIGNAL_BUF_SIZE);
     head = 0;
+
+    async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+    cfg.backlog = 4;          // up to 4 outstanding transfers
+    cfg.dma_burst_size = 64;  // match L2 cache line for efficient bursts
+    esp_err_t r = esp_async_memcpy_install_gdma_axi(&cfg, &s_dma);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "esp_async_memcpy_install_gdma_axi failed: 0x%x (%s)",
+                 r, esp_err_to_name(r));
+        return r;
+    }
+
+    s_dma_done = xSemaphoreCreateBinary();
+    if (!s_dma_done) return ESP_ERR_NO_MEM;
+    xSemaphoreGive(s_dma_done);  // first push doesn't wait
+
+    ESP_LOGI(TAG, "Signal buffer + AXI-GDMA installed");
     return ESP_OK;
 }
 
 void signal_buffer_push(const int16_t *samples, size_t n_samples)
 {
-    // n_samples is complex samples
-    // circular_buf capacity is SIGNAL_BUF_SIZE / sizeof(int16_t) / 2
-    uint32_t total_cap_samples = SIGNAL_BUF_SIZE / 4;
-    
-    for (size_t i = 0; i < n_samples; i++) {
-        circular_buf[head * 2 + 0] = samples[i * 2 + 0];
-        circular_buf[head * 2 + 1] = samples[i * 2 + 1];
-        head = (head + 1) % total_cap_samples;
+    if (!circular_buf || !s_dma) return;
+
+    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;  // complex samples
+
+    // Wait for the previous DMA to finish before reusing circular_buf at
+    // the (potentially old) head pointer or before the caller's `samples`
+    // gets overwritten by the next class_driver loop iteration.
+    xSemaphoreTake(s_dma_done, portMAX_DELAY);
+
+    size_t bytes = n_samples * 4;
+    uint8_t *dst_base = (uint8_t *)circular_buf;
+    uint32_t head_bytes = head * 4;
+    size_t bytes_to_end = (uint32_t)SIGNAL_BUF_SIZE - head_bytes;
+
+    if (bytes <= bytes_to_end) {
+        // Common path: single contiguous write.
+        esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples, bytes,
+                         dma_done_cb, NULL);
+    } else {
+        // Wrap: two writes. Only the second carries the completion callback
+        // so the semaphore is given exactly once.
+        esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples,
+                         bytes_to_end, NULL, NULL);
+        size_t remainder = bytes - bytes_to_end;
+        esp_async_memcpy(s_dma, dst_base, (uint8_t *)samples + bytes_to_end,
+                         remainder, dma_done_cb, NULL);
     }
+
+    head = (head + (uint32_t)n_samples) % total_cap;
 }
 
 void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest)
 {
-    uint32_t total_cap_samples = SIGNAL_BUF_SIZE / 4;
-    uint32_t actual_start = start_idx % total_cap_samples;
-    
+    if (!circular_buf) return;
+
+    // The DMA writes into PSRAM bypass any CPU caches on Core 0. Core 1's
+    // CPU caches may hold stale lines for the region we just wrote, so
+    // invalidate before the worker reads. M2C + INVALIDATE drops cached
+    // lines so the next reads pull fresh data from PSRAM.
+    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
+    uint32_t actual_start = start_idx % total_cap;
+    size_t bytes_to_read = length * 4;
+    uint8_t *base = (uint8_t *)circular_buf;
+    uint32_t start_bytes = actual_start * 4;
+    size_t to_end_bytes = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
+
+    if (bytes_to_read <= to_end_bytes) {
+        esp_cache_msync(base + start_bytes, bytes_to_read,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    } else {
+        esp_cache_msync(base + start_bytes, to_end_bytes,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+        size_t rem = bytes_to_read - to_end_bytes;
+        esp_cache_msync(base, rem,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    }
+
+    // Per-element copy across the wrap. Runs once per detected burst (not
+    // per sample on the hot path), so the loop overhead is fine relative
+    // to the rest of the worker pipeline.
     for (uint32_t i = 0; i < length; i++) {
-        uint32_t idx = (actual_start + i) % total_cap_samples;
+        uint32_t idx = (actual_start + i) % total_cap;
         dest[i * 2 + 0] = circular_buf[idx * 2 + 0];
         dest[i * 2 + 1] = circular_buf[idx * 2 + 1];
     }
