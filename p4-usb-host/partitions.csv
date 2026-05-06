@@ -1,0 +1,22 @@
+# ESP32-P4 partition table for the iridium ACARS firmware.
+#
+# Board: Waveshare ESP32-P4-Nano with GigaDevice GD25Q128 16 MB SPI flash.
+# Default IDF templates use 1-1.5 MB factory partitions designed for 2-4 MB
+# flash. We have 16 MB; sizing the app partition generously gives room for
+# the IDA / SBD / libacars stack, future esp_hosted Wi-Fi (~600 KB), OTA
+# slots later, etc., without requiring another partition shuffle.
+#
+# Reserved:
+#   - storage (3 MB SPIFFS): future runtime IQ fixtures, decoded message
+#     log, station config. Not used by current firmware; declaring it now
+#     so we don't have to reshuffle later when we add it.
+#
+# Sizes are conservative: 12 MB factory + 24 KB NVS + 4 KB PHY + 3 MB
+# storage + ~600 KB headers/bootloader/partition table = ~15.6 MB used,
+# ~400 KB unallocated tail.
+#
+# Name,    Type, SubType, Offset,   Size,     Flags
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xf000,   0x1000,
+factory,   app,  factory, 0x10000,  12M,
+storage,   data, spiffs,  ,         3M,
