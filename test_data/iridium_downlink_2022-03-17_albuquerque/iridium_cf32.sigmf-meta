@@ -1,0 +1,22 @@
+{
+    "global": {
+        "core:version": "1.0.0",
+        "core:datatype": "cf32_le",
+        "core:description": "Recording of Iridium Downlink",
+        "core:sample_rate": 12000000.0,
+        "core:hw": "USRP B210",
+        "core:geolocation": {
+            "type": "Point",
+            "coordinates": [35.14, -106.51]
+        },
+        "core:license": "CC0"
+    },
+    "captures": [
+        {
+            "core:datetime": "2022-03-17T21:49:12Z",
+            "core:frequency": 1621500000.0,
+            "core:sample_start": 0
+        }
+    ],
+    "annotations": []
+}

@@ -13,7 +13,7 @@ ESP32-P4-Nano or P4-Pico board.
 | **Packet drops** | **0** in steady state |
 | End-to-end DSP | Detect → extract → freq-shift → decimate → resample → DQPSK → BCH all working |
 | USB host stack | Recovers stuck-device states without physical unplug |
-| Functional regression tests | 5 layers, all green |
+| Functional regression tests | 6 layers, all green (incl. real-RF Albuquerque corpus) |
 | **Blocker** | **Antenna + LNA hardware** (Scan Iridium GO! QFH + Nooelec SAWbird+ IR + lightning protection). Until installed, only RFI is in the air. |
 
 ## Quick start
@@ -34,7 +34,7 @@ cd iridium_acars
 
 # Run the host-side regression tests (no board needed)
 cd tests/host && mkdir -p build && cd build && cmake .. && make
-./test_bch && ./test_qpsk && ./test_demod_corpus && ./test_demod_low_snr
+./test_bch && ./test_qpsk && ./test_demod_corpus && ./test_demod_low_snr && ./test_demod_albq
 ```
 
 The build/flash scripts re-source the vendored ESP-IDF v6.1 in `esp-idf/`
@@ -91,11 +91,19 @@ iridium_acars/
 │   ├── host/                      native gcc unit tests
 │   │   ├── test_bch.c             synthetic BCH(31,21) codewords
 │   │   ├── test_qpsk.c            synthetic UW + shape checks
-│   │   ├── test_demod_corpus.c    bit-level vs gr-iridium ground truth
-│   │   └── test_demod_low_snr.c   ~10 dB SNR variant for margin checks
+│   │   ├── test_demod_corpus.c    synthetic PRBS-15 vs gr-iridium ground truth
+│   │   ├── test_demod_low_snr.c   ~10 dB SNR variant for margin checks
+│   │   └── test_demod_albq.c      real-RF Albuquerque burst vs gr-iridium
 │   ├── fixtures/                  generated C arrays from test_corpus
 │   └── scripts/build_fixtures.py  rebuilds fixture headers
-├── test_corpus/                   canonical IQ + ground-truth artefacts
+├── test_corpus/                   synthetic PRBS-15 corpus from gr-iridium upstream
+├── test_data/
+│   └── iridium_downlink_2022-03-17_albuquerque/
+│                                   real-RF capture (USRP B210, 12 MSPS, 1.25s,
+│                                   CC0). Used by tests/host/test_demod_albq.c.
+│                                   Raw cf32 stored zstd-compressed (~45 MB);
+│                                   derive.sh decompresses + runs gr-iridium
+│                                   extractor + iridium-toolkit parser.
 ├── librtlsdr/                     vendored upstream (reference)
 ├── gr-iridium/                    upstream (reference)
 ├── iridium-toolkit/               upstream (reference)

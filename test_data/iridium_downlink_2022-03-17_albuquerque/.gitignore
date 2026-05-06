@@ -1,0 +1,4 @@
+# The uncompressed cf32 is 120 MB — over GitHub's 100 MB cap. We commit
+# only the zstd-compressed form (45 MB). derive.sh transparently
+# decompresses to .sigmf-data on first use.
+iridium_cf32.sigmf-data
