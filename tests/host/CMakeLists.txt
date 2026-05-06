@@ -43,7 +43,19 @@ target_include_directories(test_demod_corpus PRIVATE
 )
 target_link_libraries(test_demod_corpus PRIVATE m)
 
+add_executable(test_demod_low_snr
+    test_demod_low_snr.c
+    ${COMMON_DIR}/qpsk_demod.c
+)
+target_include_directories(test_demod_low_snr PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+    ${COMMON_DIR}
+)
+target_link_libraries(test_demod_low_snr PRIVATE m)
+
 enable_testing()
-add_test(NAME bch           COMMAND test_bch)
-add_test(NAME qpsk          COMMAND test_qpsk)
-add_test(NAME demod_corpus  COMMAND test_demod_corpus)
+add_test(NAME bch            COMMAND test_bch)
+add_test(NAME qpsk           COMMAND test_qpsk)
+add_test(NAME demod_corpus   COMMAND test_demod_corpus)
+add_test(NAME demod_low_snr  COMMAND test_demod_low_snr)

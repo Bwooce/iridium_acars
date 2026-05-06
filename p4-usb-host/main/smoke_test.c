@@ -284,6 +284,8 @@ void smoke_test_run(void)
     //     wind=16  fft=199  mag=74  detect=58  base=146  total=493
     //   Step 7a (+ linear-write magnitude, no fftshift in mag loop):
     //     wind=15  fft=200  mag=51  detect=47  base=109  total=422
+    //   Step 7b (+ eradicate floats — uint32 mag/baseline/threshold):
+    //     wind=15  fft=200  mag=39  detect=33  base=119  total=407
     //
     // If you intentionally optimise something further, lower the bar
     // (don't just raise it). If you intentionally regress for a feature
@@ -305,12 +307,12 @@ void smoke_test_run(void)
     }
 
     struct { const char *name; float actual; float bar; } checks[] = {
-        { "DSP total/frame",   dsp_st.total_us,    600.0f },  // Step 7a baseline 422
+        { "DSP total/frame",   dsp_st.total_us,    580.0f },  // Step 7b baseline 407
         { "DSP wind/frame",    dsp_st.wind_us,      25.0f },  // Step 3a baseline 16 (PIE)
         { "DSP fft/frame",     dsp_st.fft_us,      280.0f },
-        { "DSP mag/frame",     dsp_st.mag_us,       80.0f },  // Step 7a baseline 51 (linear)
-        { "DSP detect/frame",  dsp_st.detect_us,    90.0f },
-        { "DSP base/frame",    dsp_st.baseline_us, 200.0f },
+        { "DSP mag/frame",     dsp_st.mag_us,       60.0f },  // Step 7b baseline 39 (int)
+        { "DSP detect/frame",  dsp_st.detect_us,    50.0f },  // Step 7b baseline 33 (int)
+        { "DSP base/frame",    dsp_st.baseline_us, 180.0f },  // Step 7b baseline 119 (uint64 mul EMA)
     };
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
         if (checks[i].actual > checks[i].bar) {

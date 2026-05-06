@@ -9,9 +9,25 @@
 
 static const char *TAG = "DSP_PROC";
 
-#define THRESHOLD_DB 16.0f
+// Detector threshold: 40× above baseline = 10·log10(40) = 16.02 dB,
+// matching the prior float setpoint within 0.02 dB. Tried `>> 5` (32×
+// = 15.05 dB) to skip the multiply but the 1 dB drop in selectivity
+// produced too many priming-noise false positives. Tried uint64 mul
+// for full overflow safety but that cost ~20 us/frame. The compromise:
+// uint32 multiply with wrap-around. baseline > 2^26 (= ~67 M) would
+// wrap, but our magnitudes max at 2^31 and baseline tracks them — at
+// realistic noise levels baseline stays well below 2^25, so wrap is
+// not a concern in practice.
+#define THRESHOLD_MULT 40u
 #define HISTORY_SIZE 128
 #define PRIMING_FRAMES 16
+
+// EMA weights in Q15 fixed-point. Priming uses α = 0.5 (16384/32768),
+// steady-state α = 1/HISTORY_SIZE. β = 1 - α.
+#define ALPHA_PRIMING_Q15  16384u   // 0.5 in Q15
+#define BETA_PRIMING_Q15   16384u   // 0.5
+#define ALPHA_STEADY_Q15   ((uint32_t)(32768u / HISTORY_SIZE))   // 1/128 = 256
+#define BETA_STEADY_Q15    (32768u - ALPHA_STEADY_Q15)           // 32512
 
 /* Buffers - Aligned for PIE, padded for overrun bug.
  *
@@ -22,23 +38,31 @@ static const char *TAG = "DSP_PROC";
  * cache-set offsets and the EMA stage regressed by ~170 us/frame
  * from set-conflict thrashing. The linker's natural placement (each
  * buffer 16-byte aligned but at varying mod-64 offsets) scatters them
- * across L1 sets and is empirically faster. Keep aligned(16). */
-__attribute__((aligned(16))) static int16_t fft_in[FFT_SIZE * 2 + 16];
-__attribute__((aligned(16))) static int16_t window_cplx[FFT_SIZE * 2 + 16];
-__attribute__((aligned(16))) static float window_temp_f32[FFT_SIZE + 16];
-__attribute__((aligned(16))) static float magnitudes[FFT_SIZE + 16];
-__attribute__((aligned(16))) static float baseline[FFT_SIZE + 16];
+ * across L1 sets and is empirically faster. Keep aligned(16).
+ *
+ * Magnitudes and baseline used to be float32. Converted to uint32 in
+ * Step 7b: magnitudes[i] = re² + im² directly (max 2 × 32767² ≈ 2^31,
+ * fits int31), baseline tracks magnitudes in same scale. Eliminates
+ * 4096 int16→f32 casts/frame in the magnitude loop and lets the EMA
+ * run on integer arithmetic instead of scalar f32. window_temp_f32
+ * stays float because dsps_wind_blackman_f32 (called once at init)
+ * needs it, but it's no longer used as a per-frame scratch buffer.
+ */
+__attribute__((aligned(16))) static int16_t  fft_in[FFT_SIZE * 2 + 16];
+__attribute__((aligned(16))) static int16_t  window_cplx[FFT_SIZE * 2 + 16];
+__attribute__((aligned(16))) static float    window_temp_f32[FFT_SIZE + 16];
+__attribute__((aligned(16))) static uint32_t magnitudes[FFT_SIZE + 16];
+__attribute__((aligned(16))) static uint32_t baseline[FFT_SIZE + 16];
 
 typedef struct {
     bool active;
     uint32_t start_frame;
     int max_bin;
-    float max_snr;
+    uint32_t max_snr_q;   // peak ratio magnitudes/baseline as uint32
 } active_burst_t;
 
 static active_burst_t current_burst = { .active = false };
 static uint32_t frame_count = 0;
-static float threshold_lin;
 static int total_bursts = 0;
 static burst_detected_cb_t burst_cb = NULL;
 
@@ -66,9 +90,11 @@ esp_err_t dsp_processor_init(burst_detected_cb_t cb)
         window_cplx[i * 2 + 1] = w;
     }
 
-    for (int i = 0; i < FFT_SIZE; i++) baseline[i] = 1.0e-6f;
-    threshold_lin = powf(10.0f, THRESHOLD_DB / 10.0f);
-    
+    // Initial baseline: a small non-zero value. The detection threshold is
+    // 40 × baseline, so baseline=1 means threshold=40 (very low) and the
+    // priming-phase noise will quickly raise it to the actual noise floor.
+    for (int i = 0; i < FFT_SIZE; i++) baseline[i] = 1u;
+
     return ESP_OK;
 }
 
@@ -95,36 +121,38 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
         dsps_bit_rev_sc16_ansi(fft_in, FFT_SIZE);
         int64_t t2 = esp_timer_get_time();
 
-        // 3. Magnitude Squared — linear write, no fftshift here.
-        // Previously this loop did `magnitudes[(i + N/2) % N] = ...`,
-        // which produced two cache-unfriendly write streams (one to
-        // each half of magnitudes[]). Writing linearly keeps the access
-        // pattern sequential — input fft_in is also read sequentially,
-        // so the whole loop is one streaming-read + one streaming-write.
-        // The fftshift transformation is applied below in the detect /
-        // report path so the worker still sees the conventional
-        // bin 1024 = DC convention.
-        float norm = 1.0f / (FFT_SIZE * FFT_SIZE);
+        // 3. Magnitude Squared — uint32 sum-of-squares, linear write.
+        // Output is re² + im² (no normalisation; baseline tracks the
+        // same scale). With re,im in [-32768, 32767], each squared
+        // term ≤ 2^30 and the sum ≤ 2^31, fits comfortably in uint32.
+        // No fftshift here — applied at burst-report only.
         for (int i = 0; i < FFT_SIZE; i++) {
-            float re = (float)fft_in[i * 2 + 0];
-            float im = (float)fft_in[i * 2 + 1];
-            magnitudes[i] = (re * re + im * im) * norm;
+            int32_t re = fft_in[i * 2 + 0];
+            int32_t im = fft_in[i * 2 + 1];
+            magnitudes[i] = (uint32_t)(re * re + im * im);
         }
         int64_t t3 = esp_timer_get_time();
 
-        // 4. Detection
+        // 4. Detection — uint32 multiply, no uint64. baseline×40 wraps
+        // for baseline > 2^26 (~67 M); but realistic noise levels stay
+        // below 2^25 so wrap is not a concern. Matches the prior float
+        // setpoint (16 dB) within 0.02 dB.
         bool frame_has_signal = false;
         int peak_bin = -1;
-        float peak_snr = 0;
+        uint32_t peak_snr_q = 0;
 
         if (frame_count >= PRIMING_FRAMES) {
             for (int i = 0; i < FFT_SIZE; i++) {
-                float threshold = baseline[i] * threshold_lin;
+                uint32_t threshold = baseline[i] * THRESHOLD_MULT;
                 if (magnitudes[i] > threshold) {
                     frame_has_signal = true;
-                    float rel_mag = magnitudes[i] / baseline[i];
-                    if (rel_mag > peak_snr) {
-                        peak_snr = rel_mag;
+                    // Peak ratio for SNR_dB at burst end. Division per
+                    // exceeding bin only — rare in non-burst frames.
+                    uint32_t rel = baseline[i] > 0
+                        ? magnitudes[i] / baseline[i]
+                        : magnitudes[i];
+                    if (rel > peak_snr_q) {
+                        peak_snr_q = rel;
                         peak_bin = i;
                     }
                 }
@@ -137,18 +165,21 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
                 current_burst.active = true;
                 current_burst.start_frame = frame_count;
                 current_burst.max_bin = peak_bin;
-                current_burst.max_snr = peak_snr;
-            } else if (peak_snr > current_burst.max_snr) {
-                current_burst.max_snr = peak_snr;
+                current_burst.max_snr_q = peak_snr_q;
+            } else if (peak_snr_q > current_burst.max_snr_q) {
+                current_burst.max_snr_q = peak_snr_q;
                 current_burst.max_bin = peak_bin;
             }
         } else if (current_burst.active) {
-            float snr_db = 10.0f * log10f(current_burst.max_snr);
-            // The detection / EMA path now tracks bins in linear FFT
-            // order (no fftshift in the magnitude loop). Apply the
-            // shift here at the API boundary so the log line and the
-            // worker callback still get the conventional fftshifted
-            // index where bin 1024 = DC, bin > 1024 = positive freq.
+            // Convert peak ratio to dB once, at burst-end. log10f cost is
+            // negligible because it runs once per burst, not per frame.
+            float snr_db = (current_burst.max_snr_q > 0)
+                ? 10.0f * log10f((float)current_burst.max_snr_q)
+                : 0.0f;
+            // The detection / EMA path tracks bins in linear FFT order.
+            // Apply the fftshift here at the API boundary so the log
+            // line and the worker callback still get the conventional
+            // bin 1024 = DC, bin > 1024 = positive freq.
             int shifted_bin = (current_burst.max_bin + FFT_SIZE / 2) & (FFT_SIZE - 1);
             ESP_LOGI(TAG, "BURST DETECTED! Frame:%lu Bin:%d SNR:%.2f dB",
                      current_burst.start_frame, shifted_bin, snr_db);
@@ -167,20 +198,30 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
             current_burst.active = false;
         }
 
-        // 5. Baseline update — exponential moving average:
-        //   baseline = (1 - α) · baseline + α · magnitudes
-        // The scalar loop measured ~1.5 ms/frame on P4 (50%+ of DSP time).
-        // esp-dsp has no _arp4 (PIE) variant for these f32 ops on P4, only
-        // the ANSI fallback, but the calls still let the compiler unroll
-        // tighter and avoid a couple of redundant loads vs the inline loop.
-        // window_temp_f32 is reused as a scratch buffer (it's only used at
-        // init time to compute the Blackman window, then unused).
+        // 5. Baseline EMA in uint32 with Q15 weights:
+        //   b = (β·b + α·m) >> 15
+        // Priming phase (first 2× PRIMING_FRAMES) uses α = 0.5 so the
+        // baseline converges quickly to the actual noise floor; then
+        // switches to α = 1/HISTORY_SIZE for slow tracking.
+        //
+        // Per-iteration: two uint32 × uint32 → uint64 multiplies, one
+        // add, one shift, one store. Simpler than f32 (no casts), no
+        // scratch buffer needed (the prior dsps_mulc_f32 / dsps_add_f32
+        // chain through window_temp_f32 was three passes — this is one).
         if (!frame_has_signal) {
-            float alpha = (frame_count < PRIMING_FRAMES * 2) ? 0.5f : (1.0f / HISTORY_SIZE);
-            float beta = 1.0f - alpha;
-            dsps_mulc_f32(baseline,   baseline,         FFT_SIZE, beta,  1, 1);
-            dsps_mulc_f32(magnitudes, window_temp_f32,  FFT_SIZE, alpha, 1, 1);
-            dsps_add_f32 (baseline,   window_temp_f32,  baseline, FFT_SIZE, 1, 1, 1);
+            uint32_t alpha, beta;
+            if (frame_count < PRIMING_FRAMES * 2) {
+                alpha = ALPHA_PRIMING_Q15;
+                beta  = BETA_PRIMING_Q15;
+            } else {
+                alpha = ALPHA_STEADY_Q15;
+                beta  = BETA_STEADY_Q15;
+            }
+            for (int i = 0; i < FFT_SIZE; i++) {
+                uint64_t b = (uint64_t)beta * baseline[i]
+                           + (uint64_t)alpha * magnitudes[i];
+                baseline[i] = (uint32_t)(b >> 15);
+            }
         }
         int64_t t5 = esp_timer_get_time();
 

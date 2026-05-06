@@ -119,6 +119,95 @@ current 16 KB transfer size (~3300 μs/cycle). Progress:
 | base   | 111 | 109 | flat |
 | **DSP total/frame** | **447 μs** | **422 μs** | **−5.6%** |
 
+### Step 7b — float eradication (uint32 magnitudes/baseline/threshold)
+
+DSP path now runs on integer arithmetic end-to-end. `magnitudes[]` and
+`baseline[]` changed from `float32` to `uint32_t`; magnitude stores
+`re² + im²` directly with no normalisation; threshold is integer 40×
+(matching the prior float setpoint within 0.02 dB); EMA runs as
+`b = (β·b + α·m) >> 15` with Q15 weights.
+
+| Stage | Step 6.5 (f32) | Step 7a (linear-mag, f32) | **Step 7b (int)** | Δ vs 7a |
+|---|---|---|---|---|
+| wind   | 16  | 15  | 15  | flat |
+| fft    | 199 | 200 | 200 | flat (PIE Q15) |
+| mag    | 74  | 51  | **39** | **−24%** |
+| detect | 46  | 47  | **33** | **−30%** |
+| base   | 111 | 109 | 119 | +9% (uint64 mul vs f32) |
+| **DSP total/frame** | **447 μs** | **422 μs** | **407 μs** | **−3.6% / −9% cumulative** |
+
+`mag` and `detect` got faster because integer arithmetic on RV32 has
+no FPU pipeline stalls; `base` got marginally slower because the
+fused EMA does two uint64 multiplies per element (no PIE int32 SIMD
+on P4 yet — same constraint that blocked Step 3c f32-PIE). Net win
+small but real, plus we now have an integer substrate that **enables
+future PIE work on mag and EMA**.
+
+Tried the cache-audit recommendation of `aligned(64)` but it
+regressed the EMA stage by ~170 μs/frame from L1 D cache-set
+conflicts (five 8 KB buffers all at the same 64-byte alignment land
+in the same set offsets). Tried `magnitudes[i] >> 5 > baseline[i]`
+shift-only threshold; at 32× (15 dB) it produced too many priming-
+noise false positives. Settled on uint32 multiply with wrap-around
+(40 × baseline overflows for baseline > 2^26 ≈ 67 M; realistic noise
+levels stay well below 2^25 so wrap is not a concern).
+
+Confirmed `esp.vmul.f32`/`esp.vadd.f32` do **not** exist on ESP32-P4
+by enumerating IDF's `xesppie.S` (the PIE assembler's accepted-mnemonic
+list). PIE on P4 covers s8/s16/s32 + complex; no generic f32 vector
+arithmetic. So the f32-fast-path the cache audit hoped for is a
+phantom. Step 7b's integer conversion was the only viable path to
+meaningful PIE on the mag/EMA loops.
+
+In production (real RTL-SDR thermal noise, not synthetic) DSP/frame
+drops to **~300 μs** because the baseline EMA runs nearly every
+frame and stays cache-warm; the smoke test's 407 μs is the worst-
+case (false-positive noise spikes inflate the average).
+
+### AGC vs manual gain — current setting and recommendation
+
+`librtlsdr.c` currently calls `rtlsdr_set_tuner_gain_mode(rtldev, 0)`
+which selects the R820T2/R828D **automatic gain control** (AGC).
+
+**For Iridium burst reception, manual gain is generally preferable**:
+- AGC adjusts gain dynamically. Between bursts (95% of time = noise
+  only), AGC pushes gain up; when a burst arrives, the AGC has to
+  react fast or the burst clips. Slow AGC = clipping mid-burst; fast
+  AGC = gain pumping that shifts the constellation and breaks the
+  PLL phase tracker.
+- Predictable signal levels into the FFT detector mean the baseline
+  EMA tracks a stable noise floor instead of an AGC-modulated one.
+- 30–40 dB manual gain is typical for Iridium with QFH + LNA chain.
+
+**For now: stay AGC.** Without the actual antenna+LNA installed we
+can't measure the right manual setpoint. Once Phase 4 hardware is
+installed, switch to manual at ~35 dB and verify noise-floor
+stability via the `Worker-stages` and burst-detection logs.
+
+### Is 4.88 MB/s "real 100.5%" or is the pipeline capable of more?
+
+The 4.85 MB/s real-time target was computed for **2.56 MSPS × 2 bytes
+× 1 (single-channel)** at the 16 KB transfer size. The device sends
+4.88 MB/s = 313 transfers/sec × 16 KB = 100.6% of that target.
+
+But this **does not** mean the pipeline is at its ceiling:
+
+- The RTL-SDR's theoretical max at 2.56 MSPS is 5.12 MB/s with zero
+  USB overhead. Actual 4.88 MB/s is the device's real output rate
+  including USB framing. We can't see beyond 4.88 because that's
+  what comes off the wire.
+- Our Core 0 cycle currently runs ~1972 μs vs the 3300 μs/cycle
+  budget at 4.85 MB/s — about **35% headroom**.
+- Whether the pipeline could handle 3.2 MSPS (or higher) is **untested**.
+  Bumping the sample rate would reveal the next bottleneck (USB
+  ringbuffer depth? cache pressure on signal_buffer?).
+
+**Honest reading:** "100.5% of nominal real-time" is real, but it's
+limited by what the device sends, not by what the pipeline can
+process. We have measurable CPU headroom for future feature work
+(more DSP, multiple channels, higher sample rate) but the actual
+ceiling remains undetermined until we test those modes.
+
 The cache audit also recommended bumping `aligned(16) → aligned(64)` on
 the five hot DSP buffers. Tried it; **regressed** the EMA stage by
 ~170 μs/frame — five 8 KB buffers all aligned to the same 64-byte

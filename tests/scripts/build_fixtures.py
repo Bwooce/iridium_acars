@@ -187,6 +187,34 @@ def main() -> int:
     out.write_text(emit_c_int16_array("CORPUS_2SPS", iq_int16))
     print(f"wrote {out}")
 
+    # ---- Fixture B-low-snr: same burst with synthetic AWGN, lower SNR.
+    # The 20 dB corpus is too forgiving — a regression that loses 6+ dB
+    # of demod margin would still pass on it. Add white Gaussian noise
+    # to the cf32 burst before decimation, targeting ~10 dB SNR (about
+    # 10 dB harder than the corpus). Deterministic RNG seed so the
+    # fixture is reproducible run-to-run.
+    target_snr_db = 10.0
+    rng = np.random.default_rng(seed=20260507)
+    sig_power = float(np.mean(np.abs(burst_cf32) ** 2))
+    snr_linear = 10.0 ** (target_snr_db / 10.0)
+    noise_power = sig_power / snr_linear
+    # Complex AWGN: real and imag each get half the total noise power.
+    noise = (rng.standard_normal(len(burst_cf32))
+             + 1j * rng.standard_normal(len(burst_cf32))) * np.sqrt(noise_power / 2.0)
+    burst_cf32_lowsnr = burst_cf32 + noise.astype(np.complex64)
+    measured_snr = 10.0 * np.log10(sig_power / float(np.mean(np.abs(noise) ** 2)))
+    print(f"low-SNR fixture: signal_power={sig_power:.4f}, "
+          f"noise_power={noise_power:.4f}, measured_SNR={measured_snr:.1f} dB")
+
+    decimated_lowsnr = resample_poly(burst_cf32_lowsnr, up=1, down=decim).astype(np.complex64)
+    scale_lowsnr = 32767.0 / max(0.5, np.max(np.abs(decimated_lowsnr)))
+    iq_int16_lowsnr = np.zeros(2 * len(decimated_lowsnr), dtype=np.int16)
+    iq_int16_lowsnr[0::2] = np.clip(np.real(decimated_lowsnr) * scale_lowsnr, -32767, 32767).astype(np.int16)
+    iq_int16_lowsnr[1::2] = np.clip(np.imag(decimated_lowsnr) * scale_lowsnr, -32767, 32767).astype(np.int16)
+    out = FIXTURE_DIR / "fixture_corpus_2sps_lowsnr.h"
+    out.write_text(emit_c_int16_array("CORPUS_2SPS_LOWSNR", iq_int16_lowsnr))
+    print(f"wrote {out}")
+
     # ---- Fixture A: 2.56 MSPS uint8 for target detector smoke test ----
     # Resample 2_000_000 -> 2_560_000 (32/25 ratio).
     target_target_rate = 2_560_000
