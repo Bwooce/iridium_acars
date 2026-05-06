@@ -83,6 +83,51 @@ target_include_directories(test_iridium_frame_corpus PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 
+# test_libacars_link — smoke test that the same minimum source-set the
+# IDF component (common/libacars_idf/) compiles also links + runs on a
+# host (glibc) toolchain. Catches missing files in the SRCS list and
+# upstream signature regressions before they hit the firmware build.
+#
+# We pull the same upstream files the IDF component does, plus the
+# matching stub adapter, plus the static config.h / version.c. Keep
+# this list in sync with common/libacars_idf/CMakeLists.txt.
+set(LIBACARS_IDF_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/libacars_idf)
+set(LIBACARS_UPSTREAM ${CMAKE_CURRENT_SOURCE_DIR}/../../libacars)
+set(LIBACARS_SRC ${LIBACARS_UPSTREAM}/libacars)
+
+add_executable(test_libacars_link
+    test_libacars_link.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_libacars_link PRIVATE
+    ${LIBACARS_UPSTREAM}        # for <libacars/...> includes
+    ${LIBACARS_IDF_DIR}         # for "config.h"
+)
+# Match the upstream feature-test macros so strsep/memmem/strnlen are
+# visible in glibc <string.h>. Silence upstream -Wall/-Wextra spam from
+# code we don't own (test_libacars_link.c itself stays under default
+# warnings via the project-wide add_compile_options above).
+target_compile_options(test_libacars_link PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+
 enable_testing()
 add_test(NAME bch                  COMMAND test_bch)
 add_test(NAME qpsk                 COMMAND test_qpsk)
@@ -91,3 +136,4 @@ add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)
 add_test(NAME demod_albq           COMMAND test_demod_albq)
 add_test(NAME iridium_frame        COMMAND test_iridium_frame)
 add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
+add_test(NAME libacars_link        COMMAND test_libacars_link)
