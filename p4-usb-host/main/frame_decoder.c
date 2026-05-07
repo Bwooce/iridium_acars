@@ -16,6 +16,10 @@
 #include "frame_decoder.h"
 #include "frame_queue.h"
 #include "iridium_frame.h"
+#include "ida_decode.h"
+#include "sbd_reassembler.h"
+#include <libacars/libacars.h>
+#include <libacars/acars.h>
 
 static const char *TAG = "FRMDEC";
 
@@ -34,6 +38,48 @@ static _Atomic uint64_t s_class_tl       = 0;
 static _Atomic uint64_t s_class_bc       = 0;
 static _Atomic uint64_t s_class_lw_da    = 0;
 static _Atomic uint64_t s_class_lw_other = 0;
+
+// SBD reassembler instance — single global, not thread-safe (only the
+// decoder task touches it). 8 sessions × ~330 B ≈ 2.6 KB in BSS.
+static sbd_reassembler_t s_sbd;
+static _Atomic uint64_t  s_sbd_complete = 0;     // SBD messages reassembled
+static _Atomic uint64_t  s_acars_decoded = 0;    // ACARS messages successfully parsed
+
+// Walk a la_proto_node tree to find the la_acars_msg payload.
+extern la_type_descriptor const la_DEF_acars_message;
+static la_acars_msg *find_acars_msg(la_proto_node *node)
+{
+    while (node) {
+        if (node->td == &la_DEF_acars_message && node->data) {
+            return (la_acars_msg *)node->data;
+        }
+        node = node->next;
+    }
+    return NULL;
+}
+
+// Try to parse the reassembled SBD payload as ACARS. Logs the
+// decoded fields if a recognisable ACARS frame is found.
+static void try_acars(const sbd_message_t *msg)
+{
+    if (!msg || msg->payload_len < 8) return;
+    la_msg_dir dir = msg->uplink ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
+    la_proto_node *node = la_acars_parse(msg->payload, msg->payload_len, dir);
+    if (!node) return;
+    la_acars_msg *a = find_acars_msg(node);
+    if (a) {
+        atomic_fetch_add_explicit(&s_acars_decoded, 1, memory_order_relaxed);
+        ESP_LOGI(TAG, "ACARS: %s mode=%c label='%.2s' block=%c msgnum='%.4s' "
+                 "flight='%.6s' crc=%s txt=\"%s\"",
+                 msg->uplink ? "UL" : "DL",
+                 a->mode ? a->mode : '?',
+                 a->label, a->block_id ? a->block_id : '?',
+                 a->msg_num, a->flight_id,
+                 a->crc_ok ? "OK" : "BAD",
+                 a->txt ? a->txt : "");
+    }
+    la_proto_tree_destroy(node);
+}
 
 static void process_one(const frame_queue_item_t *it)
 {
@@ -71,13 +117,34 @@ static void process_one(const frame_queue_item_t *it)
     case IR_FRAME_LW:
         if (classified.lw_subtype == IR_LW_DA) {
             atomic_fetch_add_explicit(&s_class_lw_da, 1, memory_order_relaxed);
+            ESP_LOGI(TAG, "FRAME: LW.DA bin=%ld snr=%.1f freq=%lu",
+                     (long)it->peak_bin, (double)it->snr_db,
+                     (unsigned long)it->freq_hz);
+            // Run the IDA -> SBD -> ACARS chain.
+            ida_decoded_t ida = { 0 };
+            int rc_ida = ida_decode(&classified, &ida);
+            if (rc_ida == 0 && ida.ok && ida.header_ok) {
+                sbd_message_t sbd;
+                int rc_sbd = sbd_reassembler_feed(&s_sbd, &ida,
+                                                  it->direction == 1,
+                                                  (uint64_t)it->timestamp_us,
+                                                  &sbd);
+                if (rc_sbd == 1) {
+                    atomic_fetch_add_explicit(&s_sbd_complete, 1,
+                                              memory_order_relaxed);
+                    ESP_LOGI(TAG, "SBD: type=0x%04x %s len=%u (msg %u/%u)",
+                             sbd.type, sbd.uplink ? "UL" : "DL",
+                             sbd.payload_len, sbd.msg_no, sbd.msg_count);
+                    try_acars(&sbd);
+                }
+            }
         } else {
             atomic_fetch_add_explicit(&s_class_lw_other, 1, memory_order_relaxed);
+            ESP_LOGI(TAG, "FRAME: LW.%s bin=%ld snr=%.1f freq=%lu",
+                     iridium_lw_subtype_name(classified.lw_subtype),
+                     (long)it->peak_bin, (double)it->snr_db,
+                     (unsigned long)it->freq_hz);
         }
-        ESP_LOGI(TAG, "FRAME: LW.%s bin=%ld snr=%.1f freq=%lu",
-                 iridium_lw_subtype_name(classified.lw_subtype),
-                 (long)it->peak_bin, (double)it->snr_db,
-                 (unsigned long)it->freq_hz);
         break;
     case IR_FRAME_UNKNOWN:
     default:
@@ -102,8 +169,16 @@ static void decoder_task(void *arg)
     }
 
     frame_queue_item_t item;
+    uint64_t last_tick = (uint64_t)esp_timer_get_time();
     while (1) {
         bool got = frame_queue_pop(s_queue, &item);
+        // Tick the SBD reassembler periodically (~1 Hz) so stale
+        // multi-frame sessions get expired even when no frames arrive.
+        uint64_t now = (uint64_t)esp_timer_get_time();
+        if (now - last_tick > 1000000ULL) {
+            sbd_reassembler_tick(&s_sbd, now);
+            last_tick = now;
+        }
         if (got) {
             process_one(&item);
             // Yield once after each item so IDLE1 / lower-prio tasks
@@ -132,6 +207,7 @@ esp_err_t frame_decoder_init(void)
                  FRAME_QUEUE_SLOTS);
         return ESP_ERR_NO_MEM;
     }
+    sbd_reassembler_init(&s_sbd);
 
     BaseType_t ok = xTaskCreatePinnedToCore(decoder_task, "frame_decoder",
                                             DECODER_STACK, NULL,
