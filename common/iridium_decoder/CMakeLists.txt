@@ -19,6 +19,8 @@ idf_component_register(
         "frame_queue.c"
         # Phase D part 4: IDA frame post-LCW decoder (de-interleave + BCH).
         "ida_decode.c"
+        # Phase D part 5: SBD multi-frame reassembler.
+        "sbd_reassembler.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board

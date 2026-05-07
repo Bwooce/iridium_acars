@@ -120,6 +120,13 @@ target_include_directories(test_ida_decode_corpus PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 
+# Phase D part 5: SBD reassembler (multi-frame state machine).
+add_executable(test_sbd_reassembler
+    test_sbd_reassembler.c
+    ${COMMON_DIR}/sbd_reassembler.c
+)
+target_include_directories(test_sbd_reassembler PRIVATE ${COMMON_DIR})
+
 # test_libacars_link — smoke test that the same minimum source-set the
 # IDF component (common/libacars_idf/) compiles also links + runs on a
 # host (glibc) toolchain. Catches missing files in the SRCS list and
@@ -177,4 +184,5 @@ add_test(NAME iridium_frame_phaseB COMMAND test_iridium_frame_phaseB)
 add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
 add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
+add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
