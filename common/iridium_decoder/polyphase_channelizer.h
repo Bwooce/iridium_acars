@@ -1,0 +1,79 @@
+#ifndef POLYPHASE_CHANNELIZER_H
+#define POLYPHASE_CHANNELIZER_H
+
+// Polyphase FFT channelizer. Splits an input complex sample stream
+// into M parallel channel streams, each at fs_in / M sample rate.
+//
+// Architecture (critically-sampled, M=D):
+//   Input: complex samples at fs_in (e.g. 2.56 MSPS).
+//   Internal: per-phase circular delay lines + an M-point FFT.
+//   Output: M complex sample streams, one per channel, each at fs_in/M
+//           (e.g. 40 kHz). Channel k's centre frequency in the original
+//           input spectrum is k * fs_in/M (modulo fs_in, with k > M/2
+//           wrapping to negative).
+//
+// The channelizer uses a Hamming-windowed-sinc prototype low-pass filter
+// of length M * N_taps_per_phase. A short filter (N=8) gives ~40 dB
+// adjacent-channel rejection — adequate for Iridium where the closest
+// neighbour at 41.667 kHz spacing carries unrelated TDMA traffic.
+//
+// CPU: ~M*N + M*log(M) ops per output cycle (one cycle per M input
+// samples). For M=64, N=8 at 2.56 MSPS input → 40 kHz × 896 ops/cycle
+// ≈ 36 Mops/s, ~10% of one P4 core at 360 MHz.
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <complex.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// We hard-code M=64 for the first implementation; can be templated later
+// if we want different channel counts. M MUST be a power of two for the
+// internal FFT.
+#define POLYCHAN_M               64
+#define POLYCHAN_N_TAPS_PER_PHASE 8
+#define POLYCHAN_FILTER_LEN      (POLYCHAN_M * POLYCHAN_N_TAPS_PER_PHASE)
+
+typedef struct polyphase_channelizer polyphase_channelizer_t;
+
+// Allocate a channelizer with a Hamming-windowed-sinc prototype filter.
+// `fs_in_hz` is the input sample rate (informational only — used for
+// computing channel center frequencies via polyphase_channelizer_channel_freq).
+polyphase_channelizer_t *polyphase_channelizer_create(uint32_t fs_in_hz);
+void                     polyphase_channelizer_destroy(polyphase_channelizer_t *ch);
+
+// Process one block of n_input complex samples. Writes one row of
+// channel outputs (M complex samples) to `out_block[0..M-1]` for each
+// completed M-input cycle. `out_block` must have room for at least
+// (n_input / M) * M complex outputs (i.e. one full row per cycle).
+// Returns the number of complete output rows produced.
+//
+// Channel k's output is at out_block[row*M + k]. After a fftshift-style
+// remap (if you want bin 0 = DC, bin M/2 = Nyquist), apply the
+// polyphase_channelizer_channel_freq() helper.
+//
+// n_input must be a multiple of M for the simple implementation; non-
+// multiples are silently truncated.
+size_t polyphase_channelizer_process(polyphase_channelizer_t *ch,
+                                     const float complex *input,
+                                     size_t n_input,
+                                     float complex *out_block);
+
+// Returns the centre frequency (Hz, signed) of channel index `k` in
+// the input spectrum. k=0 → DC, k=M/2 → fs_in/2 = Nyquist, k>M/2 → negative.
+int32_t polyphase_channelizer_channel_freq(const polyphase_channelizer_t *ch,
+                                           int k);
+
+// For inspection: copy out the prototype filter coefficients (M*N_taps
+// floats). Caller passes a buffer of POLYCHAN_FILTER_LEN floats.
+void polyphase_channelizer_get_prototype(const polyphase_channelizer_t *ch,
+                                         float *out, size_t out_len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // POLYPHASE_CHANNELIZER_H

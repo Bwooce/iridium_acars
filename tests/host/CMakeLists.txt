@@ -127,6 +127,14 @@ add_executable(test_sbd_reassembler
 )
 target_include_directories(test_sbd_reassembler PRIVATE ${COMMON_DIR})
 
+# Phase D7: polyphase channelizer (single-FFT detector replacement).
+add_executable(test_polyphase_channelizer
+    test_polyphase_channelizer.c
+    ${COMMON_DIR}/polyphase_channelizer.c
+)
+target_include_directories(test_polyphase_channelizer PRIVATE ${COMMON_DIR})
+target_link_libraries(test_polyphase_channelizer PRIVATE m)
+
 # test_libacars_link — smoke test that the same minimum source-set the
 # IDF component (common/libacars_idf/) compiles also links + runs on a
 # host (glibc) toolchain. Catches missing files in the SRCS list and
@@ -185,4 +193,5 @@ add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
 add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
+add_test(NAME polyphase_channelizer COMMAND test_polyphase_channelizer)
 add_test(NAME libacars_link        COMMAND test_libacars_link)

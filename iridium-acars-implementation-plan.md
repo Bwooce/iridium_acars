@@ -290,6 +290,57 @@ so future child-processor P4 boards can re-use them. Until then,
 
 ---
 
+## DSP gaps vs gr-iridium (open)
+
+The current pipeline is a minimal port; gr-iridium has stages we don't.
+These gaps surface immediately on real-shape data — the smoke tests
+`CONFIG_SMOKE_TEST_RAW_IRIDIUM` and `CONFIG_SMOKE_TEST_REAL_IRIDIUM`
+both fail at the `qpsk_demod` step on the Albuquerque corpus because
+of them. **No amount of "better data later" closes the gap** —
+gr-iridium implemented these stages because real Iridium RF requires
+them. Tracked in TODOs D7-D11.
+
+| # | Gap | Why it matters | Estimated effort | TODO |
+|---|---|---|---|---|
+| D7 | Polyphase channelizer | Single FFT detector picks SNR-ratio peak which lands BETWEEN concurrent bursts in the same 2.56 MHz subband. Per-channel streams give each Iridium TDMA slot its own chain. | 3-5 days, ~10-15% of one core | #26 |
+| D8 | Fine carrier-freq estimation in worker | Bin-resolution centring leaves residual >> qpsk_demod PLL capture (1.25 kHz). 4th-power method on QPSK gives sub-Hz residual. | 1-2 days, ~1% per burst | #27 |
+| D9 | Two-stage / wider-capture PLL | Defensive: when D8's residual estimate is itself noisy at low SNR, two-stage PLL (acquisition α=0.5 → tracking α=0.2) recovers gracefully. | 1 day | #28 |
+| D10 | Symbol timing recovery (Gardner / O&M) | qpsk_demod currently sample-decimates by 2; sample-rate offset between SDR XO and Iridium symbol clock drifts the sampling instant. Real RF will surface this once D7-D9 are done. | 2-3 days, ~2-5% per burst | #29 |
+| D11 | Soft-decision BCH (Chase-2) | gr-iridium uses soft inputs to BCH for ~1-2 dB SNR margin. Lower priority — payback only at low SNR. | 2-3 days, 2-5× current BCH cost | #30 |
+| D12 | IDA CRC-16-CCITT validation | ida_decode extracts da_crc_reported but doesn't validate against payload. Real RF will produce corrupted bursts that should be filtered before SBD reassembly. | 0.5 day | #31 |
+| D13 | Burst-edge detection (sub-frame) | dsp_processor reports start/length at FFT-frame granularity (0.8 ms). qpsk_demod's UW slide-search runs out of search space when the burst's actual start is several ms past the reported one. | 1-2 days | #32 |
+| D14 | ACARS multi-segment reassembly | frame_decoder calls la_acars_parse (single-segment); messages split at the ACARS application layer don't reassemble. Switch to la_acars_parse_and_reassemble with a long-lived rtables ctx. | 0.5 day | #33 |
+| D15 | LCW sub-type body parsing | We classify LW frames by ft (DA/VO/IP/SY/U3/U6) but only DA gets a full body decode. SY/IIU/I36/IBC carry useful telemetry (sat config, time, handoff metrics). Off the ACARS path. | 3-5 days | #34 |
+| D16 | AGC / dynamic gain | RTL-SDR fixed at tuner-AGC-mode setting. Live antenna will see ±10 dB signal level swings; static gain produces saturation or undersampling at edges. | 1-2 days | #35 |
+| D17 | ESP32-C6 Wi-Fi/Thread output | Currently decoded ACARS only goes to ESP_LOGI on serial. Production rooftop node needs Wi-Fi/Thread → MQTT or JSON-over-TCP. Design doc specifies the C6 (already on board) for this. | 5-7 days | #36 |
+| D18 | NVS-backed runtime config | LO/sample rate/station ID hardcoded. Field deployment needs runtime-configurable values without re-flashing. | 2 days | #37 |
+| D19 | OTA firmware updates | Single factory partition; field updates need physical USB. Switch to two_ota or factory+ota_0 layout for esp_https_ota. | 2 days | #38 |
+
+Combined CPU budget for the DSP gaps (D7-D11): ~20-25% of one P4 core.
+Easily within the existing 60% Core 0 headroom.
+
+Combined effort estimate: D7-D14 ≈ 3 weeks of focused work to close the
+"correctness on real RF" gap. D15-D19 ≈ 2 weeks of "deployment / nice-
+to-haves". The first batch is what's required to actually decode ACARS
+from raw IQ on real silicon.
+
+Combined CPU budget: ~20% of one P4 core for D7+D8+D9+D10. Easily within
+the existing 60% Core 0 headroom.
+
+The host-side `test_demod_albq` regression passes 0/382 bit diffs vs
+gr-iridium because `tests/scripts/build_albq_fixture.py` shifts each
+burst PRECISELY to DC at fixture-build time using float math — i.e.,
+it does the work D7+D8 would do for us at runtime. Real RF doesn't
+get that pre-processing.
+
+**Why we don't skip stages gr-iridium has:** gr-iridium implemented
+each of these stages because real Iridium RF requires them. Multi-
+burst-in-subband, off-bin carriers, sample-rate drift, channel
+overlap, etc. are properties of the protocol/spec, not artefacts of
+the test data. No antenna improvement closes the gap.
+
+---
+
 ## Phase 4: Live RF Validation (NEXT — blocked on hardware)
 *Requires: 1620 MHz QFH antenna (Scan Iridium GO! recommended) + Nooelec SAWbird+ IR.*
 
