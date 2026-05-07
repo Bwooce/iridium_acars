@@ -132,7 +132,10 @@ add_executable(test_polyphase_channelizer
     test_polyphase_channelizer.c
     ${COMMON_DIR}/polyphase_channelizer.c
 )
-target_include_directories(test_polyphase_channelizer PRIVATE ${COMMON_DIR})
+target_include_directories(test_polyphase_channelizer PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
 target_link_libraries(test_polyphase_channelizer PRIVATE m)
 
 # test_libacars_link — smoke test that the same minimum source-set the
