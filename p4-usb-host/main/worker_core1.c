@@ -259,8 +259,13 @@ void worker_task(void *arg)
             // = 0.5 symbol at 2 sps) until the demod finds a UW match.
             // This is the same sliding the host regression test uses
             // for the corpus fixtures.
-            const int STEP_INT16 = 4;            // 1 complex = 0.5 symbol
-            const int MAX_DEMOD_OFFSET = 200;    // ~100 symbols slack
+            // STEP_INT16=2 (= 1 int16 IQ pair = 1 complex sample at 2 sps
+            // = 0.5 symbol) means odd-numbered slides land on the
+            // alternate 2-sps sample phase. That covers both symbol-
+            // timing phases via the existing slide loop without
+            // having to change qpsk_demod's i*4 decimation pattern.
+            const int STEP_INT16 = 2;
+            const int MAX_DEMOD_OFFSET = 400;    // ~100 symbols × 2 phases
             bool demod_ok = false;
             int chosen_offset = 0;
             int total_int16 = out_samples_50k * 2;

@@ -73,16 +73,41 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         }
     }
 
-    // 3. UW Check
-    int dl_diffs = 0, ul_diffs = 0;
-    for (int i = 0; i < IR_UW_LENGTH; i++) {
-        dl_diffs += (hard_decisions[i] != IR_UW_DL[i]);
-        ul_diffs += (hard_decisions[i] != IR_UW_UL[i]);
+    // 3. UW Check. The PLL has 4 stable phase points (90° ambiguity);
+    // it may converge to any of the 4 rotations of the symbol
+    // constellation. The UWs are absolute-quadrant patterns, so we
+    // test all 4 rotations to find the match. DQPSK below is
+    // rotation-invariant so the bits emerge unchanged regardless of
+    // which rotation matched.
+    int dl_diffs = IR_UW_LENGTH + 1;
+    int ul_diffs = IR_UW_LENGTH + 1;
+    int dl_rot = 0, ul_rot = 0;
+    for (int rot = 0; rot < 4; rot++) {
+        int dl = 0, ul = 0;
+        for (int i = 0; i < IR_UW_LENGTH; i++) {
+            int v = (hard_decisions[i] - rot + 4) & 3;
+            dl += (v != IR_UW_DL[i]);
+            ul += (v != IR_UW_UL[i]);
+        }
+        if (dl < dl_diffs) { dl_diffs = dl; dl_rot = rot; }
+        if (ul < ul_diffs) { ul_diffs = ul; ul_rot = rot; }
     }
-    
-    if (dl_diffs <= 2) out->direction = DIR_DOWNLINK;
-    else if (ul_diffs <= 2) out->direction = DIR_UPLINK;
-    else out->direction = DIR_UNKNOWN;
+
+    int chosen_rot = 0;
+    if (dl_diffs <= 2)      { out->direction = DIR_DOWNLINK; chosen_rot = dl_rot; }
+    else if (ul_diffs <= 2) { out->direction = DIR_UPLINK;   chosen_rot = ul_rot; }
+    else                    { out->direction = DIR_UNKNOWN; }
+
+    // Apply the chosen rotation to hard_decisions so the DQPSK decode
+    // below produces bits anchored to the right quadrant reference.
+    // DQPSK is differential so uniform rotation doesn't change the
+    // diff sequence — but it does change the first-symbol baseline,
+    // which the downstream consumers may rely on.
+    if (out->direction != DIR_UNKNOWN && chosen_rot != 0) {
+        for (int i = 0; i < n_symbols; i++) {
+            hard_decisions[i] = (hard_decisions[i] - chosen_rot + 4) & 3;
+        }
+    }
 
     if (out->direction == DIR_UNKNOWN) {
         // Diagnostic: show how close we were to each UW + the actual
