@@ -87,6 +87,9 @@ static void run_detector_on_fixture(uint32_t fs_hz,
 
     channelizer_detector_feed_int16(d, iq, n_complex);
     free(iq);
+    // End-of-stream: flush pending COOLING / IN_BURST bursts so the
+    // test sees all detections.
+    channelizer_detector_flush(d);
 
     channelizer_detector_stats_t stats;
     channelizer_detector_get_stats(d, &stats);
@@ -153,6 +156,9 @@ static void test_simulated_corpus(void)
     CHECK(iq != NULL, "u8_to_int16");
     channelizer_detector_feed_int16(d, iq, n_complex);
     free(iq);
+    // End-of-stream: flush pending COOLING / IN_BURST bursts so the
+    // test sees all detections.
+    channelizer_detector_flush(d);
 
     channelizer_detector_stats_t stats;
     channelizer_detector_get_stats(d, &stats);

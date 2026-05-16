@@ -55,6 +55,13 @@ void channelizer_detector_feed_int16(channelizer_detector_t *d,
                                       const int16_t *iq,
                                       size_t n_complex);
 
+// Flush any pending bursts that are currently in the post-burst
+// cooldown state. Production code never needs to call this — the
+// cooldown self-resolves as more samples arrive. Use it in tests /
+// at end-of-stream / before destroy to make sure no burst is left
+// pending in the detector's state machine.
+void channelizer_detector_flush(channelizer_detector_t *d);
+
 // Stats since last call (resets accumulators).
 typedef struct {
     uint32_t input_samples_seen;

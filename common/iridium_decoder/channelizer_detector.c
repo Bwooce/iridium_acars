@@ -64,6 +64,20 @@
 // rejecting 1-3 cycle flickers from PRBS / quantisation.
 #define MIN_BURST_CYCLES     4     // ~100 us at 40 ksps
 
+// Burst-merging cooldown. After a channel's power drops below the
+// hysteresis exit threshold, the channel state is "cooling" for this
+// many cycles. If power rises back above the entry threshold during
+// the cooling window, the burst RESUMES from its original start_cycle
+// (no new burst event) — this absorbs modulation-induced power dips
+// of up to MERGE_GAP_CYCLES (e.g. ~1 ms) that would otherwise
+// fragment a single Iridium TDMA burst into 10-50 separate detection
+// events at the smoke-test fixture's modulation depth.
+//
+// Iridium TDMA slots are ~8 ms; legitimate distinct bursts on the
+// same channel are separated by frame periods (~90 ms) so MERGE_GAP
+// of ~1 ms doesn't merge legitimately-distinct events.
+#define MERGE_GAP_CYCLES     40    // ~1 ms at 40 ksps
+
 // D20 step 3 gate. Flipped to 1 after polyphase_mac_phase_arp4 (the
 // PIE xacc-based MAC kernel) landed in polyphase_mac_arp4.S. If the
 // kernel turns out buggy / crashy, flip back to 0 and reflash to
@@ -91,9 +105,25 @@
 // the baseline and the trailing edge would never be detected.
 #define EMA_ALPHA_SHIFT      11    // alpha = 1/(1<<11) = 1/2048
 
+// Three-state per-channel machine for the burst-merging cooldown:
+//   IDLE       — channel is at noise. EMA updates here.
+//   IN_BURST   — power is currently above the rise threshold. EMA
+//                 frozen.
+//   COOLING    — power dropped below the exit threshold but we're
+//                 holding the burst record open for MERGE_GAP_CYCLES
+//                 in case power rises again (modulation dip vs
+//                 burst end). EMA frozen.
+typedef enum {
+    CH_IDLE = 0,
+    CH_IN_BURST,
+    CH_COOLING,
+} channel_phase_t;
+
 typedef struct {
-    bool     in_burst;
-    uint32_t start_cycle;
+    channel_phase_t phase;
+    uint32_t start_cycle;       // cycle the current burst began
+    uint32_t last_active_cycle; // cycle of the most recent above-threshold sample
+    uint32_t cool_end_cycle;    // cycle at which COOLING expires (this_cycle ≥ → emit)
     float    peak_power;
     float    peak_floor;        // noise floor at peak_power moment
 } channel_state_t;
@@ -198,12 +228,15 @@ static inline int signed_channel_offset(int k)
     return (k > M / 2) ? (k - M) : k;
 }
 
-static void emit_burst(channelizer_detector_t *d, int k, uint32_t cur_cycle)
+// Emit the pending burst for channel k (covers cs->start_cycle ..
+// cs->last_active_cycle). Resets the channel to IDLE regardless of
+// whether the burst met MIN_BURST_CYCLES (too-short bursts are
+// dropped silently). Called from the COOLING-expiry path in
+// process_cycles.
+static void emit_burst(channelizer_detector_t *d, int k)
 {
     channel_state_t *cs = &d->st[k];
-    if (!cs->in_burst) return;
-    uint32_t length_cycles = cur_cycle - cs->start_cycle;
-    // Drop too-short flickers without emitting (still resets state).
+    uint32_t length_cycles = cs->last_active_cycle - cs->start_cycle + 1;
     if (length_cycles >= (uint32_t)MIN_BURST_CYCLES) {
         float snr_db = 10.0f * log10f(cs->peak_power
                                        / (cs->peak_floor + 1e-30f));
@@ -218,7 +251,7 @@ static void emit_burst(channelizer_detector_t *d, int k, uint32_t cur_cycle)
         if (d->cb) d->cb(&b, d->user);
         d->bursts_emitted++;
     }
-    cs->in_burst   = false;
+    cs->phase      = CH_IDLE;
     cs->peak_power = 0.0f;
     cs->peak_floor = 0.0f;
 }
@@ -286,41 +319,76 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
         float rise_thr = noise_floor * d->threshold_mult;
         float drop_thr = noise_floor * d->drop_mult;
 
-        // 3. Per-channel threshold check + burst tracking with
-        // hysteresis: enter at rise_thr, exit at drop_thr (3 dB lower).
-        // Two conditions must hold to ENTER a burst:
-        //   (a) power[k] > rise_thr     (above cross-channel noise floor)
-        //   (b) power[k] > ema[k] × mult (above channel's own baseline —
-        //       rejects DC offset and stuck spurs that already sit above
-        //       the cross-channel floor)
-        // The slow EMA is updated only while a channel is idle (standard
-        // noise-floor practice; updating during the burst would saturate
-        // the baseline before the trailing edge is seen).
+        // 3. Per-channel three-state burst tracking:
+        //
+        //   IDLE      → rise_thr crossed → IN_BURST (record start)
+        //   IN_BURST  → drop_thr crossed → COOLING  (record last_active)
+        //   COOLING   → rise_thr crossed → IN_BURST (resume; keep
+        //                                            original start)
+        //   COOLING   → cool_end reached → IDLE     (emit burst)
+        //
+        // The COOLING state absorbs modulation-induced power dips of
+        // up to MERGE_GAP_CYCLES so a single Iridium TDMA burst
+        // doesn't fragment into many short detection events. EMA is
+        // updated only in IDLE so neither active bursts nor cooling
+        // periods pollute the noise-floor baseline.
         int n_active = 0;
         for (int k = 0; k < M; k++) {
             channel_state_t *cs = &d->st[k];
-            if (cs->in_burst) {
+            float ema_thr = cs->phase == CH_IDLE
+                              ? d->channel_ema[k] * d->threshold_mult
+                              : 0.0f;
+            bool above_rise = (power[k] > rise_thr)
+                              && (cs->phase != CH_IDLE
+                                   || power[k] > ema_thr);
+
+            switch (cs->phase) {
+            case CH_IDLE:
+                // Update slow per-channel EMA while idle.
+                d->channel_ema[k] += (power[k] - d->channel_ema[k])
+                                     * (1.0f / (float)(1 << EMA_ALPHA_SHIFT));
+                if (above_rise) {
+                    n_active++;
+                    cs->phase             = CH_IN_BURST;
+                    cs->start_cycle       = this_cycle;
+                    cs->last_active_cycle = this_cycle;
+                    cs->peak_power        = power[k];
+                    cs->peak_floor        = noise_floor;
+                }
+                break;
+
+            case CH_IN_BURST:
                 n_active++;
                 if (power[k] > cs->peak_power) {
                     cs->peak_power = power[k];
                     cs->peak_floor = noise_floor;
                 }
                 if (power[k] < drop_thr) {
-                    emit_burst(d, k, this_cycle);
+                    // Enter cooling — don't emit yet.
+                    cs->phase          = CH_COOLING;
+                    cs->cool_end_cycle = this_cycle +
+                                          (uint32_t)MERGE_GAP_CYCLES;
+                } else {
+                    cs->last_active_cycle = this_cycle;
                 }
-            } else {
-                // Update slow per-channel EMA while idle.
-                //   ema += (power - ema) / 2^SHIFT
-                d->channel_ema[k] += (power[k] - d->channel_ema[k])
-                                     * (1.0f / (float)(1 << EMA_ALPHA_SHIFT));
-                float ema_thr = d->channel_ema[k] * d->threshold_mult;
-                if (power[k] > rise_thr && power[k] > ema_thr) {
-                    n_active++;
-                    cs->in_burst    = true;
-                    cs->start_cycle = this_cycle;
-                    cs->peak_power  = power[k];
-                    cs->peak_floor  = noise_floor;
+                break;
+
+            case CH_COOLING:
+                n_active++;     // count as active during cooldown
+                if (above_rise) {
+                    // Resume the burst — keep start_cycle, return to
+                    // IN_BURST. Power may rise above the previous peak.
+                    if (power[k] > cs->peak_power) {
+                        cs->peak_power = power[k];
+                        cs->peak_floor = noise_floor;
+                    }
+                    cs->last_active_cycle = this_cycle;
+                    cs->phase             = CH_IN_BURST;
+                } else if (this_cycle >= cs->cool_end_cycle) {
+                    // Cooldown expired without re-rise — emit.
+                    emit_burst(d, k);
                 }
+                break;
             }
         }
         if ((uint32_t)n_active > d->channels_active_peak) {
@@ -366,6 +434,20 @@ void channelizer_detector_feed_int16(channelizer_detector_t *d,
 #endif
         process_cycles(d, got);
         consumed += whole;
+    }
+}
+
+void channelizer_detector_flush(channelizer_detector_t *d)
+{
+    if (!d) return;
+    for (int k = 0; k < M; k++) {
+        channel_state_t *cs = &d->st[k];
+        // IN_BURST: treat the current cycle as the burst end and emit.
+        // COOLING:  emit whatever's pending.
+        // IDLE:     nothing to do.
+        if (cs->phase == CH_IN_BURST || cs->phase == CH_COOLING) {
+            emit_burst(d, k);
+        }
     }
 }
 
