@@ -14,6 +14,7 @@
 #include "signal_buffer.h"
 #include "qpsk_demod.h"
 #include "freq_estimator.h"
+#include "uw_correlator.h"
 #include "bch_decoder.h"
 #include "frame_decoder.h"
 
@@ -251,37 +252,75 @@ void worker_task(void *arg)
                 demod_interleaved[i * 2 + 1] = resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS + i];
             }
 
-            // qpsk_demod assumes its input starts at the unique word.
-            // The channelizer's start_sample_idx is at the threshold-
-            // crossing point, so the real UW is somewhere INSIDE the
-            // extracted burst (after a preamble ramp + envelope slack).
-            // Slide the input start in 1-complex-sample steps (4 int16
-            // = 0.5 symbol at 2 sps) until the demod finds a UW match.
-            // This is the same sliding the host regression test uses
-            // for the corpus fixtures.
-            // STEP_INT16=2 (= 1 int16 IQ pair = 1 complex sample at 2 sps
-            // = 0.5 symbol) means odd-numbered slides land on the
-            // alternate 2-sps sample phase. That covers both symbol-
-            // timing phases via the existing slide loop without
-            // having to change qpsk_demod's i*4 decimation pattern.
-            const int STEP_INT16 = 2;
-            const int MAX_DEMOD_OFFSET = 400;    // ~100 symbols × 2 phases
-            bool demod_ok = false;
-            int chosen_offset = 0;
+            // (D10 timing recovery wiring removed. Per gr-iridium's
+            // burst_downmix_impl.cc, the correct approach for burst-
+            // mode timing is one-shot UW cross-correlation with
+            // parabolic peak interpolation, NOT a continuous Gardner
+            // loop. New uw_correlator module replaces this hook.)
+
+            // D10: one-shot UW cross-correlation (gr-iridium pattern).
+            // The channelizer reports start_sample_idx at the
+            // threshold-crossing point — the real UW is somewhere
+            // INSIDE the extracted burst (after preamble + envelope
+            // slack). uw_correlator_find locates the UW directly
+            // via complex correlation against the known DL/UL
+            // patterns. Peak position = UW start, direction = which
+            // pattern peaked higher.
             int total_int16 = out_samples_50k * 2;
-            for (int sym_off = 0; sym_off < MAX_DEMOD_OFFSET; sym_off++) {
-                int int16_off = sym_off * STEP_INT16;
-                if (total_int16 - int16_off < 24 * STEP_INT16) break;
-                memset(&frame, 0, sizeof(frame));
-                if (qpsk_demod_process(demod_interleaved + int16_off,
-                                        total_int16 - int16_off, &frame)) {
-                    demod_ok = true;
-                    chosen_offset = sym_off;
-                    break;
+            uw_corr_result_t uw_res;
+            uw_correlator_find(demod_interleaved, out_samples_50k,
+                                /*search_complex=*/out_samples_50k - 24,
+                                &uw_res);
+            bool demod_ok = false;
+            ESP_LOGI(TAG, "UW corr: dir=%s offset=%d corr=%.3f SNR=%.1f dB peak=%.2e",
+                     uw_res.direction == UW_DIR_DOWNLINK ? "DL" :
+                     uw_res.direction == UW_DIR_UPLINK   ? "UL" : "UNKNOWN",
+                     uw_res.uw_offset, (double)uw_res.correction,
+                     (double)uw_res.snr_estimate_db, (double)uw_res.peak_value);
+            if (uw_res.direction != UW_DIR_UNKNOWN) {
+                int int16_off = uw_res.uw_offset * 2;
+                // Pre-rotate burst by conj(peak / |peak|) so the UW
+                // symbols land at absolute quadrants 0 and 2 — PLL
+                // starts already locked. gr-iridium pattern.
+                float pmag = sqrtf(uw_res.peak_re * uw_res.peak_re
+                                 + uw_res.peak_im * uw_res.peak_im);
+                int n_rot_int16 = total_int16 - int16_off;
+                int16_t *src = demod_interleaved + int16_off;
+                if (pmag > 1e-3f) {
+                    float rot_re =  uw_res.peak_re / pmag;
+                    float rot_im =  uw_res.peak_im / pmag;
+                    // Correlator peak_phase = -burst_residual_phase
+                    // (because corr = sum(uw × conj(burst)) carries
+                    // -φ). To un-rotate the burst by φ we multiply
+                    // by exp(+j·peak_phase) = (rot_re + j·rot_im):
+                    //   new_re = re*rot_re - im*rot_im
+                    //   new_im = re*rot_im + im*rot_re
+                    int n_cplx = n_rot_int16 / 2;
+                    for (int i = 0; i < n_cplx; i++) {
+                        float re = (float)src[i * 2 + 0];
+                        float im = (float)src[i * 2 + 1];
+                        float nr = re * rot_re - im * rot_im;
+                        float ni = re * rot_im + im * rot_re;
+                        // Saturate back to int16
+                        if (nr >  32767.0f) nr =  32767.0f;
+                        if (nr < -32768.0f) nr = -32768.0f;
+                        if (ni >  32767.0f) ni =  32767.0f;
+                        if (ni < -32768.0f) ni = -32768.0f;
+                        src[i * 2 + 0] = (int16_t)nr;
+                        src[i * 2 + 1] = (int16_t)ni;
+                    }
                 }
-            }
-            if (demod_ok) {
-                ESP_LOGD(TAG, "demod sliding: UW at +%d symbols", chosen_offset);
+                // (Gardner symbol-timing recovery is intentionally not
+                // wired into the worker pipeline yet. With default
+                // textbook gains it regressed the only burst that
+                // decoded under correlator + pre-rotation alone — the
+                // loop introduces strobe jitter that the fixed-decim
+                // qpsk_demod can't tolerate. sym_timing module retained
+                // for offline tuning via tests/host/test_sym_timing_trace.c.)
+                memset(&frame, 0, sizeof(frame));
+                if (qpsk_demod_process(src, n_rot_int16, &frame)) {
+                    demod_ok = true;
+                }
             }
             int64_t t_demod = esp_timer_get_time();
             int64_t t_bch = t_demod;
@@ -351,7 +390,7 @@ esp_err_t worker_core1_init()
     stage1_in_q = heap_caps_malloc((MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS) * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     demod_interleaved = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
 
-    if (!extract_buf || !phasor_buf || !decim_buf || !resample_buf || 
+    if (!extract_buf || !phasor_buf || !decim_buf || !resample_buf ||
         !stage1_in_i || !stage1_in_q || !demod_interleaved) {
         return ESP_ERR_NO_MEM;
     }

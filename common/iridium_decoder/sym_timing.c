@@ -37,8 +37,11 @@
 // representative bursts (the simple drop-in replacement of fixed
 // decimation breaks pre-aligned host fixtures due to per-symbol
 // strobe jitter without compensating averaging).
-#define DEFAULT_KP   0.0f      // diagnostic: pure pass-through
-#define DEFAULT_KI   0.0f
+// Restored textbook gains for diagnostic / tuning runs. Production
+// qpsk_demod overrides to 0/0 below if it must (the wrapper there
+// sets Kp/Ki explicitly after init).
+#define DEFAULT_KP   0.055f
+#define DEFAULT_KI   0.00019f
 
 void sym_timing_init(sym_timing_t *st)
 {
@@ -49,6 +52,13 @@ void sym_timing_init(sym_timing_t *st)
     // happens to already be on the better phase, convergence is
     // near-instantaneous; otherwise the loop crosses over within ~8
     // symbols.
+}
+
+void sym_timing_set_trace(sym_timing_t *st, sym_timing_trace_t *trace)
+{
+    if (!st) return;
+    st->trace = trace;
+    if (trace) trace->n = 0;
 }
 
 // Linear interpolation between consecutive complex samples in the
@@ -193,6 +203,7 @@ void sym_timing_correct_2sps(sym_timing_t *st,
     float mu         = st->mu;
     float w          = st->w;
     float complex prev_strobe = st->prev_strobe;
+    float complex prev_slot1  = st->prev_midpoint;  // y_mid for current TED
     bool  have_history        = (st->have_history != 0);
 
     int out_complex = 0;
@@ -203,7 +214,7 @@ void sym_timing_correct_2sps(sym_timing_t *st,
     while (strobe_idx + 2 < n_complex && out_complex + 1 < max_out_complex) {
         // Slot 0 of output = strobe at (strobe_idx + mu).
         float complex slot0 = interp_lin(in_2sps, strobe_idx, mu);
-        // Slot 1 = half-symbol later = (strobe_idx + 1 + mu).
+        // Slot 1 = half-symbol AFTER this strobe = (strobe_idx + 1 + mu).
         float complex slot1 = interp_lin(in_2sps, strobe_idx + 1, mu);
 
         out_2sps[out_complex * 2 + 0]     = sat_int16(crealf(slot0));
@@ -212,17 +223,30 @@ void sym_timing_correct_2sps(sym_timing_t *st,
         out_2sps[out_complex * 2 + 3]     = sat_int16(cimagf(slot1));
         out_complex += 2;
 
-        // Gardner TED on slot0 (= y_curr), slot1 (= y_mid), prev_strobe (= y_prev).
+        // Gardner TED. y_mid is the midpoint BETWEEN prev_strobe and
+        // slot0 — that's the PREVIOUS iteration's slot1 (which was
+        // computed as half-symbol AFTER prev_strobe). The first
+        // iteration has no prev_slot1, so e stays at 0.
         float e = 0.0f;
         if (have_history) {
             float complex diff = slot0 - prev_strobe;
-            e = crealf(slot1) * crealf(diff) + cimagf(slot1) * cimagf(diff);
-            e *= 1.0f / 1.0e7f;     // same normalisation as 1-sps variant
+            e = crealf(prev_slot1) * crealf(diff)
+              + cimagf(prev_slot1) * cimagf(diff);
+            e *= 1.0f / 1.0e7f;     // normalise per-symbol amplitude
         }
 
         // PI loop filter.
         w += st->Ki * e;
         float v = st->Kp * e + w;
+
+        // Trace diagnostic state PRE-advance so symbol index matches
+        // the strobe used to produce this output.
+        if (st->trace && st->trace->n < SYM_TIMING_TRACE_CAP) {
+            int t = st->trace->n++;
+            st->trace->e [t] = e;
+            st->trace->mu[t] = mu;
+            st->trace->w [t] = w;
+        }
 
         // Advance by 2 input complex samples (1 symbol) + v (loop
         // correction in fractional symbol units).
@@ -234,6 +258,7 @@ void sym_timing_correct_2sps(sym_timing_t *st,
         if (strobe_idx >= n_complex) break;
 
         prev_strobe   = slot0;
+        prev_slot1    = slot1;
         have_history  = true;
     }
 
@@ -241,6 +266,7 @@ void sym_timing_correct_2sps(sym_timing_t *st,
     st->mu             = mu;
     st->w              = w;
     st->prev_strobe    = prev_strobe;
+    st->prev_midpoint  = prev_slot1;
     st->have_history   = have_history ? 1 : 0;
 
     // Zero any unwritten tail (if loop exited early). Should be rare.

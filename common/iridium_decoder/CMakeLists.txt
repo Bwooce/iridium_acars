@@ -31,6 +31,9 @@ idf_component_register(
         "freq_estimator.c"
         # D10: Gardner symbol-timing recovery for qpsk_demod.
         "sym_timing.c"
+        # D10 (gr-iridium-style): UW cross-correlator for one-shot
+        # timing + direction estimation.
+        "uw_correlator.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board

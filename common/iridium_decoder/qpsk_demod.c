@@ -64,28 +64,15 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         return 0;
     }
 
-    // 1. D10 — symbol timing recovery via the 2-sps-preserving variant.
-    // sym_timing_correct_2sps writes a timing-corrected int16 IQ
-    // stream of the same length as the input; subsequent i*4
-    // decimation picks slot 0 of each pair, which is now the
-    // strobe-corrected sample. For pre-aligned input the strobe
-    // adjustment stays near zero so output ≈ input (host tests
-    // pass within float roundoff). For real-RF input with timing
-    // offset, the loop converges and slot 0 lands on the better
-    // of the two original samples (or an interpolation).
-    sym_timing_t st_t;
-    sym_timing_init(&st_t);
-    int16_t *corrected = malloc(n_samples * sizeof(int16_t));
-    if (!corrected) {
-        free(symbols); free(pll_out); free(hard_decisions);
-        return 0;
-    }
-    sym_timing_correct_2sps(&st_t, samples_2sps, n_samples, corrected);
+    // 1. Fixed decimation to 1 sps. Symbol timing recovery (D10) is
+    // available as sym_timing_correct_2sps but is NOT yet wired
+    // upstream — default Gardner gains regressed the only burst that
+    // decoded with correlator + pre-rotation alone. Module retained
+    // for offline tuning (tests/host/test_sym_timing_trace.c).
     for (int i = 0; i < n_symbols; i++) {
-        symbols[i] = (float)corrected[i * 4 + 0]
-                   + (float)corrected[i * 4 + 1] * _Complex_I;
+        symbols[i] = (float)samples_2sps[i * 4 + 0]
+                   + (float)samples_2sps[i * 4 + 1] * _Complex_I;
     }
-    free(corrected);
 
     // 2. Second-order PLL (D9). Tracks both phase (phi_hat) and
     // frequency (omega_hat, rad/sym). Per symbol:
@@ -226,7 +213,7 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         // hard decisions for the first 12 symbols. Helps tell apart
         // "PLL never locked" (random hard_decisions) from "wrong
         // burst alignment" (decisions structured but offset).
-        ESP_LOGD(TAG,
+        ESP_LOGI(TAG,
             "UW no match: dl=%d (rot %d) ul=%d (rot %d) omega=%.4f hd[0..11]=[%d %d %d %d %d %d %d %d %d %d %d %d]",
             dl_diffs, dl_rot, ul_diffs, ul_rot, (double)omega_hat,
             hard_decisions[0], hard_decisions[1], hard_decisions[2],

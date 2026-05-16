@@ -24,6 +24,9 @@
 extern "C" {
 #endif
 
+// Forward decl of the diagnostic trace struct; defined below.
+struct sym_timing_trace;
+
 typedef struct {
     // Loop state.
     float mu;            // fractional strobe offset ∈ [0, 1)
@@ -38,6 +41,8 @@ typedef struct {
     // Gains. PI loop filter. Caller may override after init for tuning.
     float Kp;
     float Ki;
+    // Optional diagnostic trace (NULL = no trace). See sym_timing_trace_t.
+    struct sym_timing_trace *trace;
 } sym_timing_t;
 
 // Initialise per-burst state. Call once before each burst (the loop
@@ -74,6 +79,21 @@ int sym_timing_process(sym_timing_t *st,
 void sym_timing_correct_2sps(sym_timing_t *st,
                              const int16_t *in_2sps, int n_int16,
                              int16_t *out_2sps);
+
+// Diagnostic trace buffer — per-symbol PI-loop state. Set via
+// sym_timing_set_trace to enable; sym_timing_correct_2sps then
+// fills .e/.mu/.w/.n per output symbol. Used by host tooling to
+// inspect the loop's behaviour on a known burst and tune Kp/Ki.
+#define SYM_TIMING_TRACE_CAP 1024
+struct sym_timing_trace {
+    float e [SYM_TIMING_TRACE_CAP];
+    float mu[SYM_TIMING_TRACE_CAP];
+    float w [SYM_TIMING_TRACE_CAP];
+    int   n;     // number of valid entries
+};
+typedef struct sym_timing_trace sym_timing_trace_t;
+
+void sym_timing_set_trace(sym_timing_t *st, sym_timing_trace_t *trace);
 
 #ifdef __cplusplus
 }

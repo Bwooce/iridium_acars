@@ -232,6 +232,18 @@ add_executable(test_sym_timing
 target_include_directories(test_sym_timing PRIVATE ${COMMON_DIR})
 target_link_libraries(test_sym_timing PRIVATE m)
 
+# D10 tuning tool — not a regression test. Dumps per-symbol PI-loop
+# state on the corpus fixture for offline analysis.
+add_executable(test_sym_timing_trace
+    test_sym_timing_trace.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_sym_timing_trace PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_sym_timing_trace PRIVATE m)
+
 enable_testing()
 add_test(NAME bch                  COMMAND test_bch)
 add_test(NAME freq_estimator       COMMAND test_freq_estimator)

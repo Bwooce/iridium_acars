@@ -320,6 +320,29 @@ them. Tracked in TODOs D7-D11.
 Combined CPU budget for the DSP gaps (D7-D11): ~20-25% of one P4 core.
 Easily within the existing 60% Core 0 headroom.
 
+**Status snapshot (D7-D10), May 2026:**
+- **D7** — polyphase channelizer landed (host correctness 9/9, target wiring in flight).
+- **D8** — fine freq estimation in worker is in place; residual still
+  reaches the demod at moderate magnitudes (omega_hat tracking from
+  D9 catches the bulk of it).
+- **D9** — second-order PLL with phase + frequency tracking shipped
+  in `qpsk_demod` (`PLL_ALPHA=0.2`, `PLL_BETA=0.1`). Visibly tracks
+  per-symbol omega in the smoke test (±0.2–0.6 rad/sym).
+- **D10** — Gardner symbol-timing recovery is implemented
+  (`sym_timing_correct_2sps`) but **not yet wired** into the worker:
+  default textbook gains regressed the only decoding burst when added
+  on top of correlator + pre-rotation. The module + host trace tool
+  (`tests/host/test_sym_timing_trace.c`) remain for offline tuning.
+  In its place we adopted gr-iridium's burst-mode approach: a one-shot
+  UW cross-correlator (`uw_correlator_find`) gives both timing and
+  direction in one pass, and the complex peak phase is used to
+  pre-rotate the burst so the PLL starts already locked. First
+  end-to-end demod success on raw RTL-SDR corpus came from this
+  pipeline. Smoke test: 1 of 3 expected bursts decoded; remaining
+  two have larger residual freq offsets (omega -0.44, +0.59) that
+  the current PLL gains/initial phase can't acquire within the 12-
+  symbol UW window.
+
 ### D20 — Channelizer-detector optimisation roadmap
 
 The D7 channelizer + per-channel detector work is correctness-first: it
