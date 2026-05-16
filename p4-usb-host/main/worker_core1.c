@@ -251,8 +251,33 @@ void worker_task(void *arg)
                 demod_interleaved[i * 2 + 1] = resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS + i];
             }
 
-            // Note: n_samples parameter in qpsk_demod_process is number of int16_t values
-            bool demod_ok = qpsk_demod_process(demod_interleaved, out_samples_50k * 2, &frame);
+            // qpsk_demod assumes its input starts at the unique word.
+            // The channelizer's start_sample_idx is at the threshold-
+            // crossing point, so the real UW is somewhere INSIDE the
+            // extracted burst (after a preamble ramp + envelope slack).
+            // Slide the input start in 1-complex-sample steps (4 int16
+            // = 0.5 symbol at 2 sps) until the demod finds a UW match.
+            // This is the same sliding the host regression test uses
+            // for the corpus fixtures.
+            const int STEP_INT16 = 4;            // 1 complex = 0.5 symbol
+            const int MAX_DEMOD_OFFSET = 200;    // ~100 symbols slack
+            bool demod_ok = false;
+            int chosen_offset = 0;
+            int total_int16 = out_samples_50k * 2;
+            for (int sym_off = 0; sym_off < MAX_DEMOD_OFFSET; sym_off++) {
+                int int16_off = sym_off * STEP_INT16;
+                if (total_int16 - int16_off < 24 * STEP_INT16) break;
+                memset(&frame, 0, sizeof(frame));
+                if (qpsk_demod_process(demod_interleaved + int16_off,
+                                        total_int16 - int16_off, &frame)) {
+                    demod_ok = true;
+                    chosen_offset = sym_off;
+                    break;
+                }
+            }
+            if (demod_ok) {
+                ESP_LOGD(TAG, "demod sliding: UW at +%d symbols", chosen_offset);
+            }
             int64_t t_demod = esp_timer_get_time();
             int64_t t_bch = t_demod;
             if (demod_ok) {
