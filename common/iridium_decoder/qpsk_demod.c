@@ -38,6 +38,13 @@ static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 // demod where each burst is a fresh acquisition.
 #define PLL_ALPHA       0.2f
 #define PLL_BETA        0.1f
+// D9 two-stage acquisition was tried (PLL_ACQUIRE_ALPHA=0.5,
+// PLL_ACQUIRE_BETA=0.25, PLL_ACQUIRE_SYMS=16) and reverted: wider
+// initial gains did help omega_hat catch large residuals, but the
+// per-symbol pll_out got noisy enough that the complex-correlation
+// UW fallback dropped below its 0.6 threshold. Net regression on
+// the smoke corpus. Real improvement needs upstream CFO accuracy,
+// not wider-band PLL.
 #define M_SQRT1_2f      0.70710678f
 
 int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame_t *out)
