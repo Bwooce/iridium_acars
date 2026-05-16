@@ -64,6 +64,27 @@
 // rejecting 1-3 cycle flickers from PRBS / quantisation.
 #define MIN_BURST_CYCLES     4     // ~100 us at 40 ksps
 
+// Per-channel slow baseline EMA. Distinguishes a TRANSIENT burst (a
+// channel's instantaneous power spikes above its own slow baseline)
+// from a PERSISTENT spur (channel always above the cross-channel
+// floor because of DC offset, an unmodulated carrier, an SDR birdie,
+// etc.). Without this, the RTL-SDR's residual DC offset puts channel
+// 0's instantaneous power 15-25 dB above the cross-channel 25th-
+// percentile floor at every cycle, so the detector emits ~30-50
+// spurious channel-0 bursts/second on real hardware (observed in the
+// first P4 smoke run after the channelizer landed). The slow EMA
+// converges to that DC offset level after a few hundred cycles, and
+// the second threshold below (power > ema × threshold_mult) then
+// requires a transient excursion above the channel's own baseline,
+// not just above the cross-channel floor. Iridium bursts (8.28 ms,
+// ~330 cycles) are short compared to the EMA time constant
+// (~50 ms = 2048 cycles), so a real burst barely budges the EMA.
+//
+// The EMA is frozen while the channel is in burst — standard noise-
+// floor tracking practice; otherwise the burst itself would saturate
+// the baseline and the trailing edge would never be detected.
+#define EMA_ALPHA_SHIFT      11    // alpha = 1/(1<<11) = 1/2048
+
 typedef struct {
     bool     in_burst;
     uint32_t start_cycle;
@@ -80,6 +101,7 @@ struct channelizer_detector {
     void     *user;
 
     channel_state_t st[M];
+    float     channel_ema[M];       // slow per-channel power baseline
     uint32_t  cycle_count;          // total cycles processed since create()
     uint32_t  bursts_emitted;
     uint32_t  channels_active_peak;
@@ -223,6 +245,14 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
 
         // 3. Per-channel threshold check + burst tracking with
         // hysteresis: enter at rise_thr, exit at drop_thr (3 dB lower).
+        // Two conditions must hold to ENTER a burst:
+        //   (a) power[k] > rise_thr     (above cross-channel noise floor)
+        //   (b) power[k] > ema[k] × mult (above channel's own baseline —
+        //       rejects DC offset and stuck spurs that already sit above
+        //       the cross-channel floor)
+        // The slow EMA is updated only while a channel is idle (standard
+        // noise-floor practice; updating during the burst would saturate
+        // the baseline before the trailing edge is seen).
         int n_active = 0;
         for (int k = 0; k < M; k++) {
             channel_state_t *cs = &d->st[k];
@@ -236,7 +266,12 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
                     emit_burst(d, k, this_cycle);
                 }
             } else {
-                if (power[k] > rise_thr) {
+                // Update slow per-channel EMA while idle.
+                //   ema += (power - ema) / 2^SHIFT
+                d->channel_ema[k] += (power[k] - d->channel_ema[k])
+                                     * (1.0f / (float)(1 << EMA_ALPHA_SHIFT));
+                float ema_thr = d->channel_ema[k] * d->threshold_mult;
+                if (power[k] > rise_thr && power[k] > ema_thr) {
                     n_active++;
                     cs->in_burst    = true;
                     cs->start_cycle = this_cycle;
@@ -252,6 +287,12 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
     d->cycle_count += (uint32_t)n_cycles;
 }
 
+// TODO(D20): the int16→float conversion below + process_cycles' float
+// power computation + cross-channel percentile are all candidates for
+// PIE rewrite. The conversion alone is 8192 elements × ~10 ns scalar
+// vs ~1.25 ns/elem in 8-lane int16. If we keep IQ as int16 end-to-end
+// (polyphase channelizer also int16, per its TODO), this conversion
+// disappears entirely. See D20 roadmap in iridium-acars-implementation-plan.md.
 void channelizer_detector_feed_int16(channelizer_detector_t *d,
                                       const int16_t *iq,
                                       size_t n_complex)

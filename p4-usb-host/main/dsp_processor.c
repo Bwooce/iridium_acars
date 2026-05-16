@@ -1,264 +1,153 @@
+// dsp_processor — front-end burst detector. As of D7 this is a thin
+// shim around channelizer_detector (common/iridium_decoder/), which
+// runs a 64-channel polyphase channelizer + per-channel envelope
+// detector in place of the legacy 2048-bin single-FFT detector.
+//
+// The motivation: the single-FFT detector picked one strongest bin
+// across the whole 2.56 MHz subband. When two concurrent bursts on
+// nearby channels overlapped in time, the bin average landed between
+// them, putting the residual carrier offset outside the PLL's
+// capture range. Per-channel detection bounds the centre-frequency
+// error at ½ × 40 kHz = 20 kHz, well inside the PLL.
+//
+// The legacy windowing / magnitude / baseline-EMA PIE kernels
+// (dsp_window_arp4.S, dsp_mag_arp4.S) are still in this directory;
+// they're templates for the D20 int16/PIE rewrite of the channelizer
+// hot path. They're built but unused at runtime; the linker drops
+// the orphan sections from the final image.
+
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include "esp_log.h"
-#include "esp_dsp.h"
 #include "esp_timer.h"
 #include "dsp_processor.h"
-#include "dsp_window_arp4.h"
-#include "dsp_mag_arp4.h"
+#include "channelizer_detector.h"
+#include "polyphase_channelizer.h"
 
 static const char *TAG = "DSP_PROC";
 
-// Detector threshold: 40× above baseline = 10·log10(40) = 16.02 dB,
-// matching the prior float setpoint within 0.02 dB. Tried `>> 5` (32×
-// = 15.05 dB) to skip the multiply but the 1 dB drop in selectivity
-// produced too many priming-noise false positives. Tried uint64 mul
-// for full overflow safety but that cost ~20 us/frame. The compromise:
-// uint32 multiply with wrap-around. baseline > 2^26 (= ~67 M) would
-// wrap, but our magnitudes max at 2^31 and baseline tracks them — at
-// realistic noise levels baseline stays well below 2^25, so wrap is
-// not a concern in practice.
-#define THRESHOLD_MULT 40u
-#define HISTORY_SIZE 128
-#define PRIMING_FRAMES 16
+// Front-end sample rate. The SDR is locked to 2.56 MSPS; this is the
+// same rate the channelizer expects. polyphase_channelizer_create
+// validates it internally.
+#define FS_IN_HZ        2560000u
 
-// EMA weights in Q15 fixed-point. Priming uses α = 0.5 (16384/32768),
-// steady-state α = 1/HISTORY_SIZE. β = 1 - α.
-#define ALPHA_PRIMING_Q15  16384u   // 0.5 in Q15
-#define BETA_PRIMING_Q15   16384u   // 0.5
-#define ALPHA_STEADY_Q15   ((uint32_t)(32768u / HISTORY_SIZE))   // 1/128 = 256
-#define BETA_STEADY_Q15    (32768u - ALPHA_STEADY_Q15)           // 32512
+// Detector threshold. 16 dB matches the legacy float setpoint
+// (40× linear, kept across the conversion to uint32 arithmetic).
+#define DETECTOR_DB     16.0f
 
-/* Buffers - Aligned for PIE, padded for overrun bug.
- *
- * Tried aligning everything to 64 bytes (the P4 L1 D-cache line size)
- * to remove the head/tail line-share between adjacent buffers — but
- * with five 8 KB buffers (each = 128 lines = 2 way-fills in a 64-set
- * 8-way L1 D), identical 64-byte alignment puts them all at the same
- * cache-set offsets and the EMA stage regressed by ~170 us/frame
- * from set-conflict thrashing. The linker's natural placement (each
- * buffer 16-byte aligned but at varying mod-64 offsets) scatters them
- * across L1 sets and is empirically faster. Keep aligned(16).
- *
- * Magnitudes and baseline used to be float32. Converted to uint32 in
- * Step 7b: magnitudes[i] = re² + im² directly (max 2 × 32767² ≈ 2^31,
- * fits int31), baseline tracks magnitudes in same scale. Eliminates
- * 4096 int16→f32 casts/frame in the magnitude loop and lets the EMA
- * run on integer arithmetic instead of scalar f32. window_temp_f32
- * stays float because dsps_wind_blackman_f32 (called once at init)
- * needs it, but it's no longer used as a per-frame scratch buffer.
- */
-__attribute__((aligned(16))) static int16_t  fft_in[FFT_SIZE * 2 + 16];
-__attribute__((aligned(16))) static int16_t  window_cplx[FFT_SIZE * 2 + 16];
-__attribute__((aligned(16))) static float    window_temp_f32[FFT_SIZE + 16];
-__attribute__((aligned(16))) static uint32_t magnitudes[FFT_SIZE + 16];
-__attribute__((aligned(16))) static uint32_t baseline[FFT_SIZE + 16];
+// Mapping from channelizer channel index → fftshift bin. The smoke
+// test and the worker's freq-centring still operate on peak_bin in
+// the conventional fftshift order (bin FFT_SIZE/2 = DC, bin > FFT_SIZE/2
+// = positive freq). With M=64 channels in FFT_SIZE=2048 bins, each
+// channel maps to 32 contiguous bins; we pick the channel centre.
+#define BIN_PER_CHAN    (FFT_SIZE / POLYCHAN_M)
 
-// PIE mag kernel scratch — used only when the PIE path is enabled.
-// Currently NOT used (production path is scalar). Sized to fit the
-// deinterleave-first variant's 8 int32 slots per 4-complex iter.
-__attribute__((aligned(16))) int32_t dsp_mag_scratch[FFT_SIZE * 2];
+static channelizer_detector_t *s_det = NULL;
+static burst_detected_cb_t     s_user_cb = NULL;
 
-typedef struct {
-    bool active;
-    uint32_t start_frame;
-    int max_bin;
-    uint32_t max_snr_q;   // peak ratio magnitudes/baseline as uint32
-} active_burst_t;
+// Per-feed total wall time + total samples consumed. The status
+// logger calls dsp_processor_get_stage_stats once per second and
+// expects a per-FFT-frame breakdown (wind/fft/mag/detect/baseline).
+// Most of those stages don't exist any more; we report the combined
+// channelize+detect cost in the fft_us slot so the existing log
+// line has meaningful data, and zero the others. Document this in
+// dsp_processor.h.
+static volatile uint64_t s_acc_feed_us       = 0;
+static volatile uint32_t s_acc_input_samples = 0;
 
-static active_burst_t current_burst = { .active = false };
-static uint32_t frame_count = 0;
-static int total_bursts = 0;
-static burst_detected_cb_t burst_cb = NULL;
+// User callback adapter: channelizer_burst_t → detected_burst_t.
+static void on_channelizer_burst(const channelizer_burst_t *cb,
+                                  void *user)
+{
+    (void)user;
+    if (!s_user_cb) return;
 
-// Per-stage timing accumulators (sum of microseconds across frames since
-// last reset). Reset by dsp_processor_get_stage_stats().
-static volatile uint64_t s_acc_wind_us = 0;
-static volatile uint64_t s_acc_fft_us = 0;
-static volatile uint64_t s_acc_mag_us = 0;
-static volatile uint64_t s_acc_detect_us = 0;
-static volatile uint64_t s_acc_baseline_us = 0;
-static volatile uint32_t s_acc_frames = 0;
+    int signed_off = (cb->channel > POLYCHAN_M / 2)
+                     ? (cb->channel - POLYCHAN_M)
+                     : cb->channel;
+    int peak_bin = ((FFT_SIZE / 2) + signed_off * BIN_PER_CHAN)
+                   & (FFT_SIZE - 1);
+
+    detected_burst_t out = {
+        .start_sample_idx = cb->start_sample_idx,
+        .length_samples   = cb->length_samples,
+        .peak_bin         = peak_bin,
+        .peak_snr_db      = cb->snr_db,
+    };
+    s_user_cb(&out);
+}
 
 esp_err_t dsp_processor_init(burst_detected_cb_t cb)
 {
-    ESP_LOGI(TAG, "Initializing FFT Detector (Size:%d)...", FFT_SIZE);
-    burst_cb = cb;
+    ESP_LOGI(TAG,
+             "Initializing Channelizer Detector (M=%d, fs=%u Hz, thr=%.1f dB)",
+             POLYCHAN_M, (unsigned)FS_IN_HZ, (double)DETECTOR_DB);
+    s_user_cb = cb;
 
-    esp_err_t ret = dsps_fft2r_init_sc16(NULL, FFT_SIZE);
-    if (ret != ESP_OK) return ret;
-
-    dsps_wind_blackman_f32(window_temp_f32, FFT_SIZE);
-    for (int i = 0; i < FFT_SIZE; i++) {
-        int16_t w = (int16_t)(window_temp_f32[i] / 0.42f * 32767.0f);
-        window_cplx[i * 2 + 0] = w;
-        window_cplx[i * 2 + 1] = w;
+    if (s_det) {
+        channelizer_detector_destroy(s_det);
+        s_det = NULL;
+    }
+    s_det = channelizer_detector_create(FS_IN_HZ, DETECTOR_DB,
+                                         on_channelizer_burst, NULL);
+    if (!s_det) {
+        ESP_LOGE(TAG, "channelizer_detector_create failed");
+        return ESP_ERR_NO_MEM;
     }
 
-    // Initial baseline: a small non-zero value. The detection threshold is
-    // 40 × baseline, so baseline=1 means threshold=40 (very low) and the
-    // priming-phase noise will quickly raise it to the actual noise floor.
-    for (int i = 0; i < FFT_SIZE; i++) baseline[i] = 1u;
-
+    s_acc_feed_us       = 0;
+    s_acc_input_samples = 0;
     return ESP_OK;
 }
 
 void dsp_processor_feed(const int16_t *samples, size_t n_samples)
 {
-    // Note: n_samples is complex samples (I,Q pairs)
-    // At 2.56 MSPS, we receive 16KB buffers = 8192 IQ pairs
-    // Each feed is 16KB = 4 FFT frames (2048 each)
-    
-    int n_frames = n_samples / FFT_SIZE;
-    
-    for (int f = 0; f < n_frames; f++) {
-        const int16_t *frame_ptr = &samples[f * FFT_SIZE * 2];
-        int64_t t0 = esp_timer_get_time();
-
-        // 1. Window — Q15 element-wise multiply, hand-rolled PIE on P4.
-        // The scalar loop the compiler emits at -O3 measured 92 μs/frame;
-        // the 8-lane esp.vmul.s16 kernel is ~5–15 μs/frame.
-        dsp_window_s16(frame_ptr, window_cplx, fft_in, FFT_SIZE * 2);
-        int64_t t1 = esp_timer_get_time();
-
-        // 2. FFT
-        dsps_fft2r_sc16_arp4(fft_in, FFT_SIZE);
-        dsps_bit_rev_sc16_ansi(fft_in, FFT_SIZE);
-        int64_t t2 = esp_timer_get_time();
-
-        // 3. Magnitude Squared — scalar uint32 sum-of-squares.
-        // Step 7c attempted PIE here (see dsp_mag_arp4.S for the
-        // detailed findings). Three different PIE recipes produced
-        // either lossy or memory-bandwidth-bound results; scalar
-        // remains the fastest path for this specific workload on
-        // ESP32-P4's PIE.
-        dsp_mag_sq_s16(fft_in, magnitudes, FFT_SIZE);
-        int64_t t3 = esp_timer_get_time();
-
-        // 4. Detection — uint32 multiply, no uint64. baseline×40 wraps
-        // for baseline > 2^26 (~67 M); but realistic noise levels stay
-        // below 2^25 so wrap is not a concern. Matches the prior float
-        // setpoint (16 dB) within 0.02 dB.
-        bool frame_has_signal = false;
-        int peak_bin = -1;
-        uint32_t peak_snr_q = 0;
-
-        if (frame_count >= PRIMING_FRAMES) {
-            for (int i = 0; i < FFT_SIZE; i++) {
-                uint32_t threshold = baseline[i] * THRESHOLD_MULT;
-                if (magnitudes[i] > threshold) {
-                    frame_has_signal = true;
-                    // Peak ratio for SNR_dB at burst end. Division per
-                    // exceeding bin only — rare in non-burst frames.
-                    uint32_t rel = baseline[i] > 0
-                        ? magnitudes[i] / baseline[i]
-                        : magnitudes[i];
-                    if (rel > peak_snr_q) {
-                        peak_snr_q = rel;
-                        peak_bin = i;
-                    }
-                }
-            }
-        }
-        int64_t t4 = esp_timer_get_time();
-
-        if (frame_has_signal) {
-            if (!current_burst.active) {
-                current_burst.active = true;
-                current_burst.start_frame = frame_count;
-                current_burst.max_bin = peak_bin;
-                current_burst.max_snr_q = peak_snr_q;
-            } else if (peak_snr_q > current_burst.max_snr_q) {
-                current_burst.max_snr_q = peak_snr_q;
-                current_burst.max_bin = peak_bin;
-            }
-        } else if (current_burst.active) {
-            // Convert peak ratio to dB once, at burst-end. log10f cost is
-            // negligible because it runs once per burst, not per frame.
-            float snr_db = (current_burst.max_snr_q > 0)
-                ? 10.0f * log10f((float)current_burst.max_snr_q)
-                : 0.0f;
-            // The detection / EMA path tracks bins in linear FFT order.
-            // Apply the fftshift here at the API boundary so the log
-            // line and the worker callback still get the conventional
-            // bin 1024 = DC, bin > 1024 = positive freq.
-            int shifted_bin = (current_burst.max_bin + FFT_SIZE / 2) & (FFT_SIZE - 1);
-            ESP_LOGI(TAG, "BURST DETECTED! Frame:%lu Bin:%d SNR:%.2f dB",
-                     current_burst.start_frame, shifted_bin, snr_db);
-
-            if (burst_cb) {
-                detected_burst_t burst = {
-                    .start_sample_idx = current_burst.start_frame * FFT_SIZE,
-                    .length_samples = (frame_count - current_burst.start_frame) * FFT_SIZE,
-                    .peak_bin = shifted_bin,
-                    .peak_snr_db = snr_db
-                };
-                burst_cb(&burst);
-            }
-
-            total_bursts++;
-            current_burst.active = false;
-        }
-
-        // 5. Baseline EMA in uint32 with Q15 weights:
-        //   b = (β·b + α·m) >> 15
-        // Priming phase (first 2× PRIMING_FRAMES) uses α = 0.5 so the
-        // baseline converges quickly to the actual noise floor; then
-        // switches to α = 1/HISTORY_SIZE for slow tracking.
-        //
-        // Per-iteration: two uint32 × uint32 → uint64 multiplies, one
-        // add, one shift, one store. Simpler than f32 (no casts), no
-        // scratch buffer needed (the prior dsps_mulc_f32 / dsps_add_f32
-        // chain through window_temp_f32 was three passes — this is one).
-        if (!frame_has_signal) {
-            uint32_t alpha, beta;
-            if (frame_count < PRIMING_FRAMES * 2) {
-                alpha = ALPHA_PRIMING_Q15;
-                beta  = BETA_PRIMING_Q15;
-            } else {
-                alpha = ALPHA_STEADY_Q15;
-                beta  = BETA_STEADY_Q15;
-            }
-            for (int i = 0; i < FFT_SIZE; i++) {
-                uint64_t b = (uint64_t)beta * baseline[i]
-                           + (uint64_t)alpha * magnitudes[i];
-                baseline[i] = (uint32_t)(b >> 15);
-            }
-        }
-        int64_t t5 = esp_timer_get_time();
-
-        // Accumulate stage timings for diagnostic reporting.
-        s_acc_wind_us     += (uint64_t)(t1 - t0);
-        s_acc_fft_us      += (uint64_t)(t2 - t1);
-        s_acc_mag_us      += (uint64_t)(t3 - t2);
-        s_acc_detect_us   += (uint64_t)(t4 - t3);
-        s_acc_baseline_us += (uint64_t)(t5 - t4);
-        s_acc_frames++;
-
-        frame_count++;
-    }
+    // n_samples is complex samples (I,Q pairs). At 2.56 MSPS the
+    // typical USB transfer is 16 KB = 8192 IQ pairs per call.
+    if (!s_det) return;
+    int64_t t0 = esp_timer_get_time();
+    channelizer_detector_feed_int16(s_det, samples, n_samples);
+    int64_t t1 = esp_timer_get_time();
+    s_acc_feed_us       += (uint64_t)(t1 - t0);
+    s_acc_input_samples += (uint32_t)n_samples;
 }
 
 void dsp_processor_get_stage_stats(dsp_stage_stats_t *out)
 {
-    uint32_t n = s_acc_frames;
-    if (n == 0) {
-        out->frames = 0;
-        out->wind_us = out->fft_us = out->mag_us = out->detect_us =
-            out->baseline_us = out->total_us = 0;
-        return;
+    // Normalise to FFT_SIZE-sample "frames" (2048 input samples) so
+    // the printed numbers stay comparable to historical FFT-detector
+    // logs. With 8192 samples per feed call we expect ~4 frame-eq's
+    // per call.
+    uint32_t frames = s_acc_input_samples / FFT_SIZE;
+    if (frames == 0) {
+        memset(out, 0, sizeof(*out));
+    } else {
+        float fn = (float)frames;
+        out->frames      = frames;
+        out->wind_us     = 0.0f;
+        out->fft_us      = (float)s_acc_feed_us / fn;   // channelize + detect
+        out->mag_us      = 0.0f;
+        out->detect_us   = 0.0f;
+        out->baseline_us = 0.0f;
+        out->total_us    = out->fft_us;
     }
-    float fn = (float)n;
-    out->frames      = n;
-    out->wind_us     = (float)s_acc_wind_us / fn;
-    out->fft_us      = (float)s_acc_fft_us / fn;
-    out->mag_us      = (float)s_acc_mag_us / fn;
-    out->detect_us   = (float)s_acc_detect_us / fn;
-    out->baseline_us = (float)s_acc_baseline_us / fn;
-    out->total_us    = out->wind_us + out->fft_us + out->mag_us +
-                       out->detect_us + out->baseline_us;
-    s_acc_wind_us = s_acc_fft_us = s_acc_mag_us = s_acc_detect_us =
-        s_acc_baseline_us = 0;
-    s_acc_frames = 0;
+
+    // Side-band: emit a one-liner with channelizer-specific stats
+    // (peak # active channels, bursts emitted in this window) so we
+    // can see multi-burst concurrency on the real-RF feed without
+    // changing the status_logger struct.
+    if (s_det) {
+        channelizer_detector_stats_t cs;
+        channelizer_detector_get_stats(s_det, &cs);
+        ESP_LOGI(TAG,
+                 "channelizer: bursts=%u chans_active_peak=%u "
+                 "cycles=%u",
+                 (unsigned)cs.bursts_detected,
+                 (unsigned)cs.channels_active_peak,
+                 (unsigned)cs.cycles_processed);
+    }
+
+    s_acc_feed_us       = 0;
+    s_acc_input_samples = 0;
 }

@@ -1,3 +1,10 @@
+// TODO(D20): this PIE kernel is currently unused (the legacy single-FFT
+// detector it served was replaced by channelizer_detector in D7 part 2).
+// Kept in-tree as a documented PIE template — specifically as the
+// reference design for the per-channel power computation in
+// channelizer_detector.c's process_cycles (|y|² = r² + i², same
+// kernel shape). See iridium-acars-implementation-plan.md § D20.
+//
 // PIE int magnitude-squared kernel — deinterleave-first variant.
 //
 // Key insight: instead of letting qacc lanes hold separate r² and i²

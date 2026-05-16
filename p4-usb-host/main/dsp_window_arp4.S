@@ -1,3 +1,9 @@
+// TODO(D20): this PIE kernel is currently unused (the legacy single-FFT
+// detector it served was replaced by channelizer_detector in D7 part 2).
+// Kept in-tree as a template for the D20 int16/PIE rewrite of the
+// polyphase channelizer's per-cycle MAC loop. See
+// iridium-acars-implementation-plan.md § D20.
+//
 // Q15 element-wise vector multiply for the DSP windowing stage.
 //
 //   out[i] = (int16_t)(((int32_t)src[i] * win[i]) >> 15);   for i in [0, n)
