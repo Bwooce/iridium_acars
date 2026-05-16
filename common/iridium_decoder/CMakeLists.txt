@@ -29,6 +29,8 @@ idf_component_register(
         # D8: fine carrier frequency estimator for the worker
         # (companion to D7's coarse channelizer).
         "freq_estimator.c"
+        # D10: Gardner symbol-timing recovery for qpsk_demod.
+        "sym_timing.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board

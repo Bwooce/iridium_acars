@@ -3,6 +3,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "qpsk_demod.h"
+#include "sym_timing.h"
 
 static const char *TAG = "QPSK";
 
@@ -63,12 +64,18 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         return 0;
     }
 
-    // 1. Simple decimation to 1 sps
+    // 1. Simple decimation to 1 sps. D10's sym_timing module is
+    // available (and unit-tested) but not yet wired here — the
+    // textbook Gardner-loop gains drift on the pre-aligned host
+    // fixtures, requiring tuning against representative real-RF
+    // data. Activate by replacing this loop with:
+    //     sym_timing_t st_t; sym_timing_init(&st_t);
+    //     n_symbols = sym_timing_process(&st_t, samples_2sps,
+    //                                    n_samples, symbols, n_symbols);
+    // once tuning is validated.
     for (int i = 0; i < n_symbols; i++) {
-        // samples_2sps is [I0, Q0, I1, Q1, I2, Q2, I3, Q3, ...]
-        // We take every 2nd complex sample: (I0, Q0), (I2, Q2), ...
-        // Index for complex sample i is i * 2 * 2 = i * 4.
-        symbols[i] = (float)samples_2sps[i * 4 + 0] + (float)samples_2sps[i * 4 + 1] * _Complex_I;
+        symbols[i] = (float)samples_2sps[i * 4 + 0]
+                   + (float)samples_2sps[i * 4 + 1] * _Complex_I;
     }
 
     // 2. Second-order PLL (D9). Tracks both phase (phi_hat) and

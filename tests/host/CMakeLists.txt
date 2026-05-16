@@ -25,6 +25,7 @@ target_include_directories(test_bch PRIVATE ${COMMON_DIR})
 add_executable(test_qpsk
     test_qpsk.c
     ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
 )
 target_include_directories(test_qpsk PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}   # esp_log.h stub
@@ -35,6 +36,7 @@ target_link_libraries(test_qpsk PRIVATE m)
 add_executable(test_demod_corpus
     test_demod_corpus.c
     ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
 )
 target_include_directories(test_demod_corpus PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
@@ -46,6 +48,7 @@ target_link_libraries(test_demod_corpus PRIVATE m)
 add_executable(test_demod_low_snr
     test_demod_low_snr.c
     ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
 )
 target_include_directories(test_demod_low_snr PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -57,6 +60,7 @@ target_link_libraries(test_demod_low_snr PRIVATE m)
 add_executable(test_demod_albq
     test_demod_albq.c
     ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
 )
 target_include_directories(test_demod_albq PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -220,9 +224,18 @@ add_executable(test_freq_estimator
 target_include_directories(test_freq_estimator PRIVATE ${COMMON_DIR})
 target_link_libraries(test_freq_estimator PRIVATE m)
 
+# D10: Gardner symbol-timing recovery.
+add_executable(test_sym_timing
+    test_sym_timing.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_sym_timing PRIVATE ${COMMON_DIR})
+target_link_libraries(test_sym_timing PRIVATE m)
+
 enable_testing()
 add_test(NAME bch                  COMMAND test_bch)
 add_test(NAME freq_estimator       COMMAND test_freq_estimator)
+add_test(NAME sym_timing           COMMAND test_sym_timing)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
 add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)
