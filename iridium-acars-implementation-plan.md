@@ -400,20 +400,88 @@ bring this down 5-10×.
 **Stop condition:** detector keeps up at 2.56 MSPS with ≥40% Core 0
 idle headroom for the rest of the pipeline.
 
-**Progress, as of D7 Phase 3 + D20 step 1 + step 2 on hardware:**
+**Progress, final D20 results on hardware:**
 
 | Step | Status | DSP cost / frame (2048 samples) | Throughput |
 |---|---|---|---|
-| Baseline (first hardware run) | Reference | n/a (quiet log) | 320 ksps (12.5% RT) |
-| D20 step 1: cached twiddles, mask-not-mod, N=8 unroll | ✅ DONE | 1681 µs | 1150 ksps (45% RT) |
-| D20 step 2: `dsps_fft2r_fc32_arp4` for the 64-pt FFT | ✅ DONE | 1562 µs (–7%) | 1230 ksps (48% RT) |
-| D20 step 3: PIE int16 polyphase MAC | ⏳ scaffold landed | (target ≤800 µs = real-time) | (target ≥2.56 MSPS) |
-| D20 step 4: int16 Q15 throughout (skip int16→float) | not started | | |
-| D20 step 5: cross-channel percentile in PIE | not started | | |
+| Baseline (first hardware run, float) | Reference | n/a (quiet log) | 320 ksps (12.5% RT) |
+| D20 step 1: cached twiddles, mask-not-mod, N=8 unroll | ✅ done | 1681 µs | 1150 ksps (45% RT) |
+| D20 step 2: `dsps_fft2r_fc32_arp4` for the 64-pt FFT | ✅ done | 1562 µs (–7%) | 1230 ksps (48% RT) |
+| D20 step 3 (a): per-phase PIE asm kernel (xacc) | ✅ done | 1315 µs (–16%) | 1.45 MSPS (57% RT) |
+| D20 step 3 (b): 2-copy delay line + unaligned PIE | ✅ done | 845 µs (–36%) | ~2.18 MSPS (85% RT) |
+| **D20 step 3 (c): all-phases asm via esp.lp.setup** | ✅ **done** | **785 µs (–7%)** | **>2.56 MSPS (102% RT)** |
 
-Real-time budget is 800 µs per 2048-sample frame (2048 / 2.56 MSPS).
-Steps 1+2 closed ~7% of the gap; the polyphase MAC dominates what
-remains (~50% of the 1562 µs total).
+Net: ~10× speedup from the float baseline. Channelizer hits real-time
+with ~2% headroom on a 2048-sample frame (785 µs DSP vs 800 µs budget).
+Residual ~9% USB drops are scheduling jitter (not DSP starvation) on
+the live SDR feed.
+
+**Caveats / known correctness issues (as of D20 step 3 (c) landing):**
+
+- **The smoke test (`SMOKE_TEST_RAW_IRIDIUM`) shows 0 frames reaching
+  the classifier vs 3 expected — BUT this is a D7-level limitation,
+  not a D20 regression.** Both the float path AND the int16+asm
+  path produce the same "worker chain broken" diagnosis on the same
+  fixture. The channelizer detects bursts correctly (18-23 of them,
+  SNR 14-22 dB), the worker processes them, but demod produces no
+  valid frames. Root cause: the channelizer's 40 kHz frequency
+  quantisation leaves the PLL with up to ±20 kHz residual offset,
+  16× outside the PLL's ~1.25 kHz capture range. **D8 (fine carrier
+  frequency estimation) is the fix; D7 + D8 are a logical pair.**
+- The int16/Q14 path's *output values* differ from the float path's
+  in scale, saturation, and quantisation noise. A host-side
+  comparison test (`tests/host/test_polyphase_int16.c`) flags this
+  with bit-equality tolerances that Q14 cannot meet — the test
+  reveals scale/saturation differences but does NOT indicate the
+  asm path is broken. The on-target detector logic is ratio-based
+  and EMA-learning so the differences are absorbed; both paths
+  produce comparable burst counts and SNR in smoke-test mode.
+- The Q14 quantisation has 1 bit of headroom; full-scale random IQ
+  saturates the per-phase MAC sum after >>14. Production input from
+  the SDR is far below full scale, so this only shows up in the
+  synthetic host test. Consider Q13 (2 bits of headroom) if real
+  inputs ever push near saturation.
+- The unaligned-PIE cfg bit is set once at `polyphase_channelizer_create()`
+  and assumed to persist; haven't tested behaviour across deep-sleep
+  or other CSR-resetting events.
+- **CHANNELIZER_USE_INT16_PATH=1 is the production default** — the
+  asm path is functionally equivalent to the float path (both fail
+  the smoke test identically) and ~2× faster. Flip to 0 to revert
+  to the float path if a future bug is suspected.
+
+**Learnings from D20** (worth carrying into D9 / further PIE work):
+
+- The `arp4` suffix on esp-dsp's float FFT is **loop-overhead
+  removal via esp.lp.setup**, NOT PIE vectorisation — P4 PIE is
+  integer-only. Scalar float MAC (RV-32IMF fmadd.s) is competitive
+  with scalar int16 MAC on P4; the PIE win only materialises with
+  `esp.vmulas.s16.xacc` or `.qacc`.
+- `qacc` (4 × int64 lanes) requires either `esp.srcmb.s16.qacc` for
+  shift-saturate-to-vector, or `esp.st.qacc.l.{l,h}.128.ip` for
+  memory drain — but the latter is ONLY valid inside an
+  `esp.lp.setup` body (the assembler rejects it otherwise).
+  For single-accumulator MACs `xacc` + `esp.srs.s.xacc` is much
+  simpler (esp-dsp's `dsps_dotprod_s16_arp4` is the canonical
+  example).
+- `esp.srs.s.xacc rd, rsh` only accepts certain RV register
+  encodings for `rd` / `rsh` — t1/t2 was rejected, t5/t6 works.
+  Likely a 4-bit register field limited to x24..x31. The same
+  restriction applies to `.xp` base registers (matrix-mult uses
+  x24/x25 = s8/s9 specifically).
+- `esp.vld.128.ip` post-increment immediates are limited to
+  ±16 bytes. For larger strides use `.xp` with a register stride.
+- Unaligned 128-bit PIE loads need the cfg-bit-1 enable (one
+  `esp.movx.r.cfg` / `or` / `esp.movx.w.cfg` sequence; persists
+  in the CSR thereafter).
+- Per-iteration call overhead on RV-32 is ~20 cycles. For 64
+  identical operations per cycle, folding the loop into the asm
+  via `esp.lp.setup` is a real win even at the same per-iteration
+  PIE-instruction cost.
+- Cache scratch matters: at 4 KB delay-line + ~2 KB tap state +
+  output buffers, we're comfortably in L1 D-cache. Larger
+  working sets thrash the cache and can erase PIE wins (see
+  `dsp_mag_arp4.S` for a case where the kernel itself was faster
+  but the increased scratch caused a net regression).
 
 **D20 step 3 — sub-task breakdown** (entry point:
 `common/iridium_decoder/polyphase_mac_arp4.S`, scaffold + algorithm

@@ -143,6 +143,15 @@ target_compile_options(test_polyphase_channelizer PRIVATE
     -Wno-unused-but-set-variable
 )
 
+# Cross-validate int16/Q14 channelizer path against the float reference.
+# No fixtures — synthesises inputs at runtime.
+add_executable(test_polyphase_int16
+    test_polyphase_int16.c
+    ${COMMON_DIR}/polyphase_channelizer.c
+)
+target_include_directories(test_polyphase_int16 PRIVATE ${COMMON_DIR})
+target_link_libraries(test_polyphase_int16 PRIVATE m)
+
 # Phase D7 part 2: channelizer-driven burst detector (replaces the
 # single-FFT detector in dsp_processor). Validates the full detection
 # pipeline on the same fixtures used for the bare channelizer.
@@ -217,5 +226,6 @@ add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME polyphase_channelizer COMMAND test_polyphase_channelizer)
+add_test(NAME polyphase_int16       COMMAND test_polyphase_int16)
 add_test(NAME channelizer_detector  COMMAND test_channelizer_detector)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
