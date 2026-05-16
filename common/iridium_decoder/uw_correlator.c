@@ -21,9 +21,153 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <string.h>
 
 #define UW_LENGTH    12
 #define SYM_STRIDE   2     // 2 samples per symbol
+
+// gr-iridium-style fine CFO estimator. Squaring a BPSK signal
+// (UW symbols at quadrants 0/2 = ±(1+j)) removes the modulation:
+//   x² = (±(1+j))² = ±2j → constant ±2j, no information, so any
+//   carrier offset Δω becomes a tone at 2Δω after squaring.
+// We FFT the squared region, find the peak, parabolic-interpolate
+// for sub-bin resolution, divide by 2 to undo squaring. Result is
+// returned in rad/sym (assuming the input samples are at 2 sps,
+// which matches the rest of this module).
+//
+// N=64 with hand-rolled radix-2 to keep the call cost tiny — this
+// runs once per detected burst, so a few hundred flops is nothing.
+#define CFO_FFT_N    64
+#define CFO_FFT_LOG  6
+#define CFO_INPUT_N  24      // 12 UW symbols × 2 sps — uses just the UW
+                              // region, no preamble dependency.
+
+static inline float parabolic_interp(float yl, float yc, float yr);
+
+static uint8_t  s_cfo_brev[CFO_FFT_N];
+static float    s_cfo_tw_re[CFO_FFT_N / 2];
+static float    s_cfo_tw_im[CFO_FFT_N / 2];
+static float    s_cfo_window[CFO_INPUT_N];
+static bool     s_cfo_inited = false;
+
+static void cfo_init(void)
+{
+    if (s_cfo_inited) return;
+    for (int i = 0; i < CFO_FFT_N; i++) {
+        uint8_t r = 0, v = (uint8_t)i;
+        for (int b = 0; b < CFO_FFT_LOG; b++) {
+            r = (uint8_t)((r << 1) | (v & 1));
+            v = (uint8_t)(v >> 1);
+        }
+        s_cfo_brev[i] = r;
+    }
+    for (int k = 0; k < CFO_FFT_N / 2; k++) {
+        double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CFO_FFT_N;
+        s_cfo_tw_re[k] = (float)cos(ang);
+        s_cfo_tw_im[k] = (float)sin(ang);
+    }
+    for (int i = 0; i < CFO_INPUT_N; i++) {
+        s_cfo_window[i] = 0.5f * (1.0f - cosf(2.0f * 3.14159265358979323846f *
+                                              (float)i / (float)(CFO_INPUT_N - 1)));
+    }
+    s_cfo_inited = true;
+}
+
+static void cfo_fft(float *re, float *im)
+{
+    for (int i = 0; i < CFO_FFT_N; i++) {
+        int j = s_cfo_brev[i];
+        if (j > i) {
+            float tr = re[i]; re[i] = re[j]; re[j] = tr;
+            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+    for (int stride = 1; stride < CFO_FFT_N; stride <<= 1) {
+        int span = stride << 1;
+        int step = (CFO_FFT_N / 2) / stride;
+        for (int k = 0; k < stride; k++) {
+            float wr = s_cfo_tw_re[k * step];
+            float wi = s_cfo_tw_im[k * step];
+            for (int i = k; i < CFO_FFT_N; i += span) {
+                float xr = re[i + stride];
+                float xi = im[i + stride];
+                float tr = wr * xr - wi * xi;
+                float ti = wr * xi + wi * xr;
+                re[i + stride] = re[i] - tr;
+                im[i + stride] = im[i] - ti;
+                re[i]          = re[i] + tr;
+                im[i]          = im[i] + ti;
+            }
+        }
+    }
+}
+
+// Square-then-FFT CFO estimator over the 24-sample UW region starting
+// at burst_2sps[2 * uw_offset]. Returns omega_per_sym in rad/sym.
+// Search window is bounded by the Nyquist of the squared signal
+// (±π post-squaring → ±π/2 input omega), but we additionally clamp to
+// ±1.5 rad/sym since anything beyond that would already have failed
+// upstream alignment.
+static float cfo_fine_estimate(const int16_t *burst_2sps, int uw_offset_complex)
+{
+    cfo_init();
+
+    float re[CFO_FFT_N], im[CFO_FFT_N];
+    memset(re, 0, sizeof(re));
+    memset(im, 0, sizeof(im));
+
+    // Square the windowed UW region. (re + j·im)² = (re²-im²) + j·(2·re·im).
+    // Normalise by 1/32768 to keep magnitudes in float range and so the
+    // window shape, not amplitude, dominates the FFT spectrum.
+    const float inv_full = 1.0f / 32768.0f;
+    for (int i = 0; i < CFO_INPUT_N; i++) {
+        float w = s_cfo_window[i];
+        float r = (float)burst_2sps[(uw_offset_complex + i) * 2 + 0] * inv_full;
+        float m = (float)burst_2sps[(uw_offset_complex + i) * 2 + 1] * inv_full;
+        re[i] = (r * r - m * m) * w;
+        im[i] = (2.0f * r * m)   * w;
+    }
+
+    cfo_fft(re, im);
+
+    // Find peak across the full FFT (the squared tone can land anywhere).
+    float peak_mag = -1.0f;
+    int   peak_k   = 0;
+    for (int k = 0; k < CFO_FFT_N; k++) {
+        float m = re[k] * re[k] + im[k] * im[k];
+        if (m > peak_mag) { peak_mag = m; peak_k = k; }
+    }
+    if (peak_mag <= 1e-9f) return 0.0f;
+
+    // Parabolic interpolation around the peak (with wrap).
+    int km1 = (peak_k - 1 + CFO_FFT_N) % CFO_FFT_N;
+    int kp1 = (peak_k + 1) % CFO_FFT_N;
+    float yl = re[km1] * re[km1] + im[km1] * im[km1];
+    float yc = peak_mag;
+    float yr = re[kp1] * re[kp1] + im[kp1] * im[kp1];
+    float delta = parabolic_interp(yl, yc, yr);
+
+    // Convert (signed) bin position to fractional cycles per sample,
+    // then to rad/sym. The squared spectrum is at 2·Δω_per_sample =
+    // 2·(Δω_per_sym/2) = Δω_per_sym, so dividing by 2 at the end
+    // gives back the original per-symbol omega.
+    float kf = (float)peak_k + delta;
+    if (kf >= (float)CFO_FFT_N / 2.0f) kf -= (float)CFO_FFT_N;
+    // Cycles per FFT bin = kf / CFO_FFT_N → rad/sample = 2π·kf/N.
+    float rad_per_sample = 2.0f * 3.14159265358979323846f * kf / (float)CFO_FFT_N;
+    // 2 sps → rad/sym = 2 × rad/sample; squared so divide by 2 → cancels.
+    // Net: omega_per_sym = rad_per_sample.
+    // Sign convention: worker multiplies burst by exp(+j·omega/2·n).
+    // The burst's carrier offset is encoded as exp(+j·Δω/2·n), so to
+    // CANCEL it the per-sample advance must be exp(-j·Δω/2·n) — i.e.,
+    // the returned omega_per_sym must be -Δω. The squared FFT finds
+    // +Δω, so we negate. (The earlier two-half method already had the
+    // negation baked in via the conj order in h2·conj(h1).)
+    float omega = -rad_per_sample;
+    if (omega >  1.5f) omega =  1.5f;
+    if (omega < -1.5f) omega = -1.5f;
+    return omega;
+}
 
 // UW patterns from iridium.h (IR_UW_DL / IR_UW_UL) mapped to {+1, -1}
 // on the BPSK +1+j / -1-j axis. We store just the sign because both I
@@ -181,31 +325,36 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         out_result->peak_im = best_ul_im;
     }
 
-    // Two-half phase difference → residual carrier omega estimate.
-    // Compute correlations of the first 6 UW symbols and the last 6
-    // separately at the winning offset. If the burst has a residual
-    // freq offset Δω rad/sym, half2/half1 ≈ exp(j·Δω·6). The angle
-    // of that ratio divided by 6 gives Δω. This is much finer than
-    // the freq_estimator's ~5 kHz/bin FFT resolution, because the
-    // UW correlator's effective freq bin is 1/(12·T) ≈ 2 kHz.
+    // CFO estimate over the UW region. Two methods explored:
+    //   (a) Two-half phase difference: h2·conj(h1)/(6·T_sym).
+    //       Coarse (~4 kHz resolution at 25 ksym/s) but averages 6
+    //       symbols' worth of signal per half → robust at SNR ≥ 7 dB.
+    //   (b) gr-iridium square-then-FFT: 24-sample squared UW into a
+    //       64-pt FFT, parabolic peak interp. Theoretically finer
+    //       (~100 Hz) but at SNR 7-9 dB with only 24 samples the FFT
+    //       picks a noise spike, producing wildly over-corrected
+    //       omega values (often ±1.5 rad/sym, clamped). gr-iridium
+    //       uses preamble + UW (~28 syms × oversample) — we don't
+    //       have that much guaranteed BPSK upstream of the UW yet.
+    // Production path: (a). See cfo_fine_estimate() for the FFT code
+    // (kept dormant; re-enable once we have larger BPSK window).
     {
-        const int8_t *sign = (dir == UW_DIR_DOWNLINK) ? UW_DL_SIGN : UW_UL_SIGN;
+        const int8_t *sign_uw = (dir == UW_DIR_DOWNLINK) ? UW_DL_SIGN : UW_UL_SIGN;
         float h1_re = 0, h1_im = 0, h2_re = 0, h2_im = 0;
         for (int i = 0; i < UW_LENGTH; i++) {
             int idx = (peak_k + i * SYM_STRIDE) * 2;
             int br = burst_2sps[idx + 0];
             int bi = burst_2sps[idx + 1];
-            int s  = sign[i];
+            int s  = sign_uw[i];
             float cr = s * (br + bi);
             float ci = s * (br - bi);
             if (i < UW_LENGTH / 2) { h1_re += cr; h1_im += ci; }
             else                    { h2_re += cr; h2_im += ci; }
         }
-        // ratio = h2 * conj(h1), angle = atan2(im, re), normalised by
-        // 6 symbol periods (midpoint-to-midpoint of the two halves).
         float r_re = h2_re * h1_re + h2_im * h1_im;
         float r_im = h2_im * h1_re - h2_re * h1_im;
         float ang = atan2f(r_im, r_re);
         out_result->omega_per_sym = ang / (float)(UW_LENGTH / 2);
     }
+    (void)cfo_fine_estimate;   // suppress unused warning until re-enabled
 }
