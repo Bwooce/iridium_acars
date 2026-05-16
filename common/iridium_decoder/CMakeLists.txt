@@ -24,6 +24,12 @@ idf_component_register(
         # Phase D7: polyphase FFT channelizer (front-end multi-burst separation).
         "polyphase_channelizer.c"
         "channelizer_detector.c"
+        # D20 step 3: PIE/SIMD polyphase MAC kernel — SCAFFOLD ONLY.
+        # The .S body is currently a `ret`-only stub (see file header
+        # for the spec and sub-task breakdown). Building it here so the
+        # symbol is in place for the eventual caller; the symbol is not
+        # called from production code yet.
+        "polyphase_mac_arp4.S"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board
@@ -31,5 +37,8 @@ idf_component_register(
     # decoder for free.
     REQUIRES libacars_idf
     # frame_queue uses heap_caps_calloc with MALLOC_CAP_SPIRAM.
-    PRIV_REQUIRES esp_mm
+    # polyphase_channelizer.c (D20 step 2) calls dsps_fft2r_fc32_arp4
+    # on target; gated by #ifdef ESP_PLATFORM so it does not affect
+    # host unit-test builds.
+    PRIV_REQUIRES esp_mm espressif__esp-dsp
 )

@@ -400,6 +400,49 @@ bring this down 5-10×.
 **Stop condition:** detector keeps up at 2.56 MSPS with ≥40% Core 0
 idle headroom for the rest of the pipeline.
 
+**Progress, as of D7 Phase 3 + D20 step 1 + step 2 on hardware:**
+
+| Step | Status | DSP cost / frame (2048 samples) | Throughput |
+|---|---|---|---|
+| Baseline (first hardware run) | Reference | n/a (quiet log) | 320 ksps (12.5% RT) |
+| D20 step 1: cached twiddles, mask-not-mod, N=8 unroll | ✅ DONE | 1681 µs | 1150 ksps (45% RT) |
+| D20 step 2: `dsps_fft2r_fc32_arp4` for the 64-pt FFT | ✅ DONE | 1562 µs (–7%) | 1230 ksps (48% RT) |
+| D20 step 3: PIE int16 polyphase MAC | ⏳ scaffold landed | (target ≤800 µs = real-time) | (target ≥2.56 MSPS) |
+| D20 step 4: int16 Q15 throughout (skip int16→float) | not started | | |
+| D20 step 5: cross-channel percentile in PIE | not started | | |
+
+Real-time budget is 800 µs per 2048-sample frame (2048 / 2.56 MSPS).
+Steps 1+2 closed ~7% of the gap; the polyphase MAC dominates what
+remains (~50% of the 1562 µs total).
+
+**D20 step 3 — sub-task breakdown** (entry point:
+`common/iridium_decoder/polyphase_mac_arp4.S`, scaffold + algorithm
+spec + register map already in-tree; symbol stub-only):
+
+1. **Int16 caller in C.** Add `polyphase_channelizer_process_int16`
+   to `polyphase_channelizer.c`. Quantise the float prototype to Q15
+   at create-time. Validate Q15 output against the float path on
+   host (allow tolerance; bit-equal is not expected). Choose delay-
+   line discipline (rotate writes vs head-rotated reads — currently
+   recommending rotate writes so the asm reads linearly).
+2. **Scalar C reference.** `polyphase_mac_arp4_ref` — pure C
+   implementation of the same kernel, 4-phase parallel in the same
+   layout the asm will use. Compare bit-for-bit against the
+   straight 64-phase unrolled scalar. Becomes the host fallback +
+   the asm validation baseline.
+3. **PIE asm, incremental.**
+   - 3a. 1-phase-per-qacc-round PIE (slower, simpler, bit-equal to
+     reference; this is the "make it work" milestone).
+   - 3b. 4-phase parallel via `vunzip.16` (the design described in
+     the .S file header).
+   - 3c. Wrap the 16 qacc rounds in `esp.lp.setup` for zero-overhead
+     loop. End state should be `≤64 PIE ops` per channelizer cycle.
+4. **Wire into `polyphase_channelizer_process_int16` on target only**
+   (ifdef ESP_PLATFORM). Host build keeps scalar reference.
+5. **Re-measure on hardware.** Compare to the 1562 µs/frame baseline
+   above. Stop if real-time + 40% headroom achieved; otherwise
+   continue to step 4 (int16 throughout) and step 5 (PIE percentile).
+
 Combined effort estimate: D7-D14 ≈ 3 weeks of focused work to close the
 "correctness on real RF" gap. D15-D19 ≈ 2 weeks of "deployment / nice-
 to-haves". The first batch is what's required to actually decode ACARS

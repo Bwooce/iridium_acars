@@ -13,6 +13,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef ESP_PLATFORM
+#include "dsps_fft2r.h"
+#include "esp_log.h"
+static bool s_dsps_fft64_inited = false;
+static void init_dsps_fft64_once(void)
+{
+    if (s_dsps_fft64_inited) return;
+    // esp-dsp keeps a per-N twiddle table internal to the library;
+    // init for N=64 is one-shot and shared across any future N=64
+    // callers in the binary.
+    esp_err_t err = dsps_fft2r_init_fc32(NULL, 64);
+    if (err == ESP_OK) {
+        s_dsps_fft64_inited = true;
+    } else {
+        ESP_LOGW("POLYCH", "dsps_fft2r_init_fc32(64) failed: %d — "
+                            "falling back to hand-rolled FFT", err);
+    }
+}
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -55,14 +75,28 @@ static void init_fft_twiddles(void)
     s_fft_twiddles_inited = true;
 }
 
-// FFT for the channelizer (M=64). Direct radix-2 Cooley-Tukey,
-// in-place, no scaling. Bit-reversal permutation up front.
-//
-// We don't use esp-dsp here because we want the channelizer host-buildable
-// (for unit tests) and the M=64 case is small enough that a hand-rolled
-// FFT is faster than the function-call overhead of the IDF version.
+// FFT for the channelizer (M=64). On target we hand off to esp-dsp's
+// PIE/LP-setup-accelerated kernel; on host we keep the hand-rolled
+// radix-2 (no esp-dsp dependency for unit tests).
 static void fft_64(float complex *x)
 {
+#ifdef ESP_PLATFORM
+    // dsps_fft2r_fc32_arp4 operates on interleaved float pairs
+    // (Re, Im, Re, Im, ...) which is exactly the layout of
+    // float complex on glibc/gcc; cast through (float *). The
+    // routine wraps esp.lp.setup zero-overhead loop + scalar
+    // fmadd.s — the "arp4" suffix is loop-overhead removal, NOT
+    // PIE vectorisation (P4 PIE is integer-only; float FFT
+    // remains scalar there). Bit reversal is a separate ANSI
+    // call; the PIE/LP machinery doesn't apply to it.
+    if (s_dsps_fft64_inited) {
+        dsps_fft2r_fc32_arp4((float *)x, 64);
+        dsps_bit_rev_fc32_ansi((float *)x, 64);
+        return;
+    }
+    // Fall through to the hand-rolled implementation if init
+    // failed for any reason.
+#endif
     // Bit-reversal permutation (M = 64 = 2^6, so reverse 6 bits).
     static const uint8_t br[64] = {
          0, 32, 16, 48,  8, 40, 24, 56,  4, 36, 20, 52, 12, 44, 28, 60,
@@ -149,6 +183,9 @@ polyphase_channelizer_t *polyphase_channelizer_create(uint32_t fs_in_hz)
     build_prototype(ch->h_phase);
     ch->dl_head = 0;
     init_fft_twiddles();
+#ifdef ESP_PLATFORM
+    init_dsps_fft64_once();
+#endif
     return ch;
 }
 
