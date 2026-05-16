@@ -2,6 +2,7 @@
 // Master index for the Albuquerque multi-stripe fixtures.
 #pragma once
 #include <stdint.h>
+#include "channelizer_burst_ref.h"
 #include "fixture_albq_stripe_0.h"
 #include "fixture_albq_stripe_1.h"
 #include "fixture_albq_stripe_2.h"
@@ -14,19 +15,20 @@
 #define ALBQ_NUM_STRIPES 8
 
 typedef struct {
-    const uint8_t   *data;
-    unsigned int     len;
-    uint32_t         center_hz;
-    int              expected_bursts;
+    const uint8_t                 *data;
+    unsigned int                   len;
+    uint32_t                       center_hz;
+    int                            expected_bursts;
+    const channelizer_burst_ref_t *bursts;
 } albq_stripe_t;
 
 static const albq_stripe_t ALBQ_STRIPES[ALBQ_NUM_STRIPES] = {
-    { ALBQ_STRIPE_0_UINT8, ALBQ_STRIPE_0_UINT8_LEN, 1617000000u, 2 },
-    { ALBQ_STRIPE_1_UINT8, ALBQ_STRIPE_1_UINT8_LEN, 1618280000u, 3 },
-    { ALBQ_STRIPE_2_UINT8, ALBQ_STRIPE_2_UINT8_LEN, 1619560000u, 1 },
-    { ALBQ_STRIPE_3_UINT8, ALBQ_STRIPE_3_UINT8_LEN, 1620840000u, 0 },
-    { ALBQ_STRIPE_4_UINT8, ALBQ_STRIPE_4_UINT8_LEN, 1622120000u, 0 },
-    { ALBQ_STRIPE_5_UINT8, ALBQ_STRIPE_5_UINT8_LEN, 1623400000u, 0 },
-    { ALBQ_STRIPE_6_UINT8, ALBQ_STRIPE_6_UINT8_LEN, 1624680000u, 5 },
-    { ALBQ_STRIPE_7_UINT8, ALBQ_STRIPE_7_UINT8_LEN, 1625960000u, 5 },
+    { ALBQ_STRIPE_0_UINT8, ALBQ_STRIPE_0_UINT8_LEN, 1617000000u, 2, ALBQ_STRIPE_0_BURSTS },
+    { ALBQ_STRIPE_1_UINT8, ALBQ_STRIPE_1_UINT8_LEN, 1618280000u, 3, ALBQ_STRIPE_1_BURSTS },
+    { ALBQ_STRIPE_2_UINT8, ALBQ_STRIPE_2_UINT8_LEN, 1619560000u, 1, ALBQ_STRIPE_2_BURSTS },
+    { ALBQ_STRIPE_3_UINT8, ALBQ_STRIPE_3_UINT8_LEN, 1620840000u, 0, ALBQ_STRIPE_3_BURSTS },
+    { ALBQ_STRIPE_4_UINT8, ALBQ_STRIPE_4_UINT8_LEN, 1622120000u, 0, ALBQ_STRIPE_4_BURSTS },
+    { ALBQ_STRIPE_5_UINT8, ALBQ_STRIPE_5_UINT8_LEN, 1623400000u, 0, ALBQ_STRIPE_5_BURSTS },
+    { ALBQ_STRIPE_6_UINT8, ALBQ_STRIPE_6_UINT8_LEN, 1624680000u, 5, ALBQ_STRIPE_6_BURSTS },
+    { ALBQ_STRIPE_7_UINT8, ALBQ_STRIPE_7_UINT8_LEN, 1625960000u, 5, ALBQ_STRIPE_7_BURSTS },
 };

@@ -23,6 +23,7 @@ idf_component_register(
         "sbd_reassembler.c"
         # Phase D7: polyphase FFT channelizer (front-end multi-burst separation).
         "polyphase_channelizer.c"
+        "channelizer_detector.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board

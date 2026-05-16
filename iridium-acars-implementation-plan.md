@@ -315,9 +315,90 @@ them. Tracked in TODOs D7-D11.
 | D17 | ESP32-C6 Wi-Fi/Thread output | Currently decoded ACARS only goes to ESP_LOGI on serial. Production rooftop node needs Wi-Fi/Thread → MQTT or JSON-over-TCP. Design doc specifies the C6 (already on board) for this. | 5-7 days | #36 |
 | D18 | NVS-backed runtime config | LO/sample rate/station ID hardcoded. Field deployment needs runtime-configurable values without re-flashing. | 2 days | #37 |
 | D19 | OTA firmware updates | Single factory partition; field updates need physical USB. Switch to two_ota or factory+ota_0 layout for esp_https_ota. | 2 days | #38 |
+| D20 | Channelizer-detector PIE/SIMD optimisation | Host-side correctness landed in pure float; on the P4 the malloc-free path will be borderline at 2.56 MSPS without the kind of PIE-assembly treatment dsp_window_arp4.S / dsp_mag_arp4.S got for the legacy detector. Detail in §"D20 — Channelizer-detector optimisation roadmap" below. | 5-8 days, expected ~10-15% one core after | (new) |
 
 Combined CPU budget for the DSP gaps (D7-D11): ~20-25% of one P4 core.
 Easily within the existing 60% Core 0 headroom.
+
+### D20 — Channelizer-detector optimisation roadmap
+
+The D7 channelizer + per-channel detector work is correctness-first: it
+runs in pure scalar float complex on the host and target. That gets us
+to 9/9 host tests passing across simulated PRBS and real-RF Albuquerque
+fixtures at multiple LOs. It will **not** be fast enough on the P4 at
+2.56 MSPS without further work. This TODO captures the optimisation
+plan so we don't lose it; do **not** start before:
+  1. Worker-chain integration is done (channelizer_detector wired into
+     dsp_processor in place of the single-FFT path).
+  2. We've measured actual hardware cost on the P4 with the live SDR
+     feed — we want to know which stage is the bottleneck, not guess.
+
+**Cost breakdown (estimates, scalar float on P4 @ 360 MHz):**
+
+| Stage | Per-cycle cost | Cycles/s | Mflops |
+|---|---|---|---|
+| int16 → float complex | 64 muls + 64 adds | 40 000 | ~5 |
+| Polyphase filter | 8 taps × 64 phases × cmplx mul-acc = 1024 flops | 40 000 | ~40 |
+| 64-pt radix-2 FFT (hand-rolled) | ~600 flops | 40 000 | ~25 |
+| Per-cycle power + percentile + threshold | ~250 ops | 40 000 | ~10 |
+| **Total** | | | **~80** |
+
+Scalar float on the P4 lands ~50-100 Mflops, so we'd be running at
+~80% of one core just for the detector. Tight. PIE / esp-dsp can
+bring this down 5-10×.
+
+**Optimisation steps, in priority order:**
+
+1. **Eliminate per-feed malloc (DONE).** `channelizer_detector_create()`
+   pre-allocates `in_buf` (8192 cf32) + `out_buf` (128 × 64 cf32)
+   once. Verified host-side; carry forward into target.
+
+2. **Replace 64-pt FFT with esp-dsp PIE.** The hand-rolled radix-2
+   `fft_64()` in `polyphase_channelizer.c` is portable scalar float.
+   esp-dsp's `dsps_fft2r_fc32_aes3` (Anyfft P4) hits ~3-4× scalar.
+   For an N=64 FFT this is borderline — fixed twiddles + small N
+   means cache effects dominate. Measure first. Likely: use
+   esp-dsp's sc16 FFT after converting to int16 cmplx (frees up
+   PIE for the polyphase filter too).
+
+3. **Polyphase filter as PIE kernel.** The inner loop is
+   8-tap × M=64 channels × cmplx-FIR per cycle. The pattern is
+   identical to the windowing kernel in `dsp_window_arp4.S` —
+   8-lane Q15 multiply-accumulate. Expected 5-10× speedup over
+   scalar float. This is the single biggest win.
+
+4. **int16 fixed-point throughout the channelizer.** Float complex
+   is convenient for prototyping but the P4 has no FPU SIMD; PIE
+   only operates on int8/int16 vectors. Quantise the prototype
+   filter taps to Q15, run the polyphase + FFT in int16 cmplx,
+   convert to power as uint32. Same precision in practice (Iridium
+   bursts are 12-15 dB SNR, well above quantisation noise floor).
+
+5. **Cross-channel percentile in PIE.** Per-cycle 16th-of-64
+   selection isn't a textbook PIE kernel but two passes of
+   8-lane parallel-min (find min, mask it, find next min, etc.)
+   to the 16th rank — ~16 PIE iterations. Or: skip percentile
+   entirely and use a fixed noise-floor (calibrated at boot from
+   a quiet 50 ms sample). Lower priority once 1-4 are done.
+
+6. **Per-burst log10f → fixed-point.** SNR_dB is computed at
+   burst-end with `log10f(power / floor)`. Once per burst, not
+   hot-path. Leave as float.
+
+**What we explicitly are NOT doing:**
+
+- Threading the channelizer onto Core 1 — Core 1 is already used
+  by the DQPSK demod / frame_decoder pipeline. Adding the
+  channelizer there ruins the producer/consumer split.
+- Reducing M from 64. 64 channels at 40 kHz × M = 2.56 MHz
+  matches our channel-spacing target (Iridium uses 41.667 kHz
+  spacing, so 40 kHz channels overlap somewhat — close enough).
+  Going to M=32 (80 kHz channels) makes adjacent-channel rejection
+  insufficient and breaks the "burst centre is ≤20 kHz from
+  channel centre" guarantee that drives D8's PLL-friendliness.
+
+**Stop condition:** detector keeps up at 2.56 MSPS with ≥40% Core 0
+idle headroom for the rest of the pipeline.
 
 Combined effort estimate: D7-D14 ≈ 3 weeks of focused work to close the
 "correctness on real RF" gap. D15-D19 ≈ 2 weeks of "deployment / nice-

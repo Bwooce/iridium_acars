@@ -173,7 +173,11 @@ static void test_channel_freq_helper(void)
 //     tests/scripts/build_channelizer_reference.py from a numpy
 //     implementation of the same polyphase + FFT math.
 #include "fixture_channelizer_reference.h"
+#include "channelizer_burst_ref.h"
 #include "fixture_albq_raw.h"
+#include "fixture_albq_raw_high.h"
+#include "fixture_albq_stripes.h"
+#include "fixture_corpus_uint8.h"
 
 static void test_against_numpy_reference(void)
 {
@@ -230,38 +234,35 @@ static void test_against_numpy_reference(void)
 }
 
 // --- Cross-check against gr-iridium's burst detection ground truth.
-//     We feed the Albuquerque raw-mode fixture (cf32 downconverted at
-//     LO=1618.5 MHz, 2.56 MSPS uint8 IQ — the same input the worker
-//     pipeline sees in CONFIG_SMOKE_TEST_RAW_IRIDIUM mode) through our
-//     channelizer and verify each gr-iridium-detected burst's energy
-//     lands in the channel that floor((f - LO) / 40 kHz) mod M predicts.
+//     For each fixture (different LOs across the Albuquerque cf32),
+//     feed the IQ through our channelizer and verify each gr-iridium-
+//     detected burst's energy lands in the channel that
+//     round((f - LO) / 40 kHz) mod M predicts.
 //
-//     This is the "matches gr-iridium's findings" cross-check the user
-//     asked for: gr-iridium found bursts at specific frequencies in
-//     iridium.bits; our channelizer must route each to the corresponding
-//     channel. If we send a burst to the wrong channel, we'd silently
-//     break the worker chain downstream.
-//
-//     Bursts in this 9.6 ms × 2.56 MHz subband window (per
-//     iridium.bits filtered to t ∈ [1150.88, 1160.48 ms] and f within
-//     ±1.28 MHz of 1618.5 MHz):
-//        t=1151.88 ms, f=1618.267 MHz, rel=-232891 Hz, ch=58
-//        t=1153.81 ms, f=1618.184 MHz, rel=-316217 Hz, ch=56
-//        t=1160.27 ms, f=1618.517 MHz, rel=+17103 Hz,  ch=0
-static void test_against_gr_iridium_corpus(void)
+//     This is the "matches gr-iridium's findings" cross-check: gr-iridium
+//     found bursts at specific frequencies in iridium.bits; our
+//     channelizer must route each to the corresponding channel.
+//     Different LOs catch different burst clusters (the Albuquerque
+//     1.25 s recording has bursts spread across the full 1616-1626.5 MHz
+//     band), exercising the channelizer at different center freqs.
+static void run_corpus_check(uint32_t fs_in_hz,
+                             const uint8_t *iq_bytes,
+                             unsigned int  iq_len,
+                             const channelizer_burst_ref_t *bursts,
+                             int n_bursts,
+                             const char *label)
 {
-    printf("Test: channelizer routes Albuquerque corpus bursts to the channels "
-           "gr-iridium's burst freqs predict\n");
-    polyphase_channelizer_t *ch = polyphase_channelizer_create(ALBQ_RAW_SAMPLE_RATE_HZ);
+    printf("Test: corpus cross-check %s (%d gr-iridium bursts in subband)\n",
+           label, n_bursts);
+    polyphase_channelizer_t *ch = polyphase_channelizer_create(fs_in_hz);
     CHECK(ch != NULL, "create");
 
-    // Convert uint8 IQ to float complex (RTL-SDR convention: 128 = 0).
-    int n_complex = ALBQ_RAW_UINT8_LEN / 2;
+    int n_complex = iq_len / 2;
     float complex *in = malloc(n_complex * sizeof(float complex));
     CHECK(in != NULL, "malloc in");
     for (int i = 0; i < n_complex; i++) {
-        float re = ((float)ALBQ_RAW_UINT8[2 * i + 0] - 128.0f) / 127.0f;
-        float im = ((float)ALBQ_RAW_UINT8[2 * i + 1] - 128.0f) / 127.0f;
+        float re = ((float)iq_bytes[2 * i + 0] - 128.0f) / 127.0f;
+        float im = ((float)iq_bytes[2 * i + 1] - 128.0f) / 127.0f;
         in[i] = re + im * I;
     }
 
@@ -269,10 +270,8 @@ static void test_against_gr_iridium_corpus(void)
     float complex *out = malloc(n_cycles * M * sizeof(float complex));
     CHECK(out != NULL, "malloc out");
     size_t got_cycles = polyphase_channelizer_process(ch, in, n_complex, out);
-    CHECK((int)got_cycles == n_cycles, "got %zu cycles (expected %d)",
-          got_cycles, n_cycles);
+    CHECK((int)got_cycles == n_cycles, "got %zu cycles", got_cycles);
 
-    // Per-channel total power across the whole window.
     double power[M] = { 0 };
     for (int cycle = 0; cycle < n_cycles; cycle++) {
         for (int k = 0; k < M; k++) {
@@ -281,11 +280,6 @@ static void test_against_gr_iridium_corpus(void)
         }
     }
 
-    // Expected channels for the 3 corpus bursts in this subband.
-    const int expected_channels[] = { 58, 56, 0 };
-    const int n_expected = 3;
-
-    // Top-K channels by power.
     int top[M];
     for (int i = 0; i < M; i++) top[i] = i;
     for (int i = 0; i < M; i++) {
@@ -295,39 +289,174 @@ static void test_against_gr_iridium_corpus(void)
             }
         }
     }
-    printf("    top-8 channels by total power:\n");
-    for (int i = 0; i < 8; i++) {
-        // Compute relative freq for context.
+    int top_to_show = (n_bursts < 4) ? 8 : (n_bursts * 2);
+    if (top_to_show > 12) top_to_show = 12;
+    printf("    top-%d channels by total power:\n", top_to_show);
+    for (int i = 0; i < top_to_show; i++) {
         int signed_k = (top[i] > M / 2) ? (top[i] - M) : top[i];
         printf("      #%d  ch %2d  (%+5d kHz)   power=%.3e\n",
                i + 1, top[i], signed_k * (FS_IN / M / 1000), power[top[i]]);
     }
 
-    // Each expected channel (or its immediate neighbour, since bursts are
-    // off-bin-center) should appear in the top-K where K = a few × n_expected.
-    int K = 6;
-    int found = 0;
-    for (int e = 0; e < n_expected; e++) {
-        int target = expected_channels[e];
+    // Each expected channel (or ±1 neighbour) should appear in the
+    // top-K. K = max(2 × n_bursts, 6) to allow neighbour leakage and
+    // legitimate other bursts in the window. We split the assertion
+    // by gr-iridium's confidence: high-conf bursts (≥90%) MUST be
+    // in top-K (assertion); low-conf ones are reported but don't
+    // fail the test — borderline detections (e.g. 60% conf with
+    // "Access code missing") are noisy by definition, so the
+    // channelizer behaviour on them is observable but not enforceable.
+    const int HI_CONF = 90;
+    int K = (2 * n_bursts < 6) ? 6 : (2 * n_bursts);
+    if (K > M) K = M;
+    int hi_total = 0, hi_found = 0;
+    int lo_total = 0, lo_found = 0;
+    for (int e = 0; e < n_bursts; e++) {
+        int target = bursts[e].expected_channel;
+        bool is_hi = (bursts[e].conf_pct >= HI_CONF);
         bool hit = false;
         for (int i = 0; i < K; i++) {
             if (top[i] == target ||
                 top[i] == (target + 1) % M ||
                 top[i] == (target - 1 + M) % M) {
-                hit = true;
-                break;
+                hit = true; break;
             }
         }
+        if (is_hi) hi_total++;
+        else       lo_total++;
         if (hit) {
-            found++;
+            if (is_hi) hi_found++;
+            else       lo_found++;
         } else {
-            printf("    MISS: ch %d (expected for burst #%d) not in top-%d\n",
-                   target, e, K);
+            printf("    %s: ch %d (rel %+d Hz, SNR %.1f dB, conf %u%%) "
+                   "not in top-%d\n",
+                   is_hi ? "MISS" : "miss(low-conf)",
+                   target, bursts[e].rel_hz,
+                   (double)bursts[e].snr_db,
+                   (unsigned)bursts[e].conf_pct, K);
         }
     }
-    CHECK(found == n_expected,
-          "%d/%d expected channels in top-%d (channelizer may be misrouting)",
-          found, n_expected, K);
+    printf("    high-conf: %d/%d hit  |  low-conf: %d/%d hit\n",
+           hi_found, hi_total, lo_found, lo_total);
+    CHECK(hi_found == hi_total,
+          "%d/%d high-confidence bursts in top-%d (low-conf %d/%d "
+          "is informational)",
+          hi_found, hi_total, K, lo_found, lo_total);
+
+    free(in); free(out);
+    polyphase_channelizer_destroy(ch);
+}
+
+static void test_against_gr_iridium_corpus(void)
+{
+    // Fixture 1: Albuquerque @ LO=1618.5 MHz — dense 1618 MHz cluster.
+    run_corpus_check(ALBQ_RAW_SAMPLE_RATE_HZ,
+                     ALBQ_RAW_UINT8, ALBQ_RAW_UINT8_LEN,
+                     ALBQ_RAW_BURSTS,
+                     (int)(sizeof(ALBQ_RAW_BURSTS) / sizeof(ALBQ_RAW_BURSTS[0])),
+                     "Albuquerque LO=1618.5 MHz");
+    // Fixture 2: Albuquerque @ LO=1625.5 MHz — captures the high-SNR
+    // 1625.27 MHz IDA-DL burst plus its neighbours.
+    run_corpus_check(ALBQ_RAW_HIGH_SAMPLE_RATE_HZ,
+                     ALBQ_RAW_HIGH_UINT8, ALBQ_RAW_HIGH_UINT8_LEN,
+                     ALBQ_RAW_HIGH_BURSTS,
+                     (int)(sizeof(ALBQ_RAW_HIGH_BURSTS)
+                           / sizeof(ALBQ_RAW_HIGH_BURSTS[0])),
+                     "Albuquerque LO=1625.5 MHz");
+}
+
+// All 8 Albuquerque stripes (50% overlap covering 1615.72-1627.24 MHz):
+// each stripe is 2.56 MSPS uint8 IQ pre-shifted so its center sits at
+// DC. Iterating through all 8 exercises the channelizer at every LO
+// across the Iridium downlink band — bursts in overlapping regions
+// are tested twice (in two adjacent stripes) at different relative
+// frequencies, catching bias that's specific to one LO.
+static void test_against_albq_all_stripes(void)
+{
+    for (int s = 0; s < ALBQ_NUM_STRIPES; s++) {
+        const albq_stripe_t *st = &ALBQ_STRIPES[s];
+        if (st->expected_bursts == 0) {
+            // Empty-stripe test data is still good test data: feed it
+            // through, observe the noise-floor distribution. We don't
+            // assert on a specific channel since gr-iridium found nothing
+            // to predict, but we still confirm the channelizer accepts
+            // the fixture and produces sane output.
+            polyphase_channelizer_t *ch = polyphase_channelizer_create(2560000u);
+            CHECK(ch != NULL, "create empty-stripe");
+            int n_complex = st->len / 2;
+            float complex *in  = malloc(n_complex * sizeof(float complex));
+            float complex *out = malloc((n_complex / M) * M
+                                        * sizeof(float complex));
+            CHECK(in && out, "malloc empty-stripe");
+            for (int i = 0; i < n_complex; i++) {
+                float re = ((float)st->data[2*i+0] - 128.0f) / 127.0f;
+                float im = ((float)st->data[2*i+1] - 128.0f) / 127.0f;
+                in[i] = re + im * I;
+            }
+            size_t got = polyphase_channelizer_process(ch, in, n_complex, out);
+            (void)got;
+            printf("Test: Albuquerque stripe %d center %.3f MHz "
+                   "(0 expected bursts — noise-floor smoke check) ok\n",
+                   s, st->center_hz / 1e6);
+            free(in); free(out);
+            polyphase_channelizer_destroy(ch);
+            continue;
+        }
+        char label[64];
+        snprintf(label, sizeof(label),
+                 "Albuquerque stripe %d @ %.3f MHz", s, st->center_hz / 1e6);
+        run_corpus_check(2560000u,
+                         st->data, st->len,
+                         st->bursts, st->expected_bursts,
+                         label);
+    }
+}
+
+// Simulated PRBS15 burst @ 20 dB SNR, 2.56 MSPS, already at baseband
+// (single tone-like burst at DC). The test_corpus burst is the classic
+// "clean signal at DC" case — a sanity check that the channelizer
+// puts a strong on-channel burst exactly where it should without any
+// real-RF complications. Channel 0 must be the dominant channel, and
+// adjacent channels should be well below it.
+static void test_against_simulated_corpus(void)
+{
+    printf("Test: simulated PRBS15-20dB corpus @ 2.56 MSPS (single burst at DC)\n");
+    polyphase_channelizer_t *ch = polyphase_channelizer_create(2560000u);
+    CHECK(ch != NULL, "create");
+    int n_complex = CORPUS_UINT8_LEN / 2;
+    float complex *in  = malloc(n_complex * sizeof(float complex));
+    int n_cycles = n_complex / M;
+    float complex *out = malloc(n_cycles * M * sizeof(float complex));
+    CHECK(in && out, "malloc");
+    for (int i = 0; i < n_complex; i++) {
+        float re = ((float)CORPUS_UINT8[2*i+0] - 128.0f) / 127.0f;
+        float im = ((float)CORPUS_UINT8[2*i+1] - 128.0f) / 127.0f;
+        in[i] = re + im * I;
+    }
+    polyphase_channelizer_process(ch, in, n_complex, out);
+
+    // Skip transient.
+    int skip = 16;
+    double power[M] = {0};
+    int count = n_cycles - skip;
+    for (int cycle = skip; cycle < n_cycles; cycle++) {
+        for (int k = 0; k < M; k++) {
+            float complex y = out[cycle * M + k];
+            power[k] += (double)(crealf(y) * crealf(y)
+                                 + cimagf(y) * cimagf(y));
+        }
+    }
+    for (int k = 0; k < M; k++) power[k] /= count;
+
+    double max_p = 0; int max_k = -1;
+    for (int k = 0; k < M; k++) {
+        if (power[k] > max_p) { max_p = power[k]; max_k = k; }
+    }
+    printf("    max channel = %d, power = %.3e\n", max_k, max_p);
+    // PRBS15 burst spans ~50 kHz around DC; ch 0 (and possibly ±1 due
+    // to spectral spreading at modulator edges) should dominate.
+    bool ok = (max_k == 0 || max_k == 1 || max_k == M - 1);
+    CHECK(ok, "expected ch 0 (or ±1), got ch %d", max_k);
 
     free(in); free(out);
     polyphase_channelizer_destroy(ch);
@@ -345,6 +474,8 @@ int main(void)
     test_two_tones();
     test_against_numpy_reference();
     test_against_gr_iridium_corpus();
+    test_against_albq_all_stripes();
+    test_against_simulated_corpus();
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;

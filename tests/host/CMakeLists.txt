@@ -137,6 +137,26 @@ target_include_directories(test_polyphase_channelizer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 target_link_libraries(test_polyphase_channelizer PRIVATE m)
+# Silence -Wunused-but-set-variable for the tone-construction helpers
+# (we set up phase but only use it for the cumulative phasor advance).
+target_compile_options(test_polyphase_channelizer PRIVATE
+    -Wno-unused-but-set-variable
+)
+
+# Phase D7 part 2: channelizer-driven burst detector (replaces the
+# single-FFT detector in dsp_processor). Validates the full detection
+# pipeline on the same fixtures used for the bare channelizer.
+add_executable(test_channelizer_detector
+    test_channelizer_detector.c
+    ${COMMON_DIR}/polyphase_channelizer.c
+    ${COMMON_DIR}/channelizer_detector.c
+)
+target_include_directories(test_channelizer_detector PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_channelizer_detector PRIVATE m)
 
 # test_libacars_link — smoke test that the same minimum source-set the
 # IDF component (common/libacars_idf/) compiles also links + runs on a
@@ -197,4 +217,5 @@ add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME polyphase_channelizer COMMAND test_polyphase_channelizer)
+add_test(NAME channelizer_detector  COMMAND test_channelizer_detector)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
