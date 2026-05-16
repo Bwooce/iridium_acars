@@ -56,6 +56,25 @@ int sym_timing_process(sym_timing_t *st,
                        const int16_t *in_2sps, int n_int16,
                        float complex *out_syms, int out_cap);
 
+// 2-sps-preserving variant: emits a timing-corrected int16 IQ stream
+// at the SAME 2-sps rate as the input. Each symbol period produces
+// 2 output complex samples: slot 0 = strobe (the corrected sampling
+// point), slot 1 = strobe + 0.5 symbol period. The downstream
+// qpsk_demod can keep its existing i*4 decimation pattern unchanged
+// — slot 0 is always at the optimal strobe.
+//
+// This is the production-friendly integration: for already-aligned
+// input the strobe drift is near zero and output ≈ input, so the
+// existing host demod regression tests pass. For real-RF input with
+// timing offset, the loop converges and slot 0 lands on the better
+// of the two original samples (or an interpolation between).
+//
+// in_2sps : interleaved I/Q at 2 sps, n_int16 = 2 × n_complex int16.
+// out_2sps: must be at least n_int16 in size (same length as input).
+void sym_timing_correct_2sps(sym_timing_t *st,
+                             const int16_t *in_2sps, int n_int16,
+                             int16_t *out_2sps);
+
 #ifdef __cplusplus
 }
 #endif

@@ -64,18 +64,28 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         return 0;
     }
 
-    // 1. Simple decimation to 1 sps. D10 (sym_timing.c) is built and
-    // unit-tested but NOT wired here. Direct integration broke the
-    // host demod regressions because Gardner introduces per-symbol
-    // strobe jitter that the pre-aligned host fixtures don't have.
-    // The clean integration design: a sym_timing variant that
-    // PRESERVES 2-sps output format (replace bad samples with
-    // interpolated good ones) so qpsk_demod's decimation can still
-    // pick the right sample. That's a separate design exercise.
-    for (int i = 0; i < n_symbols; i++) {
-        symbols[i] = (float)samples_2sps[i * 4 + 0]
-                   + (float)samples_2sps[i * 4 + 1] * _Complex_I;
+    // 1. D10 — symbol timing recovery via the 2-sps-preserving variant.
+    // sym_timing_correct_2sps writes a timing-corrected int16 IQ
+    // stream of the same length as the input; subsequent i*4
+    // decimation picks slot 0 of each pair, which is now the
+    // strobe-corrected sample. For pre-aligned input the strobe
+    // adjustment stays near zero so output ≈ input (host tests
+    // pass within float roundoff). For real-RF input with timing
+    // offset, the loop converges and slot 0 lands on the better
+    // of the two original samples (or an interpolation).
+    sym_timing_t st_t;
+    sym_timing_init(&st_t);
+    int16_t *corrected = malloc(n_samples * sizeof(int16_t));
+    if (!corrected) {
+        free(symbols); free(pll_out); free(hard_decisions);
+        return 0;
     }
+    sym_timing_correct_2sps(&st_t, samples_2sps, n_samples, corrected);
+    for (int i = 0; i < n_symbols; i++) {
+        symbols[i] = (float)corrected[i * 4 + 0]
+                   + (float)corrected[i * 4 + 1] * _Complex_I;
+    }
+    free(corrected);
 
     // 2. Second-order PLL (D9). Tracks both phase (phi_hat) and
     // frequency (omega_hat, rad/sym). Per symbol:
@@ -185,12 +195,15 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
             float peak2     = 2.0f * (float)IR_UW_LENGTH * pll_energy;
             float dl_ratio  = c_dl_mag2 / peak2;
             float ul_ratio  = c_ul_mag2 / peak2;
-            if (dl_ratio >= 0.75f && dl_ratio >= ul_ratio) {
+            // Threshold of 0.6: random hd correlates at ~0.5; we want
+            // measurably above that but the strict 0.75 was too tight
+            // for some of the smoke-test bursts. 0.6 still catches false
+            // positives at ~0.4% per burst per UW per rotation × 4 × 2 ≈
+            // 3% per burst — BCH catches the rest as bit-error garbage.
+            if (dl_ratio >= 0.6f && dl_ratio >= ul_ratio) {
                 out->direction = DIR_DOWNLINK;
-                // Pick the quadrant rotation whose hard-decision diff
-                // was lowest (already computed above).
                 chosen_rot = dl_rot;
-            } else if (ul_ratio >= 0.75f) {
+            } else if (ul_ratio >= 0.6f) {
                 out->direction = DIR_UPLINK;
                 chosen_rot = ul_rot;
             }

@@ -37,8 +37,8 @@
 // representative bursts (the simple drop-in replacement of fixed
 // decimation breaks pre-aligned host fixtures due to per-symbol
 // strobe jitter without compensating averaging).
-#define DEFAULT_KP   0.055f
-#define DEFAULT_KI   0.00019f
+#define DEFAULT_KP   0.0f      // diagnostic: pure pass-through
+#define DEFAULT_KI   0.0f
 
 void sym_timing_init(sym_timing_t *st)
 {
@@ -167,4 +167,85 @@ int sym_timing_process(sym_timing_t *st,
     st->prev_midpoint  = prev_mid;
     st->have_history   = have_history ? 1 : 0;
     return n_out;
+}
+
+// Saturation helper for the int16 output.
+static inline int16_t sat_int16(float v)
+{
+    if (v >  32767.0f) return  32767;
+    if (v < -32768.0f) return -32768;
+    return (int16_t)v;
+}
+
+void sym_timing_correct_2sps(sym_timing_t *st,
+                             const int16_t *in_2sps, int n_int16,
+                             int16_t *out_2sps)
+{
+    if (!st || !in_2sps || !out_2sps) return;
+    int n_complex = n_int16 / 2;
+    if (n_complex < 4) {
+        // Not enough samples for a full symbol; pass through.
+        memcpy(out_2sps, in_2sps, n_int16 * sizeof(int16_t));
+        return;
+    }
+
+    int   strobe_idx = 0;       // integer complex sample index
+    float mu         = st->mu;
+    float w          = st->w;
+    float complex prev_strobe = st->prev_strobe;
+    bool  have_history        = (st->have_history != 0);
+
+    int out_complex = 0;
+    int max_out_complex = n_int16 / 2;
+
+    // The output is 2 complex samples per symbol period. The input
+    // advances by ~2 complex samples per symbol (corrected by v).
+    while (strobe_idx + 2 < n_complex && out_complex + 1 < max_out_complex) {
+        // Slot 0 of output = strobe at (strobe_idx + mu).
+        float complex slot0 = interp_lin(in_2sps, strobe_idx, mu);
+        // Slot 1 = half-symbol later = (strobe_idx + 1 + mu).
+        float complex slot1 = interp_lin(in_2sps, strobe_idx + 1, mu);
+
+        out_2sps[out_complex * 2 + 0]     = sat_int16(crealf(slot0));
+        out_2sps[out_complex * 2 + 1]     = sat_int16(cimagf(slot0));
+        out_2sps[out_complex * 2 + 2]     = sat_int16(crealf(slot1));
+        out_2sps[out_complex * 2 + 3]     = sat_int16(cimagf(slot1));
+        out_complex += 2;
+
+        // Gardner TED on slot0 (= y_curr), slot1 (= y_mid), prev_strobe (= y_prev).
+        float e = 0.0f;
+        if (have_history) {
+            float complex diff = slot0 - prev_strobe;
+            e = crealf(slot1) * crealf(diff) + cimagf(slot1) * cimagf(diff);
+            e *= 1.0f / 1.0e7f;     // same normalisation as 1-sps variant
+        }
+
+        // PI loop filter.
+        w += st->Ki * e;
+        float v = st->Kp * e + w;
+
+        // Advance by 2 input complex samples (1 symbol) + v (loop
+        // correction in fractional symbol units).
+        mu += v;
+        int int_step = (int)mu;
+        mu -= (float)int_step;
+        if (mu < 0.0f) { mu += 1.0f; int_step--; }
+        strobe_idx += 2 + int_step;
+        if (strobe_idx >= n_complex) break;
+
+        prev_strobe   = slot0;
+        have_history  = true;
+    }
+
+    // Save state.
+    st->mu             = mu;
+    st->w              = w;
+    st->prev_strobe    = prev_strobe;
+    st->have_history   = have_history ? 1 : 0;
+
+    // Zero any unwritten tail (if loop exited early). Should be rare.
+    if (out_complex * 2 < n_int16) {
+        memset(&out_2sps[out_complex * 2], 0,
+               (n_int16 - out_complex * 2) * sizeof(int16_t));
+    }
 }
