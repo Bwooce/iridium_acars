@@ -272,42 +272,50 @@ void worker_task(void *arg)
                                 /*search_complex=*/out_samples_50k - 24,
                                 &uw_res);
             bool demod_ok = false;
-            ESP_LOGI(TAG, "UW corr: dir=%s offset=%d corr=%.3f SNR=%.1f dB peak=%.2e",
+            ESP_LOGI(TAG, "UW corr: dir=%s offset=%d corr=%.3f SNR=%.1f dB peak=%.2e omega=%.3f",
                      uw_res.direction == UW_DIR_DOWNLINK ? "DL" :
                      uw_res.direction == UW_DIR_UPLINK   ? "UL" : "UNKNOWN",
                      uw_res.uw_offset, (double)uw_res.correction,
-                     (double)uw_res.snr_estimate_db, (double)uw_res.peak_value);
+                     (double)uw_res.snr_estimate_db, (double)uw_res.peak_value,
+                     (double)uw_res.omega_per_sym);
             if (uw_res.direction != UW_DIR_UNKNOWN) {
                 int int16_off = uw_res.uw_offset * 2;
-                // Pre-rotate burst by conj(peak / |peak|) so the UW
-                // symbols land at absolute quadrants 0 and 2 — PLL
-                // starts already locked. gr-iridium pattern.
+                // Pre-rotate burst by exp(+j·peak_phase) AND apply a
+                // linear phase ramp to cancel the residual carrier omega
+                // estimated from the UW two-half phase diff. After this,
+                // the PLL starts with both phi and omega near zero.
                 float pmag = sqrtf(uw_res.peak_re * uw_res.peak_re
                                  + uw_res.peak_im * uw_res.peak_im);
                 int n_rot_int16 = total_int16 - int16_off;
                 int16_t *src = demod_interleaved + int16_off;
                 if (pmag > 1e-3f) {
+                    // Constant phase factor (rotates burst back to UW axes).
                     float rot_re =  uw_res.peak_re / pmag;
                     float rot_im =  uw_res.peak_im / pmag;
-                    // Correlator peak_phase = -burst_residual_phase
-                    // (because corr = sum(uw × conj(burst)) carries
-                    // -φ). To un-rotate the burst by φ we multiply
-                    // by exp(+j·peak_phase) = (rot_re + j·rot_im):
-                    //   new_re = re*rot_re - im*rot_im
-                    //   new_im = re*rot_im + im*rot_re
+                    // Per-SAMPLE phase increment = omega_per_sym/2
+                    // (omega is per SYMBOL; burst is at 2 sps). Sign:
+                    // burst has phase -omega·sym_idx encoded; we
+                    // multiply by exp(+j·omega·sym_idx) to undo it.
+                    float dphi = uw_res.omega_per_sym * 0.5f;
+                    float c_step = cosf(dphi);
+                    float s_step = sinf(dphi);
                     int n_cplx = n_rot_int16 / 2;
+                    float pr = rot_re, pi = rot_im;
                     for (int i = 0; i < n_cplx; i++) {
                         float re = (float)src[i * 2 + 0];
                         float im = (float)src[i * 2 + 1];
-                        float nr = re * rot_re - im * rot_im;
-                        float ni = re * rot_im + im * rot_re;
-                        // Saturate back to int16
+                        float nr = re * pr - im * pi;
+                        float ni = re * pi + im * pr;
                         if (nr >  32767.0f) nr =  32767.0f;
                         if (nr < -32768.0f) nr = -32768.0f;
                         if (ni >  32767.0f) ni =  32767.0f;
                         if (ni < -32768.0f) ni = -32768.0f;
                         src[i * 2 + 0] = (int16_t)nr;
                         src[i * 2 + 1] = (int16_t)ni;
+                        // Advance phasor: p ← p · exp(j·dphi)
+                        float npr = pr * c_step - pi * s_step;
+                        float npi = pr * s_step + pi * c_step;
+                        pr = npr; pi = npi;
                     }
                 }
                 // (Gardner symbol-timing recovery is intentionally not

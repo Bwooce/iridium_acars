@@ -59,6 +59,9 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     out_result->direction = UW_DIR_UNKNOWN;
     out_result->snr_estimate_db = 0.0f;
     out_result->peak_value = 0.0f;
+    out_result->peak_re = 0.0f;
+    out_result->peak_im = 0.0f;
+    out_result->omega_per_sym = 0.0f;
 
     int max_k = n_complex - UW_LENGTH * SYM_STRIDE;
     if (max_k <= 0) return;
@@ -176,5 +179,33 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     } else {
         out_result->peak_re = best_ul_re;
         out_result->peak_im = best_ul_im;
+    }
+
+    // Two-half phase difference → residual carrier omega estimate.
+    // Compute correlations of the first 6 UW symbols and the last 6
+    // separately at the winning offset. If the burst has a residual
+    // freq offset Δω rad/sym, half2/half1 ≈ exp(j·Δω·6). The angle
+    // of that ratio divided by 6 gives Δω. This is much finer than
+    // the freq_estimator's ~5 kHz/bin FFT resolution, because the
+    // UW correlator's effective freq bin is 1/(12·T) ≈ 2 kHz.
+    {
+        const int8_t *sign = (dir == UW_DIR_DOWNLINK) ? UW_DL_SIGN : UW_UL_SIGN;
+        float h1_re = 0, h1_im = 0, h2_re = 0, h2_im = 0;
+        for (int i = 0; i < UW_LENGTH; i++) {
+            int idx = (peak_k + i * SYM_STRIDE) * 2;
+            int br = burst_2sps[idx + 0];
+            int bi = burst_2sps[idx + 1];
+            int s  = sign[i];
+            float cr = s * (br + bi);
+            float ci = s * (br - bi);
+            if (i < UW_LENGTH / 2) { h1_re += cr; h1_im += ci; }
+            else                    { h2_re += cr; h2_im += ci; }
+        }
+        // ratio = h2 * conj(h1), angle = atan2(im, re), normalised by
+        // 6 symbol periods (midpoint-to-midpoint of the two halves).
+        float r_re = h2_re * h1_re + h2_im * h1_im;
+        float r_im = h2_im * h1_re - h2_re * h1_im;
+        float ang = atan2f(r_im, r_re);
+        out_result->omega_per_sym = ang / (float)(UW_LENGTH / 2);
     }
 }

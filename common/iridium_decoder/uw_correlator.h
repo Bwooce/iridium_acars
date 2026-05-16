@@ -53,6 +53,15 @@ typedef struct {
     // (burst_downmix_impl.cc, `corr_result` variable).
     float           peak_re;
     float           peak_im;
+    // Per-symbol residual carrier frequency in rad/sym, estimated from
+    // the phase difference between the first-half and second-half UW
+    // correlations. If the burst has a residual freq offset Δω, the
+    // two halves' complex correlations differ by exp(j·Δω·6_sym), so
+    // angle(half2/half1)/6 = Δω. The worker uses this to apply a
+    // linear-phase-ramp correction across the whole burst before
+    // calling qpsk_demod, giving the PLL a near-zero starting omega
+    // instead of having to chase 0.5+ rad/sym within 12 UW symbols.
+    float           omega_per_sym;
 } uw_corr_result_t;
 
 // Run correlation on a 2-sps interleaved int16 IQ burst. Searches
