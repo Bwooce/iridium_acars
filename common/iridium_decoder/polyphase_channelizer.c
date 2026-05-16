@@ -415,22 +415,25 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
         }
         ch->dl_head_int16 = (wr_head + 1) & N_MASK;
 
-        // 2. Per-phase MAC. The 2-copy delay-line layout means we can
-        // read N consecutive Re samples and N consecutive Im samples
-        // from a fixed offset, no deinterleave or wrap-around handling.
-        // On target the PIE asm kernel does this in three PIE
-        // instructions per accumulator (xacc path). Host falls back
-        // to a scalar reference that reads from the same memory
-        // layout — bit-near-equal to the asm (within Q14 quantisation).
+        // 2. All-phase MAC. With the 2-copy delay-line layout the
+        // per-phase Re/Im pointers advance by a fixed 64-byte stride
+        // and the taps by 16 bytes, so the entire 64-phase loop fits
+        // inside a single esp.lp.setup hardware loop in
+        // polyphase_mac_all_phases_arp4. The C caller invokes the
+        // kernel exactly once per cycle, saving 63 of the 64 asm
+        // prologue/epilogue costs.
         const int read_head = ch->dl_head_int16;
+#ifdef ESP_PLATFORM
+        polyphase_mac_all_phases_arp4(
+            ch->h_phase_q15,
+            &ch->dl_int16[read_head],          // Re of phase 0 + head
+            &ch->dl_int16[2 * N + read_head],  // Im of phase 0 + head
+            fft_buf_i16);
+#else
         for (int p = 0; p < M; p++) {
             const int16_t *re_ptr = &ch->dl_int16[p * (4 * N) + read_head];
             const int16_t *im_ptr = re_ptr + 2 * N;
             const int16_t *hp     = &ch->h_phase_q15[p * N];
-#ifdef ESP_PLATFORM
-            polyphase_mac_phase_arp4(hp, re_ptr, im_ptr,
-                                     &fft_buf_i16[p * 2]);
-#else
             int64_t acc_re = 0;
             int64_t acc_im = 0;
             for (int n = 0; n < N; n++) {
@@ -446,8 +449,8 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
             else if (im < -32768) im = -32768;
             fft_buf_i16[p * 2 + 0] = (int16_t)re;
             fft_buf_i16[p * 2 + 1] = (int16_t)im;
-#endif
         }
+#endif
 
         // 3. FFT.
 #ifdef ESP_PLATFORM

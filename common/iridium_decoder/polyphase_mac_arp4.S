@@ -79,4 +79,66 @@ polyphase_mac_phase_arp4:
 
     .size polyphase_mac_phase_arp4, .-polyphase_mac_phase_arp4
 
+    .align  4
+    .global polyphase_mac_all_phases_arp4
+    .type   polyphase_mac_all_phases_arp4, @function
+
+// All-phases-at-once variant. Same per-phase math as
+// polyphase_mac_phase_arp4 but the per-phase loop runs inside the
+// PIE hardware loop instead of as 64 C function calls. Each cycle
+// the C caller invokes this exactly once instead of 64 times,
+// saving 64 × asm prologue/epilogue (~20 cycles each at 360 MHz =
+// ~3.5 us per cycle = ~115 us per 2048-sample frame).
+//
+// Inputs (RV32 a-class regs are caller-saved, so no register save):
+//   a0 = h_phase_q15 (M*N int16 = 1024 bytes total).
+//        Phase p occupies bytes [p*16, p*16+15]. Loop advances by 16
+//        bytes per iteration via .ip.
+//   a1 = &dl_int16[head] (per-phase stride = 4N int16 = 64 bytes).
+//        Phase p's Re block starts at &dl_int16[p*32 + head] and is
+//        N=8 int16 wide. Loop advances by 64 bytes per iter via .xp.
+//   a2 = &dl_int16[2N + head] (per-phase stride = 64 bytes; Im block).
+//   a3 = out (M*2 int16 = 256 bytes; 2 int16 = 4 bytes per phase).
+//
+// The C caller is responsible for having called polyphase_mac_pie_init
+// once already (enables unaligned PIE vld so non-zero head values
+// don't fault).
+polyphase_mac_all_phases_arp4:
+    // Save callee-saved s8/s9 (we use them as .xp base registers
+    // because the PIE encoding for esp.vld.128.xp restricts the
+    // base to the upper-half register file — matrix_mult uses the
+    // same x24/x25 pair for the same reason).
+    addi    sp, sp, -16
+    sw      s8, 0(sp)
+    sw      s9, 4(sp)
+
+    mv      s8, a1               // s8 = re_ptr (will be advanced by .xp)
+    mv      s9, a2               // s9 = im_ptr (will be advanced by .xp)
+    li      t3, 64               // phase stride for re/im (bytes)
+    li      t6, 14               // Q14 → int16 shift
+    li      t1, 64               // phase loop count (= POLYCHAN_M)
+
+    esp.lp.setup    0, t1, .Lpoly_loop_end
+        esp.vld.128.ip   q0, a0, 16    // q0 = 8 taps,  h += 16
+        esp.vld.128.xp   q1, s8, t3    // q1 = 8 Re,    re += 64
+        esp.vld.128.xp   q2, s9, t3    // q2 = 8 Im,    im += 64
+
+        esp.zero.xacc
+        esp.vmulas.s16.xacc  q0, q1
+        esp.srs.s.xacc       t5, t6
+        sh      t5, 0(a3)
+
+        esp.zero.xacc
+        esp.vmulas.s16.xacc  q0, q2
+        esp.srs.s.xacc       t5, t6
+        sh      t5, 2(a3)
+.Lpoly_loop_end:
+        addi    a3, a3, 4
+
+    lw      s8, 0(sp)
+    lw      s9, 4(sp)
+    addi    sp, sp, 16
+    ret
+    .size polyphase_mac_all_phases_arp4, .-polyphase_mac_all_phases_arp4
+
 #endif // CONFIG_IDF_TARGET_ESP32P4
