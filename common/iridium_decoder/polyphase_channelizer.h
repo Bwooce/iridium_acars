@@ -62,6 +62,25 @@ size_t polyphase_channelizer_process(polyphase_channelizer_t *ch,
                                      size_t n_input,
                                      float complex *out_block);
 
+// D20 step 3: int16 IQ path. Same semantics as polyphase_channelizer_process
+// but the entire data path is integer (Q14 taps, int16 IQ delay line,
+// int64 MAC accumulator, sc16 FFT on target). Saves the int16→float
+// conversion the float caller would otherwise do, and is the entry
+// point for the future PIE-asm MAC kernel (D20 step 3 sub-task 4).
+//
+// input_iq is interleaved I,Q,I,Q,... of length 2*n_input_complex int16.
+// out_block_iq is interleaved I,Q,... per channel per cycle, total
+// (n_input_complex / POLYCHAN_M) * POLYCHAN_M * 2 int16. Returns the
+// number of complete cycles produced (= n_input_complex / POLYCHAN_M).
+//
+// Maintains its own delay-line state separate from the float path —
+// the two functions don't share input history. Don't interleave
+// calls to both on the same instance.
+size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
+                                            const int16_t *input_iq,
+                                            size_t n_input_complex,
+                                            int16_t *out_block_iq);
+
 // Returns the centre frequency (Hz, signed) of channel index `k` in
 // the input spectrum. k=0 → DC, k=M/2 → fs_in/2 = Nyquist, k>M/2 → negative.
 int32_t polyphase_channelizer_channel_freq(const polyphase_channelizer_t *ch,

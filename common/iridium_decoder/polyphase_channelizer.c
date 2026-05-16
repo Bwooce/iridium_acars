@@ -16,19 +16,31 @@
 #ifdef ESP_PLATFORM
 #include "dsps_fft2r.h"
 #include "esp_log.h"
-static bool s_dsps_fft64_inited = false;
+static bool s_dsps_fft64_fc32_inited = false;
+static bool s_dsps_fft64_sc16_inited = false;
 static void init_dsps_fft64_once(void)
 {
-    if (s_dsps_fft64_inited) return;
-    // esp-dsp keeps a per-N twiddle table internal to the library;
-    // init for N=64 is one-shot and shared across any future N=64
-    // callers in the binary.
-    esp_err_t err = dsps_fft2r_init_fc32(NULL, 64);
-    if (err == ESP_OK) {
-        s_dsps_fft64_inited = true;
-    } else {
-        ESP_LOGW("POLYCH", "dsps_fft2r_init_fc32(64) failed: %d — "
-                            "falling back to hand-rolled FFT", err);
+    // esp-dsp keeps separate twiddle tables for fc32 vs sc16; both
+    // are needed because we run the float path (process) and the
+    // int16 path (process_int16) on target. Each init is idempotent
+    // across the program lifetime.
+    if (!s_dsps_fft64_fc32_inited) {
+        esp_err_t err = dsps_fft2r_init_fc32(NULL, 64);
+        if (err == ESP_OK) {
+            s_dsps_fft64_fc32_inited = true;
+        } else {
+            ESP_LOGW("POLYCH", "dsps_fft2r_init_fc32(64) failed: %d — "
+                                "float FFT falls back to hand-rolled", err);
+        }
+    }
+    if (!s_dsps_fft64_sc16_inited) {
+        esp_err_t err = dsps_fft2r_init_sc16(NULL, 64);
+        if (err == ESP_OK) {
+            s_dsps_fft64_sc16_inited = true;
+        } else {
+            ESP_LOGW("POLYCH", "dsps_fft2r_init_sc16(64) failed: %d — "
+                                "int16 FFT falls back to scalar", err);
+        }
     }
 }
 #endif
@@ -52,6 +64,18 @@ struct polyphase_channelizer {
     // Position within the per-phase delay line (newest sample at index dl_head).
     // Phases all share the same head — they advance in lockstep.
     int                 dl_head;
+
+    // D20 step 3: Q15 / int16 path. Quantised taps and an int16 IQ
+    // delay line live alongside the float ones; channelizer clients
+    // pick which path via polyphase_channelizer_process (float) vs
+    // polyphase_channelizer_process_int16 (int16). The two paths
+    // maintain independent state — calling both on the same
+    // channelizer instance is supported but not recommended (each
+    // would see only half the samples). 16-byte alignment is for
+    // the future PIE asm kernel which uses 128-bit vector loads.
+    __attribute__((aligned(16))) int16_t h_phase_q15[POLYCHAN_FILTER_LEN];
+    __attribute__((aligned(16))) int16_t dl_int16[POLYCHAN_FILTER_LEN * 2];
+    int                 dl_head_int16;
 };
 
 // D20-step1: cached twiddle factors for fft_64. 32 entries covering
@@ -89,7 +113,7 @@ static void fft_64(float complex *x)
     // PIE vectorisation (P4 PIE is integer-only; float FFT
     // remains scalar there). Bit reversal is a separate ANSI
     // call; the PIE/LP machinery doesn't apply to it.
-    if (s_dsps_fft64_inited) {
+    if (s_dsps_fft64_fc32_inited) {
         dsps_fft2r_fc32_arp4((float *)x, 64);
         dsps_bit_rev_fc32_ansi((float *)x, 64);
         return;
@@ -174,6 +198,26 @@ static void build_prototype(float h_phase[POLYCHAN_FILTER_LEN])
     }
 }
 
+// Quantise the float prototype to Q15 int16 for the D20 step 3 path.
+// Maximum tap magnitude in the windowed-sinc prototype is bounded by
+// the peak of the central lobe (≈ 1/M scaled by the DC-response
+// normalisation, so ≈ 1 in float). To leave one bit of headroom for
+// the 8-tap MAC accumulation we scale by 16384 (Q14) rather than
+// 32768 (Q15); the consumer shifts right by 14 instead of 15. With
+// N=8 taps × max(int16) input × max Q14 tap = 8 × 32767 × 16384 ≈
+// 4.3e9, the sum just fits int32 (max 2.1e9 unsigned) only if we
+// pre-shift each product; safer to accumulate in int64 and shift at
+// the end. The scalar reference does that.
+static void quantise_q14(const float *src, int16_t *dst, int n)
+{
+    for (int i = 0; i < n; i++) {
+        float v = src[i] * 16384.0f;
+        if      (v >  32767.0f) v =  32767.0f;
+        else if (v < -32768.0f) v = -32768.0f;
+        dst[i] = (int16_t)lrintf(v);
+    }
+}
+
 polyphase_channelizer_t *polyphase_channelizer_create(uint32_t fs_in_hz)
 {
     polyphase_channelizer_t *ch = (polyphase_channelizer_t *)
@@ -181,7 +225,11 @@ polyphase_channelizer_t *polyphase_channelizer_create(uint32_t fs_in_hz)
     if (!ch) return NULL;
     ch->fs_in_hz = fs_in_hz;
     build_prototype(ch->h_phase);
+    // D20 step 3: pre-compute Q14 (not Q15 — see quantise_q14 comment)
+    // taps for the int16 path. Cheap one-shot at create() time.
+    quantise_q14(ch->h_phase, ch->h_phase_q15, POLYCHAN_FILTER_LEN);
     ch->dl_head = 0;
+    ch->dl_head_int16 = 0;
     init_fft_twiddles();
 #ifdef ESP_PLATFORM
     init_dsps_fft64_once();
@@ -291,6 +339,122 @@ size_t polyphase_channelizer_process(polyphase_channelizer_t *ch,
         for (int k = 0; k < M; k++) {
             out_block[cycle * M + k] = fft_buf[k];
         }
+    }
+    return n_cycles;
+}
+
+// D20 step 3: scalar int16/Q14 reference implementation of the
+// channelizer process. Numerically equivalent to the float path
+// within Q14 quantisation noise. On target uses esp-dsp's sc16
+// FFT (dsps_fft2r_sc16_arp4, PIE-vectorised int16). On host falls
+// back to converting per-phase MAC output through fft_64 — this
+// keeps the host test harness independent of esp-dsp.
+//
+// Scaling notes (see also quantise_q14):
+//   - Taps in Q14 (16384 = 1.0 in float). Allows the 8-tap MAC sum
+//     to fit int32 without overflow before the shift, and matches
+//     the int64 accumulator pattern the eventual PIE kernel will use.
+//   - Per-phase output is shift-right-14 from the int64 sum. The
+//     float prototype's per-phase sum is 1/M ≈ 0.0156, so a full-
+//     scale int16 input produces a per-phase output of ~512. The
+//     FFT then mixes 64 such values, peaking at ~M × 512 ≈ 32768
+//     for a coherent (DC) input — exactly int16 saturation. For
+//     realistic Iridium bursts (energy spread across 1-2 channels,
+//     not all 64) the peak channel output is well below saturation.
+//     sc16 FFT does internal stage scaling; output is in the same
+//     int16 scale as input. If saturation becomes observable in
+//     channel-power readings, add an extra shift-right between the
+//     MAC and FFT (cost: 6 dB of dynamic range).
+size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
+                                            const int16_t *input_iq,
+                                            size_t n_input_complex,
+                                            int16_t *out_block_iq)
+{
+    if (!ch || !input_iq || !out_block_iq) return 0;
+    const int M = POLYCHAN_M;
+    const int N = POLYCHAN_N_TAPS_PER_PHASE;
+    _Static_assert((POLYCHAN_N_TAPS_PER_PHASE &
+                    (POLYCHAN_N_TAPS_PER_PHASE - 1)) == 0,
+                   "POLYCHAN_N_TAPS_PER_PHASE must be a power of two");
+    const int N_MASK = N - 1;
+    size_t n_cycles = n_input_complex / (size_t)M;
+
+    // FFT scratch — interleaved IQ.
+    int16_t fft_buf_i16[POLYCHAN_M * 2];
+#ifndef ESP_PLATFORM
+    float complex fft_buf_fc32[POLYCHAN_M];
+#endif
+
+    for (size_t cycle = 0; cycle < n_cycles; cycle++) {
+        // 1. Write M input IQ pairs to delay line at new_head.
+        int new_head = (ch->dl_head_int16 - 1 + N) & N_MASK;
+        const int16_t *in = input_iq + cycle * M * 2;
+        for (int p = 0; p < M; p++) {
+            ch->dl_int16[p * N * 2 + new_head * 2 + 0] = in[p * 2 + 0];
+            ch->dl_int16[p * N * 2 + new_head * 2 + 1] = in[p * 2 + 1];
+        }
+        ch->dl_head_int16 = new_head;
+
+        // 2. Per-phase MAC: 8 Q14 taps × 8 complex int16 samples.
+        //
+        // Future asm path: this is the loop polyphase_channelizer_mac_arp4
+        // (D20 step 3, see polyphase_mac_arp4.S) replaces. The current
+        // scalar reference is the validation baseline for that kernel.
+        const int head = ch->dl_head_int16;
+        for (int p = 0; p < M; p++) {
+            const int16_t *hp  = &ch->h_phase_q15[p * N];
+            const int16_t *dlp = &ch->dl_int16[p * N * 2];
+            int64_t acc_re = 0;
+            int64_t acc_im = 0;
+            for (int n = 0; n < N; n++) {
+                int slot = (head + n) & N_MASK;
+                int32_t tap = (int32_t)hp[n];
+                acc_re += (int64_t)tap * (int32_t)dlp[slot * 2 + 0];
+                acc_im += (int64_t)tap * (int32_t)dlp[slot * 2 + 1];
+            }
+            // Q14 → int16 (unscaled). Saturate just in case.
+            int32_t re = (int32_t)(acc_re >> 14);
+            int32_t im = (int32_t)(acc_im >> 14);
+            if      (re >  32767) re =  32767;
+            else if (re < -32768) re = -32768;
+            if      (im >  32767) im =  32767;
+            else if (im < -32768) im = -32768;
+            fft_buf_i16[p * 2 + 0] = (int16_t)re;
+            fft_buf_i16[p * 2 + 1] = (int16_t)im;
+        }
+
+        // 3. FFT.
+#ifdef ESP_PLATFORM
+        if (s_dsps_fft64_sc16_inited) {
+            dsps_fft2r_sc16_arp4(fft_buf_i16, M);
+            dsps_bit_rev_sc16_ansi(fft_buf_i16, M);
+        }
+        // Else: leave the (MAC-only, no-FFT) data through. Tests
+        // would fail loudly; production gates on init success.
+#else
+        // Host fallback: convert int16 → float complex → fft_64 →
+        // back to int16 with saturation. Keeps host tests free of
+        // esp-dsp.
+        for (int p = 0; p < M; p++) {
+            fft_buf_fc32[p] = (float)fft_buf_i16[p * 2 + 0]
+                            + (float)fft_buf_i16[p * 2 + 1] * I;
+        }
+        fft_64(fft_buf_fc32);
+        for (int k = 0; k < M; k++) {
+            int32_t re = (int32_t)lrintf(crealf(fft_buf_fc32[k]));
+            int32_t im = (int32_t)lrintf(cimagf(fft_buf_fc32[k]));
+            if      (re >  32767) re =  32767;
+            else if (re < -32768) re = -32768;
+            if      (im >  32767) im =  32767;
+            else if (im < -32768) im = -32768;
+            fft_buf_i16[k * 2 + 0] = (int16_t)re;
+            fft_buf_i16[k * 2 + 1] = (int16_t)im;
+        }
+#endif
+
+        // 4. Write out the M channels for this cycle (interleaved).
+        memcpy(&out_block_iq[cycle * M * 2], fft_buf_i16,
+               sizeof(fft_buf_i16));
     }
     return n_cycles;
 }

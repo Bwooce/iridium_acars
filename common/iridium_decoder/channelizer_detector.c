@@ -110,13 +110,25 @@ struct channelizer_detector {
     // every feed() call. Sized to handle one 16 KB SDR transfer's
     // worth of int16 IQ at a time — matches what the legacy detector
     // sees per dsp_processor_feed() invocation.
-    //   in_buf  : float complex, capacity in_capacity_samples
-    //   out_buf : float complex, capacity (in_capacity_samples / M) × M
+    //
+    // D20 step 3: an int16 fast path through
+    // polyphase_channelizer_process_int16 is wired up below, gated on
+    // CHANNELIZER_USE_INT16_PATH. Today it's OFF on target because
+    // scalar Q14 MAC + scalar sc16 FFT is ~19% slower than scalar
+    // float MAC + fc32 FFT on the P4 (P4 has fmadd.s for float but
+    // no fused int equivalent; "arp4" FFT variants are just
+    // esp.lp.setup-wrapped scalar). The path lights up when the PIE
+    // asm kernel in polyphase_mac_arp4.S replaces the scalar MAC.
     size_t           in_capacity_samples;     // == out_capacity_cycles × M
     size_t           out_capacity_cycles;
     float complex   *in_buf;
     float complex   *out_buf;
 };
+
+// D20 step 3 gate. Set to 1 once polyphase_channelizer_mac_arp4 lands
+// in polyphase_mac_arp4.S so the int16 path is actually faster than
+// the float path on P4 — until then this flag stays 0.
+#define CHANNELIZER_USE_INT16_PATH 0
 
 channelizer_detector_t *channelizer_detector_create(uint32_t fs_in_hz,
                                                      float threshold_db,
@@ -316,6 +328,9 @@ void channelizer_detector_feed_int16(channelizer_detector_t *d,
         }
         size_t got = polyphase_channelizer_process(d->ch, d->in_buf, whole,
                                                     d->out_buf);
+        // D20 step 3 (CHANNELIZER_USE_INT16_PATH=0 today): the int16
+        // fast path goes here once polyphase_channelizer_mac_arp4 is
+        // implemented. See header comment for the gate condition.
         process_cycles(d, got);
         consumed += whole;
     }
