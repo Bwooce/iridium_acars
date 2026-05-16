@@ -37,6 +37,22 @@
 
     .text
     .align  4
+    .global polyphase_mac_pie_init
+    .type   polyphase_mac_pie_init, @function
+
+// One-shot: enable unaligned PIE vector loads. Called once from
+// polyphase_channelizer_create() on target so the kernel below
+// can read &dl[head] for head ∈ [0, N) without faulting on the
+// non-16-byte-aligned head values. The same cfg-bit-1 pattern is
+// used in esp-dsp's dsps_dotprod_s16_arp4 for the same reason.
+polyphase_mac_pie_init:
+    esp.movx.r.cfg  t5
+    ori             t5, t5, 2
+    esp.movx.w.cfg  t5
+    ret
+    .size polyphase_mac_pie_init, .-polyphase_mac_pie_init
+
+    .align  4
     .global polyphase_mac_phase_arp4
     .type   polyphase_mac_phase_arp4, @function
 

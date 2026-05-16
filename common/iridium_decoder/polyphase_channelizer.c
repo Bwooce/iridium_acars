@@ -66,16 +66,19 @@ struct polyphase_channelizer {
     // Phases all share the same head — they advance in lockstep.
     int                 dl_head;
 
-    // D20 step 3: Q15 / int16 path. Quantised taps and an int16 IQ
-    // delay line live alongside the float ones; channelizer clients
-    // pick which path via polyphase_channelizer_process (float) vs
-    // polyphase_channelizer_process_int16 (int16). The two paths
-    // maintain independent state — calling both on the same
-    // channelizer instance is supported but not recommended (each
-    // would see only half the samples). 16-byte alignment is for
-    // the future PIE asm kernel which uses 128-bit vector loads.
+    // D20 step 3: Q14 / int16 path with deinterleave-free 2-copy
+    // delay line. Layout per phase (4N=32 int16 = 64 bytes):
+    //   dl_int16[p * 4N + 0 .. + 2N-1]    = Re slots, 2-copy ring
+    //   dl_int16[p * 4N + 2N .. + 4N-1]   = Im slots, 2-copy ring
+    // Each cycle writes the new sample at slot[head] AND slot[head+N]
+    // (both Re and Im); the asm reads N consecutive int16 from
+    // &dl[p*4N + head] (Re) and &dl[p*4N + 2N + head] (Im) — chrono
+    // order oldest→newest, no deinterleave needed.
+    // The Q14 taps are stored REVERSED relative to h_phase so h[0]
+    // multiplies the oldest slot (matching the new read order).
+    // 16-byte alignment is for the PIE 128-bit vector loads.
     __attribute__((aligned(16))) int16_t h_phase_q15[POLYCHAN_FILTER_LEN];
-    __attribute__((aligned(16))) int16_t dl_int16[POLYCHAN_FILTER_LEN * 2];
+    __attribute__((aligned(16))) int16_t dl_int16[POLYCHAN_FILTER_LEN * 4];
     int                 dl_head_int16;
 };
 
@@ -199,23 +202,26 @@ static void build_prototype(float h_phase[POLYCHAN_FILTER_LEN])
     }
 }
 
-// Quantise the float prototype to Q15 int16 for the D20 step 3 path.
-// Maximum tap magnitude in the windowed-sinc prototype is bounded by
-// the peak of the central lobe (≈ 1/M scaled by the DC-response
-// normalisation, so ≈ 1 in float). To leave one bit of headroom for
-// the 8-tap MAC accumulation we scale by 16384 (Q14) rather than
-// 32768 (Q15); the consumer shifts right by 14 instead of 15. With
-// N=8 taps × max(int16) input × max Q14 tap = 8 × 32767 × 16384 ≈
-// 4.3e9, the sum just fits int32 (max 2.1e9 unsigned) only if we
-// pre-shift each product; safer to accumulate in int64 and shift at
-// the end. The scalar reference does that.
-static void quantise_q14(const float *src, int16_t *dst, int n)
+// Quantise the float prototype to Q14 int16 with the per-phase tap
+// order REVERSED. The new int16 read path (D20 step 3, deinterleave-
+// free 2-copy delay line) reads N consecutive samples chronologically
+// (oldest → newest); the conventional polyphase tap order is
+// newest → oldest (h_phase[p][0] is the tap for the newest sample).
+// Reversing the taps per phase at quantisation time means the asm
+// can multiply tap n by the n-th read slot without any index gymnastics.
+// Q14 not Q15: leaves one bit of headroom for the 8-tap MAC sum.
+static void build_q14_taps_reversed(const float *h_phase_float,
+                                    int16_t *h_phase_q14_rev)
 {
-    for (int i = 0; i < n; i++) {
-        float v = src[i] * 16384.0f;
-        if      (v >  32767.0f) v =  32767.0f;
-        else if (v < -32768.0f) v = -32768.0f;
-        dst[i] = (int16_t)lrintf(v);
+    const int M = POLYCHAN_M;
+    const int N = POLYCHAN_N_TAPS_PER_PHASE;
+    for (int p = 0; p < M; p++) {
+        for (int n = 0; n < N; n++) {
+            float v = h_phase_float[p * N + (N - 1 - n)] * 16384.0f;
+            if      (v >  32767.0f) v =  32767.0f;
+            else if (v < -32768.0f) v = -32768.0f;
+            h_phase_q14_rev[p * N + n] = (int16_t)lrintf(v);
+        }
     }
 }
 
@@ -226,14 +232,15 @@ polyphase_channelizer_t *polyphase_channelizer_create(uint32_t fs_in_hz)
     if (!ch) return NULL;
     ch->fs_in_hz = fs_in_hz;
     build_prototype(ch->h_phase);
-    // D20 step 3: pre-compute Q14 (not Q15 — see quantise_q14 comment)
-    // taps for the int16 path. Cheap one-shot at create() time.
-    quantise_q14(ch->h_phase, ch->h_phase_q15, POLYCHAN_FILTER_LEN);
+    // D20 step 3: pre-compute Q14 reversed-order taps for the int16
+    // deinterleave-free path. Cheap one-shot at create() time.
+    build_q14_taps_reversed(ch->h_phase, ch->h_phase_q15);
     ch->dl_head = 0;
     ch->dl_head_int16 = 0;
     init_fft_twiddles();
 #ifdef ESP_PLATFORM
     init_dsps_fft64_once();
+    polyphase_mac_pie_init();    // enable unaligned PIE vld for 2-copy reads
 #endif
     return ch;
 }
@@ -387,50 +394,49 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
 #endif
 
     for (size_t cycle = 0; cycle < n_cycles; cycle++) {
-        // 1. Write M input IQ pairs to delay line at new_head.
-        int new_head = (ch->dl_head_int16 - 1 + N) & N_MASK;
+        // 1. Write M input IQ pairs to the 2-copy delay line.
+        //   Layout: dl[p*4N + 0..2N-1] = Re (2-copy), dl[p*4N + 2N..4N-1] = Im
+        //   The slot at index `head` (current oldest) gets overwritten,
+        //   then head advances to the next-oldest position. We write
+        //   into BOTH slot[head] and slot[head+N] (the 2-copy) so a
+        //   linear read of N samples from &dl[head+1] after the
+        //   advance gives chronological oldest→newest.
+        int wr_head = ch->dl_head_int16;
         const int16_t *in = input_iq + cycle * M * 2;
         for (int p = 0; p < M; p++) {
-            ch->dl_int16[p * N * 2 + new_head * 2 + 0] = in[p * 2 + 0];
-            ch->dl_int16[p * N * 2 + new_head * 2 + 1] = in[p * 2 + 1];
+            int16_t *re_base = &ch->dl_int16[p * (4 * N)];
+            int16_t *im_base = re_base + 2 * N;
+            int16_t re_val = in[p * 2 + 0];
+            int16_t im_val = in[p * 2 + 1];
+            re_base[wr_head]     = re_val;
+            re_base[wr_head + N] = re_val;
+            im_base[wr_head]     = im_val;
+            im_base[wr_head + N] = im_val;
         }
-        ch->dl_head_int16 = new_head;
+        ch->dl_head_int16 = (wr_head + 1) & N_MASK;
 
-        // 2. Per-phase MAC: 8 Q14 taps × 8 complex int16 samples.
-        //
-        // On target (ESP_PLATFORM) the inner MAC is a hand-rolled PIE
-        // kernel: polyphase_mac_phase_arp4 (vmulas.s16.qacc, see
-        // polyphase_mac_arp4.S). The C side deinterleaves the per-phase
-        // delay line into aligned re_buf/im_buf in head-rotated order,
-        // then calls the kernel; the kernel produces one [Re, Im]
-        // int16 pair. On host the scalar reference below stays
-        // bit-equal to what the asm should produce.
-        const int head = ch->dl_head_int16;
+        // 2. Per-phase MAC. The 2-copy delay-line layout means we can
+        // read N consecutive Re samples and N consecutive Im samples
+        // from a fixed offset, no deinterleave or wrap-around handling.
+        // On target the PIE asm kernel does this in three PIE
+        // instructions per accumulator (xacc path). Host falls back
+        // to a scalar reference that reads from the same memory
+        // layout — bit-near-equal to the asm (within Q14 quantisation).
+        const int read_head = ch->dl_head_int16;
+        for (int p = 0; p < M; p++) {
+            const int16_t *re_ptr = &ch->dl_int16[p * (4 * N) + read_head];
+            const int16_t *im_ptr = re_ptr + 2 * N;
+            const int16_t *hp     = &ch->h_phase_q15[p * N];
 #ifdef ESP_PLATFORM
-        __attribute__((aligned(16))) int16_t re_buf[N];
-        __attribute__((aligned(16))) int16_t im_buf[N];
-        for (int p = 0; p < M; p++) {
-            const int16_t *dlp = &ch->dl_int16[p * N * 2];
-            for (int n = 0; n < N; n++) {
-                int slot = (head + n) & N_MASK;
-                re_buf[n] = dlp[slot * 2 + 0];
-                im_buf[n] = dlp[slot * 2 + 1];
-            }
-            polyphase_mac_phase_arp4(&ch->h_phase_q15[p * N],
-                                     re_buf, im_buf,
+            polyphase_mac_phase_arp4(hp, re_ptr, im_ptr,
                                      &fft_buf_i16[p * 2]);
-        }
 #else
-        for (int p = 0; p < M; p++) {
-            const int16_t *hp  = &ch->h_phase_q15[p * N];
-            const int16_t *dlp = &ch->dl_int16[p * N * 2];
             int64_t acc_re = 0;
             int64_t acc_im = 0;
             for (int n = 0; n < N; n++) {
-                int slot = (head + n) & N_MASK;
                 int32_t tap = (int32_t)hp[n];
-                acc_re += (int64_t)tap * (int32_t)dlp[slot * 2 + 0];
-                acc_im += (int64_t)tap * (int32_t)dlp[slot * 2 + 1];
+                acc_re += (int64_t)tap * (int32_t)re_ptr[n];
+                acc_im += (int64_t)tap * (int32_t)im_ptr[n];
             }
             int32_t re = (int32_t)(acc_re >> 14);
             int32_t im = (int32_t)(acc_im >> 14);
@@ -440,8 +446,8 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
             else if (im < -32768) im = -32768;
             fft_buf_i16[p * 2 + 0] = (int16_t)re;
             fft_buf_i16[p * 2 + 1] = (int16_t)im;
-        }
 #endif
+        }
 
         // 3. FFT.
 #ifdef ESP_PLATFORM

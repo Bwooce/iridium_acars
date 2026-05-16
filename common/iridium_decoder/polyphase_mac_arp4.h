@@ -26,6 +26,13 @@ void polyphase_mac_phase_arp4(const int16_t *h,
                               const int16_t *im,
                               int16_t       *out);
 
+// One-shot: enable unaligned PIE vector loads. Idempotent. Must be
+// called before the first polyphase_mac_phase_arp4 invocation if
+// the re/im pointers passed to that kernel may be at non-16-byte
+// offsets (which the D20-step-3 2-copy delay line produces for
+// head ∈ 1..7).
+void polyphase_mac_pie_init(void);
+
 #ifdef __cplusplus
 }
 #endif
