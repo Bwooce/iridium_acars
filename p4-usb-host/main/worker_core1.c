@@ -160,12 +160,21 @@ void worker_task(void *arg)
                     float ns = c * s_step + s * c_step;
                     c = nc; s = ns;
                 }
+                // Search ±40 kHz (full channelizer channel spacing).
+                // The 40 kHz channelizer spacing mismatches Iridium's
+                // 41.667 kHz, and the channelizer's ~40 dB adjacent-
+                // channel rejection lets it trigger on leakage, so
+                // the actual carrier can land outside the ±20 kHz
+                // half-channel that you'd expect from a clean assignment.
                 residual_hz = freq_estimator_run(pre_mix, FREQ_EST_FFT_N,
-                                                  2560000, 20000);
+                                                  2560000, 40000);
             }
 
             // 2. Frequency Centering
             float freq_offset = coarse_offset_hz + (float)residual_hz;
+            ESP_LOGD(TAG, "freq: coarse=%.0f residual=%d total=%.0f Hz (peak_bin=%d)",
+                     (double)coarse_offset_hz, (int)residual_hz,
+                     (double)freq_offset, burst.peak_bin);
             float norm_freq = -freq_offset / 2560000.0f;
             // dsps_cplx_gen accepts normalised frequency in (-1, 1) exclusive.
             // Clamp defensively in case detector ever emits an unusual peak_bin.

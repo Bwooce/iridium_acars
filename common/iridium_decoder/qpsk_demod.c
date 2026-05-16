@@ -85,6 +85,17 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     else out->direction = DIR_UNKNOWN;
 
     if (out->direction == DIR_UNKNOWN) {
+        // Diagnostic: show how close we were to each UW + the actual
+        // hard decisions for the first 12 symbols. Helps tell apart
+        // "PLL never locked" (random hard_decisions) from "wrong
+        // burst alignment" (decisions structured but offset).
+        ESP_LOGD(TAG,
+            "UW no match: dl_diffs=%d ul_diffs=%d hd=[%d %d %d %d %d %d %d %d %d %d %d %d]",
+            dl_diffs, ul_diffs,
+            hard_decisions[0], hard_decisions[1], hard_decisions[2],
+            hard_decisions[3], hard_decisions[4], hard_decisions[5],
+            hard_decisions[6], hard_decisions[7], hard_decisions[8],
+            hard_decisions[9], hard_decisions[10], hard_decisions[11]);
         free(symbols); free(pll_out); free(hard_decisions);
         return 0;
     }
