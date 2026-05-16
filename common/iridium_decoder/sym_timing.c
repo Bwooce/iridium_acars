@@ -31,6 +31,12 @@
 #include <stdbool.h>
 #include <string.h>
 
+// Textbook PI gains for Bn·T = 0.01, ζ = 0.707, Gardner Kd = 0.5.
+// See sym_timing.h header for derivation. The host unit test passes
+// with these; real-RF integration needs careful tuning against
+// representative bursts (the simple drop-in replacement of fixed
+// decimation breaks pre-aligned host fixtures due to per-symbol
+// strobe jitter without compensating averaging).
 #define DEFAULT_KP   0.055f
 #define DEFAULT_KI   0.00019f
 

@@ -64,15 +64,14 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         return 0;
     }
 
-    // 1. Simple decimation to 1 sps. D10's sym_timing module is
-    // available (and unit-tested) but not yet wired here — the
-    // textbook Gardner-loop gains drift on the pre-aligned host
-    // fixtures, requiring tuning against representative real-RF
-    // data. Activate by replacing this loop with:
-    //     sym_timing_t st_t; sym_timing_init(&st_t);
-    //     n_symbols = sym_timing_process(&st_t, samples_2sps,
-    //                                    n_samples, symbols, n_symbols);
-    // once tuning is validated.
+    // 1. Simple decimation to 1 sps. D10 (sym_timing.c) is built and
+    // unit-tested but NOT wired here. Direct integration broke the
+    // host demod regressions because Gardner introduces per-symbol
+    // strobe jitter that the pre-aligned host fixtures don't have.
+    // The clean integration design: a sym_timing variant that
+    // PRESERVES 2-sps output format (replace bad samples with
+    // interpolated good ones) so qpsk_demod's decimation can still
+    // pick the right sample. That's a separate design exercise.
     for (int i = 0; i < n_symbols; i++) {
         symbols[i] = (float)samples_2sps[i * 4 + 0]
                    + (float)samples_2sps[i * 4 + 1] * _Complex_I;
