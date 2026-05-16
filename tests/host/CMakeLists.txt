@@ -212,8 +212,17 @@ target_compile_options(test_libacars_link PRIVATE
     -Wno-sign-compare
 )
 
+# D8: fine carrier frequency estimator (companion to D7's channelizer).
+add_executable(test_freq_estimator
+    test_freq_estimator.c
+    ${COMMON_DIR}/freq_estimator.c
+)
+target_include_directories(test_freq_estimator PRIVATE ${COMMON_DIR})
+target_link_libraries(test_freq_estimator PRIVATE m)
+
 enable_testing()
 add_test(NAME bch                  COMMAND test_bch)
+add_test(NAME freq_estimator       COMMAND test_freq_estimator)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
 add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)

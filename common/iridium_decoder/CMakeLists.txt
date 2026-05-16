@@ -24,12 +24,11 @@ idf_component_register(
         # Phase D7: polyphase FFT channelizer (front-end multi-burst separation).
         "polyphase_channelizer.c"
         "channelizer_detector.c"
-        # D20 step 3: PIE/SIMD polyphase MAC kernel — SCAFFOLD ONLY.
-        # The .S body is currently a `ret`-only stub (see file header
-        # for the spec and sub-task breakdown). Building it here so the
-        # symbol is in place for the eventual caller; the symbol is not
-        # called from production code yet.
+        # D20 step 3: PIE/SIMD polyphase MAC kernel.
         "polyphase_mac_arp4.S"
+        # D8: fine carrier frequency estimator for the worker
+        # (companion to D7's coarse channelizer).
+        "freq_estimator.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board

@@ -13,6 +13,7 @@
 #include "worker_core1.h"
 #include "signal_buffer.h"
 #include "qpsk_demod.h"
+#include "freq_estimator.h"
 #include "bch_decoder.h"
 #include "frame_decoder.h"
 
@@ -126,8 +127,45 @@ void worker_task(void *arg)
             signal_buffer_extract(burst.start_sample_idx, burst.length_samples, extract_buf);
             int64_t t_extract = esp_timer_get_time();
 
+            // 1b. D8 fine carrier frequency estimation. The channelizer
+            // reports peak_bin at channel granularity (40 kHz steps),
+            // leaving up to ±20 kHz residual carrier offset — 16×
+            // outside the PLL's ~1.25 kHz capture range. Refine by:
+            //   (i) pre-mix the first FREQ_EST_FFT_N samples by the
+            //       coarse offset into a stack scratch buffer (so the
+            //       burst lands near DC of the scratch),
+            //  (ii) run the estimator on the scratch → residual_hz
+            //       inside the ±20 kHz window,
+            // (iii) combine coarse + residual into the freq_offset
+            //       that the existing mix-down uses.
+            // This costs ~50-100 µs/burst — negligible against the
+            // FIR decimation that follows.
+            float coarse_offset_hz = (burst.peak_bin - 1024) * 1250.0f;
+            int32_t residual_hz = 0;
+            if (burst.length_samples >= FREQ_EST_FFT_N) {
+                __attribute__((aligned(16))) int16_t pre_mix[FREQ_EST_FFT_N * 2];
+                float phi_step = -2.0f * (float)M_PI * coarse_offset_hz / 2560000.0f;
+                float c_step = cosf(phi_step), s_step = sinf(phi_step);
+                float c = 1.0f, s = 0.0f;       // current phasor
+                for (int i = 0; i < FREQ_EST_FFT_N; i++) {
+                    int32_t x_re = extract_buf[i * 2 + 0];
+                    int32_t x_im = extract_buf[i * 2 + 1];
+                    // (x_re + j x_im) × (c + j s)
+                    float yr = (float)x_re * c - (float)x_im * s;
+                    float yi = (float)x_re * s + (float)x_im * c;
+                    pre_mix[i * 2 + 0] = (int16_t)lrintf(yr);
+                    pre_mix[i * 2 + 1] = (int16_t)lrintf(yi);
+                    // Advance phasor: (c, s) ← (c, s) × (c_step, s_step)
+                    float nc = c * c_step - s * s_step;
+                    float ns = c * s_step + s * c_step;
+                    c = nc; s = ns;
+                }
+                residual_hz = freq_estimator_run(pre_mix, FREQ_EST_FFT_N,
+                                                  2560000, 20000);
+            }
+
             // 2. Frequency Centering
-            float freq_offset = (burst.peak_bin - 1024) * 1250.0f;
+            float freq_offset = coarse_offset_hz + (float)residual_hz;
             float norm_freq = -freq_offset / 2560000.0f;
             // dsps_cplx_gen accepts normalised frequency in (-1, 1) exclusive.
             // Clamp defensively in case detector ever emits an unusual peak_bin.
