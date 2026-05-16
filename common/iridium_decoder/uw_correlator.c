@@ -37,17 +37,27 @@
 //
 // N=64 with hand-rolled radix-2 to keep the call cost tiny — this
 // runs once per detected burst, so a few hundred flops is nothing.
-#define CFO_FFT_N    64
-#define CFO_FFT_LOG  6
-#define CFO_INPUT_N  24      // 12 UW symbols × 2 sps — uses just the UW
-                              // region, no preamble dependency.
+#define CFO_FFT_N        128
+#define CFO_FFT_LOG      7
+#define CFO_INPUT_N      56  // 16 preamble syms + 12 UW syms, ×2 sps.
+                              // Both Iridium preambles square to a
+                              // constant phasor (DL: all s0; UL: s1,s0
+                              // alternating — s1²=s0²=2j), so the whole
+                              // 56-sample window is BPSK after squaring
+                              // and produces a clean tone at Δω. Falls
+                              // back to UW-only if uw_offset is too
+                              // small to include the preamble.
+#define CFO_PREAMBLE_N   32  // 16 syms × 2 sps available before UW.
 
 static inline float parabolic_interp(float yl, float yc, float yr);
 
 static uint8_t  s_cfo_brev[CFO_FFT_N];
 static float    s_cfo_tw_re[CFO_FFT_N / 2];
 static float    s_cfo_tw_im[CFO_FFT_N / 2];
-static float    s_cfo_window[CFO_INPUT_N];
+// Two precomputed Hann windows: one for the full 56-sample
+// preamble+UW window, one for the 24-sample UW-only fallback.
+static float    s_cfo_window_full[CFO_INPUT_N];
+static float    s_cfo_window_uw[24];
 static bool     s_cfo_inited = false;
 
 static void cfo_init(void)
@@ -67,8 +77,12 @@ static void cfo_init(void)
         s_cfo_tw_im[k] = (float)sin(ang);
     }
     for (int i = 0; i < CFO_INPUT_N; i++) {
-        s_cfo_window[i] = 0.5f * (1.0f - cosf(2.0f * 3.14159265358979323846f *
-                                              (float)i / (float)(CFO_INPUT_N - 1)));
+        s_cfo_window_full[i] = 0.5f * (1.0f - cosf(2.0f * 3.14159265358979323846f *
+                                                   (float)i / (float)(CFO_INPUT_N - 1)));
+    }
+    for (int i = 0; i < 24; i++) {
+        s_cfo_window_uw[i] = 0.5f * (1.0f - cosf(2.0f * 3.14159265358979323846f *
+                                                 (float)i / (float)(24 - 1)));
     }
     s_cfo_inited = true;
 }
@@ -102,13 +116,16 @@ static void cfo_fft(float *re, float *im)
     }
 }
 
-// Square-then-FFT CFO estimator over the 24-sample UW region starting
-// at burst_2sps[2 * uw_offset]. Returns omega_per_sym in rad/sym.
-// Search window is bounded by the Nyquist of the squared signal
-// (±π post-squaring → ±π/2 input omega), but we additionally clamp to
-// ±1.5 rad/sym since anything beyond that would already have failed
-// upstream alignment.
-static float cfo_fine_estimate(const int16_t *burst_2sps, int uw_offset_complex)
+// Square-then-FFT CFO estimator. Uses preamble + UW (~56 samples)
+// when uw_offset is large enough to include the preamble; otherwise
+// falls back to UW-only (24 samples). The Iridium preamble (DL: 16×
+// (+1+j); UL: alternating (-1-j), (+1+j)) squares to a constant 2j
+// phasor — both halves of the squared signal are noise-free DC, so
+// the carrier offset becomes a single clean tone at Δω rad/sample
+// throughout the whole window. Returns omega_per_sym in rad/sym
+// (with the sign convention the worker expects, see end of function).
+static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
+                                int uw_offset_complex)
 {
     cfo_init();
 
@@ -116,28 +133,54 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int uw_offset_complex)
     memset(re, 0, sizeof(re));
     memset(im, 0, sizeof(im));
 
-    // Square the windowed UW region. (re + j·im)² = (re²-im²) + j·(2·re·im).
+    // Decide preamble+UW vs UW-only based on what's in range.
+    int start, n_in;
+    const float *win;
+    if (uw_offset_complex >= CFO_PREAMBLE_N &&
+        uw_offset_complex - CFO_PREAMBLE_N + CFO_INPUT_N <= n_complex) {
+        start = uw_offset_complex - CFO_PREAMBLE_N;
+        n_in  = CFO_INPUT_N;
+        win   = s_cfo_window_full;
+    } else if (uw_offset_complex + 24 <= n_complex) {
+        start = uw_offset_complex;
+        n_in  = 24;
+        win   = s_cfo_window_uw;
+    } else {
+        return 0.0f;       // burst too short, skip
+    }
+
+    // Square the windowed region. (re + j·im)² = (re²-im²) + j·(2·re·im).
     // Normalise by 1/32768 to keep magnitudes in float range and so the
     // window shape, not amplitude, dominates the FFT spectrum.
     const float inv_full = 1.0f / 32768.0f;
-    for (int i = 0; i < CFO_INPUT_N; i++) {
-        float w = s_cfo_window[i];
-        float r = (float)burst_2sps[(uw_offset_complex + i) * 2 + 0] * inv_full;
-        float m = (float)burst_2sps[(uw_offset_complex + i) * 2 + 1] * inv_full;
+    for (int i = 0; i < n_in; i++) {
+        float w = win[i];
+        float r = (float)burst_2sps[(start + i) * 2 + 0] * inv_full;
+        float m = (float)burst_2sps[(start + i) * 2 + 1] * inv_full;
         re[i] = (r * r - m * m) * w;
         im[i] = (2.0f * r * m)   * w;
     }
 
     cfo_fft(re, im);
 
-    // Find peak across the full FFT (the squared tone can land anywhere).
+    // Find peak + accumulate total spectrum energy for SNR gating.
     float peak_mag = -1.0f;
     int   peak_k   = 0;
+    double sum_mag = 0;
     for (int k = 0; k < CFO_FFT_N; k++) {
         float m = re[k] * re[k] + im[k] * im[k];
+        sum_mag += m;
         if (m > peak_mag) { peak_mag = m; peak_k = k; }
     }
     if (peak_mag <= 1e-9f) return 0.0f;
+    // Gate on peak vs mean off-peak: legitimate squared-preamble
+    // tones have peak/mean ≥ N/4 (single bin dominates ~quarter of
+    // power). Noise spectra have peak/mean ~ N/N = 1. Require ≥ 5×
+    // (about CFO_FFT_N / 25) to reject noise events.
+    double off_mean = (sum_mag - peak_mag) / (double)(CFO_FFT_N - 1);
+    if (off_mean > 1e-12 && peak_mag / off_mean < 5.0) {
+        return 0.0f;
+    }
 
     // Parabolic interpolation around the peak (with wrap).
     int km1 = (peak_k - 1 + CFO_FFT_N) % CFO_FFT_N;
@@ -325,36 +368,9 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         out_result->peak_im = best_ul_im;
     }
 
-    // CFO estimate over the UW region. Two methods explored:
-    //   (a) Two-half phase difference: h2·conj(h1)/(6·T_sym).
-    //       Coarse (~4 kHz resolution at 25 ksym/s) but averages 6
-    //       symbols' worth of signal per half → robust at SNR ≥ 7 dB.
-    //   (b) gr-iridium square-then-FFT: 24-sample squared UW into a
-    //       64-pt FFT, parabolic peak interp. Theoretically finer
-    //       (~100 Hz) but at SNR 7-9 dB with only 24 samples the FFT
-    //       picks a noise spike, producing wildly over-corrected
-    //       omega values (often ±1.5 rad/sym, clamped). gr-iridium
-    //       uses preamble + UW (~28 syms × oversample) — we don't
-    //       have that much guaranteed BPSK upstream of the UW yet.
-    // Production path: (a). See cfo_fine_estimate() for the FFT code
-    // (kept dormant; re-enable once we have larger BPSK window).
-    {
-        const int8_t *sign_uw = (dir == UW_DIR_DOWNLINK) ? UW_DL_SIGN : UW_UL_SIGN;
-        float h1_re = 0, h1_im = 0, h2_re = 0, h2_im = 0;
-        for (int i = 0; i < UW_LENGTH; i++) {
-            int idx = (peak_k + i * SYM_STRIDE) * 2;
-            int br = burst_2sps[idx + 0];
-            int bi = burst_2sps[idx + 1];
-            int s  = sign_uw[i];
-            float cr = s * (br + bi);
-            float ci = s * (br - bi);
-            if (i < UW_LENGTH / 2) { h1_re += cr; h1_im += ci; }
-            else                    { h2_re += cr; h2_im += ci; }
-        }
-        float r_re = h2_re * h1_re + h2_im * h1_im;
-        float r_im = h2_im * h1_re - h2_re * h1_im;
-        float ang = atan2f(r_im, r_re);
-        out_result->omega_per_sym = ang / (float)(UW_LENGTH / 2);
-    }
-    (void)cfo_fine_estimate;   // suppress unused warning until re-enabled
+    // CFO estimate via gr-iridium-style square-then-FFT over
+    // preamble+UW (56 samples) when available, UW-only (24 samples)
+    // when uw_offset is too close to the start of the burst to
+    // include the preamble. See cfo_fine_estimate() for math.
+    out_result->omega_per_sym = cfo_fine_estimate(burst_2sps, n_complex, peak_k);
 }
