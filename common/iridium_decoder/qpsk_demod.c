@@ -115,12 +115,20 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         omega_hat += PLL_BETA * angle;
     }
 
-    // 3. UW Check. The PLL has 4 stable phase points (90° ambiguity);
-    // it may converge to any of the 4 rotations of the symbol
-    // constellation. The UWs are absolute-quadrant patterns, so we
-    // test all 4 rotations to find the match. DQPSK below is
-    // rotation-invariant so the bits emerge unchanged regardless of
-    // which rotation matched.
+    // 3. UW Check. Two paths in parallel:
+    //   (a) Hard-decision rotation-aware match (kept for backward
+    //       compatibility with existing host fixtures — these decode
+    //       cleanly under rot=0 with dl_diffs=0).
+    //   (b) Complex correlation against the UW patterns interpreted
+    //       as QPSK symbols. The correlation magnitude measures match
+    //       strength independent of constellation rotation and absorbs
+    //       small per-symbol noise gracefully. Used as a fallback when
+    //       the hard-decision check fails but a correlation peak is
+    //       clearly present.
+    //
+    // Whichever path declares a match first wins. DQPSK below is
+    // rotation-invariant so bit output is unaffected by the rotation
+    // applied.
     int dl_diffs = IR_UW_LENGTH + 1;
     int ul_diffs = IR_UW_LENGTH + 1;
     int dl_rot = 0, ul_rot = 0;
@@ -139,6 +147,55 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     if (dl_diffs <= 2)      { out->direction = DIR_DOWNLINK; chosen_rot = dl_rot; }
     else if (ul_diffs <= 2) { out->direction = DIR_UPLINK;   chosen_rot = ul_rot; }
     else                    { out->direction = DIR_UNKNOWN; }
+
+    // Complex correlation fallback — only runs if the hard-decision
+    // path didn't find a match. Build UW reference as complex QPSK
+    // symbols, correlate, peak magnitude indicates match strength.
+    if (out->direction == DIR_UNKNOWN) {
+        static const int8_t QUAD_TO_RE[4] = {  1, -1, -1,  1 };
+        static const int8_t QUAD_TO_IM[4] = {  1,  1, -1, -1 };
+        float c_dl_re = 0, c_dl_im = 0, c_ul_re = 0, c_ul_im = 0;
+        float pll_energy = 0;
+        for (int i = 0; i < IR_UW_LENGTH; i++) {
+            float re_y = crealf(pll_out[i]);
+            float im_y = cimagf(pll_out[i]);
+            pll_energy += re_y * re_y + im_y * im_y;
+            // conj(uw_dl[i]) × pll_out[i], where uw_dl[i] has unit
+            // magnitude per QUAD_TO_RE/IM (×M_SQRT1_2 scaling absorbed
+            // into the threshold).
+            float u_re = QUAD_TO_RE[IR_UW_DL[i]];
+            float u_im = QUAD_TO_IM[IR_UW_DL[i]];
+            // conj(u) * y = (u_re - j*u_im) * (re_y + j*im_y)
+            c_dl_re += u_re * re_y + u_im * im_y;
+            c_dl_im += u_re * im_y - u_im * re_y;
+            u_re = QUAD_TO_RE[IR_UW_UL[i]];
+            u_im = QUAD_TO_IM[IR_UW_UL[i]];
+            c_ul_re += u_re * re_y + u_im * im_y;
+            c_ul_im += u_re * im_y - u_im * re_y;
+        }
+        // Match strength: |c|² normalised by per-symbol energy ×
+        // N. For a perfect match c_mag² ≈ (2 × N × avg_y_mag²),
+        // i.e. accept_ratio of 1.0 means perfect alignment. Random
+        // hd → c_mag² ≈ avg_y_mag² × N → accept_ratio ≈ 0.5.
+        // Threshold at 0.75: requires significantly better than
+        // random.
+        if (pll_energy > 1e-3f) {
+            float c_dl_mag2 = c_dl_re * c_dl_re + c_dl_im * c_dl_im;
+            float c_ul_mag2 = c_ul_re * c_ul_re + c_ul_im * c_ul_im;
+            float peak2     = 2.0f * (float)IR_UW_LENGTH * pll_energy;
+            float dl_ratio  = c_dl_mag2 / peak2;
+            float ul_ratio  = c_ul_mag2 / peak2;
+            if (dl_ratio >= 0.75f && dl_ratio >= ul_ratio) {
+                out->direction = DIR_DOWNLINK;
+                // Pick the quadrant rotation whose hard-decision diff
+                // was lowest (already computed above).
+                chosen_rot = dl_rot;
+            } else if (ul_ratio >= 0.75f) {
+                out->direction = DIR_UPLINK;
+                chosen_rot = ul_rot;
+            }
+        }
+    }
 
     // Apply the chosen rotation to hard_decisions so the DQPSK decode
     // below produces bits anchored to the right quadrant reference.
