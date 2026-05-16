@@ -10,8 +10,34 @@ static const int IR_UW_DL[] = { 0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2 };
 static const int IR_UW_UL[] = { 2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2 };
 static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 
-#define PLL_ALPHA 0.2f
-#define M_SQRT1_2f 0.70710678f
+// Second-order PLL gains. ALPHA is the phase (proportional) term;
+// BETA is the frequency (integral) term. Critically-damped second-
+// order rule of thumb: beta ≈ alpha² / 4. With alpha = 0.2 → beta
+// = 0.01. The frequency integrator lets the loop track a residual
+// carrier offset that the first-order phase-only loop couldn't
+// (a constant freq offset of f Hz produces a phase error that
+// integrates monotonically; omega_hat accumulates the integral and
+// supplies it as a feed-forward to phi_hat).
+//
+// D9 motivation: D8 produces ±700 Hz residual carrier. Drift rate at
+// 700 Hz / 25 ksym/s = ~10°/symbol. The old first-order loop at
+// ALPHA=0.2 only corrected ~2° per symbol = couldn't keep up. Over
+// the 12-symbol UW the constellation rotated ~120° while phase
+// correction kept up with ~24°. With the frequency integrator
+// settling, omega_hat absorbs the constant rate and phase tracking
+// catches up within a few symbols.
+// ALPHA = phase (proportional) gain, BETA = frequency (integral) gain.
+// First-order rule of thumb is beta ≈ alpha²/4 = 0.01 for critical
+// damping. But that's tuned for STEADY-STATE tracking — for FAST
+// ACQUISITION (the 12-symbol UW lock window) we need much more
+// aggressive integral gain or omega_hat hasn't caught up in time.
+// At 0.1, omega_hat reaches the true offset rate within ~6 symbols
+// for ±700 Hz residual (verified by simulation). Trades steady-
+// state noise for acquisition speed — acceptable for burst-mode
+// demod where each burst is a fresh acquisition.
+#define PLL_ALPHA       0.2f
+#define PLL_BETA        0.1f
+#define M_SQRT1_2f      0.70710678f
 
 int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame_t *out)
 {
@@ -45,14 +71,20 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         symbols[i] = (float)samples_2sps[i * 4 + 0] + (float)samples_2sps[i * 4 + 1] * _Complex_I;
     }
 
-    // 2. PLL Phase Tracking
+    // 2. Second-order PLL (D9). Tracks both phase (phi_hat) and
+    // frequency (omega_hat, rad/sym). Per symbol:
+    //   pll_out = symbol × phi_hat
+    //   err = arg(conj(x_hat) × pll_out)            // signed phase error
+    //   phi_hat ← phi_hat × exp(-j(α·err + ω_hat))   // phase + freq feed-fwd
+    //   ω_hat += β · err                              // frequency integrator
     float complex phi_hat = 1.0f + 0.0f * _Complex_I;
+    float omega_hat = 0.0f;
     for (int i = 0; i < n_symbols; i++) {
         pll_out[i] = symbols[i] * phi_hat;
-        
+
         float re = crealf(pll_out[i]);
         float im = cimagf(pll_out[i]);
-        
+
         // Hard decision (QPSK: pi/4, 3pi/4, -3pi/4, -pi/4)
         float complex x_hat;
         if (re >= 0 && im >= 0)      { x_hat = M_SQRT1_2f + M_SQRT1_2f * _Complex_I; hard_decisions[i] = 0; }
@@ -62,15 +94,19 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
 
         float complex er = conjf(x_hat) * pll_out[i];
         float er_mag = cabsf(er);
-        if (er_mag > 1e-10f) {
-            float angle = cargf(er / er_mag);
-            float scaled_angle = PLL_ALPHA * angle;
-            float complex correction = cosf(scaled_angle) + sinf(scaled_angle) * _Complex_I;
-            phi_hat = conjf(correction) * phi_hat;
-            // Normalise to prevent drift
-            float mag = cabsf(phi_hat);
-            if (mag > 1e-10f) phi_hat /= mag;
-        }
+        float angle = (er_mag > 1e-10f) ? cargf(er / er_mag) : 0.0f;
+
+        // Combined rotation: alpha·err (proportional) + omega_hat (integral).
+        // phi_hat *= exp(-j*total) to oppose the measured drift.
+        float total = PLL_ALPHA * angle + omega_hat;
+        float complex correction = cosf(total) + sinf(total) * _Complex_I;
+        phi_hat = conjf(correction) * phi_hat;
+        // Normalise to prevent drift.
+        float mag = cabsf(phi_hat);
+        if (mag > 1e-10f) phi_hat /= mag;
+
+        // Frequency integrator update. omega_hat is in rad/sym.
+        omega_hat += PLL_BETA * angle;
     }
 
     // 3. UW Check. The PLL has 4 stable phase points (90° ambiguity);
@@ -115,8 +151,8 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         // "PLL never locked" (random hard_decisions) from "wrong
         // burst alignment" (decisions structured but offset).
         ESP_LOGD(TAG,
-            "UW no match: dl_diffs=%d ul_diffs=%d hd=[%d %d %d %d %d %d %d %d %d %d %d %d]",
-            dl_diffs, ul_diffs,
+            "UW no match: dl=%d (rot %d) ul=%d (rot %d) omega=%.4f hd[0..11]=[%d %d %d %d %d %d %d %d %d %d %d %d]",
+            dl_diffs, dl_rot, ul_diffs, ul_rot, (double)omega_hat,
             hard_decisions[0], hard_decisions[1], hard_decisions[2],
             hard_decisions[3], hard_decisions[4], hard_decisions[5],
             hard_decisions[6], hard_decisions[7], hard_decisions[8],
