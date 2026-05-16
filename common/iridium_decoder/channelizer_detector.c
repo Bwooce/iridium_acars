@@ -64,6 +64,12 @@
 // rejecting 1-3 cycle flickers from PRBS / quantisation.
 #define MIN_BURST_CYCLES     4     // ~100 us at 40 ksps
 
+// D20 step 3 gate. Flipped to 1 after polyphase_mac_phase_arp4 (the
+// PIE xacc-based MAC kernel) landed in polyphase_mac_arp4.S. If the
+// kernel turns out buggy / crashy, flip back to 0 and reflash to
+// restore the float path.
+#define CHANNELIZER_USE_INT16_PATH 1
+
 // Per-channel slow baseline EMA. Distinguishes a TRANSIENT burst (a
 // channel's instantaneous power spikes above its own slow baseline)
 // from a PERSISTENT spur (channel always above the cross-channel
@@ -123,12 +129,10 @@ struct channelizer_detector {
     size_t           out_capacity_cycles;
     float complex   *in_buf;
     float complex   *out_buf;
+#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+    int16_t         *out_buf_i16;             // interleaved IQ
+#endif
 };
-
-// D20 step 3 gate. Set to 1 once polyphase_channelizer_mac_arp4 lands
-// in polyphase_mac_arp4.S so the int16 path is actually faster than
-// the float path on P4 — until then this flag stays 0.
-#define CHANNELIZER_USE_INT16_PATH 0
 
 channelizer_detector_t *channelizer_detector_create(uint32_t fs_in_hz,
                                                      float threshold_db,
@@ -164,6 +168,16 @@ channelizer_detector_t *channelizer_detector_create(uint32_t fs_in_hz,
         free(d);
         return NULL;
     }
+#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+    d->out_buf_i16 = malloc(d->out_capacity_cycles * M * 2 * sizeof(int16_t));
+    if (!d->out_buf_i16) {
+        free(d->in_buf);
+        free(d->out_buf);
+        polyphase_channelizer_destroy(d->ch);
+        free(d);
+        return NULL;
+    }
+#endif
     return d;
 }
 
@@ -173,6 +187,9 @@ void channelizer_detector_destroy(channelizer_detector_t *d)
     if (d->ch)      polyphase_channelizer_destroy(d->ch);
     if (d->in_buf)  free(d->in_buf);
     if (d->out_buf) free(d->out_buf);
+#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+    if (d->out_buf_i16) free(d->out_buf_i16);
+#endif
     free(d);
 }
 
@@ -233,15 +250,29 @@ static float select_nth(float *arr, int n, int len)
 static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
 {
     for (size_t cyc = 0; cyc < n_cycles; cyc++) {
-        const float complex *row = &d->out_buf[cyc * M];
         uint32_t this_cycle = d->cycle_count + (uint32_t)cyc;
 
-        // 1. Compute per-channel power.
+        // 1. Compute per-channel power. Two source paths:
+        //   - Int16 (D20 step 3): channelizer wrote sc16 IQ to out_buf_i16;
+        //     compute power as int32 r²+i² and cast to float for the
+        //     existing percentile / threshold logic (which is ratio-based,
+        //     so absolute scale is irrelevant).
+        //   - Float: channelizer wrote complex float to out_buf.
         float power[M];
+#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+        const int16_t *row = &d->out_buf_i16[cyc * M * 2];
+        for (int k = 0; k < M; k++) {
+            int32_t re = row[k * 2 + 0];
+            int32_t im = row[k * 2 + 1];
+            power[k] = (float)(re * re + im * im);
+        }
+#else
+        const float complex *row = &d->out_buf[cyc * M];
         for (int k = 0; k < M; k++) {
             float complex y = row[k];
             power[k] = crealf(y) * crealf(y) + cimagf(y) * cimagf(y);
         }
+#endif
 
         // 2. Estimate noise floor as the cross-channel 25th percentile.
         // (Most of 64 channels are at noise at any given moment, so
@@ -321,6 +352,10 @@ void channelizer_detector_feed_int16(channelizer_detector_t *d,
         size_t whole = (want / M) * M;
         if (whole == 0) break;
 
+#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+        size_t got = polyphase_channelizer_process_int16(
+            d->ch, &iq[consumed * 2], whole, d->out_buf_i16);
+#else
         for (size_t i = 0; i < whole; i++) {
             float re = (float)iq[2 * (consumed + i) + 0] * (1.0f / 32768.0f);
             float im = (float)iq[2 * (consumed + i) + 1] * (1.0f / 32768.0f);
@@ -328,9 +363,7 @@ void channelizer_detector_feed_int16(channelizer_detector_t *d,
         }
         size_t got = polyphase_channelizer_process(d->ch, d->in_buf, whole,
                                                     d->out_buf);
-        // D20 step 3 (CHANNELIZER_USE_INT16_PATH=0 today): the int16
-        // fast path goes here once polyphase_channelizer_mac_arp4 is
-        // implemented. See header comment for the gate condition.
+#endif
         process_cycles(d, got);
         consumed += whole;
     }

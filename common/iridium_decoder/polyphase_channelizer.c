@@ -16,6 +16,7 @@
 #ifdef ESP_PLATFORM
 #include "dsps_fft2r.h"
 #include "esp_log.h"
+#include "polyphase_mac_arp4.h"
 static bool s_dsps_fft64_fc32_inited = false;
 static bool s_dsps_fft64_sc16_inited = false;
 static void init_dsps_fft64_once(void)
@@ -397,10 +398,29 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
 
         // 2. Per-phase MAC: 8 Q14 taps × 8 complex int16 samples.
         //
-        // Future asm path: this is the loop polyphase_channelizer_mac_arp4
-        // (D20 step 3, see polyphase_mac_arp4.S) replaces. The current
-        // scalar reference is the validation baseline for that kernel.
+        // On target (ESP_PLATFORM) the inner MAC is a hand-rolled PIE
+        // kernel: polyphase_mac_phase_arp4 (vmulas.s16.qacc, see
+        // polyphase_mac_arp4.S). The C side deinterleaves the per-phase
+        // delay line into aligned re_buf/im_buf in head-rotated order,
+        // then calls the kernel; the kernel produces one [Re, Im]
+        // int16 pair. On host the scalar reference below stays
+        // bit-equal to what the asm should produce.
         const int head = ch->dl_head_int16;
+#ifdef ESP_PLATFORM
+        __attribute__((aligned(16))) int16_t re_buf[N];
+        __attribute__((aligned(16))) int16_t im_buf[N];
+        for (int p = 0; p < M; p++) {
+            const int16_t *dlp = &ch->dl_int16[p * N * 2];
+            for (int n = 0; n < N; n++) {
+                int slot = (head + n) & N_MASK;
+                re_buf[n] = dlp[slot * 2 + 0];
+                im_buf[n] = dlp[slot * 2 + 1];
+            }
+            polyphase_mac_phase_arp4(&ch->h_phase_q15[p * N],
+                                     re_buf, im_buf,
+                                     &fft_buf_i16[p * 2]);
+        }
+#else
         for (int p = 0; p < M; p++) {
             const int16_t *hp  = &ch->h_phase_q15[p * N];
             const int16_t *dlp = &ch->dl_int16[p * N * 2];
@@ -412,7 +432,6 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
                 acc_re += (int64_t)tap * (int32_t)dlp[slot * 2 + 0];
                 acc_im += (int64_t)tap * (int32_t)dlp[slot * 2 + 1];
             }
-            // Q14 → int16 (unscaled). Saturate just in case.
             int32_t re = (int32_t)(acc_re >> 14);
             int32_t im = (int32_t)(acc_im >> 14);
             if      (re >  32767) re =  32767;
@@ -422,6 +441,7 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
             fft_buf_i16[p * 2 + 0] = (int16_t)re;
             fft_buf_i16[p * 2 + 1] = (int16_t)im;
         }
+#endif
 
         // 3. FFT.
 #ifdef ESP_PLATFORM
