@@ -171,18 +171,19 @@ static void build_prototype(float h_phase[POLYCHAN_FILTER_LEN])
     float center = (L - 1) / 2.0f;
     // Normalised cutoff = 1/(2M) so each channel passes ±fs/(2M)/2 and
     // adjacent channels (centered at multiples of fs/M) are fully in
-    // the stop-band. With a Hamming window at L = M*N taps, the
+    // the stop-band. With a Hamming window at L = M*N taps the
     // transition band is ~fs/L; for N=8 that's about half a channel
     // spacing, giving ≥40 dB adjacent rejection.
     //
-    // Iridium grid mismatch (41.667 vs 40 kHz) costs ~3 dB on
-    // edge-aligned channels (test_snr_gap_measurement). Widening the
-    // filter to recover some of this regresses the channelizer
-    // reference test (fixture computed with the 1/(2M) cutoff —
-    // changing the filter diverges from gr-iridium's reference
-    // outputs). Proper fix is fs/M alignment with the Iridium grid
-    // (e.g. fs=2.667 MHz with M=64 gives exact 41.667 kHz channels);
-    // tracked as task #41 step 2.
+    // Task #45 attempted Kaiser β=8.6 (~80 dB stopband) here. Measured
+    // change vs Hamming: +0.12 dB at 2.56 MHz, -0.22 dB at 2.667 MHz —
+    // not a meaningful improvement. The fundamental limit is filter
+    // LENGTH (L=512 = N*M with N=8): for L=512 even a perfect Kaiser
+    // can't get the transition band below ~20 kHz, so adjacent-channel
+    // leakage at 40 kHz can't be tightened much. Real channel-filter
+    // improvement requires N=12 or 16 taps/phase (L=768 or 1024) —
+    // more memory and PIE asm reflow. Deferred until D20 PIE rewrite
+    // makes the longer filter affordable. Hamming retained.
     float cutoff = 1.0f / (2.0f * (float)M);
     float sum = 0.0f;
     for (int k = 0; k < L; k++) {
