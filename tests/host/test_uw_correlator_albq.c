@@ -47,13 +47,31 @@ static int s_failed = 0;
 
 int main(void)
 {
-    // Make a mutable copy of the fixture (RRC filter writes back in-place).
-    int n_complex = (int)(ALBQ_2SPS_LEN / 2);
-    int16_t *burst = malloc(ALBQ_2SPS_LEN * sizeof(int16_t));
-    memcpy(burst, ALBQ_2SPS, ALBQ_2SPS_LEN * sizeof(int16_t));
+    // ALBQ_2SPS is at 2 sps (50 kHz). uw_correlator now expects 10 sps
+    // (UW_SPS, gr-iridium aligned). Upsample the fixture 5× by linear
+    // interpolation so the matched filter sees the right sample density.
+    // The reconstruction noise from 2→10 linear interp is acceptable
+    // for this test (we check direction + UW found + bounded CFO,
+    // not bit-exact reproduction).
+    int n_complex_2sps = (int)(ALBQ_2SPS_LEN / 2);
+    int n_complex = n_complex_2sps * 5;          // 10 sps
+    int n_int16 = n_complex * 2;
+    int16_t *burst = malloc(n_int16 * sizeof(int16_t));
+    for (int n = 0; n < n_complex; n++) {
+        // Position in 2-sps units: n / 5 + (n % 5) / 5.0
+        int n2 = n / 5;
+        int n2p = (n2 + 1 < n_complex_2sps) ? n2 + 1 : n2;
+        float frac = (n % 5) / 5.0f;
+        float re = (1.0f - frac) * (float)ALBQ_2SPS[2 * n2]
+                 +         frac  * (float)ALBQ_2SPS[2 * n2p];
+        float im = (1.0f - frac) * (float)ALBQ_2SPS[2 * n2 + 1]
+                 +         frac  * (float)ALBQ_2SPS[2 * n2p + 1];
+        burst[2 * n + 0] = (int16_t)re;
+        burst[2 * n + 1] = (int16_t)im;
+    }
 
-    printf("Albuquerque DL burst: %d complex samples (%d int16)\n",
-           n_complex, (int)ALBQ_2SPS_LEN);
+    printf("Albuquerque DL burst: upsampled 2→10 sps, %d complex samples\n",
+           n_complex);
     printf("Truth direction: %s (%d bits)\n",
            ALBQ_TRUTH_BITS_DIRECTION, 382 /* ALBQ_TRUTH_BITS_LEN — header has it */);
 
@@ -74,7 +92,7 @@ int main(void)
 
     // Stage 3: matched-filter UW correlator + Blackman FFT CFO.
     uw_corr_result_t res;
-    uw_correlator_find(adj_burst, adj_n, adj_n - 24, &res);
+    uw_correlator_find(adj_burst, adj_n, adj_n - 120, &res);
 
     printf("UW corr: dir=%s offset=%d corr=%.3f SNR=%.1f dB peak=%.2e omega=%.3f\n",
            res.direction == UW_DIR_DOWNLINK ? "DL"

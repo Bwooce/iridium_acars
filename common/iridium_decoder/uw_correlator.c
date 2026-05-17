@@ -26,7 +26,29 @@
 #define UW_LENGTH        12
 #define PREAMBLE_LENGTH  16
 #define SYNC_LENGTH      (PREAMBLE_LENGTH + UW_LENGTH)   // 28
-#define SYM_STRIDE       2     // 2 samples per symbol
+// SYM_STRIDE = UW_SPS (10) to match gr-iridium's burst_downmix
+// internal rate. Worker now produces a 250 kHz / 10 sps stream into
+// these functions (was 50 kHz / 2 sps). Host tests must synthesize
+// at 10 sps too.
+#define SYM_STRIDE       UW_SPS  // = 10 samples per symbol
+
+// Modified Bessel function I0(x), polynomial approximation
+// (Abramowitz & Stegun 9.8). Used by the Kaiser-windowed start-finder LP.
+static float bessel_i0(float x)
+{
+    float ax = (x < 0.0f) ? -x : x;
+    if (ax < 3.75f) {
+        float y = x / 3.75f;
+        y = y * y;
+        return 1.0f + y * (3.5156229f + y * (3.0899424f + y * (1.2067492f
+              + y * (0.2659732f + y * (0.0360768f + y * 0.0045813f)))));
+    }
+    float y = 3.75f / ax;
+    return (expf(ax) / sqrtf(ax)) * (0.39894228f + y * (0.01328592f
+           + y * (0.00225319f + y * (-0.00157565f + y * (0.00916281f
+           + y * (-0.02057706f + y * (0.02635537f + y * (-0.01647633f
+           + y * 0.00392377f))))))));
+}
 
 // Full sync-word sign patterns: preamble (16 syms) + UW (12 syms),
 // each symbol mapped to BPSK ±(1+j) on the +1+j / -1-j axis.
@@ -45,14 +67,13 @@ static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
     -1,-1,+1,+1,+1,-1,+1,+1,-1,+1,-1,-1                  // UW
 };
 
-// RRC pulse shape: β=0.4, 11 taps at 2 sps = 5.5 symbol periods.
-// Matches gr-iridium's symbol-period coverage (51 taps at 10 sps =
-// 5.1 symbols). Earlier we used 21 taps (10 symbols, 2× coverage)
-// which gave slightly higher matched-filter SNR on quiet bursts but
-// diverged from gr-iridium's reference behaviour.
+// RRC pulse shape: β=0.4, 51 taps at 10 sps = 5.1 symbol periods.
+// Matches gr-iridium's prototype exactly (51 taps, fs=250 kHz,
+// fs_sym=25 kHz, β=0.4 — see iridium_extractor_flowgraph.py and
+// the burst_downmix RRC FIR init).
 #define RRC_BETA       0.4f
-#define RRC_NTAPS      11
-#define SYNC_RRC_LEN   (SYNC_LENGTH * SYM_STRIDE)   // 56 samples
+#define RRC_NTAPS      51
+#define SYNC_RRC_LEN   (SYNC_LENGTH * SYM_STRIDE)   // 280 samples at sps=10
 static float s_rrc_taps[RRC_NTAPS];     // RRC for filtering the burst
 static float s_rc_taps[RRC_NTAPS];      // RC for shaping the sync ref
 // RRC-shaped sync word references (complex, +1+j axis). Computed
@@ -169,13 +190,14 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
 // Per burst we FFT the burst (zero-padded to CORR_FFT_N), multiply
 // elementwise by the stored sync FFT, IFFT, and peak-find.
 //
-// CORR_FFT_N matches gr-iridium's d_corr_fft_size = next_pow2(
-//   d_sync_search_len + sync_word_len - 1) = next_pow2(168 + 56 - 1)
-//   = 256. Search range = CORR_FFT_N - SYNC_RRC_LEN + 1 = 201 burst
-// samples after D13's start-finder trim — covers the worst-case
-// envelope misalignment gr-iridium's pipeline is designed for.
-#define CORR_FFT_N   256
-#define CORR_FFT_LOG 8
+// CORR_FFT_N matches gr-iridium's d_corr_fft_size at 10 sps:
+//   next_pow2(d_sync_search_len + sync_word_len - 1)
+//   = next_pow2((16 + 12 + 8)*10 + 280 - 1) = next_pow2(639) = 1024
+// Search range = CORR_FFT_N - SYNC_RRC_LEN + 1 = 745 burst samples
+// after D13's start-finder trim. At 10 sps that's ~3 ms — comfortably
+// past the worst-case envelope misalignment.
+#define CORR_FFT_N   1024
+#define CORR_FFT_LOG 10
 static uint16_t s_corr_brev[CORR_FFT_N];
 static float    s_corr_tw_re[CORR_FFT_N / 2];
 static float    s_corr_tw_im[CORR_FFT_N / 2];
@@ -305,15 +327,17 @@ static void sync_init(void)
 // runs once per detected burst, so a few hundred flops is nothing.
 // gr-iridium parameters (burst_downmix_impl.cc lines 128-134):
 //   d_cfo_est_fft_size = next_pow2(sps × (PREAMBLE_LENGTH_SHORT + 10))
-//                      = next_pow2(2 × 26) = 64
-//   d_fft_over_size_facor = 16  → effective FFT = 64 × 16 = 1024
+//                      = next_pow2(10 × 26) = 512  (at 10 sps)
+//   d_fft_over_size_facor = 16  → effective FFT = 512 × 16 = 8192
 //   Window = Blackman (gr::fft::window::WIN_BLACKMAN)
 //   No SNR gate.
-#define CFO_FFT_N        1024
-#define CFO_FFT_LOG      10
-#define CFO_INPUT_N      56     // 28 syms (preamble + UW) × 2 sps
-#define CFO_PREAMBLE_N   32     // 16 syms × 2 sps; uw_offset_complex
-                                // anchors the window's right side
+// We use a 4096-pt FFT (still gives ~60 Hz resolution at 250 kHz =
+// ~0.015 rad/sym, plenty for our needs) — keeps memory bounded.
+#define CFO_FFT_N        4096
+#define CFO_FFT_LOG      12
+#define CFO_INPUT_N      (SYNC_LENGTH * UW_SPS)        // 280 samples
+#define CFO_PREAMBLE_N   (PREAMBLE_LENGTH * UW_SPS)    // 160 samples
+#define CFO_UW_ONLY_N    (UW_LENGTH * UW_SPS)          // 120 samples (fallback)
 
 static inline float parabolic_interp(float yl, float yc, float yr);
 
@@ -322,11 +346,9 @@ static float    s_cfo_tw_re[CFO_FFT_N / 2];
 static float    s_cfo_tw_im[CFO_FFT_N / 2];
 // Blackman windows (matches gr::fft::window::WIN_BLACKMAN):
 //   w[n] = 0.42 - 0.5·cos(2πn/(N-1)) + 0.08·cos(4πn/(N-1))
-// One for the full 56-sample preamble+UW window, one for the
-// 24-sample UW-only fallback used when uw_offset doesn't leave
-// room for the preamble.
+// One for the full preamble+UW window, one for the UW-only fallback.
 static float    s_cfo_window_full[CFO_INPUT_N];
-static float    s_cfo_window_uw[24];
+static float    s_cfo_window_uw[CFO_UW_ONLY_N];
 static bool     s_cfo_inited = false;
 
 static void cfo_init(void)
@@ -352,8 +374,8 @@ static void cfo_init(void)
         s_cfo_window_full[i] = 0.42f - 0.5f * cosf(2.0f * PI * t)
                                      + 0.08f * cosf(4.0f * PI * t);
     }
-    for (int i = 0; i < 24; i++) {
-        float t = (float)i / (float)(24 - 1);
+    for (int i = 0; i < CFO_UW_ONLY_N; i++) {
+        float t = (float)i / (float)(CFO_UW_ONLY_N - 1);
         s_cfo_window_uw[i] = 0.42f - 0.5f * cosf(2.0f * PI * t)
                                    + 0.08f * cosf(4.0f * PI * t);
     }
@@ -417,9 +439,9 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
         start = uw_offset_complex - CFO_PREAMBLE_N;
         n_in  = CFO_INPUT_N;
         win   = s_cfo_window_full;
-    } else if (uw_offset_complex + 24 <= n_complex) {
+    } else if (uw_offset_complex + CFO_UW_ONLY_N <= n_complex) {
         start = uw_offset_complex;
-        n_in  = 24;
+        n_in  = CFO_UW_ONLY_N;
         win   = s_cfo_window_uw;
     } else {
         return 0.0f;       // burst too short, skip
@@ -456,23 +478,31 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     float yr = re[kp1] * re[kp1] + im[kp1] * im[kp1];
     float delta = parabolic_interp(yl, yc, yr);
 
-    // Convert (signed) bin position to fractional cycles per sample,
-    // then to rad/sym. The squared spectrum is at 2·Δω_per_sample =
-    // 2·(Δω_per_sym/2) = Δω_per_sym, so dividing by 2 at the end
-    // gives back the original per-symbol omega.
+    // Convert (signed) bin position to rad/sym.
+    //
+    // For a burst at sps samples per symbol with carrier offset
+    // Δω_sym rad/sym, the per-sample phase increment is Δω_sym / sps.
+    // Squaring the signal doubles that: 2·Δω_sym / sps rad/sample.
+    // FFT peak bin k corresponds to angular freq 2π·k/N rad/sample.
+    // Solving: Δω_sym = (2π·k/N) × sps / 2 = π·k·sps / N.
+    //
+    // At sps=2: Δω_sym = π·k/N × 2 / 2 = π·k/N (original formula was
+    // really kf × 2π/N which = 2 × π·k/N — wait that was wrong).
+    // Actually the OLD formula was rad/sample = 2π·k/N and was claimed
+    // to equal omega_sym at sps=2 because /2 from sps and ×2 from
+    // squaring cancelled. That's correct.
+    // At sps=10 the cancellation gives factor 5, so omega_sym =
+    // rad/sample × (sps/2). Generalising: omega_sym = rad/sample × sps/2.
     float kf = (float)peak_k + delta;
     if (kf >= (float)CFO_FFT_N / 2.0f) kf -= (float)CFO_FFT_N;
-    // Cycles per FFT bin = kf / CFO_FFT_N → rad/sample = 2π·kf/N.
     float rad_per_sample = 2.0f * 3.14159265358979323846f * kf / (float)CFO_FFT_N;
-    // 2 sps → rad/sym = 2 × rad/sample; squared so divide by 2 → cancels.
-    // Net: omega_per_sym = rad_per_sample.
-    // Sign convention: worker multiplies burst by exp(+j·omega/2·n).
-    // The burst's carrier offset is encoded as exp(+j·Δω/2·n), so to
-    // CANCEL it the per-sample advance must be exp(-j·Δω/2·n) — i.e.,
-    // the returned omega_per_sym must be -Δω. The squared FFT finds
-    // +Δω, so we negate. (The earlier two-half method already had the
-    // negation baked in via the conj order in h2·conj(h1).)
-    float omega = -rad_per_sample;
+    // Sign convention: worker multiplies burst by exp(+j·omega/2·n)
+    // (treating omega as per-symbol, dividing by 2 sps... wait at 10
+    // sps it'd be /10). General sign convention: the returned
+    // omega_per_sym is NEGATIVE of the actual offset so the worker can
+    // multiply the burst sample by exp(+j·omega_per_sym/sps·n) to
+    // CANCEL it.
+    float omega = -rad_per_sample * ((float)UW_SPS / 2.0f);
     if (omega >  1.5f) omega =  1.5f;
     if (omega < -1.5f) omega = -1.5f;
     return omega;
@@ -689,11 +719,19 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 // D13 burst-start finder constants (mirror gr-iridium defaults).
 // Their low-pass filter is firdes.low_pass_2(1, fs, 2.5e3, 5e3, 60dB)
 // which at 50 ksps yields ~33 taps. We use a simpler triangular
-// (Bartlett-windowed) moving average of 17 taps (≈0.34 ms = 8.5
-// symbol periods at 25 ksym/s) for the smoothing step — same
-// effective time-constant, much cheaper, doesn't ring on signal
-// onsets the way a sharp-cutoff LP would.
-#define START_LP_NTAPS         17
+// Kaiser-windowed sinc LP filter for the start finder. gr-iridium
+// uses `firdes.low_pass_2(1, fs, 2.5e3, 5e3, 60)` on the magnitude²
+// envelope — Kaiser β corresponding to 60 dB stopband attenuation
+// (β ≈ 5.65), ~182 taps at their 250 ksps. The filter time constant
+// is what matters for envelope smoothing — at their rate this is
+// ~0.73 ms (~18 symbol periods).
+//
+// At our 50 ksps rate to keep the same TIME constant we need
+// 0.73 ms × 50 = 37 taps. Round up to 41 for symmetry. β=5.65 gives
+// us the same stopband attenuation. Much sharper envelope detection
+// than the previous Bartlett MA (17 taps, no stopband control).
+#define START_LP_NTAPS         41
+#define START_LP_KAISER_BETA   5.65f
 #define START_THRESHOLD_FRAC   0.28f
 // gr-iridium's d_pre_start_samples is a small bias to back off from
 // the detected edge so we don't clip the preamble's first symbol.
@@ -727,19 +765,39 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
         mag2[n] = r * r + i * i;
     }
 
-    // Step 2: smooth with Bartlett-windowed moving average (acts as
-    // a near-LP filter; triangular shape reduces high-freq leakage).
-    // Coefficients: w[k] = 1 - |k - center|/center, normalised.
-    float wsum = 0;
-    float w[START_LP_NTAPS];
+    // Step 2: smooth with Kaiser-windowed sinc LP filter.
+    // Cutoff fc/fs = 2.5/50 = 0.05 (same proportion as gr-iridium's
+    // 2.5 kHz cutoff at 250 ksps). The filter shapes a sharp envelope
+    // estimate with 60 dB stopband; much better burst-edge precision
+    // than the prior Bartlett MA.
+    //
+    // Computed lazily once per init (we have a static-init pattern
+    // elsewhere for cfo_init / sync_init; reuse it for the LP taps).
+    static float w[START_LP_NTAPS];
+    static bool s_start_lp_inited = false;
     int half = START_LP_NTAPS / 2;
-    for (int k = 0; k < START_LP_NTAPS; k++) {
-        float d = (float)(k - half);
-        if (d < 0) d = -d;
-        w[k] = 1.0f - d / (float)half;
-        wsum += w[k];
+    if (!s_start_lp_inited) {
+        const float PI = 3.14159265358979323846f;
+        const float fc_norm = 0.05f;       // cutoff = 0.05 × fs
+        const float inv_i0_beta = 1.0f / bessel_i0(START_LP_KAISER_BETA);
+        float wsum = 0.0f;
+        for (int k = 0; k < START_LP_NTAPS; k++) {
+            float t = (float)(k - half);
+            float sinc = (t == 0.0f)
+                         ? 2.0f * fc_norm
+                         : sinf(2.0f * PI * fc_norm * t) / (PI * t);
+            // Kaiser window: I0(β·sqrt(1-(2k/(N-1)-1)²)) / I0(β)
+            float u = 2.0f * (float)k / (float)(START_LP_NTAPS - 1) - 1.0f;
+            float arg = START_LP_KAISER_BETA * sqrtf(1.0f - u * u);
+            float kw  = bessel_i0(arg) * inv_i0_beta;
+            w[k] = sinc * kw;
+            wsum += w[k];
+        }
+        if (wsum != 0.0f) {
+            for (int k = 0; k < START_LP_NTAPS; k++) w[k] /= wsum;
+        }
+        s_start_lp_inited = true;
     }
-    for (int k = 0; k < START_LP_NTAPS; k++) w[k] /= wsum;
     // Apply (valid mode): smooth[n] valid for n in [half, search_max-half-1].
     // For n outside that, copy raw mag² (so threshold search still
     // works at the very start of the burst).
@@ -829,14 +887,13 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
     }
 }
 
-float uw_correlator_estimate_cfo(const int16_t *burst_2sps, int n_complex,
-                                  int head_n)
+float uw_correlator_estimate_cfo(const int16_t *burst, int n_complex)
 {
-    // Reuse cfo_fine_estimate by anchoring at head_n/2 so it starts
-    // at sample 0 (its internal start = anchor - CFO_PREAMBLE_N).
-    // We don't need head_n parameter for the FFT itself — internally
-    // it always picks 56 samples if preamble window fits, else 24.
-    (void)head_n;
-    if (n_complex <= CFO_PREAMBLE_N + 12 * SYM_STRIDE) return 0.0f;
-    return cfo_fine_estimate(burst_2sps, n_complex, CFO_PREAMBLE_N);
+    // Anchor at PREAMBLE_LENGTH*SYM_STRIDE so cfo_fine_estimate's
+    // internal window starts at burst sample 0 (start = anchor -
+    // CFO_PREAMBLE_N = 0) and covers the first SYNC_LENGTH × SYM_STRIDE
+    // samples (= 280 at sps=10). Used by the worker BEFORE uw_correlator_find
+    // to do an initial coarse CFO correction.
+    if (n_complex <= CFO_INPUT_N) return 0.0f;
+    return cfo_fine_estimate(burst, n_complex, CFO_PREAMBLE_N);
 }

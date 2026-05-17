@@ -43,10 +43,17 @@ static volatile uint64_t s_t_bch_us = 0;
 #define DECIM_FACTOR 32
 #define FIR_TAPS 64
 
-// Resample 80 kHz -> 50 kHz (Ratio 1.6, Interp 5, Decim 8)
-#define RESAMPLE_INTERP 5
+// Resample 80 kHz -> 250 kHz (Interp 25, Decim 8 — gives 80 × 25/8 =
+// 250 kHz = 10 sps × 25 ksym/s). 10 sps matches gr-iridium's
+// burst_downmix internal rate; uw_correlator's UW_SPS = 10.
+#define RESAMPLE_INTERP 25
 #define RESAMPLE_DECIM 8
 #define RESAMPLE_TAPS 64
+
+// After matched filter + pre-rotation we decimate 5× back to 50 kHz
+// (2 sps) so qpsk_demod (which expects 2 sps interleaved IQ) doesn't
+// need changing.
+#define POST_CORR_DECIM 5
 
 // Buffer for burst extraction (max 50ms = 128k complex samples)
 #define MAX_EXTRACT_SAMPLES (128 * 1024)
@@ -296,11 +303,9 @@ void worker_task(void *arg)
                     // Constant phase factor (rotates burst back to UW axes).
                     float rot_re =  uw_res.peak_re / pmag;
                     float rot_im =  uw_res.peak_im / pmag;
-                    // Per-SAMPLE phase increment = omega_per_sym/2
-                    // (omega is per SYMBOL; burst is at 2 sps). Sign:
-                    // burst has phase -omega·sym_idx encoded; we
-                    // multiply by exp(+j·omega·sym_idx) to undo it.
-                    float dphi = uw_res.omega_per_sym * 0.5f;
+                    // Per-SAMPLE phase increment = omega_per_sym / sps
+                    // (omega is per SYMBOL; burst is at UW_SPS=10 sps).
+                    float dphi = uw_res.omega_per_sym / (float)UW_SPS;
                     float c_step = cosf(dphi);
                     float s_step = sinf(dphi);
                     // #46: linear sub-sample interpolation factor.
@@ -333,15 +338,25 @@ void worker_task(void *arg)
                         pr = npr; pi = npi;
                     }
                 }
-                // (Gardner symbol-timing recovery is intentionally not
-                // wired into the worker pipeline yet. With default
-                // textbook gains it regressed the only burst that
-                // decoded under correlator + pre-rotation alone — the
-                // loop introduces strobe jitter that the fixed-decim
-                // qpsk_demod can't tolerate. sym_timing module retained
-                // for offline tuning via tests/host/test_sym_timing_trace.c.)
+                // Decimate 10 sps → 2 sps for qpsk_demod (which still
+                // expects 2 sps interleaved IQ). 5:1 decimation by
+                // picking every 5th complex sample — matches what
+                // qpsk_demod's internal i*4 stride already does at
+                // sps=2 once it sees 2-sps input. Pre-rotation +
+                // sub-sample interpolation above already aligned
+                // symbol centres to integer sample positions.
+                int n_rot_cplx = n_rot_int16 / 2;
+                int n_post_cplx = n_rot_cplx / POST_CORR_DECIM;
+                int16_t *post = src;        // in-place: src has 10 sps,
+                                            // we write 2 sps to same buf
+                for (int i = 0; i < n_post_cplx; i++) {
+                    int j = i * POST_CORR_DECIM;
+                    post[i * 2 + 0] = src[j * 2 + 0];
+                    post[i * 2 + 1] = src[j * 2 + 1];
+                }
+                int n_post_int16 = n_post_cplx * 2;
                 memset(&frame, 0, sizeof(frame));
-                if (qpsk_demod_process(src, n_rot_int16, &frame)) {
+                if (qpsk_demod_process(post, n_post_int16, &frame)) {
                     demod_ok = true;
                 }
             }

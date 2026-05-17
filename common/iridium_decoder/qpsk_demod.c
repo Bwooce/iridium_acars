@@ -37,7 +37,17 @@ static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 // state noise for acquisition speed — acceptable for burst-mode
 // demod where each burst is a fresh acquisition.
 #define PLL_ALPHA       0.2f
-#define PLL_BETA        0.1f
+// PLL_BETA = 0 to match gr-iridium's qpskFirstOrderPLL (alpha=1/5,
+// no frequency tracking). With β=0 omega_hat stays at 0 and the PLL
+// is pure phase-only — exactly first-order. Their pipeline assumes
+// CFO has been removed upstream (matched-filter pre-rotation), so
+// the PLL has only small residual phase to track.
+// We had β=0.1 (second-order, freq tracking) which amplified hard-
+// decision errors into spurious freq drift — a single noise-induced
+// 90°-off symbol gave β·(π/2) = 0.16 rad/sym of fake omega, then
+// the next 6 syms accumulated π rad of bogus rotation → cascading
+// quadrant flips. Setting β=0 prevents this cascade.
+#define PLL_BETA        0.0f
 // D9 two-stage acquisition was tried (PLL_ACQUIRE_ALPHA=0.5,
 // PLL_ACQUIRE_BETA=0.25, PLL_ACQUIRE_SYMS=16) and reverted: wider
 // initial gains did help omega_hat catch large residuals, but the

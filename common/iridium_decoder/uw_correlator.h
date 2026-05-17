@@ -64,24 +64,21 @@ typedef struct {
     float           omega_per_sym;
 } uw_corr_result_t;
 
-// Run correlation on a 2-sps interleaved int16 IQ burst. Searches
+// Samples-per-symbol the module operates at. Hardcoded to 10 to
+// match gr-iridium's burst_downmix internal rate. Worker must
+// produce 10 sps input to these functions; host tests must
+// synthesize bursts at 10 sps.
+#define UW_SPS  10
+
+// Run correlation on a 10-sps interleaved int16 IQ burst. Searches
 // for the UW pattern across the first `search_complex_samples`
-// complex samples of the burst. Results written into *out_result.
+// complex samples. Results written into *out_result.
 //
-// burst_2sps      : interleaved int16 IQ (2-sps), length = 2 × n_complex
-// n_complex       : number of complex samples in burst_2sps
-// search_complex  : how many candidate UW start positions to test
-//                   (clamped to n_complex - UW_LENGTH × 2)
-// out_result      : result; .direction == UW_DIR_UNKNOWN if SNR too low
-//
-// IMPORTANT: the UW correlation is NOT carrier-offset tolerant. When
-// the burst's residual Δω exceeds ~0.4 rad/sym, the 12-symbol UW
-// rotates through enough phase that the correlation peak collapses
-// below the detection threshold. Use uw_correlator_estimate_cfo on
-// the burst head FIRST and pre-rotate before calling this — matches
-// gr-iridium's burst_downmix order of operations (CFO estimation,
-// then sync search on CFO-corrected samples).
-void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
+// burst       : interleaved int16 IQ at 10 sps × 25 ksym/s = 250 kHz
+// n_complex   : number of complex samples
+// search_complex : how many candidate UW start positions to test
+// out_result  : result; .direction == UW_DIR_UNKNOWN if SNR too low
+void uw_correlator_find(const int16_t *burst, int n_complex,
                          int search_complex,
                          uw_corr_result_t *out_result);
 
@@ -96,8 +93,7 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 // n_complex  : total number of complex samples available
 // head_n     : how many samples of the burst head to use (typical
 //              56 = 16 preamble + 12 UW × 2 sps; clamped to 24-56)
-float uw_correlator_estimate_cfo(const int16_t *burst_2sps, int n_complex,
-                                  int head_n);
+float uw_correlator_estimate_cfo(const int16_t *burst, int n_complex);
 
 // Apply the root-raised-cosine matched filter to a 2-sps interleaved
 // int16 IQ burst, in-place equivalent (in and out may be the same
@@ -141,7 +137,7 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
 //                pass ~3× max-expected-preamble-position for safety
 // Returns the burst-start sample offset (in complex samples). Zero
 // if no clear envelope rise found (caller leaves burst unshifted).
-int uw_correlator_find_burst_start(const int16_t *burst_2sps,
+int uw_correlator_find_burst_start(const int16_t *burst,
                                     int n_complex, int search_max);
 
 #ifdef __cplusplus

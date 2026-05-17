@@ -19,10 +19,11 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Iridium parameters. We synthesise at 2 sps (50 ksps) — matches
-// the worker's pre-correlator state.
+// Iridium parameters. We synthesise at 10 sps (250 ksps) — matches
+// the worker's pre-correlator state (uw_correlator hardcoded to SPS=10
+// = UW_SPS = gr-iridium's burst_downmix internal rate).
 #define FS_SYM       25000.0    // symbol rate
-#define SPS          2          // samples per symbol
+#define SPS          10         // samples per symbol (= UW_SPS)
 #define FS_SAMP      (FS_SYM * SPS)
 
 // UW patterns (must match IR_UW_DL / IR_UW_UL from iridium.h, mapped
@@ -135,9 +136,10 @@ static int build_burst(int16_t *burst, int preamble_len, int tail_len,
 static float run_correlator(int16_t *burst, int n_complex,
                              int *out_uw_offset, uw_direction_t *out_dir)
 {
-    float coarse_omega = uw_correlator_estimate_cfo(burst, n_complex, 56);
+    float coarse_omega = uw_correlator_estimate_cfo(burst, n_complex);
     if (coarse_omega != 0.0f) {
-        float dphi = coarse_omega * 0.5f;
+        // Per-sample phase = omega / sps (omega is per SYMBOL).
+        float dphi = coarse_omega / (float)SPS;
         double c_step = cos(dphi), s_step = sin(dphi);
         double pr = 1.0, pi = 0.0;
         for (int i = 0; i < n_complex; i++) {
@@ -157,7 +159,9 @@ static float run_correlator(int16_t *burst, int n_complex,
         }
     }
     uw_corr_result_t res;
-    int search = n_complex - 24;
+    // Need room for the full 28-sym sync × sps stride after the search
+    // start. = SYNC_LENGTH × SPS samples.
+    int search = n_complex - 28 * SPS;
     if (search < 1) search = 1;
     uw_correlator_find(burst, n_complex, search, &res);
     if (out_uw_offset) *out_uw_offset = res.uw_offset;
@@ -180,7 +184,9 @@ int main(void)
         printf("  uw_offset=%d (expect %d) dir=%d omega=%.4f\n",
                off, PREAMBLE_LEN * SPS, dir, omega);
         CHECK_NEAR(omega, 0.0, 0.05, "zero CFO ground truth");
-        CHECK_NEAR(off, PREAMBLE_LEN * SPS, 1, "UW offset matches preamble length");
+        // Tolerance = half a symbol (= sps/2 samples) — generous for
+        // the matched filter's sub-sample precision.
+        CHECK_NEAR(off, PREAMBLE_LEN * SPS, SPS / 2, "UW offset matches preamble length");
     }
 
     printf("\nTest 2: small positive CFO (+0.2 rad/sym), no noise\n");
@@ -234,7 +240,7 @@ int main(void)
         printf("  uw_offset=%d dir=%d omega=%.4f\n", off, dir, omega);
         CHECK_NEAR(dir, (int)UW_DIR_UPLINK, 0, "UL direction detected");
         CHECK_NEAR(omega, 0.0, 0.05, "UL zero CFO ground truth");
-        CHECK_NEAR(off, PREAMBLE_LEN * SPS, 1, "UL UW offset matches preamble length");
+        CHECK_NEAR(off, PREAMBLE_LEN * SPS, SPS / 2, "UL UW offset matches preamble length");
     }
 
     printf("\nTest 7: UL direction, +0.4 rad/sym CFO, no noise\n");
