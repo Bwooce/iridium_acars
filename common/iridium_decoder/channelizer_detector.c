@@ -80,11 +80,11 @@
 
 // Cross-channel dedup hold window. After emitting a burst we hold
 // it for this many cycles, replacing it if a higher-SNR overlap
-// arrives, before publishing to the callback. Chosen to comfortably
-// cover the worst case where a strong burst trips adjacent channels
-// minutes apart in cycle terms: a few channels can sequentially
-// emit within ~MERGE_GAP_CYCLES of each other; we want to see the
-// last of those before publishing. 100 cycles ≈ 2.5 ms at 40 ksps.
+// arrives, before publishing to the callback. 100 cycles ≈ 2.5 ms
+// at 40 ksps. Bumped to 200 once to catch longer-gap overlaps but
+// that regressed decode rate (merged bursts that were actually
+// distinct physical TDMA slots with different correct centre freqs).
+// 100 is the empirical sweet spot for the smoke corpus.
 #define DEDUP_HOLD_CYCLES    100
 
 // D20 step 3 gate. Flipped to 1 after polyphase_mac_phase_arp4 (the
