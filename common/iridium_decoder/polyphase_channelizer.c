@@ -9,6 +9,7 @@
 // CPUs but heavier overall — polyphase is a better fit for embedded.
 
 #include "polyphase_channelizer.h"
+#include "q14_fixed.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -227,9 +228,9 @@ static void build_q14_taps_reversed(const float *h_phase_float,
     const int N = POLYCHAN_N_TAPS_PER_PHASE;
     for (int p = 0; p < M; p++) {
         for (int n = 0; n < N; n++) {
-            float v = h_phase_float[p * N + (N - 1 - n)] * 16384.0f;
-            if      (v >  32767.0f) v =  32767.0f;
-            else if (v < -32768.0f) v = -32768.0f;
+            float v = h_phase_float[p * N + (N - 1 - n)] * (float)Q14_ONE;
+            if      (v > (float)INT16_MAX) v = (float)INT16_MAX;
+            else if (v < (float)INT16_MIN) v = (float)INT16_MIN;
             h_phase_q14_rev[p * N + n] = (int16_t)lrintf(v);
         }
     }
@@ -457,12 +458,12 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
                 acc_re += (int64_t)tap * (int32_t)re_ptr[n];
                 acc_im += (int64_t)tap * (int32_t)im_ptr[n];
             }
-            int32_t re = (int32_t)(acc_re >> 14);
-            int32_t im = (int32_t)(acc_im >> 14);
-            if      (re >  32767) re =  32767;
-            else if (re < -32768) re = -32768;
-            if      (im >  32767) im =  32767;
-            else if (im < -32768) im = -32768;
+            int32_t re = (int32_t)(acc_re >> Q14_SHIFT);
+            int32_t im = (int32_t)(acc_im >> Q14_SHIFT);
+            if      (re > INT16_MAX) re = INT16_MAX;
+            else if (re < INT16_MIN) re = INT16_MIN;
+            if      (im > INT16_MAX) im = INT16_MAX;
+            else if (im < INT16_MIN) im = INT16_MIN;
             fft_buf_i16[p * 2 + 0] = (int16_t)re;
             fft_buf_i16[p * 2 + 1] = (int16_t)im;
         }
@@ -488,10 +489,10 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
         for (int k = 0; k < M; k++) {
             int32_t re = (int32_t)lrintf(crealf(fft_buf_fc32[k]));
             int32_t im = (int32_t)lrintf(cimagf(fft_buf_fc32[k]));
-            if      (re >  32767) re =  32767;
-            else if (re < -32768) re = -32768;
-            if      (im >  32767) im =  32767;
-            else if (im < -32768) im = -32768;
+            if      (re > INT16_MAX) re = INT16_MAX;
+            else if (re < INT16_MIN) re = INT16_MIN;
+            if      (im > INT16_MAX) im = INT16_MAX;
+            else if (im < INT16_MIN) im = INT16_MIN;
             fft_buf_i16[k * 2 + 0] = (int16_t)re;
             fft_buf_i16[k * 2 + 1] = (int16_t)im;
         }

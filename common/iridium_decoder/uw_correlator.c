@@ -74,16 +74,25 @@ static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
 #define RRC_BETA       0.4f
 #define RRC_NTAPS      51
 #define SYNC_RRC_LEN   (SYNC_LENGTH * SYM_STRIDE)   // 280 samples at sps=10
-static float s_rrc_taps[RRC_NTAPS];     // RRC for filtering the burst
-static float s_rc_taps[RRC_NTAPS];      // RC for shaping the sync ref
-// RRC-shaped sync word references (complex, +1+j axis). Computed
-// at init by zero-padding the BPSK symbols at sps stride and
-// convolving with the RRC FIR. Used as the matched filter against
-// the burst — proper RRC matched-filter SNR.
+
+// Q14 fixed-point: tap range [-16384, +16383], multiply-accumulate
+// over 51 taps fits in int32 with one bit of headroom. Output =
+// (acc >> 14) saturated to int16. Q14 not Q15 because some RRC
+// taps approach unity and Q15(1.0) = 32768 doesn't fit in int16.
+#include "q14_fixed.h"
+
+// Q14 burst-side FIR taps (RRC). Used by uw_correlator_apply_rrc.
+static int16_t s_rrc_taps_q14[RRC_NTAPS];
+
+// RC-shaped sync word references in FLOAT (used by FFT correlation
+// and CFO FFT paths, which are still float — Q15 FFT conversion
+// tracked as the next step after this commit).
 static float s_sync_dl_re[SYNC_RRC_LEN];
 static float s_sync_dl_im[SYNC_RRC_LEN];
 static float s_sync_ul_re[SYNC_RRC_LEN];
 static float s_sync_ul_im[SYNC_RRC_LEN];
+static float s_rrc_taps[RRC_NTAPS];     // float copy (used by init only)
+static float s_rc_taps[RRC_NTAPS];      // float copy (used by init only)
 static bool  s_sync_inited = false;
 
 // Generate root-raised-cosine FIR taps. Standard textbook formula;
@@ -264,6 +273,17 @@ static void sync_init(void)
     make_rc_taps (s_rc_taps,  RRC_NTAPS, SYM_STRIDE, RRC_BETA);
     build_shaped_sync(SYNC_DL_SIGN, s_rc_taps, s_sync_dl_re, s_sync_dl_im);
     build_shaped_sync(SYNC_UL_SIGN, s_rc_taps, s_sync_ul_re, s_sync_ul_im);
+    // Quantise to Q14: tap × Q14_ONE = Q14 representation. Since the
+    // float taps are DC-gain-normalised (sum = 1), the Q14 taps' DC
+    // gain is also 1 — output = sum(tap_q14[n] × x[n]) >> Q14_SHIFT
+    // ≈ float convolution result. Max float tap ≈ 0.1 → Q14 ≈ 1638,
+    // comfortably in int16 range.
+    for (int n = 0; n < RRC_NTAPS; n++) {
+        float v = s_rrc_taps[n] * (float)Q14_ONE;
+        if (v > (float)INT16_MAX) v = (float)INT16_MAX;
+        if (v < (float)INT16_MIN) v = (float)INT16_MIN;
+        s_rrc_taps_q14[n] = (int16_t)lrintf(v);
+    }
 
     // Init the correlation FFT tables.
     for (int i = 0; i < CORR_FFT_N; i++) {
@@ -752,34 +772,36 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
     if (search_max > n_complex) search_max = n_complex;
     if (search_max <= START_LP_NTAPS + 1) return 0;
 
-    // Use a static scratch — bursts are processed one at a time on
-    // worker_core1, so no reentrancy concern.
-    static float mag2[START_SEARCH_MAX];
-    static float smooth[START_SEARCH_MAX];
+    // Integer-only envelope detector. mag² of int16 IQ pair fits in
+    // int32 with no overflow (2 × (2^15)² = 2^31, JUST fits — we
+    // saturate the boundary case to INT32_MAX). LP filter taps are
+    // Q15 (sum-normalised → DC gain = 1 in Q15 too). MAC sum into
+    // int64, then >>15 and saturate back to int32 for the smoothed
+    // envelope. Threshold and max comparisons are all int32.
+    static int32_t mag2[START_SEARCH_MAX];
+    static int32_t smooth[START_SEARCH_MAX];
     if (search_max > START_SEARCH_MAX) search_max = START_SEARCH_MAX;
 
-    // Step 1: per-sample magnitude² of complex burst.
     for (int n = 0; n < search_max; n++) {
-        float r = (float)burst_2sps[n * 2 + 0];
-        float i = (float)burst_2sps[n * 2 + 1];
-        mag2[n] = r * r + i * i;
+        int32_t r = (int32_t)burst_2sps[n * 2 + 0];
+        int32_t i = (int32_t)burst_2sps[n * 2 + 1];
+        int32_t m2 = r * r + i * i;
+        if (m2 < 0) m2 = INT32_MAX;        // overflow guard (extreme case)
+        mag2[n] = m2;
     }
 
-    // Step 2: smooth with Kaiser-windowed sinc LP filter.
-    // Cutoff fc/fs = 2.5/50 = 0.05 (same proportion as gr-iridium's
-    // 2.5 kHz cutoff at 250 ksps). The filter shapes a sharp envelope
-    // estimate with 60 dB stopband; much better burst-edge precision
-    // than the prior Bartlett MA.
-    //
-    // Computed lazily once per init (we have a static-init pattern
-    // elsewhere for cfo_init / sync_init; reuse it for the LP taps).
-    static float w[START_LP_NTAPS];
+    // Kaiser LP taps in Q15. Cutoff fc/fs = 2.5/50 = 0.05 (same
+    // proportion as gr-iridium's 2.5 kHz cutoff at 250 ksps). The
+    // filter shapes a sharp envelope estimate with 60 dB stopband;
+    // much better burst-edge precision than the prior Bartlett MA.
+    static int16_t w_q15[START_LP_NTAPS];
     static bool s_start_lp_inited = false;
     int half = START_LP_NTAPS / 2;
     if (!s_start_lp_inited) {
         const float PI = 3.14159265358979323846f;
         const float fc_norm = 0.05f;       // cutoff = 0.05 × fs
         const float inv_i0_beta = 1.0f / bessel_i0(START_LP_KAISER_BETA);
+        float w_f[START_LP_NTAPS];
         float wsum = 0.0f;
         for (int k = 0; k < START_LP_NTAPS; k++) {
             float t = (float)(k - half);
@@ -790,11 +812,20 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
             float u = 2.0f * (float)k / (float)(START_LP_NTAPS - 1) - 1.0f;
             float arg = START_LP_KAISER_BETA * sqrtf(1.0f - u * u);
             float kw  = bessel_i0(arg) * inv_i0_beta;
-            w[k] = sinc * kw;
-            wsum += w[k];
+            w_f[k] = sinc * kw;
+            wsum += w_f[k];
         }
         if (wsum != 0.0f) {
-            for (int k = 0; k < START_LP_NTAPS; k++) w[k] /= wsum;
+            for (int k = 0; k < START_LP_NTAPS; k++) w_f[k] /= wsum;
+        }
+        // Sum-normalised → max tap ≈ 0.05–0.1 → Q15 ≈ 1600–3300,
+        // well inside int16. Sum of Q15 taps = 2^15, so the inner
+        // MAC's >>15 restores the input scale.
+        for (int k = 0; k < START_LP_NTAPS; k++) {
+            float v = w_f[k] * (float)INT16_MAX;
+            if (v > (float)INT16_MAX) v = (float)INT16_MAX;
+            if (v < (float)INT16_MIN) v = (float)INT16_MIN;
+            w_q15[k] = (int16_t)lrintf(v);
         }
         s_start_lp_inited = true;
     }
@@ -803,25 +834,31 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
     // works at the very start of the burst).
     for (int n = 0; n < search_max; n++) {
         if (n >= half && n + half < search_max) {
-            float acc = 0;
+            int64_t acc = 0;
             for (int k = 0; k < START_LP_NTAPS; k++) {
-                acc += w[k] * mag2[n - half + k];
+                acc += (int64_t)w_q15[k] * (int64_t)mag2[n - half + k];
             }
-            smooth[n] = acc;
+            acc >>= 15;
+            if (acc > INT32_MAX) acc = INT32_MAX;
+            if (acc < 0)         acc = 0;        // negative ringing on edges
+            smooth[n] = (int32_t)acc;
         } else {
             smooth[n] = mag2[n];
         }
     }
 
     // Step 3: max of smoothed envelope.
-    float max_val = 0;
+    int32_t max_val = 0;
     for (int n = 0; n < search_max; n++) {
         if (smooth[n] > max_val) max_val = smooth[n];
     }
-    if (max_val <= 1.0f) return 0;     // essentially silence
+    if (max_val <= 1) return 0;     // essentially silence
 
-    // Step 4: first crossing of 28% of max.
-    float thr = max_val * START_THRESHOLD_FRAC;
+    // Step 4: first crossing of START_THRESHOLD_FRAC of max. Compute
+    // threshold via int64 to avoid overflow at large mag² values:
+    // max_val × 28% = max_val × (0.28 × 2^15) >> 15.
+    const int32_t thr_q15 = (int32_t)lrintf(START_THRESHOLD_FRAC * (float)(1 << 15));
+    int32_t thr = (int32_t)(((int64_t)max_val * (int64_t)thr_q15) >> 15);
     int start = -1;
     for (int n = 0; n < search_max; n++) {
         if (smooth[n] >= thr) { start = n; break; }
@@ -867,22 +904,28 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
         ring_q[head] = sq;
         head = (head + 1) % RRC_NTAPS;
         // Compute output once we've fed enough samples (out_idx >= 0).
+        // Q14 multiply-accumulate: each tap × int16 sample = int32
+        // (fits with margin: tap < 2^14, sample < 2^16 → product <
+        // 2^30). Sum of 51 such products fits in int64 (always); we
+        // use int32 because 51 × 2^30 < 2^36 → fits in int32 with
+        // sign bit (2^31) only if the sum stays bounded — which it
+        // does since most taps are small. Use int64 for safety.
         if (out_idx >= 0 && out_idx < n_complex) {
-            float acc_re = 0, acc_im = 0;
-            // ring[head] is the OLDEST sample (next to be overwritten);
-            // it corresponds to the sample at out_idx - center (= the
-            // left edge of the filter window).
+            int64_t acc_re = 0, acc_im = 0;
             for (int t = 0; t < RRC_NTAPS; t++) {
                 int ring_idx = (head + t) % RRC_NTAPS;
-                acc_re += s_rrc_taps[t] * (float)ring_i[ring_idx];
-                acc_im += s_rrc_taps[t] * (float)ring_q[ring_idx];
+                int32_t tap = (int32_t)s_rrc_taps_q14[t];
+                acc_re += (int64_t)tap * (int32_t)ring_i[ring_idx];
+                acc_im += (int64_t)tap * (int32_t)ring_q[ring_idx];
             }
-            if (acc_re >  32767.0f) acc_re =  32767.0f;
-            if (acc_re < -32768.0f) acc_re = -32768.0f;
-            if (acc_im >  32767.0f) acc_im =  32767.0f;
-            if (acc_im < -32768.0f) acc_im = -32768.0f;
-            burst_out[out_idx * 2 + 0] = (int16_t)acc_re;
-            burst_out[out_idx * 2 + 1] = (int16_t)acc_im;
+            int32_t re = (int32_t)(acc_re >> Q14_SHIFT);
+            int32_t im = (int32_t)(acc_im >> Q14_SHIFT);
+            if (re > INT16_MAX) re = INT16_MAX;
+            if (re < INT16_MIN) re = INT16_MIN;
+            if (im > INT16_MAX) im = INT16_MAX;
+            if (im < INT16_MIN) im = INT16_MIN;
+            burst_out[out_idx * 2 + 0] = (int16_t)re;
+            burst_out[out_idx * 2 + 1] = (int16_t)im;
         }
     }
 }

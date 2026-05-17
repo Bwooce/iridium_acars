@@ -300,42 +300,60 @@ void worker_task(void *arg)
                 int n_rot_int16 = adj_n * 2 - int16_off;
                 int16_t *src = adj_burst + int16_off;
                 if (pmag > 1e-3f) {
-                    // Constant phase factor (rotates burst back to UW axes).
+                    // Q15 pre-rotation + linear sub-sample interp.
+                    // Phasor pr/pi and step c_step/s_step live in Q15
+                    // (range [-1,1] → int16 [-INT16_MAX, INT16_MAX]).
+                    // Interp blends in Q15 too. Per sample:
+                    //   re = (a × src[i].re + b × src[i+1].re) >> 15   [int16]
+                    //   nr = (re × pr - im × pi) >> 15                 [int16]
+                    //   pr' = (pr × cs - pi × ss) >> 15
+                    // Magnitude of |phasor| drifts by ~ε per step; for
+                    // ≤1100-sample bursts the cumulative drift is well
+                    // under 4% and harmless for downstream demod (PLL
+                    // pulls it back).
                     float rot_re =  uw_res.peak_re / pmag;
                     float rot_im =  uw_res.peak_im / pmag;
-                    // Per-SAMPLE phase increment = omega_per_sym / sps
-                    // (omega is per SYMBOL; burst is at UW_SPS=10 sps).
                     float dphi = uw_res.omega_per_sym / (float)UW_SPS;
                     float c_step = cosf(dphi);
                     float s_step = sinf(dphi);
-                    // #46: linear sub-sample interpolation factor.
-                    // sample(i) = (1 - interp_frac) × src[i] + interp_frac × src[i+1]
-                    // Doing this in-place is safe because output[i] only
-                    // depends on input positions i and i+1, and we write
-                    // to position i before moving to i+1.
-                    float interp_a = 1.0f - interp_frac;
-                    float interp_b = interp_frac;
+
+                    #define Q15F(x)  ((int16_t)lrintf((x) * 32767.0f))
+                    int16_t pr_q = Q15F(rot_re);
+                    int16_t pi_q = Q15F(rot_im);
+                    int16_t cs_q = Q15F(c_step);
+                    int16_t ss_q = Q15F(s_step);
+                    int16_t a_q  = Q15F(1.0f - interp_frac);
+                    int16_t b_q  = Q15F(interp_frac);
+                    #undef Q15F
+
                     int n_cplx = n_rot_int16 / 2;
                     if (n_cplx > 0) n_cplx -= 1;   // need src[i+1] for interp
-                    float pr = rot_re, pi = rot_im;
                     for (int i = 0; i < n_cplx; i++) {
-                        // Linear interp at fractional position i + frac.
-                        float re = interp_a * (float)src[i * 2 + 0]
-                                 + interp_b * (float)src[(i + 1) * 2 + 0];
-                        float im = interp_a * (float)src[i * 2 + 1]
-                                 + interp_b * (float)src[(i + 1) * 2 + 1];
-                        float nr = re * pr - im * pi;
-                        float ni = re * pi + im * pr;
-                        if (nr >  32767.0f) nr =  32767.0f;
-                        if (nr < -32768.0f) nr = -32768.0f;
-                        if (ni >  32767.0f) ni =  32767.0f;
-                        if (ni < -32768.0f) ni = -32768.0f;
+                        int32_t re = ((int32_t)a_q * (int32_t)src[i * 2 + 0]
+                                    + (int32_t)b_q * (int32_t)src[(i + 1) * 2 + 0]) >> 15;
+                        int32_t im = ((int32_t)a_q * (int32_t)src[i * 2 + 1]
+                                    + (int32_t)b_q * (int32_t)src[(i + 1) * 2 + 1]) >> 15;
+                        int32_t nr = ((int32_t)re * (int32_t)pr_q
+                                    - (int32_t)im * (int32_t)pi_q) >> 15;
+                        int32_t ni = ((int32_t)re * (int32_t)pi_q
+                                    + (int32_t)im * (int32_t)pr_q) >> 15;
+                        if (nr > INT16_MAX) nr = INT16_MAX;
+                        if (nr < INT16_MIN) nr = INT16_MIN;
+                        if (ni > INT16_MAX) ni = INT16_MAX;
+                        if (ni < INT16_MIN) ni = INT16_MIN;
                         src[i * 2 + 0] = (int16_t)nr;
                         src[i * 2 + 1] = (int16_t)ni;
-                        // Advance phasor: p ← p · exp(j·dphi)
-                        float npr = pr * c_step - pi * s_step;
-                        float npi = pr * s_step + pi * c_step;
-                        pr = npr; pi = npi;
+                        // Advance phasor: p ← p · exp(j·dphi).
+                        int32_t npr = ((int32_t)pr_q * (int32_t)cs_q
+                                     - (int32_t)pi_q * (int32_t)ss_q) >> 15;
+                        int32_t npi = ((int32_t)pr_q * (int32_t)ss_q
+                                     + (int32_t)pi_q * (int32_t)cs_q) >> 15;
+                        if (npr > INT16_MAX) npr = INT16_MAX;
+                        if (npr < INT16_MIN) npr = INT16_MIN;
+                        if (npi > INT16_MAX) npi = INT16_MAX;
+                        if (npi < INT16_MIN) npi = INT16_MIN;
+                        pr_q = (int16_t)npr;
+                        pi_q = (int16_t)npi;
                     }
                 }
                 // Decimate 10 sps → 2 sps for qpsk_demod (which still
@@ -448,7 +466,7 @@ esp_err_t worker_core1_init()
     }
     float sum = 0;
     for (int i = 0; i < FIR_TAPS; i++) sum += coeffs_f32[i];
-    for (int i = 0; i < FIR_TAPS; i++) coeffs[i] = (int16_t)(coeffs_f32[i] / sum * 32767.0f);
+    for (int i = 0; i < FIR_TAPS; i++) coeffs[i] = (int16_t)(coeffs_f32[i] / sum * (float)INT16_MAX);
 
     // Stage 2 Coefficients (RRC/LPF for resampling)
     // For now, use simple LPF for resampler
@@ -469,7 +487,7 @@ esp_err_t worker_core1_init()
     }
     sum = 0;
     for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) sum += rcoeffs_f32[i];
-    for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) resample_coeffs[i] = (int16_t)(rcoeffs_f32[i] / sum * 32767.0f);
+    for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) resample_coeffs[i] = (int16_t)(rcoeffs_f32[i] / sum * (float)INT16_MAX);
 
     // Multi-rate FIR with interp=5, decim=8 → 5/8 ratio, 80 kHz → 50 kHz.
     // length here is the total filter length (taps × interp = 64 × 5 = 320),
@@ -491,7 +509,7 @@ esp_err_t worker_core1_init()
     // generated. After this, dsps_cplx_gen_freq_set() is enough per burst.
     for (int i = 0; i < PHASOR_LUT_LEN; i++) {
         float term = (2.0f * (float)M_PI) * ((float)i / (float)PHASOR_LUT_LEN);
-        s_phasor_lut[i] = (int16_t)(sinf(term) * 32767.0f);
+        s_phasor_lut[i] = (int16_t)(sinf(term) * (float)INT16_MAX);
     }
     esp_err_t pg = dsps_cplx_gen_init(&s_phasor_gen, S16_FIXED, s_phasor_lut,
                                       PHASOR_LUT_LEN, 0.0f, 0.0f);
