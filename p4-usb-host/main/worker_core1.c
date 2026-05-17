@@ -227,25 +227,24 @@ void worker_task(void *arg)
             // parabolic peak interpolation, NOT a continuous Gardner
             // loop. New uw_correlator module replaces this hook.)
 
-            // D10+D13: gr-iridium-aligned pipeline.
-            //   1. RRC matched filter on the burst.
-            //   2. D13 burst-start finder: envelope-based onset
-            //      detection to sub-frame precision. The channelizer
-            //      gives start_sample_idx at threshold-cross
-            //      granularity; this refines to the actual preamble
-            //      onset within a few samples.
-            //   3. uw_correlator_find on the offset-trimmed burst.
+            // gr-iridium-aligned order (burst_downmix_impl.cc lines
+            // 841-880 then 584-650):
+            //   1. D13 start_finder on the raw resampled burst.
+            //   2. RRC matched filter on the trimmed burst.
+            //   3. uw_correlator_find on the trimmed+RRC'd burst.
             //   4. (existing) peak-phase + omega pre-rotation, then
             //      qpsk_demod_process.
-            uw_correlator_apply_rrc(demod_interleaved, demod_interleaved,
-                                     out_samples_50k);
-            // D13: trim leading noise/quiet so the preamble lands
-            // near sample 0. Search ~3× max-expected-burst-prefix.
+            //
+            // Search the whole burst for the envelope onset — gr-iridium
+            // uses d_search_depth ~1000-3000 samples; we pass the full
+            // burst length (the start_finder's internal LP filter
+            // smooths noise, so wider search doesn't add false positives).
             int burst_start = uw_correlator_find_burst_start(
                                   demod_interleaved, out_samples_50k,
-                                  /*search_max=*/256);
+                                  /*search_max=*/out_samples_50k);
             int16_t *adj_burst = demod_interleaved + burst_start * 2;
             int adj_n = out_samples_50k - burst_start;
+            uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
             ESP_LOGI(TAG, "D13 burst start: %d (of %d samples)",
                      burst_start, out_samples_50k);
             uw_corr_result_t uw_res;
@@ -260,7 +259,20 @@ void worker_task(void *arg)
                      (double)uw_res.snr_estimate_db, (double)uw_res.peak_value,
                      (double)uw_res.omega_per_sym);
             if (uw_res.direction != UW_DIR_UNKNOWN) {
-                int int16_off = uw_res.uw_offset * 2;
+                // D10b: incorporate the matched-filter peak's sub-
+                // sample correction into the integer decimation phase.
+                // uw_res.correction ∈ (-0.5, +0.5] tells us where the
+                // true symbol-center sits between integer samples. If
+                // |correction| > 0.5 we'd round to a different sample;
+                // if positive and ≥ 0, the next integer sample is closer
+                // to the real centre. We round to the nearest integer
+                // shift (0 or +1) and apply it on top of uw_offset so
+                // that qpsk_demod's fixed even-sample decimation lands
+                // on symbol centres rather than between-symbol midpoints.
+                int sub_shift = (uw_res.correction >= 0.5f) ? 1
+                              : (uw_res.correction <= -0.5f) ? -1 : 0;
+                int int16_off = (uw_res.uw_offset + sub_shift) * 2;
+                if (int16_off < 0) int16_off = 0;
                 // Pre-rotate burst by exp(+j·peak_phase) AND apply a
                 // linear phase ramp to cancel the residual carrier omega
                 // estimated from the UW two-half phase diff. After this,

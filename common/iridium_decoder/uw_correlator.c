@@ -45,11 +45,13 @@ static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
     -1,-1,+1,+1,+1,-1,+1,+1,-1,+1,-1,-1                  // UW
 };
 
-// RRC pulse shape parameters (gr-iridium: roll-off β = 0.4, 51 taps
-// at 250 ksps = 10 symbol periods of filter length). For us at 50
-// ksps that's 21 taps (10 sym × 2 sps + 1 for symmetric centring).
+// RRC pulse shape: β=0.4, 11 taps at 2 sps = 5.5 symbol periods.
+// Matches gr-iridium's symbol-period coverage (51 taps at 10 sps =
+// 5.1 symbols). Earlier we used 21 taps (10 symbols, 2× coverage)
+// which gave slightly higher matched-filter SNR on quiet bursts but
+// diverged from gr-iridium's reference behaviour.
 #define RRC_BETA       0.4f
-#define RRC_NTAPS      21
+#define RRC_NTAPS      11
 #define SYNC_RRC_LEN   (SYNC_LENGTH * SYM_STRIDE)   // 56 samples
 static float s_rrc_taps[RRC_NTAPS];     // RRC for filtering the burst
 static float s_rc_taps[RRC_NTAPS];      // RC for shaping the sync ref
@@ -167,12 +169,13 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
 // Per burst we FFT the burst (zero-padded to CORR_FFT_N), multiply
 // elementwise by the stored sync FFT, IFFT, and peak-find.
 //
-// CORR_FFT_N = next_pow2(burst_len_max + sync_len - 1) for the
-// linear-convolution requirement. Our 50 ksps bursts run up to
-// ~700 samples; 1024-pt covers up to 1024 - 56 + 1 = 969 sample
-// search range with one FFT.
-#define CORR_FFT_N   1024
-#define CORR_FFT_LOG 10
+// CORR_FFT_N matches gr-iridium's d_corr_fft_size = next_pow2(
+//   d_sync_search_len + sync_word_len - 1) = next_pow2(168 + 56 - 1)
+//   = 256. Search range = CORR_FFT_N - SYNC_RRC_LEN + 1 = 201 burst
+// samples after D13's start-finder trim — covers the worst-case
+// envelope misalignment gr-iridium's pipeline is designed for.
+#define CORR_FFT_N   256
+#define CORR_FFT_LOG 8
 static uint16_t s_corr_brev[CORR_FFT_N];
 static float    s_corr_tw_re[CORR_FFT_N / 2];
 static float    s_corr_tw_im[CORR_FFT_N / 2];
@@ -687,6 +690,13 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 // They use 1-2 samples; we follow with 2.
 #define START_PRE_SAMPLES      2
 
+// D13 scratch sized for the worst-case burst length we see (50 ksps
+// × ~50 ms max burst = 2500 samples). Independent of CORR_FFT_N
+// because start_finder needs to scan the WHOLE burst (gr-iridium's
+// d_search_depth is also a few thousand samples), whereas the
+// sync-search FFT operates only on the trimmed window after D13.
+#define START_SEARCH_MAX   2560
+
 int uw_correlator_find_burst_start(const int16_t *burst_2sps,
                                     int n_complex, int search_max)
 {
@@ -696,9 +706,9 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
 
     // Use a static scratch — bursts are processed one at a time on
     // worker_core1, so no reentrancy concern.
-    static float mag2[CORR_FFT_N];
-    static float smooth[CORR_FFT_N];
-    if (search_max > CORR_FFT_N) search_max = CORR_FFT_N;
+    static float mag2[START_SEARCH_MAX];
+    static float smooth[START_SEARCH_MAX];
+    if (search_max > START_SEARCH_MAX) search_max = START_SEARCH_MAX;
 
     // Step 1: per-sample magnitude² of complex burst.
     for (int n = 0; n < search_max; n++) {
