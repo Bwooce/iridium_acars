@@ -339,15 +339,12 @@ size_t polyphase_channelizer_process(polyphase_channelizer_t *ch,
         for (int p = 0; p < M; p++) {
             const float *hp = &ch->h_phase[p * N];
             const float complex *dlp = &ch->dl[p * N];
-            float complex acc =
-                  hp[0] * dlp[(head + 0) & N_MASK]
-                + hp[1] * dlp[(head + 1) & N_MASK]
-                + hp[2] * dlp[(head + 2) & N_MASK]
-                + hp[3] * dlp[(head + 3) & N_MASK]
-                + hp[4] * dlp[(head + 4) & N_MASK]
-                + hp[5] * dlp[(head + 5) & N_MASK]
-                + hp[6] * dlp[(head + 6) & N_MASK]
-                + hp[7] * dlp[(head + 7) & N_MASK];
+            // N-tap MAC; the loop is `& N_MASK` so the compiler can
+            // unroll cleanly when N is a small power of two.
+            float complex acc = 0.0f + 0.0f * I;
+            for (int n = 0; n < N; n++) {
+                acc += hp[n] * dlp[(head + n) & N_MASK];
+            }
             fft_buf[p] = acc;
         }
 

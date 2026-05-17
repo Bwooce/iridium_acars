@@ -24,8 +24,8 @@ REPO = Path(__file__).resolve().parent.parent.parent
 FIXTURE_DIR = REPO / "tests" / "fixtures"
 
 M = 64
-N_TAPS_PER_PHASE = 8
-L = M * N_TAPS_PER_PHASE     # 512
+N_TAPS_PER_PHASE = 16          # was 8; matches polyphase_channelizer.h
+L = M * N_TAPS_PER_PHASE     # 1024
 FS_IN = 2_560_000
 
 def build_prototype():

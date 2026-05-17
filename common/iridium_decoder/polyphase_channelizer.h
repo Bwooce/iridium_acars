@@ -33,8 +33,24 @@ extern "C" {
 // We hard-code M=64 for the first implementation; can be templated later
 // if we want different channel counts. M MUST be a power of two for the
 // internal FFT.
+//
+// N_TAPS_PER_PHASE = 16 (was 8): bumps the prototype filter length to
+// L = 1024 taps (was 512). Narrows the transition band from ~20 kHz to
+// ~10 kHz at fs=2.56 MHz, sharpening adjacent-channel rejection
+// without changing the window function (Hamming, ~52 dB stopband).
+//
+// N=16 (not 12) because polyphase_channelizer.c uses `& (N-1)` indexing
+// which requires N to be a power of two. N=12 would need `% N` and
+// loses the optimisation. We pay 100% more channelizer MAC ops vs N=8
+// for cleaner adjacent-channel separation.
+//
+// This exceeds gr-iridium's PFB tap budget (~300 max per their warning
+// in iridium_extractor_flowgraph.py) — they accept wider transition
+// because they use the FFT channelizer for high-decim configs like ours
+// (`fft_channelizer_impl.cc`, no per-channel filter beyond rect-window
+// FFT bins). Our polyphase + tighter filter is a different trade-off.
 #define POLYCHAN_M               64
-#define POLYCHAN_N_TAPS_PER_PHASE 8
+#define POLYCHAN_N_TAPS_PER_PHASE 16
 #define POLYCHAN_FILTER_LEN      (POLYCHAN_M * POLYCHAN_N_TAPS_PER_PHASE)
 
 typedef struct polyphase_channelizer polyphase_channelizer_t;
