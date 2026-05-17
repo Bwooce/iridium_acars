@@ -660,12 +660,22 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     out_result->direction       = dir;
     out_result->snr_estimate_db = snr_db;
     out_result->peak_value      = peak_mag2;
+    // Sign convention fix: the FFT correlation computes
+    //   conv = burst ⊛ conj(reversed(sync))
+    //        = Σ conj(sync)·burst    → peak phase = +φ_burst
+    // whereas the worker's pre-rotation was designed for the
+    // time-domain convention
+    //   Σ sync·conj(burst)            → peak phase = -φ_burst
+    // (worker multiplies sample by peak/|peak| to UNDO the burst's
+    // phase: works for -φ peak, but doubles the phase for +φ peak).
+    // Conjugate the peak value here so callers see the time-domain
+    // sign convention regardless of which correlation path was used.
     if (dir == UW_DIR_DOWNLINK) {
-        out_result->peak_re = best_dl_re;
-        out_result->peak_im = best_dl_im;
+        out_result->peak_re =  best_dl_re;
+        out_result->peak_im = -best_dl_im;
     } else {
-        out_result->peak_re = best_ul_re;
-        out_result->peak_im = best_ul_im;
+        out_result->peak_re =  best_ul_re;
+        out_result->peak_im = -best_ul_im;
     }
 
     // CFO estimate over the preamble+UW window. peak_k is the SYNC
