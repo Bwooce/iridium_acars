@@ -266,20 +266,17 @@ void worker_task(void *arg)
                      (double)uw_res.snr_estimate_db, (double)uw_res.peak_value,
                      (double)uw_res.omega_per_sym);
             if (uw_res.direction != UW_DIR_UNKNOWN) {
-                // D10b: incorporate the matched-filter peak's sub-
-                // sample correction into the integer decimation phase.
-                // uw_res.correction ∈ (-0.5, +0.5] tells us where the
-                // true symbol-center sits between integer samples. If
-                // |correction| > 0.5 we'd round to a different sample;
-                // if positive and ≥ 0, the next integer sample is closer
-                // to the real centre. We round to the nearest integer
-                // shift (0 or +1) and apply it on top of uw_offset so
-                // that qpsk_demod's fixed even-sample decimation lands
-                // on symbol centres rather than between-symbol midpoints.
-                int sub_shift = (uw_res.correction >= 0.5f) ? 1
-                              : (uw_res.correction <= -0.5f) ? -1 : 0;
-                int int16_off = (uw_res.uw_offset + sub_shift) * 2;
-                if (int16_off < 0) int16_off = 0;
+                // D10b + #46: sub-sample timing correction.
+                // True peak position = uw_offset + correction (fractional).
+                // Split into integer base + fractional residue ∈ [0, 1),
+                // then linear-interpolate in the pre-rotation loop so
+                // qpsk_demod's fixed-decim sees samples at the TRUE
+                // symbol centres rather than the nearest integer.
+                float true_pos = (float)uw_res.uw_offset + uw_res.correction;
+                int   int_base = (int)floorf(true_pos);
+                float interp_frac = true_pos - (float)int_base;   // [0, 1)
+                if (int_base < 0) { int_base = 0; interp_frac = 0.0f; }
+                int int16_off = int_base * 2;
                 // Pre-rotate burst by exp(+j·peak_phase) AND apply a
                 // linear phase ramp to cancel the residual carrier omega
                 // estimated from the UW two-half phase diff. After this,
@@ -302,11 +299,22 @@ void worker_task(void *arg)
                     float dphi = uw_res.omega_per_sym * 0.5f;
                     float c_step = cosf(dphi);
                     float s_step = sinf(dphi);
+                    // #46: linear sub-sample interpolation factor.
+                    // sample(i) = (1 - interp_frac) × src[i] + interp_frac × src[i+1]
+                    // Doing this in-place is safe because output[i] only
+                    // depends on input positions i and i+1, and we write
+                    // to position i before moving to i+1.
+                    float interp_a = 1.0f - interp_frac;
+                    float interp_b = interp_frac;
                     int n_cplx = n_rot_int16 / 2;
+                    if (n_cplx > 0) n_cplx -= 1;   // need src[i+1] for interp
                     float pr = rot_re, pi = rot_im;
                     for (int i = 0; i < n_cplx; i++) {
-                        float re = (float)src[i * 2 + 0];
-                        float im = (float)src[i * 2 + 1];
+                        // Linear interp at fractional position i + frac.
+                        float re = interp_a * (float)src[i * 2 + 0]
+                                 + interp_b * (float)src[(i + 1) * 2 + 0];
+                        float im = interp_a * (float)src[i * 2 + 1]
+                                 + interp_b * (float)src[(i + 1) * 2 + 1];
                         float nr = re * pr - im * pi;
                         float ni = re * pi + im * pr;
                         if (nr >  32767.0f) nr =  32767.0f;
