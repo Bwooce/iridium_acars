@@ -370,8 +370,36 @@ was computed with the original 1/(2M) cutoff. Widening moves AWAY
 from gr-iridium parity by that test. Reverted; the path to recovery
 is fs/M change, not filter widening.
 
-*Step 2 (PENDING, task #48)*: Iridium-grid channelizer. Three design
-options analysed; chosen approach to be decided before implementation:
+*Step 2 (MEASURED + DEFERRED, task #48)*: Iridium-grid channelizer.
+Three design options analysed; option B (fs=2.667 MHz) measured
+empirically before commitment:
+
+**Measurement result** (test_snr_gap_measurement, ALBQ_RAW vs
+ALBQ_RAW_2667 fixtures — same source content, different sample rates):
+
+| burst | baseline 2.56 MHz | option B 2.667 MHz |
+|---|---|---|
+| ch 58 (-232891 Hz) | -3.80 dB | -4.16 dB (slightly worse) |
+| ch 56 (-316217 Hz) | MISSED  | -0.82 dB (recovered) |
+| ch  0 (+17103 Hz)  | -2.22 dB | MISSED (regressed) |
+| **mean over matched** | **-3.01 dB** | **-2.49 dB (+0.52 dB)** |
+
+The +0.5 dB net gain is much smaller than the ~3 dB I predicted
+because my analysis assumed bursts arrive on the nominal Iridium
+41.667 kHz grid. In practice **Doppler shifts of ±40 kHz at 1.6 GHz
+move actual carriers off the nominal grid** — so channelizer
+grid-alignment doesn't uniformly help, it just reshuffles which
+bursts are well-aligned vs poorly-aligned with our bins.
+
+Option B's substantial refactor (SDR rate, FIR coefficient regen,
+resampler retune, fixture regen for every host test) isn't justified
+by 0.5 dB. **Deferred indefinitely**. The measurement infrastructure
+(build_albq_raw_2667.py script + fixture_albq_raw_2667.h + the
+side-by-side measurement test) is committed so any future revisit
+can re-measure under different conditions (e.g. after AGC / D16 work
+or with a sharper channelizer prototype filter design).
+
+Original option design choices for reference:
 
 | Option | fs | M | Channel | FFT | Effort | Notes |
 |---|---|---|---|---|---|---|

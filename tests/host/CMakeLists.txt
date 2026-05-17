@@ -270,6 +270,11 @@ target_include_directories(test_snr_gap_measurement PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 target_link_libraries(test_snr_gap_measurement PRIVATE m)
+# This test embeds fixture_albq_raw_2667.h which is large; mark as a
+# dependency so cmake rebuilds when the fixture changes.
+set_source_files_properties(test_snr_gap_measurement.c PROPERTIES
+    OBJECT_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/fixture_albq_raw_2667.h)
 
 # D10 tuning tool — not a regression test. Dumps per-symbol PI-loop
 # state on the corpus fixture for offline analysis.
