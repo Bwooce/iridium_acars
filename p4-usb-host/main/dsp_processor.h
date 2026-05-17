@@ -7,6 +7,14 @@
 
 #define FFT_SIZE 2048
 
+// Central rate and frequency constants. Single source of truth for the
+// whole target DSP chain; derive everything else from these (FFT bin
+// width, decimation cutoffs, channelizer channel spacing, etc.).
+#define FS_IN_HZ                2560000u    // SDR sample rate
+#define IRIDIUM_CENTER_FREQ_HZ  1626000000u // SDR tuned LO (mid-band of
+                                            // Iridium downlink 1616-1626)
+#define IRIDIUM_CHANNEL_HZ      41666.67f   // Iridium channel grid spacing
+
 typedef struct {
     uint32_t start_sample_idx;
     uint32_t length_samples;

@@ -430,7 +430,16 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
         // kernel exactly once per cycle, saving 63 of the 64 asm
         // prologue/epilogue costs.
         const int read_head = ch->dl_head_int16;
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+        // PIE asm kernel polyphase_mac_all_phases_arp4 is hardcoded for
+        // 8 taps per phase (one xacc vld + one vmulas). With N=16 it
+        // would need 2 vld + 2 vmulas per accumulator. NOT updated yet;
+        // tracked under D20. Guard with a static assert so anyone who
+        // re-enables the int16 fast path with N ≠ 8 hits this comment.
+        // TODO(D20): update polyphase_mac_arp4.S for N=16 (or make it
+        // size-agnostic) and remove this guard.
+        _Static_assert(POLYCHAN_N_TAPS_PER_PHASE == 8,
+                       "PIE asm kernel hardcoded for 8 taps - see TODO above");
         polyphase_mac_all_phases_arp4(
             ch->h_phase_q15,
             &ch->dl_int16[read_head],          // Re of phase 0 + head

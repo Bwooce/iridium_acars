@@ -30,7 +30,7 @@ static const char *TAG = "DSP_PROC";
 // Front-end sample rate. The SDR is locked to 2.56 MSPS; this is the
 // same rate the channelizer expects. polyphase_channelizer_create
 // validates it internally.
-#define FS_IN_HZ        2560000u
+// FS_IN_HZ now lives in dsp_processor.h (shared with worker_core1.c).
 
 // Detector threshold. 16 dB matches the legacy float setpoint
 // (40× linear, kept across the conversion to uint32 arithmetic).

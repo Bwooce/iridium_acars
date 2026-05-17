@@ -12,7 +12,9 @@
 #include "esp_timer.h"
 #include "worker_core1.h"
 #include "signal_buffer.h"
+#include "dsp_processor.h"    // FS_IN_HZ, FFT_SIZE, IRIDIUM_CHANNEL_HZ
 #include "qpsk_demod.h"
+#include "polyphase_channelizer.h"   // POLYCHAN_M
 #include "uw_correlator.h"
 #include "bch_decoder.h"
 #include "frame_decoder.h"
@@ -145,14 +147,16 @@ void worker_task(void *arg)
             // task #41 step 1 — companion to the wider channelizer
             // passband (polyphase_channelizer.c) so the energy actually
             // reaches the worker.
-            float coarse_offset_hz = (burst.peak_bin - 1024) * 1250.0f;
-            const float IRIDIUM_GRID_HZ = 41666.67f;
-            float n_iridium = roundf(coarse_offset_hz / IRIDIUM_GRID_HZ);
-            float freq_offset = n_iridium * IRIDIUM_GRID_HZ;
+            // FFT bin spacing = FS_IN_HZ / FFT_SIZE (= 1250 Hz at the
+            // 2.56 MHz / 2048-pt config). Bin FFT_SIZE/2 = DC.
+            float coarse_offset_hz = (burst.peak_bin - FFT_SIZE / 2)
+                                     * ((float)FS_IN_HZ / (float)FFT_SIZE);
+            float n_iridium = roundf(coarse_offset_hz / IRIDIUM_CHANNEL_HZ);
+            float freq_offset = n_iridium * IRIDIUM_CHANNEL_HZ;
             ESP_LOGD(TAG, "freq: bin=%.0f → Iridium grid %.0f Hz (peak_bin=%d)",
                      (double)coarse_offset_hz, (double)freq_offset,
                      burst.peak_bin);
-            float norm_freq = -freq_offset / 2560000.0f;
+            float norm_freq = -freq_offset / (float)FS_IN_HZ;
             // dsps_cplx_gen accepts normalised frequency in (-1, 1) exclusive.
             // Clamp defensively in case detector ever emits an unusual peak_bin.
             float gen_freq = norm_freq * 2.0f;
@@ -418,7 +422,9 @@ esp_err_t worker_core1_init()
     float coeffs_f32[FIR_TAPS];
     dsps_fird_init_s16(&fir_i, coeffs, delay_i, FIR_TAPS, DECIM_FACTOR, 0, 15);
     dsps_fird_init_s16(&fir_q, coeffs, delay_q, FIR_TAPS, DECIM_FACTOR, 0, 15);
-    float omega_c = 2.0f * M_PI * 20000.0f / 2560000.0f;
+    // Stage 1 FIR cutoff: ±fs/(2M) = ±20 kHz at fs=2.56 MHz, M=64.
+    // Normalised angular freq = 2π × (fs/(2M)) / fs = π / M.
+    float omega_c = (float)M_PI / (float)POLYCHAN_M;
     for (int i = 0; i < FIR_TAPS; i++) {
         float n = i - (FIR_TAPS - 1) / 2.0f;
         float h = (fabsf(n) < 1e-9f) ? (omega_c / M_PI) : (sinf(omega_c * n) / (M_PI * n));
@@ -432,7 +438,14 @@ esp_err_t worker_core1_init()
     // Stage 2 Coefficients (RRC/LPF for resampling)
     // For now, use simple LPF for resampler
     float rcoeffs_f32[RESAMPLE_TAPS * RESAMPLE_INTERP];
-    float r_omega_c = 2.0f * M_PI * 20000.0f / (80000.0f * RESAMPLE_INTERP);
+    // Stage 2 polyphase resampler cutoff: same ±20 kHz passband at
+    // the polyphase rate = stage1_rate × RESAMPLE_INTERP = (fs / DECIM_FACTOR)
+    // × INTERP. Normalised: 2π × half_bw / poly_rate.
+    const float stage2_poly_rate_hz = (float)FS_IN_HZ
+                                      / (float)DECIM_FACTOR
+                                      * (float)RESAMPLE_INTERP;
+    const float channel_half_bw_hz = (float)FS_IN_HZ / (2.0f * (float)POLYCHAN_M);
+    float r_omega_c = 2.0f * (float)M_PI * channel_half_bw_hz / stage2_poly_rate_hz;
     for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) {
         float n = i - (RESAMPLE_TAPS * RESAMPLE_INTERP - 1) / 2.0f;
         float h = (fabsf(n) < 1e-9f) ? (r_omega_c / M_PI) : (sinf(r_omega_c * n) / (M_PI * n));

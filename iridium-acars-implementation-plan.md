@@ -300,6 +300,54 @@ of them. **No amount of "better data later" closes the gap** —
 gr-iridium implemented these stages because real Iridium RF requires
 them. Tracked in TODOs D7-D11.
 
+### Side-by-side: us vs gr-iridium (May 2026)
+
+Stage-by-stage comparison. "Equivalent" means same algorithm + same
+parameters (within rate scaling). "Deviation" means different
+algorithm or parameters that affect outcome.
+
+| Stage | gr-iridium | us | Status |
+|---|---|---|---|
+| SDR ingest | USRP/HackRF 6-12 MSPS, float complex, 96 dB DR | RTL-SDR 2.56 MSPS, uint8 → int16, 48 dB DR | Hardware delta (not algorithmic) |
+| Wideband channelizer | FFT overlap-save (decim ≥8), no window, rect bins. PFB ≤300 taps Kaiser 60 dB for decim <8 | Polyphase M=64, Hamming-windowed sinc, L=1024 taps (N=16), ~52 dB stopband, 64.6 dB adjacent rejection | Different architecture; we have TIGHTER per-channel filtering than their high-decim option |
+| Burst detect | `fft_burst_tagger` (spectrogram peak + persistence + hysteresis on wideband) | Per-channel power threshold + EMA baseline + dedup | Functionally equivalent; theirs operates pre-channelization |
+| Per-burst extract | Burst tags drive `burst_downmix` with whole-burst window | `signal_buffer_extract` from PSRAM ringbuffer | Equivalent |
+| Coarse freq center | Channel selection only (no extra QPSK estimation) | Snap to nearest Iridium 41.667 kHz grid + channelizer bin → DC mix | Equivalent (#41 step 1) |
+| Decimation | input_fir + decimate to channel rate | FIR decim 32× (2.56M → 80k) + polyphase resample 5/8 (→ 50k = 2 sps) | Equivalent |
+| Start finder (D13) | `start_finder_fir`: Kaiser LP @ 2.5 kHz cutoff, ~182 taps, 28% threshold | Bartlett MA 17-tap, 28% threshold | **Deviation**: ours is 10× shorter; sharper envelope detection might help low-SNR bursts |
+| RRC on burst | β=0.4, 51 taps at 10 sps (5.1 sym periods) | β=0.4, 11 taps at 2 sps (5.5 sym periods) | Equivalent (matched per-symbol coverage) |
+| Sync reference | RC (RRC ⊛ RRC) of preamble + UW = 28 syms | Same — RC of preamble + UW = 28 syms | Equivalent |
+| Sync search | FFT cross-correlation, 256-pt | FFT cross-correlation, 256-pt | Equivalent |
+| CFO estimation | Square-then-FFT on 64 sym × 16× zero-pad (1024-pt), Blackman window | Same: 56-sample preamble+UW, 1024-pt FFT, Blackman | Equivalent |
+| CFO correction | Multiply burst by exp(-j·CFO·n) | Same (worker pre-rotation) | Equivalent |
+| Sub-sample timing | Implicit via sync_pos + integer decim from that sample | Linear interpolation by `uw_res.correction` (#46) | Equivalent (we added explicit interp; they get it free from 10 sps) |
+| Symbol rate | 10 sps internal (250 kHz from their channelizer) | 2 sps (50 kHz from our resampler) | **Deviation**: ours is 5× lower oversampling; timing precision is coarser, linear-interp adds reconstruction noise |
+| DQPSK PLL | First-order (alpha=0.2 = 1/5), phase only | Second-order (alpha=0.2, beta=0.1), phase + freq | **Deviation**: our beta could amplify hard-decision errors into spurious freq drift; theirs doesn't track freq (assumed CFO already removed) |
+| UW check | Sum of \|demod-uw\| per symbol (cap diff=3 → 1); threshold ≤ 2; **no rotation trial** | Exact-match per symbol per rotation r ∈ {0..3}; min ≤ 2; complex-correlation fallback ≥ 0.6 | **Deviation in shape, not strictness**: theirs tolerates per-symbol noise (partial credit for 90° off); ours tolerates uniform rotation |
+| BCH | Hard-decision (main path) | Hard-decision | Equivalent (theirs has soft-decision experimental, not in main pipeline) |
+| Frame parser | `iridium-parser.py` — full classifier + LCW decode | `iridium_frame.c` + LCW classifier + IDA decode | Equivalent for IDA/SBD path |
+| ACARS | `libacars` via iridium-toolkit | `libacars_idf` (vendored) | Equivalent |
+
+**Outcome on shared ALBQ_RAW corpus**:
+- gr-iridium reports SNR 19-25 dB on the 3 known bursts; decodes them
+- Us: detects same bursts at SNR 16-21 dB (channelizer -1.4 to -2.8 dB delta), all bursts get to qpsk_demod, decode fails with `dl_diffs=6-8` (just above the threshold of 2)
+
+The remaining algorithmic deviations that could explain the 0/5 smoke
+result (in order of suspected impact):
+
+1. **Start finder filter length** (10× shorter than gr-iridium) — could
+   put burst-trim position off enough to misalign the matched-filter
+   peak in marginal cases. Their Kaiser LP at ~4 ms time constant gives
+   much smoother envelope detection.
+2. **2 sps vs 10 sps** — linear-interp at 2 sps adds reconstruction
+   noise that's not in their 10 sps path. ~0.5-1 dB SNR cost.
+3. **Second-order PLL beta** — our omega tracking can accumulate noise-
+   induced phase errors during the UW where their first-order PLL stays
+   bounded. Could spin our PLL during the critical 12-sym UW window.
+4. **Channel oversampling** — gr-iridium's 250 kHz per-channel rate vs
+   our 50 kHz gives them 5× more samples for the matched filter and PLL
+   to integrate — pure SNR gain.
+
 | # | Gap | Why it matters | Estimated effort | TODO |
 |---|---|---|---|---|
 | D7 | Polyphase channelizer | Single FFT detector picks SNR-ratio peak which lands BETWEEN concurrent bursts in the same 2.56 MHz subband. Per-channel streams give each Iridium TDMA slot its own chain. | 3-5 days, ~10-15% of one core | #26 |

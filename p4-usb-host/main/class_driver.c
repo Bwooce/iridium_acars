@@ -84,8 +84,8 @@ static void action_open_dev(class_driver_t *driver_obj)
 static void action_start_stream(class_driver_t *driver_obj)
 {
     ESP_LOGI(TAG, "Configuring RTL-SDR...");
-    rtlsdr_set_sample_rate(rtldev, 2560000);
-    rtlsdr_set_center_freq(rtldev, 1626000000);
+    rtlsdr_set_sample_rate(rtldev, FS_IN_HZ);
+    rtlsdr_set_center_freq(rtldev, IRIDIUM_CENTER_FREQ_HZ);
     rtlsdr_set_tuner_gain_mode(rtldev, 0);
     rtlsdr_reset_buffer(rtldev);
 
