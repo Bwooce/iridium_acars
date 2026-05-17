@@ -161,6 +161,77 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
     }
 }
 
+// FFT-based correlation (gr-iridium burst_downmix_impl.cc, lines
+// 342-394, 608-650). The reversed-conjugated RC-shaped sync word
+// is FFT'd once at init and stored in s_sync_dl_fft / s_sync_ul_fft.
+// Per burst we FFT the burst (zero-padded to CORR_FFT_N), multiply
+// elementwise by the stored sync FFT, IFFT, and peak-find.
+//
+// CORR_FFT_N = next_pow2(burst_len_max + sync_len - 1) for the
+// linear-convolution requirement. Our 50 ksps bursts run up to
+// ~700 samples; 1024-pt covers up to 1024 - 56 + 1 = 969 sample
+// search range with one FFT.
+#define CORR_FFT_N   1024
+#define CORR_FFT_LOG 10
+static uint16_t s_corr_brev[CORR_FFT_N];
+static float    s_corr_tw_re[CORR_FFT_N / 2];
+static float    s_corr_tw_im[CORR_FFT_N / 2];
+// Pre-computed FFTs of the reversed-conjugated RC-shaped sync
+// references, zero-padded to CORR_FFT_N. Used by the burst-
+// correlation FFT path. gr-iridium pattern: `volk_32fc_conjugate`
+// + `std::reverse` + FFT, stored as `d_dl_preamble_reversed_conj_fft`.
+static float    s_sync_dl_fft_re[CORR_FFT_N];
+static float    s_sync_dl_fft_im[CORR_FFT_N];
+static float    s_sync_ul_fft_re[CORR_FFT_N];
+static float    s_sync_ul_fft_im[CORR_FFT_N];
+
+// Generic radix-2 DIT FFT. Used at both CFO and correlation scales
+// (CFO_FFT_N and CORR_FFT_N are both 1024 in this build; if they
+// ever diverge, give each its own table set).
+static void radix2_fft(float *re, float *im, int N, int log_N,
+                        const uint16_t *brev,
+                        const float *tw_re, const float *tw_im)
+{
+    for (int i = 0; i < N; i++) {
+        int j = brev[i];
+        if (j > i) {
+            float tr = re[i]; re[i] = re[j]; re[j] = tr;
+            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+    (void)log_N;
+    for (int stride = 1; stride < N; stride <<= 1) {
+        int span = stride << 1;
+        int step = (N / 2) / stride;
+        for (int k = 0; k < stride; k++) {
+            float wr = tw_re[k * step];
+            float wi = tw_im[k * step];
+            for (int i = k; i < N; i += span) {
+                float xr = re[i + stride];
+                float xi = im[i + stride];
+                float tr = wr * xr - wi * xi;
+                float ti = wr * xi + wi * xr;
+                re[i + stride] = re[i] - tr;
+                im[i + stride] = im[i] - ti;
+                re[i]          = re[i] + tr;
+                im[i]          = im[i] + ti;
+            }
+        }
+    }
+}
+
+// Inverse FFT via conj-FFT-conj/N (gr-iridium uses VOLK's IFFT but
+// this is mathematically identical).
+static void radix2_ifft(float *re, float *im, int N, int log_N,
+                         const uint16_t *brev,
+                         const float *tw_re, const float *tw_im)
+{
+    for (int i = 0; i < N; i++) im[i] = -im[i];
+    radix2_fft(re, im, N, log_N, brev, tw_re, tw_im);
+    float inv = 1.0f / (float)N;
+    for (int i = 0; i < N; i++) { re[i] *= inv; im[i] = -im[i] * inv; }
+}
+
 static void sync_init(void)
 {
     if (s_sync_inited) return;
@@ -168,6 +239,53 @@ static void sync_init(void)
     make_rc_taps (s_rc_taps,  RRC_NTAPS, SYM_STRIDE, RRC_BETA);
     build_shaped_sync(SYNC_DL_SIGN, s_rc_taps, s_sync_dl_re, s_sync_dl_im);
     build_shaped_sync(SYNC_UL_SIGN, s_rc_taps, s_sync_ul_re, s_sync_ul_im);
+
+    // Init the correlation FFT tables.
+    for (int i = 0; i < CORR_FFT_N; i++) {
+        uint16_t r = 0, v = (uint16_t)i;
+        for (int b = 0; b < CORR_FFT_LOG; b++) {
+            r = (uint16_t)((r << 1) | (v & 1));
+            v = (uint16_t)(v >> 1);
+        }
+        s_corr_brev[i] = r;
+    }
+    for (int k = 0; k < CORR_FFT_N / 2; k++) {
+        double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CORR_FFT_N;
+        s_corr_tw_re[k] = (float)cos(ang);
+        s_corr_tw_im[k] = (float)sin(ang);
+    }
+
+    // Pre-compute reversed-conjugated sync FFTs. gr-iridium does:
+    //   std::reverse(sync_padded.begin(), sync_padded.end());
+    //   volk_32fc_conjugate_32fc(sync_padded, sync_padded, ...);
+    //   fft_engine.execute(sync_padded → store_buf)
+    // For our purposes, the RC-shaped sync is real-imag (1+j axis),
+    // so reversed-conjugate is: out[n] = conj(sync[L-1-n]).
+    float tmp_re[CORR_FFT_N], tmp_im[CORR_FFT_N];
+    const int L = SYNC_RRC_LEN;
+    // DL
+    memset(tmp_re, 0, sizeof(tmp_re));
+    memset(tmp_im, 0, sizeof(tmp_im));
+    for (int n = 0; n < L; n++) {
+        tmp_re[n] =  s_sync_dl_re[L - 1 - n];
+        tmp_im[n] = -s_sync_dl_im[L - 1 - n];      // conjugate
+    }
+    radix2_fft(tmp_re, tmp_im, CORR_FFT_N, CORR_FFT_LOG,
+                s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    memcpy(s_sync_dl_fft_re, tmp_re, sizeof(tmp_re));
+    memcpy(s_sync_dl_fft_im, tmp_im, sizeof(tmp_im));
+    // UL
+    memset(tmp_re, 0, sizeof(tmp_re));
+    memset(tmp_im, 0, sizeof(tmp_im));
+    for (int n = 0; n < L; n++) {
+        tmp_re[n] =  s_sync_ul_re[L - 1 - n];
+        tmp_im[n] = -s_sync_ul_im[L - 1 - n];
+    }
+    radix2_fft(tmp_re, tmp_im, CORR_FFT_N, CORR_FFT_LOG,
+                s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    memcpy(s_sync_ul_fft_re, tmp_re, sizeof(tmp_re));
+    memcpy(s_sync_ul_fft_im, tmp_im, sizeof(tmp_im));
+
     s_sync_inited = true;
 }
 
@@ -397,57 +515,85 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     if (search_complex > max_k) search_complex = max_k;
     if (search_complex <= 2) return;
 
-    // Scan correlations across k = 0..search_complex-1. Track the
-    // best DL and UL peaks separately.
+    sync_init();    // ensures RRC taps + shaped refs + sync FFTs
+
+    // gr-iridium FFT-based correlation (burst_downmix_impl.cc 608-650):
+    //   1. Copy burst into CORR_FFT_N buffer, zero-padded.
+    //   2. Forward FFT (d_corr_fft).
+    //   3. Multiply elementwise by pre-computed reversed-conj sync FFT
+    //      (d_dl_preamble_reversed_conj_fft / _ul_).
+    //   4. Inverse FFT (d_corr_dl_ifft / _ul_).
+    //   5. Find peak of magnitude² (std::max_element).
+    static float burst_re[CORR_FFT_N], burst_im[CORR_FFT_N];
+    static float ifft_re[CORR_FFT_N], ifft_im[CORR_FFT_N];
+    memset(burst_re, 0, sizeof(burst_re));
+    memset(burst_im, 0, sizeof(burst_im));
+    int load_n = n_complex < CORR_FFT_N ? n_complex : CORR_FFT_N;
+    for (int i = 0; i < load_n; i++) {
+        burst_re[i] = (float)burst_2sps[i * 2 + 0];
+        burst_im[i] = (float)burst_2sps[i * 2 + 1];
+    }
+    radix2_fft(burst_re, burst_im, CORR_FFT_N, CORR_FFT_LOG,
+                s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+
+    // The convolution peak for cross-correlation (sync * conj(reversed)
+    // ⊛ burst) lands at k = search_position + (L-1) where L = sync
+    // length. We compensate by shifting the peak index by -(L-1) when
+    // reporting, so peak_k becomes the burst-sample offset where the
+    // sync STARTS.
     float best_dl = 0.0f, best_ul = 0.0f;
     int   best_dl_k = 0, best_ul_k = 0;
     float best_dl_re = 0, best_dl_im = 0;
     float best_ul_re = 0, best_ul_im = 0;
-    // Save just-around-peak mags for parabolic interpolation. We
-    // store the 3 most recent magnitudes per direction.
-    // Simpler: do a second pass after locating the peak.
-    // For now: skip interpolation; compute it post-loop.
-
-    // For SNR estimate, accumulate sum of all squared correlations.
     double sum_dl = 0, sum_ul = 0;
+    int valid_count = 0;
+    const int L_minus_1 = SYNC_RRC_LEN - 1;
 
-    sync_init();    // ensures RRC taps + shaped references are computed
-
+    // DL path: multiply burst_fft × sync_dl_fft (elementwise complex),
+    // IFFT, magnitude-find.
+    for (int k = 0; k < CORR_FFT_N; k++) {
+        float ar = burst_re[k], ai = burst_im[k];
+        float br = s_sync_dl_fft_re[k], bi = s_sync_dl_fft_im[k];
+        ifft_re[k] = ar * br - ai * bi;
+        ifft_im[k] = ar * bi + ai * br;
+    }
+    radix2_ifft(ifft_re, ifft_im, CORR_FFT_N, CORR_FFT_LOG,
+                 s_corr_brev, s_corr_tw_re, s_corr_tw_im);
     for (int k = 0; k < search_complex; k++) {
-        // RRC-shaped matched-filter correlation. The shaped sync
-        // reference is complex (±1±j on the BPSK axis) and runs
-        // sample-by-sample (not symbol-by-symbol). For each candidate
-        // sync start k, correlate over all SYNC_RRC_LEN (=56) samples:
-        //   corr = sum_n sync[n] · conj(burst[k + n])
-        // This is the proper matched filter — gives optimal SNR when
-        // both burst and reference are RRC-shaped (gr-iridium pattern).
-        float dl_re = 0, dl_im = 0, ul_re = 0, ul_im = 0;
-        for (int n = 0; n < SYNC_RRC_LEN; n++) {
-            int idx = (k + n) * 2;
-            float br = (float)burst_2sps[idx + 0];
-            float bi = (float)burst_2sps[idx + 1];
-            float dr = s_sync_dl_re[n], di = s_sync_dl_im[n];
-            float ur = s_sync_ul_re[n], ui = s_sync_ul_im[n];
-            // sync · conj(burst) = (dr+j·di)(br - j·bi)
-            //                    = (dr·br + di·bi) + j(di·br - dr·bi)
-            dl_re += dr * br + di * bi;
-            dl_im += di * br - dr * bi;
-            ul_re += ur * br + ui * bi;
-            ul_im += ui * br - ur * bi;
-        }
-        float dl_mag2 = dl_re * dl_re + dl_im * dl_im;
-        float ul_mag2 = ul_re * ul_re + ul_im * ul_im;
-        sum_dl += dl_mag2;
-        sum_ul += ul_mag2;
-        if (dl_mag2 > best_dl) {
-            best_dl = dl_mag2; best_dl_k = k;
-            best_dl_re = dl_re; best_dl_im = dl_im;
-        }
-        if (ul_mag2 > best_ul) {
-            best_ul = ul_mag2; best_ul_k = k;
-            best_ul_re = ul_re; best_ul_im = ul_im;
+        int idx = k + L_minus_1;
+        if (idx >= CORR_FFT_N) break;
+        float re = ifft_re[idx], im = ifft_im[idx];
+        float m2 = re * re + im * im;
+        sum_dl += m2;
+        if (k == 0) valid_count = 0;
+        valid_count++;
+        if (m2 > best_dl) {
+            best_dl = m2; best_dl_k = k;
+            best_dl_re = re; best_dl_im = im;
         }
     }
+    // UL path: same with sync_ul_fft.
+    for (int k = 0; k < CORR_FFT_N; k++) {
+        float ar = burst_re[k], ai = burst_im[k];
+        float br = s_sync_ul_fft_re[k], bi = s_sync_ul_fft_im[k];
+        ifft_re[k] = ar * br - ai * bi;
+        ifft_im[k] = ar * bi + ai * br;
+    }
+    radix2_ifft(ifft_re, ifft_im, CORR_FFT_N, CORR_FFT_LOG,
+                 s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    for (int k = 0; k < search_complex; k++) {
+        int idx = k + L_minus_1;
+        if (idx >= CORR_FFT_N) break;
+        float re = ifft_re[idx], im = ifft_im[idx];
+        float m2 = re * re + im * im;
+        sum_ul += m2;
+        if (m2 > best_ul) {
+            best_ul = m2; best_ul_k = k;
+            best_ul_re = re; best_ul_im = im;
+        }
+    }
+    if (valid_count <= 1) return;
+    (void)search_complex;       // valid_count is the real divisor
 
     // Pick the better direction.
     uw_direction_t dir;
@@ -458,12 +604,12 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         dir = UW_DIR_DOWNLINK;
         peak_k = best_dl_k;
         peak_mag2 = best_dl;
-        avg_off_peak = (sum_dl - best_dl) / (double)(search_complex - 1);
+        avg_off_peak = (sum_dl - best_dl) / (double)(valid_count - 1);
     } else {
         dir = UW_DIR_UPLINK;
         peak_k = best_ul_k;
         peak_mag2 = best_ul;
-        avg_off_peak = (sum_ul - best_ul) / (double)(search_complex - 1);
+        avg_off_peak = (sum_ul - best_ul) / (double)(valid_count - 1);
     }
 
     // SNR estimate: peak² over mean off-peak² (in dB).
