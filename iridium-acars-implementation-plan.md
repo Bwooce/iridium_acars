@@ -370,11 +370,34 @@ was computed with the original 1/(2M) cutoff. Widening moves AWAY
 from gr-iridium parity by that test. Reverted; the path to recovery
 is fs/M change, not filter widening.
 
-*Step 2 (PENDING, task #48)*: Change SDR fs from 2.56 → 2.667 MHz
-so M=64 bins land exactly on the 41.667 kHz Iridium grid. Substantial
-refactor (SDR config, signal_buffer, downstream resampler) — touches
-the whole DSP chain's sample-rate constants. Will properly recover
-the ~3 dB measured loss.
+*Step 2 (PENDING, task #48)*: Iridium-grid channelizer. Three design
+options analysed; chosen approach to be decided before implementation:
+
+| Option | fs | M | Channel | FFT | Effort | Notes |
+|---|---|---|---|---|---|---|
+| A | 2.0 MHz  | 48 | 41667 Hz (exact) | mixed-radix | ~1-2 weeks | needs new FFT; -0.56 MHz coverage |
+| B | 2.667 MHz | 64 | 41671 Hz (~exact) | radix-2 (existing) | ~3-5 days | RTL-SDR quantises rate |
+| C | 2.56 MHz | 64 × 2 | 20 kHz effective (half-bin) | radix-2 (existing) | ~2-3 days | 2× channelizer compute |
+
+All three options give ~3 dB recovery on the measured channelizer
+loss. Option B is the cleanest gr-iridium parity with minimal
+architecture disruption; option C is the fallback if 2.667 MHz isn't
+clean on our RTL-SDR v4.
+
+**Filter widening attempted as an interim (REVERTED)**: a cheaper
+"middle ground" — widen the channelizer's prototype filter cutoff
+from 1/(2M) to ~1.1× — would recover some loss without changing
+fs/M. Tried both 1.10× and 1.25× cutoffs. Both improved the SNR-gap
+measurement but broke the channelizer reference tests (the per-cell
+snapshot fixture was computed with the original 1/(2M) cutoff;
+widening the filter changes all channel outputs and breaks bit-exact
+comparison). One specific high-conf burst (ch 53 at 29.5 dB on
+LO=1625.5 fixture) was lost with 1.25× because wider filter
+admits more adjacent-channel energy, raising the relative noise
+floor. The per-cell test could be regenerated if we commit to a new
+filter, but that's a divergence from gr-iridium's reference filter
+design — the proper Iridium-grid fix is option A/B/C above, not
+ad-hoc cutoff tuning. Reverted to 1/(2M).
 
 **Status snapshot (D7-D10), May 2026:**
 - **D7** — polyphase channelizer landed (host correctness 9/9, target wiring in flight).
