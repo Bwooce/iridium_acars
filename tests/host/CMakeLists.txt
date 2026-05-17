@@ -242,6 +242,19 @@ add_executable(test_uw_correlator_cfo
 target_include_directories(test_uw_correlator_cfo PRIVATE ${COMMON_DIR})
 target_link_libraries(test_uw_correlator_cfo PRIVATE m)
 
+# Real-RF cross-validation: runs the uw_correlator pipeline on the
+# Albuquerque corpus burst (the same one gr-iridium decoded at 30 dB
+# SNR) and asserts gr-iridium-aligned per-stage outputs.
+add_executable(test_uw_correlator_albq
+    test_uw_correlator_albq.c
+    ${COMMON_DIR}/uw_correlator.c
+)
+target_include_directories(test_uw_correlator_albq PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_uw_correlator_albq PRIVATE m)
+
 # D10 tuning tool — not a regression test. Dumps per-symbol PI-loop
 # state on the corpus fixture for offline analysis.
 add_executable(test_sym_timing_trace
@@ -259,6 +272,7 @@ add_test(NAME bch                  COMMAND test_bch)
 add_test(NAME freq_estimator       COMMAND test_freq_estimator)
 add_test(NAME sym_timing           COMMAND test_sym_timing)
 add_test(NAME uw_correlator_cfo    COMMAND test_uw_correlator_cfo)
+add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
 add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)

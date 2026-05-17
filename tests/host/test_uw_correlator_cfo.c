@@ -28,6 +28,7 @@
 // UW patterns (must match IR_UW_DL / IR_UW_UL from iridium.h, mapped
 // to BPSK ±(1+j) on the +1+j / -1-j axis).
 static const int UW_DL_SIGN[12] = { +1,-1,-1,-1,-1,+1,+1,+1,-1,+1,+1,-1 };
+static const int UW_UL_SIGN[12] = { -1,-1,+1,+1,+1,-1,+1,+1,-1,+1,-1,-1 };
 
 static int s_passed = 0;
 static int s_failed = 0;
@@ -47,30 +48,40 @@ static int s_failed = 0;
     }                                                            \
 } while (0)
 
+// Direction selector for the synthetic burst.
+typedef enum { DIR_DL = 0, DIR_UL = 1 } burst_dir_t;
+
 // Build a synthetic 2-sps interleaved int16 burst:
-//   - PREAMBLE_LEN syms of all +1 (DL preamble = all s0 = +(1+j))
-//   - 12 syms of DL UW pattern
+//   - PREAMBLE_LEN syms (DL: all s0; UL: alternating s1,s0)
+//   - 12 syms of UW pattern (direction-appropriate)
 //   - TAIL_LEN syms of random data (placeholder for the data field)
 // All modulated by a constant amplitude and a carrier offset of
 // `omega_per_sym` rad/sym. Optional Gaussian noise with σ = sigma.
 //
 // burst[2i+0..2i+1] is sample i (interleaved I, Q).
 // Returns total complex sample count (= PREAMBLE_LEN+12+TAIL_LEN syms × SPS).
-static int build_burst(int16_t *burst, int preamble_len, int tail_len,
-                       double omega_per_sym, double amp, double sigma)
+static int build_burst_dir(int16_t *burst, int preamble_len, int tail_len,
+                            double omega_per_sym, double amp, double sigma,
+                            burst_dir_t dir)
 {
     const int total_syms = preamble_len + 12 + tail_len;
     const int total_samps = total_syms * SPS;
     const double per_sample_phase = omega_per_sym / (double)SPS;
+    const int *uw_signs = (dir == DIR_DL) ? UW_DL_SIGN : UW_UL_SIGN;
 
     for (int n = 0; n < total_samps; n++) {
         int sym = n / SPS;
         // pick the symbol's BPSK sign
         int sign;
         if (sym < preamble_len) {
-            sign = +1;          // DL preamble all s0
+            if (dir == DIR_DL) {
+                sign = +1;          // DL preamble all s0
+            } else {
+                // UL preamble alternates s1, s0, s1, s0, ... starting s1.
+                sign = (sym & 1) ? +1 : -1;
+            }
         } else if (sym < preamble_len + 12) {
-            sign = UW_DL_SIGN[sym - preamble_len];
+            sign = uw_signs[sym - preamble_len];
         } else {
             // simple repeatable random pattern for the data tail
             sign = ((sym * 1103515245u + 12345u) >> 30) & 1 ? +1 : -1;
@@ -104,6 +115,14 @@ static int build_burst(int16_t *burst, int preamble_len, int tail_len,
         burst[2 * n + 1] = (int16_t)v_im;
     }
     return total_samps;
+}
+
+// Back-compat wrapper: always DL.
+static int build_burst(int16_t *burst, int preamble_len, int tail_len,
+                       double omega_per_sym, double amp, double sigma)
+{
+    return build_burst_dir(burst, preamble_len, tail_len,
+                           omega_per_sym, amp, sigma, DIR_DL);
 }
 
 // Apply the worker's gr-iridium-style pipeline to a burst:
@@ -203,6 +222,64 @@ int main(void)
         printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ -0.2)\n",
                off, dir, omega);
         CHECK_NEAR(omega, -0.2, 0.20, "+0.2 rad/sym CFO + noise");
+    }
+
+    // --- UL direction tests (gr-iridium alignment coverage) ---
+    printf("\nTest 6: UL direction, zero CFO, no noise\n");
+    {
+        int n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
+                                0.0, AMP, 0.0, DIR_UL);
+        int off; uw_direction_t dir;
+        float omega = run_correlator(burst, n, &off, &dir);
+        printf("  uw_offset=%d dir=%d omega=%.4f\n", off, dir, omega);
+        CHECK_NEAR(dir, (int)UW_DIR_UPLINK, 0, "UL direction detected");
+        CHECK_NEAR(omega, 0.0, 0.05, "UL zero CFO ground truth");
+        CHECK_NEAR(off, PREAMBLE_LEN * SPS, 1, "UL UW offset matches preamble length");
+    }
+
+    printf("\nTest 7: UL direction, +0.4 rad/sym CFO, no noise\n");
+    {
+        int n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
+                                0.4, AMP, 0.0, DIR_UL);
+        int off; uw_direction_t dir;
+        float omega = run_correlator(burst, n, &off, &dir);
+        printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ -0.4)\n",
+               off, dir, omega);
+        CHECK_NEAR(dir, (int)UW_DIR_UPLINK, 0, "UL direction with CFO");
+        CHECK_NEAR(omega, -0.4, 0.15, "UL +0.4 rad/sym CFO ground truth");
+    }
+
+    // --- Low-SNR sweep on DL ---
+    printf("\nTest 8: low SNR sweep (σ ∈ {2000, 4000, 6000})\n");
+    {
+        const double sigmas[] = { 2000.0, 4000.0, 6000.0 };
+        for (int s = 0; s < 3; s++) {
+            srand(0xc0fee + s);
+            int n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
+                                    0.1, AMP, sigmas[s], DIR_DL);
+            int off; uw_direction_t dir;
+            float omega = run_correlator(burst, n, &off, &dir);
+            printf("  σ=%.0f: uw_offset=%d dir=%d omega=%.4f\n",
+                   sigmas[s], off, dir, omega);
+            // At AMP=8000, sigma=6000 is roughly SNR ≈ 2.5 dB per sample.
+            // Direction detection should still work; CFO may drift.
+            CHECK_NEAR(dir, (int)UW_DIR_DOWNLINK, 0,
+                       "direction at sigma=%.0f", sigmas[s]);
+        }
+    }
+
+    // --- Mixed: large CFO + noise ---
+    printf("\nTest 9: large CFO (+0.6) + moderate noise (σ=3000), DL\n");
+    {
+        srand(0xbeef);
+        int n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
+                                0.6, AMP, 3000.0, DIR_DL);
+        int off; uw_direction_t dir;
+        float omega = run_correlator(burst, n, &off, &dir);
+        printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ -0.6)\n",
+               off, dir, omega);
+        CHECK_NEAR(dir, (int)UW_DIR_DOWNLINK, 0, "DL at large CFO + noise");
+        CHECK_NEAR(omega, -0.6, 0.25, "+0.6 rad/sym CFO + noise");
     }
 
     printf("\n=== %d passed, %d failed ===\n", s_passed, s_failed);
