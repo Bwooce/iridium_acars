@@ -320,6 +320,38 @@ them. Tracked in TODOs D7-D11.
 Combined CPU budget for the DSP gaps (D7-D11): ~20-25% of one P4 core.
 Easily within the existing 60% Core 0 headroom.
 
+**Per-stage SNR-gap measurement (May 2026 baseline)** — task #47
+
+Comparing our channelizer's per-burst SNR_dB against gr-iridium's
+reported SNR on the same raw uint8 SDR data (ALBQ_RAW_UINT8 fixture,
+LO=1618.5 MHz):
+
+| Burst | gr-iridium | ours | delta |
+|---|---|---|---|
+| ch 58 (-232891 Hz) | 25.10 dB | 21.30 dB | **-3.80 dB** |
+| ch  0 (+17103 Hz)  | 20.46 dB | 18.24 dB | **-2.22 dB** |
+| ch 56 (-316217 Hz) | 19.16 dB | **MISSED** (16 dB threshold) | — |
+
+Mean delta over the 2 detected bursts: **-3.01 dB** at the channelizer
+stage alone. The missed third burst lands close to bin edge between
+ch 56 and ch 57 — strongly suggests 40 kHz / 41.667 kHz grid mismatch
+is real and biting hardest at edge-aligned channels.
+
+This 3 dB upstream loss propagates through the rest of the chain,
+which is why the smoke test sees matched-filter SNRs of 7-9 dB on
+bursts gr-iridium decoded at 19-25 dB. Run
+`tests/host/test_snr_gap_measurement` to reproduce; it always passes
+(diagnostic instrument) and the numbers are the gate.
+
+**dB-recovery priority ranking** (where to look first):
+
+| Source | Estimated recovery | Task |
+|---|---|---|
+| Channelizer Iridium-grid alignment | 3-4 dB | #41 (D7+) |
+| Channel filter quality / freq-centering | 1-2 dB | #45 |
+| Soft-decision BCH (only matters after demod works) | 2 dB | #30 (D11) |
+| Symbol timing refinement / Gardner loop | 0.5-1 dB | #46 |
+
 **Status snapshot (D7-D10), May 2026:**
 - **D7** — polyphase channelizer landed (host correctness 9/9, target wiring in flight).
 - **D8** — fine freq estimation in worker is in place; residual still

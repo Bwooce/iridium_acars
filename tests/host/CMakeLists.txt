@@ -255,6 +255,22 @@ target_include_directories(test_uw_correlator_albq PRIVATE
 )
 target_link_libraries(test_uw_correlator_albq PRIVATE m)
 
+# Per-stage SNR-gap measurement test (diagnostic, always-passes).
+# Feeds ALBQ_RAW_UINT8 — the same raw uint8 SDR data gr-iridium
+# decoded at known SNRs — through our channelizer and reports the
+# per-burst delta vs gr-iridium ground truth. Baseline before task
+# #41 (Iridium-grid alignment) so we can quantify improvement.
+add_executable(test_snr_gap_measurement
+    test_snr_gap_measurement.c
+    ${COMMON_DIR}/channelizer_detector.c
+    ${COMMON_DIR}/polyphase_channelizer.c
+)
+target_include_directories(test_snr_gap_measurement PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_snr_gap_measurement PRIVATE m)
+
 # D10 tuning tool — not a regression test. Dumps per-symbol PI-loop
 # state on the corpus fixture for offline analysis.
 add_executable(test_sym_timing_trace
@@ -273,6 +289,7 @@ add_test(NAME freq_estimator       COMMAND test_freq_estimator)
 add_test(NAME sym_timing           COMMAND test_sym_timing)
 add_test(NAME uw_correlator_cfo    COMMAND test_uw_correlator_cfo)
 add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
+add_test(NAME snr_gap_measurement  COMMAND test_snr_gap_measurement)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
 add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)
