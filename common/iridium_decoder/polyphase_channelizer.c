@@ -174,6 +174,15 @@ static void build_prototype(float h_phase[POLYCHAN_FILTER_LEN])
     // the stop-band. With a Hamming window at L = M*N taps, the
     // transition band is ~fs/L; for N=8 that's about half a channel
     // spacing, giving ≥40 dB adjacent rejection.
+    //
+    // Iridium grid mismatch (41.667 vs 40 kHz) costs ~3 dB on
+    // edge-aligned channels (test_snr_gap_measurement). Widening the
+    // filter to recover some of this regresses the channelizer
+    // reference test (fixture computed with the 1/(2M) cutoff —
+    // changing the filter diverges from gr-iridium's reference
+    // outputs). Proper fix is fs/M alignment with the Iridium grid
+    // (e.g. fs=2.667 MHz with M=64 gives exact 41.667 kHz channels);
+    // tracked as task #41 step 2.
     float cutoff = 1.0f / (2.0f * (float)M);
     float sum = 0.0f;
     for (int k = 0; k < L; k++) {

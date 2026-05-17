@@ -136,15 +136,22 @@ void worker_task(void *arg)
             // uw_correlator's CFO estimate, run on the BPSK preamble+UW
             // window where squaring removes modulation).
             //
-            // Worst-case residual after channelizer-only centering:
-            // ~±0.8 kHz from the 40 kHz channelizer bin vs 41.667 kHz
-            // Iridium-grid mismatch, plus ~±1 kHz Doppler residual.
-            // Total ~±2 kHz = ~±0.5 rad/sym at our 25 ksym/s symbol
-            // rate, well within uw_correlator's CFO range (±π rad/sym).
+            // Channelizer bin centre may be off the actual Iridium
+            // carrier by up to ±20 kHz (worst case at bin edge between
+            // two Iridium channels). Snap the freq_offset to the
+            // nearest Iridium-grid carrier (41.666... kHz multiple from
+            // the SDR LO) so the worker mixes the burst exactly to DC
+            // rather than to bin-centre-with-Iridium-offset. This is
+            // task #41 step 1 — companion to the wider channelizer
+            // passband (polyphase_channelizer.c) so the energy actually
+            // reaches the worker.
             float coarse_offset_hz = (burst.peak_bin - 1024) * 1250.0f;
-            float freq_offset = coarse_offset_hz;
-            ESP_LOGD(TAG, "freq: coarse=%.0f Hz (peak_bin=%d)",
-                     (double)coarse_offset_hz, burst.peak_bin);
+            const float IRIDIUM_GRID_HZ = 41666.67f;
+            float n_iridium = roundf(coarse_offset_hz / IRIDIUM_GRID_HZ);
+            float freq_offset = n_iridium * IRIDIUM_GRID_HZ;
+            ESP_LOGD(TAG, "freq: bin=%.0f → Iridium grid %.0f Hz (peak_bin=%d)",
+                     (double)coarse_offset_hz, (double)freq_offset,
+                     burst.peak_bin);
             float norm_freq = -freq_offset / 2560000.0f;
             // dsps_cplx_gen accepts normalised frequency in (-1, 1) exclusive.
             // Clamp defensively in case detector ever emits an unusual peak_bin.
