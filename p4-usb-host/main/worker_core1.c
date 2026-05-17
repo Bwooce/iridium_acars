@@ -258,15 +258,16 @@ void worker_task(void *arg)
             // parabolic peak interpolation, NOT a continuous Gardner
             // loop. New uw_correlator module replaces this hook.)
 
-            // D10: one-shot UW cross-correlation (gr-iridium pattern).
-            // The channelizer reports start_sample_idx at the
-            // threshold-crossing point — the real UW is somewhere
-            // INSIDE the extracted burst (after preamble + envelope
-            // slack). uw_correlator_find locates the UW directly
-            // via complex correlation against the known DL/UL
-            // patterns. Peak position = UW start, direction = which
-            // pattern peaked higher.
+            // D10: gr-iridium-aligned pipeline.
+            //   1. RRC matched filter on the burst (proper matched-
+            //      filter SNR when correlated against RRC-shaped sync).
+            //   2. uw_correlator_find with RRC-shaped 28-symbol
+            //      preamble+UW reference + Blackman 16× FFT CFO.
+            //   3. (existing) peak-phase + omega pre-rotation, then
+            //      qpsk_demod_process.
             int total_int16 = out_samples_50k * 2;
+            uw_correlator_apply_rrc(demod_interleaved, demod_interleaved,
+                                     out_samples_50k);
             uw_corr_result_t uw_res;
             uw_correlator_find(demod_interleaved, out_samples_50k,
                                 /*search_complex=*/out_samples_50k - 24,

@@ -23,8 +23,153 @@
 #include <stdbool.h>
 #include <string.h>
 
-#define UW_LENGTH    12
-#define SYM_STRIDE   2     // 2 samples per symbol
+#define UW_LENGTH        12
+#define PREAMBLE_LENGTH  16
+#define SYNC_LENGTH      (PREAMBLE_LENGTH + UW_LENGTH)   // 28
+#define SYM_STRIDE       2     // 2 samples per symbol
+
+// Full sync-word sign patterns: preamble (16 syms) + UW (12 syms),
+// each symbol mapped to BPSK ±(1+j) on the +1+j / -1-j axis.
+//
+// Per gr-iridium burst_downmix_impl.cc::generate_sync_word():
+//   DL preamble = 16× s0 (= +(1+j))   → signs all +1
+//   UL preamble = 8× (s1, s0)         → signs -1, +1, -1, +1, ...
+//   DL UW = { s0, s1, s1, s1, s1, s0, s0, s0, s1, s0, s0, s1 }
+//   UL UW = { s1, s1, s0, s0, s0, s1, s0, s0, s1, s0, s1, s1 }
+static const int8_t SYNC_DL_SIGN[SYNC_LENGTH] = {
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,   // preamble
+    +1,-1,-1,-1,-1,+1,+1,+1,-1,+1,+1,-1                  // UW
+};
+static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
+    -1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,   // preamble
+    -1,-1,+1,+1,+1,-1,+1,+1,-1,+1,-1,-1                  // UW
+};
+
+// RRC pulse shape parameters (gr-iridium: roll-off β = 0.4, 51 taps
+// at 250 ksps = 10 symbol periods of filter length). For us at 50
+// ksps that's 21 taps (10 sym × 2 sps + 1 for symmetric centring).
+#define RRC_BETA       0.4f
+#define RRC_NTAPS      21
+#define SYNC_RRC_LEN   (SYNC_LENGTH * SYM_STRIDE)   // 56 samples
+static float s_rrc_taps[RRC_NTAPS];     // RRC for filtering the burst
+static float s_rc_taps[RRC_NTAPS];      // RC for shaping the sync ref
+// RRC-shaped sync word references (complex, +1+j axis). Computed
+// at init by zero-padding the BPSK symbols at sps stride and
+// convolving with the RRC FIR. Used as the matched filter against
+// the burst — proper RRC matched-filter SNR.
+static float s_sync_dl_re[SYNC_RRC_LEN];
+static float s_sync_dl_im[SYNC_RRC_LEN];
+static float s_sync_ul_re[SYNC_RRC_LEN];
+static float s_sync_ul_im[SYNC_RRC_LEN];
+static bool  s_sync_inited = false;
+
+// Generate root-raised-cosine FIR taps. Standard textbook formula;
+// matches gr::filter::firdes::root_raised_cosine. Used to RRC-filter
+// the received burst (matched-filter side: gr-iridium's d_rrc_fir).
+static void make_rrc_taps(float *taps, int ntaps, int sps, float beta)
+{
+    const float PI = 3.14159265358979323846f;
+    int center = (ntaps - 1) / 2;
+    float sum = 0.0f;
+    for (int n = 0; n < ntaps; n++) {
+        float k = (float)(n - center) / (float)sps;     // in symbol periods
+        float v;
+        float abs_k = k < 0 ? -k : k;
+        if (abs_k < 1e-6f) {
+            v = 1.0f - beta + 4.0f * beta / PI;
+        } else {
+            float four_bk = 4.0f * beta * k;
+            float denom = PI * k * (1.0f - four_bk * four_bk);
+            if (fabsf(denom) < 1e-9f) {
+                // Singularity at k = ±1/(4β): use l'Hôpital limit.
+                v = (beta / sqrtf(2.0f)) *
+                    ((1.0f + 2.0f / PI) * sinf(PI / (4.0f * beta)) +
+                     (1.0f - 2.0f / PI) * cosf(PI / (4.0f * beta)));
+            } else {
+                float num = sinf(PI * (1.0f - beta) * k)
+                          + four_bk * cosf(PI * (1.0f + beta) * k);
+                v = num / denom;
+            }
+        }
+        taps[n] = v;
+        sum += v;
+    }
+    // Normalise to unit DC gain (matches gr-iridium gain=1.0).
+    if (sum != 0.0f) {
+        float inv = 1.0f / sum;
+        for (int n = 0; n < ntaps; n++) taps[n] *= inv;
+    }
+}
+
+// Generate raised-cosine FIR taps. RC = RRC ⊛ RRC; gr-iridium uses
+// RC on the sync_word reference so that correlating against the
+// RRC-filtered burst gives the true matched-filter output.
+static void make_rc_taps(float *taps, int ntaps, int sps, float beta)
+{
+    const float PI = 3.14159265358979323846f;
+    int center = (ntaps - 1) / 2;
+    float sum = 0.0f;
+    for (int n = 0; n < ntaps; n++) {
+        float k = (float)(n - center) / (float)sps;     // in symbol periods
+        float v;
+        float abs_k = k < 0 ? -k : k;
+        if (abs_k < 1e-6f) {
+            v = 1.0f;
+        } else {
+            float two_bk = 2.0f * beta * k;
+            float denom = 1.0f - two_bk * two_bk;
+            if (fabsf(denom) < 1e-9f) {
+                // Singularity at k = ±1/(2β)
+                v = (PI / 4.0f) * (sinf(PI / (2.0f * beta)) / (PI / (2.0f * beta)));
+            } else {
+                float sinc = (fabsf(PI * k) < 1e-9f) ? 1.0f
+                             : sinf(PI * k) / (PI * k);
+                v = sinc * cosf(PI * beta * k) / denom;
+            }
+        }
+        taps[n] = v;
+        sum += v;
+    }
+    if (sum != 0.0f) {
+        float inv = 1.0f / sum;
+        for (int n = 0; n < ntaps; n++) taps[n] *= inv;
+    }
+}
+
+// Convolve the BPSK sync impulses (one per symbol, at stride sps)
+// with the given pulse-shape FIR to get the matched-filter reference
+// at sample rate. Output is complex (±1±j axis): for each symbol with
+// sign s, the impulse contributes s·(1+j)·shape[k]. gr-iridium uses
+// RC (= RRC ⊛ RRC) on the sync reference so that correlating against
+// the RRC-filtered burst gives the optimal matched filter output.
+static void build_shaped_sync(const int8_t *signs, const float *shape,
+                              float *out_re, float *out_im)
+{
+    memset(out_re, 0, SYNC_RRC_LEN * sizeof(float));
+    memset(out_im, 0, SYNC_RRC_LEN * sizeof(float));
+    int center = (RRC_NTAPS - 1) / 2;
+    for (int sym = 0; sym < SYNC_LENGTH; sym++) {
+        int impulse_pos = sym * SYM_STRIDE;
+        int s = signs[sym];                 // ±1
+        for (int t = 0; t < RRC_NTAPS; t++) {
+            int out_idx = impulse_pos + (t - center);
+            if (out_idx < 0 || out_idx >= SYNC_RRC_LEN) continue;
+            float contrib = (float)s * shape[t];
+            out_re[out_idx] += contrib;
+            out_im[out_idx] += contrib;
+        }
+    }
+}
+
+static void sync_init(void)
+{
+    if (s_sync_inited) return;
+    make_rrc_taps(s_rrc_taps, RRC_NTAPS, SYM_STRIDE, RRC_BETA);
+    make_rc_taps (s_rc_taps,  RRC_NTAPS, SYM_STRIDE, RRC_BETA);
+    build_shaped_sync(SYNC_DL_SIGN, s_rc_taps, s_sync_dl_re, s_sync_dl_im);
+    build_shaped_sync(SYNC_UL_SIGN, s_rc_taps, s_sync_ul_re, s_sync_ul_im);
+    s_sync_inited = true;
+}
 
 // gr-iridium-style fine CFO estimator. Squaring a BPSK signal
 // (UW symbols at quadrants 0/2 = ±(1+j)) removes the modulation:
@@ -37,25 +182,28 @@
 //
 // N=64 with hand-rolled radix-2 to keep the call cost tiny — this
 // runs once per detected burst, so a few hundred flops is nothing.
-#define CFO_FFT_N        128
-#define CFO_FFT_LOG      7
-#define CFO_INPUT_N      56  // 16 preamble syms + 12 UW syms, ×2 sps.
-                              // Both Iridium preambles square to a
-                              // constant phasor (DL: all s0; UL: s1,s0
-                              // alternating — s1²=s0²=2j), so the whole
-                              // 56-sample window is BPSK after squaring
-                              // and produces a clean tone at Δω. Falls
-                              // back to UW-only if uw_offset is too
-                              // small to include the preamble.
-#define CFO_PREAMBLE_N   32  // 16 syms × 2 sps available before UW.
+// gr-iridium parameters (burst_downmix_impl.cc lines 128-134):
+//   d_cfo_est_fft_size = next_pow2(sps × (PREAMBLE_LENGTH_SHORT + 10))
+//                      = next_pow2(2 × 26) = 64
+//   d_fft_over_size_facor = 16  → effective FFT = 64 × 16 = 1024
+//   Window = Blackman (gr::fft::window::WIN_BLACKMAN)
+//   No SNR gate.
+#define CFO_FFT_N        1024
+#define CFO_FFT_LOG      10
+#define CFO_INPUT_N      56     // 28 syms (preamble + UW) × 2 sps
+#define CFO_PREAMBLE_N   32     // 16 syms × 2 sps; uw_offset_complex
+                                // anchors the window's right side
 
 static inline float parabolic_interp(float yl, float yc, float yr);
 
-static uint8_t  s_cfo_brev[CFO_FFT_N];
+static uint16_t s_cfo_brev[CFO_FFT_N];
 static float    s_cfo_tw_re[CFO_FFT_N / 2];
 static float    s_cfo_tw_im[CFO_FFT_N / 2];
-// Two precomputed Hann windows: one for the full 56-sample
-// preamble+UW window, one for the 24-sample UW-only fallback.
+// Blackman windows (matches gr::fft::window::WIN_BLACKMAN):
+//   w[n] = 0.42 - 0.5·cos(2πn/(N-1)) + 0.08·cos(4πn/(N-1))
+// One for the full 56-sample preamble+UW window, one for the
+// 24-sample UW-only fallback used when uw_offset doesn't leave
+// room for the preamble.
 static float    s_cfo_window_full[CFO_INPUT_N];
 static float    s_cfo_window_uw[24];
 static bool     s_cfo_inited = false;
@@ -64,10 +212,10 @@ static void cfo_init(void)
 {
     if (s_cfo_inited) return;
     for (int i = 0; i < CFO_FFT_N; i++) {
-        uint8_t r = 0, v = (uint8_t)i;
+        uint16_t r = 0, v = (uint16_t)i;
         for (int b = 0; b < CFO_FFT_LOG; b++) {
-            r = (uint8_t)((r << 1) | (v & 1));
-            v = (uint8_t)(v >> 1);
+            r = (uint16_t)((r << 1) | (v & 1));
+            v = (uint16_t)(v >> 1);
         }
         s_cfo_brev[i] = r;
     }
@@ -76,13 +224,17 @@ static void cfo_init(void)
         s_cfo_tw_re[k] = (float)cos(ang);
         s_cfo_tw_im[k] = (float)sin(ang);
     }
+    // Blackman windows (gr::fft::window::WIN_BLACKMAN definition).
+    const float PI = 3.14159265358979323846f;
     for (int i = 0; i < CFO_INPUT_N; i++) {
-        s_cfo_window_full[i] = 0.5f * (1.0f - cosf(2.0f * 3.14159265358979323846f *
-                                                   (float)i / (float)(CFO_INPUT_N - 1)));
+        float t = (float)i / (float)(CFO_INPUT_N - 1);
+        s_cfo_window_full[i] = 0.42f - 0.5f * cosf(2.0f * PI * t)
+                                     + 0.08f * cosf(4.0f * PI * t);
     }
     for (int i = 0; i < 24; i++) {
-        s_cfo_window_uw[i] = 0.5f * (1.0f - cosf(2.0f * 3.14159265358979323846f *
-                                                 (float)i / (float)(24 - 1)));
+        float t = (float)i / (float)(24 - 1);
+        s_cfo_window_uw[i] = 0.42f - 0.5f * cosf(2.0f * PI * t)
+                                   + 0.08f * cosf(4.0f * PI * t);
     }
     s_cfo_inited = true;
 }
@@ -129,7 +281,10 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
 {
     cfo_init();
 
-    float re[CFO_FFT_N], im[CFO_FFT_N];
+    // FFT scratch in BSS — at N=1024 it's 8 KB per array, too big
+    // for stack on the worker task. Function is single-threaded so
+    // static is fine.
+    static float re[CFO_FFT_N], im[CFO_FFT_N];
     memset(re, 0, sizeof(re));
     memset(im, 0, sizeof(im));
 
@@ -163,24 +318,14 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
 
     cfo_fft(re, im);
 
-    // Find peak + accumulate total spectrum energy for SNR gating.
+    // Find peak (gr-iridium: std::max_element on magnitude²).
     float peak_mag = -1.0f;
     int   peak_k   = 0;
-    double sum_mag = 0;
     for (int k = 0; k < CFO_FFT_N; k++) {
         float m = re[k] * re[k] + im[k] * im[k];
-        sum_mag += m;
         if (m > peak_mag) { peak_mag = m; peak_k = k; }
     }
     if (peak_mag <= 1e-9f) return 0.0f;
-    // Gate on peak vs mean off-peak: legitimate squared-preamble
-    // tones have peak/mean ≥ N/4 (single bin dominates ~quarter of
-    // power). Noise spectra have peak/mean ~ N/N = 1. Require ≥ 5×
-    // (about CFO_FFT_N / 25) to reject noise events.
-    double off_mean = (sum_mag - peak_mag) / (double)(CFO_FFT_N - 1);
-    if (off_mean > 1e-12 && peak_mag / off_mean < 5.0) {
-        return 0.0f;
-    }
 
     // Parabolic interpolation around the peak (with wrap).
     int km1 = (peak_k - 1 + CFO_FFT_N) % CFO_FFT_N;
@@ -212,16 +357,9 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     return omega;
 }
 
-// UW patterns from iridium.h (IR_UW_DL / IR_UW_UL) mapped to {+1, -1}
-// on the BPSK +1+j / -1-j axis. We store just the sign because both I
-// and Q have the same sign per symbol.
-//   sign = +1 for UW value 0, sign = -1 for UW value 2.
-static const int8_t UW_DL_SIGN[UW_LENGTH] = {
-    +1, -1, -1, -1, -1, +1, +1, +1, -1, +1, +1, -1
-};
-static const int8_t UW_UL_SIGN[UW_LENGTH] = {
-    -1, -1, +1, +1, +1, -1, +1, +1, -1, +1, -1, -1
-};
+// (UW-only sign arrays removed — the active correlator uses
+// SYNC_*_SIGN[28]. The second half of each SYNC_*_SIGN array is the
+// UW pattern, kept synchronised by source.)
 
 // Quadratic interpolation of the parabolic peak through three points
 // (y_left, y_peak, y_right). Returns the fractional offset from the
@@ -250,7 +388,11 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     out_result->peak_im = 0.0f;
     out_result->omega_per_sym = 0.0f;
 
-    int max_k = n_complex - UW_LENGTH * SYM_STRIDE;
+    // Search range must leave room for the entire SYNC matched filter
+    // (preamble + UW = 28 syms × 2 sps = 56 samples). With RRC pulse
+    // shape that's also the sample-rate length, since the impulses
+    // sit at symbol positions and RRC tails fall within the window.
+    int max_k = n_complex - SYNC_RRC_LEN;
     if (max_k <= 0) return;
     if (search_complex > max_k) search_complex = max_k;
     if (search_complex <= 2) return;
@@ -269,22 +411,29 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     // For SNR estimate, accumulate sum of all squared correlations.
     double sum_dl = 0, sum_ul = 0;
 
+    sync_init();    // ensures RRC taps + shaped references are computed
+
     for (int k = 0; k < search_complex; k++) {
-        // Accumulate complex correlation for DL and UL at this offset.
+        // RRC-shaped matched-filter correlation. The shaped sync
+        // reference is complex (±1±j on the BPSK axis) and runs
+        // sample-by-sample (not symbol-by-symbol). For each candidate
+        // sync start k, correlate over all SYNC_RRC_LEN (=56) samples:
+        //   corr = sum_n sync[n] · conj(burst[k + n])
+        // This is the proper matched filter — gives optimal SNR when
+        // both burst and reference are RRC-shaped (gr-iridium pattern).
         float dl_re = 0, dl_im = 0, ul_re = 0, ul_im = 0;
-        for (int i = 0; i < UW_LENGTH; i++) {
-            int idx = (k + i * SYM_STRIDE) * 2;
-            int br = burst_2sps[idx + 0];
-            int bi = burst_2sps[idx + 1];
-            int s_dl = UW_DL_SIGN[i];
-            int s_ul = UW_UL_SIGN[i];
-            // UW symbol = s * (1 + j). conj(burst) = (br, -bi).
-            //   uw_dl × conj(burst) = s_dl * (1 + j) * (br - j*bi)
-            //                       = s_dl * (br + bi + j*(br - bi))
-            dl_re += s_dl * (br + bi);
-            dl_im += s_dl * (br - bi);
-            ul_re += s_ul * (br + bi);
-            ul_im += s_ul * (br - bi);
+        for (int n = 0; n < SYNC_RRC_LEN; n++) {
+            int idx = (k + n) * 2;
+            float br = (float)burst_2sps[idx + 0];
+            float bi = (float)burst_2sps[idx + 1];
+            float dr = s_sync_dl_re[n], di = s_sync_dl_im[n];
+            float ur = s_sync_ul_re[n], ui = s_sync_ul_im[n];
+            // sync · conj(burst) = (dr+j·di)(br - j·bi)
+            //                    = (dr·br + di·bi) + j(di·br - dr·bi)
+            dl_re += dr * br + di * bi;
+            dl_im += di * br - dr * bi;
+            ul_re += ur * br + ui * bi;
+            ul_im += ui * br - ur * bi;
         }
         float dl_mag2 = dl_re * dl_re + dl_im * dl_im;
         float ul_mag2 = ul_re * ul_re + ul_im * ul_im;
@@ -332,22 +481,21 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         return;
     }
 
-    // Parabolic interpolation around the peak. Need the three
-    // magnitudes at k-1, k, k+1 for the winning direction.
+    // Parabolic interpolation around the peak. Recompute the RRC-
+    // shaped matched-filter magnitudes at peak_k-1 and peak_k+1.
     float yl = 0, yc = peak_mag2, yr = 0;
     if (peak_k > 0 && peak_k + 1 < search_complex) {
-        // Recompute mags at peak_k-1 and peak_k+1 (cheap — 12 multiplies).
-        const int8_t *sign = (dir == UW_DIR_DOWNLINK) ? UW_DL_SIGN : UW_UL_SIGN;
+        const float *rr = (dir == UW_DIR_DOWNLINK) ? s_sync_dl_re : s_sync_ul_re;
+        const float *ii = (dir == UW_DIR_DOWNLINK) ? s_sync_dl_im : s_sync_ul_im;
         for (int side = 0; side < 2; side++) {
             int k = peak_k + (side ? +1 : -1);
             float re = 0, im = 0;
-            for (int i = 0; i < UW_LENGTH; i++) {
-                int idx = (k + i * SYM_STRIDE) * 2;
-                int br = burst_2sps[idx + 0];
-                int bi = burst_2sps[idx + 1];
-                int s = sign[i];
-                re += s * (br + bi);
-                im += s * (br - bi);
+            for (int n = 0; n < SYNC_RRC_LEN; n++) {
+                int idx = (k + n) * 2;
+                float br = (float)burst_2sps[idx + 0];
+                float bi = (float)burst_2sps[idx + 1];
+                re += rr[n] * br + ii[n] * bi;
+                im += ii[n] * br - rr[n] * bi;
             }
             float m2 = re * re + im * im;
             if (side) yr = m2; else yl = m2;
@@ -355,7 +503,10 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     }
     float correction = parabolic_interp(yl, yc, yr);
 
-    out_result->uw_offset       = peak_k;
+    // peak_k is the SYNC start = PREAMBLE start. Downstream consumers
+    // want the UW position. UW is PREAMBLE_LENGTH × SYM_STRIDE = 32
+    // complex samples after sync start.
+    out_result->uw_offset       = peak_k + PREAMBLE_LENGTH * SYM_STRIDE;
     out_result->correction      = correction;
     out_result->direction       = dir;
     out_result->snr_estimate_db = snr_db;
@@ -368,28 +519,70 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         out_result->peak_im = best_ul_im;
     }
 
-    // Restored two-half phase-diff CFO as the active path. The
-    // square-then-FFT (cfo_fine_estimate) is functionally better but
-    // empirically picks noise peaks at the SNRs we see on the smoke
-    // corpus even with preamble+UW (56 samples) and 5× peak-vs-floor
-    // gating. Two-half is coarser (~4 kHz res) but more robust.
-    {
-        const int8_t *sign_uw = (dir == UW_DIR_DOWNLINK) ? UW_DL_SIGN : UW_UL_SIGN;
-        float h1_re = 0, h1_im = 0, h2_re = 0, h2_im = 0;
-        for (int i = 0; i < UW_LENGTH; i++) {
-            int idx = (peak_k + i * SYM_STRIDE) * 2;
-            int br = burst_2sps[idx + 0];
-            int bi = burst_2sps[idx + 1];
-            int s  = sign_uw[i];
-            float cr = s * (br + bi);
-            float ci = s * (br - bi);
-            if (i < UW_LENGTH / 2) { h1_re += cr; h1_im += ci; }
-            else                    { h2_re += cr; h2_im += ci; }
+    // CFO estimate over the preamble+UW window. peak_k is the SYNC
+    // start (= preamble start); cfo_fine_estimate's interface takes
+    // the UW position (= peak_k + 32), from which it windows the 56
+    // samples behind. Result is the residual omega in rad/sym.
+    out_result->omega_per_sym = cfo_fine_estimate(
+        burst_2sps, n_complex, peak_k + PREAMBLE_LENGTH * SYM_STRIDE);
+}
+
+void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
+                              int n_complex)
+{
+    sync_init();   // ensures RRC taps are populated
+    const int center = (RRC_NTAPS - 1) / 2;
+    // We support in-place by reading-before-write via an N-sample
+    // ring of the input. For our typical RRC_NTAPS=21 this is a
+    // 21-sample × 4-byte ring = 84 bytes of stack — trivial.
+    int16_t ring_i[RRC_NTAPS] = {0};
+    int16_t ring_q[RRC_NTAPS] = {0};
+    int head = 0;
+    // The output sample at index n depends on input samples
+    // [n - center .. n + center]. We delay output by `center`
+    // samples relative to input so the ring always holds the
+    // needed window. Burst[in_idx=n-center] is fed in when we
+    // emit out[n]. For in_idx < 0 we feed zeros.
+    for (int out_idx = -center; out_idx < n_complex + center; out_idx++) {
+        // Feed input at (out_idx + center) into the ring.
+        int in_idx = out_idx + center;
+        int16_t si = 0, sq = 0;
+        if (in_idx >= 0 && in_idx < n_complex) {
+            si = burst_in[in_idx * 2 + 0];
+            sq = burst_in[in_idx * 2 + 1];
         }
-        float r_re = h2_re * h1_re + h2_im * h1_im;
-        float r_im = h2_im * h1_re - h2_re * h1_im;
-        float ang = atan2f(r_im, r_re);
-        out_result->omega_per_sym = ang / (float)(UW_LENGTH / 2);
+        ring_i[head] = si;
+        ring_q[head] = sq;
+        head = (head + 1) % RRC_NTAPS;
+        // Compute output once we've fed enough samples (out_idx >= 0).
+        if (out_idx >= 0 && out_idx < n_complex) {
+            float acc_re = 0, acc_im = 0;
+            // ring[head] is the OLDEST sample (next to be overwritten);
+            // it corresponds to the sample at out_idx - center (= the
+            // left edge of the filter window).
+            for (int t = 0; t < RRC_NTAPS; t++) {
+                int ring_idx = (head + t) % RRC_NTAPS;
+                acc_re += s_rrc_taps[t] * (float)ring_i[ring_idx];
+                acc_im += s_rrc_taps[t] * (float)ring_q[ring_idx];
+            }
+            if (acc_re >  32767.0f) acc_re =  32767.0f;
+            if (acc_re < -32768.0f) acc_re = -32768.0f;
+            if (acc_im >  32767.0f) acc_im =  32767.0f;
+            if (acc_im < -32768.0f) acc_im = -32768.0f;
+            burst_out[out_idx * 2 + 0] = (int16_t)acc_re;
+            burst_out[out_idx * 2 + 1] = (int16_t)acc_im;
+        }
     }
-    (void)cfo_fine_estimate;   // keep dormant; suppress warning
+}
+
+float uw_correlator_estimate_cfo(const int16_t *burst_2sps, int n_complex,
+                                  int head_n)
+{
+    // Reuse cfo_fine_estimate by anchoring at head_n/2 so it starts
+    // at sample 0 (its internal start = anchor - CFO_PREAMBLE_N).
+    // We don't need head_n parameter for the FFT itself — internally
+    // it always picks 56 samples if preamble window fits, else 24.
+    (void)head_n;
+    if (n_complex <= CFO_PREAMBLE_N + 12 * SYM_STRIDE) return 0.0f;
+    return cfo_fine_estimate(burst_2sps, n_complex, CFO_PREAMBLE_N);
 }

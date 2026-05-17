@@ -73,9 +73,50 @@ typedef struct {
 // search_complex  : how many candidate UW start positions to test
 //                   (clamped to n_complex - UW_LENGTH × 2)
 // out_result      : result; .direction == UW_DIR_UNKNOWN if SNR too low
+//
+// IMPORTANT: the UW correlation is NOT carrier-offset tolerant. When
+// the burst's residual Δω exceeds ~0.4 rad/sym, the 12-symbol UW
+// rotates through enough phase that the correlation peak collapses
+// below the detection threshold. Use uw_correlator_estimate_cfo on
+// the burst head FIRST and pre-rotate before calling this — matches
+// gr-iridium's burst_downmix order of operations (CFO estimation,
+// then sync search on CFO-corrected samples).
 void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
                          int search_complex,
                          uw_corr_result_t *out_result);
+
+// Coarse CFO estimator for use BEFORE the UW correlator search.
+// Squares the first n_in complex samples (which the worker arranges
+// to be preamble + UW, both BPSK), windows, FFTs, and returns the
+// detected residual carrier omega in rad/sym. Returns 0 if the
+// signal-to-noise of the squared FFT peak is too low (peak/mean <
+// 5×) — caller leaves the burst unrotated in that case.
+//
+// burst_2sps : interleaved int16 IQ (2-sps)
+// n_complex  : total number of complex samples available
+// head_n     : how many samples of the burst head to use (typical
+//              56 = 16 preamble + 12 UW × 2 sps; clamped to 24-56)
+float uw_correlator_estimate_cfo(const int16_t *burst_2sps, int n_complex,
+                                  int head_n);
+
+// Apply the root-raised-cosine matched filter to a 2-sps interleaved
+// int16 IQ burst, in-place equivalent (in and out may be the same
+// buffer). gr-iridium's burst_downmix_impl.cc applies RRC to the
+// downconverted burst before sync correlation — that's the matched-
+// filter property: when both the reference and burst are RRC-shaped,
+// correlation gives optimal SNR.
+//
+// The shape parameters (β=0.4, 21 taps centred over ±5 symbols) match
+// gr-iridium's d_rrc_fir at 2 sps. Output is the same length as
+// input, with edge handling that zero-pads input (so the first ~10
+// samples of output are slightly attenuated, well outside the UW
+// search range in practice).
+//
+// burst_in    : input interleaved int16 IQ, length 2 × n_complex
+// burst_out   : output interleaved int16 IQ (may alias burst_in)
+// n_complex   : number of complex samples
+void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
+                              int n_complex);
 
 #ifdef __cplusplus
 }

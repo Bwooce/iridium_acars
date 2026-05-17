@@ -232,6 +232,16 @@ add_executable(test_sym_timing
 target_include_directories(test_sym_timing PRIVATE ${COMMON_DIR})
 target_link_libraries(test_sym_timing PRIVATE m)
 
+# D10: cross-validate uw_correlator's CFO output against synthetic
+# bursts with known carrier offsets. Catches algorithm bugs that
+# would otherwise hide behind low-SNR real-RF symptoms.
+add_executable(test_uw_correlator_cfo
+    test_uw_correlator_cfo.c
+    ${COMMON_DIR}/uw_correlator.c
+)
+target_include_directories(test_uw_correlator_cfo PRIVATE ${COMMON_DIR})
+target_link_libraries(test_uw_correlator_cfo PRIVATE m)
+
 # D10 tuning tool — not a regression test. Dumps per-symbol PI-loop
 # state on the corpus fixture for offline analysis.
 add_executable(test_sym_timing_trace
@@ -248,6 +258,7 @@ enable_testing()
 add_test(NAME bch                  COMMAND test_bch)
 add_test(NAME freq_estimator       COMMAND test_freq_estimator)
 add_test(NAME sym_timing           COMMAND test_sym_timing)
+add_test(NAME uw_correlator_cfo    COMMAND test_uw_correlator_cfo)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
 add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)
