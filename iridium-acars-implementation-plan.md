@@ -352,6 +352,30 @@ bursts gr-iridium decoded at 19-25 dB. Run
 | Soft-decision BCH (only matters after demod works) | 2 dB | #30 (D11) |
 | Symbol timing refinement / Gardner loop | 0.5-1 dB | #46 |
 
+**Task #41 progress notes (May 2026)**:
+
+*Step 1 (DONE)*: Worker-side Iridium-grid carrier snap. Computes the
+nearest 41.666... kHz multiple from the channelizer's bin-centre
+coarse offset and uses that as the mix-down frequency instead. Effect
+on smoke corpus's strong burst: CFO estimate dropped from -0.715
+rad/sym → -0.213 rad/sym; PLL residual now ~0 after pre-rotation.
+Doesn't recover the upstream channelizer energy loss.
+
+*Step 1 alt (TRIED + REVERTED)*: Widened the channelizer's prototype
+filter cutoff (1.10× and 1.25× of 1/(2M)) to capture more of an
+Iridium channel when it falls between our bins. Did recover ~0.9 dB
+of mean SNR loss and rescued a previously-missed edge-aligned burst
+— but broke the channelizer reference tests because their fixture
+was computed with the original 1/(2M) cutoff. Widening moves AWAY
+from gr-iridium parity by that test. Reverted; the path to recovery
+is fs/M change, not filter widening.
+
+*Step 2 (PENDING, task #48)*: Change SDR fs from 2.56 → 2.667 MHz
+so M=64 bins land exactly on the 41.667 kHz Iridium grid. Substantial
+refactor (SDR config, signal_buffer, downstream resampler) — touches
+the whole DSP chain's sample-rate constants. Will properly recover
+the ~3 dB measured loss.
+
 **Status snapshot (D7-D10), May 2026:**
 - **D7** — polyphase channelizer landed (host correctness 9/9, target wiring in flight).
 - **D8** — fine freq estimation in worker is in place; residual still
