@@ -368,9 +368,28 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         out_result->peak_im = best_ul_im;
     }
 
-    // CFO estimate via gr-iridium-style square-then-FFT over
-    // preamble+UW (56 samples) when available, UW-only (24 samples)
-    // when uw_offset is too close to the start of the burst to
-    // include the preamble. See cfo_fine_estimate() for math.
-    out_result->omega_per_sym = cfo_fine_estimate(burst_2sps, n_complex, peak_k);
+    // Restored two-half phase-diff CFO as the active path. The
+    // square-then-FFT (cfo_fine_estimate) is functionally better but
+    // empirically picks noise peaks at the SNRs we see on the smoke
+    // corpus even with preamble+UW (56 samples) and 5× peak-vs-floor
+    // gating. Two-half is coarser (~4 kHz res) but more robust.
+    {
+        const int8_t *sign_uw = (dir == UW_DIR_DOWNLINK) ? UW_DL_SIGN : UW_UL_SIGN;
+        float h1_re = 0, h1_im = 0, h2_re = 0, h2_im = 0;
+        for (int i = 0; i < UW_LENGTH; i++) {
+            int idx = (peak_k + i * SYM_STRIDE) * 2;
+            int br = burst_2sps[idx + 0];
+            int bi = burst_2sps[idx + 1];
+            int s  = sign_uw[i];
+            float cr = s * (br + bi);
+            float ci = s * (br - bi);
+            if (i < UW_LENGTH / 2) { h1_re += cr; h1_im += ci; }
+            else                    { h2_re += cr; h2_im += ci; }
+        }
+        float r_re = h2_re * h1_re + h2_im * h1_im;
+        float r_im = h2_im * h1_re - h2_re * h1_im;
+        float ang = atan2f(r_im, r_re);
+        out_result->omega_per_sym = ang / (float)(UW_LENGTH / 2);
+    }
+    (void)cfo_fine_estimate;   // keep dormant; suppress warning
 }

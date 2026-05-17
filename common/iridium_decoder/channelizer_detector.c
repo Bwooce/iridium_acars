@@ -78,6 +78,15 @@
 // of ~1 ms doesn't merge legitimately-distinct events.
 #define MERGE_GAP_CYCLES     40    // ~1 ms at 40 ksps
 
+// Cross-channel dedup hold window. After emitting a burst we hold
+// it for this many cycles, replacing it if a higher-SNR overlap
+// arrives, before publishing to the callback. Chosen to comfortably
+// cover the worst case where a strong burst trips adjacent channels
+// minutes apart in cycle terms: a few channels can sequentially
+// emit within ~MERGE_GAP_CYCLES of each other; we want to see the
+// last of those before publishing. 100 cycles ≈ 2.5 ms at 40 ksps.
+#define DEDUP_HOLD_CYCLES    100
+
 // D20 step 3 gate. Flipped to 1 after polyphase_mac_phase_arp4 (the
 // PIE xacc-based MAC kernel) landed in polyphase_mac_arp4.S. If the
 // kernel turns out buggy / crashy, flip back to 0 and reflash to
@@ -162,6 +171,22 @@ struct channelizer_detector {
 #if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
     int16_t         *out_buf_i16;             // interleaved IQ
 #endif
+
+    // Cross-channel dedup: a single physical Iridium burst hits ~2-4
+    // adjacent channels with similar power (the polyphase filter's
+    // ~40 dB sidelobe rolloff isn't sharp enough to confine all
+    // energy to one channel). Without dedup we publish duplicate
+    // bursts and the worker pipeline tries to demod the same TDMA
+    // slot multiple times — wasting CPU and (per the smoke test)
+    // sometimes picking a lower-SNR channel that fails to decode.
+    // We hold each emitted burst in this single-slot deferred queue
+    // for DEDUP_HOLD_CYCLES cycles; new emissions overlapping in
+    // time with the held one REPLACE it if higher SNR, else are
+    // dropped. The held burst publishes when no candidate has
+    // arrived for DEDUP_HOLD_CYCLES.
+    bool              pending_valid;
+    channelizer_burst_t pending;
+    uint32_t          pending_last_touched_cycle;
 };
 
 channelizer_detector_t *channelizer_detector_create(uint32_t fs_in_hz,
@@ -228,11 +253,37 @@ static inline int signed_channel_offset(int k)
     return (k > M / 2) ? (k - M) : k;
 }
 
+// Publish the currently-held pending burst (if any) to the callback
+// and clear the slot. Internal helper called when a new emission
+// wants the slot OR when DEDUP_HOLD_CYCLES has elapsed.
+static void publish_pending(channelizer_detector_t *d)
+{
+    if (!d->pending_valid) return;
+    if (d->cb) d->cb(&d->pending, d->user);
+    d->bursts_emitted++;
+    d->pending_valid = false;
+}
+
+// Two bursts overlap if either starts inside the other's sample
+// range. Compare sample indices (post-converted from cycles).
+static inline bool bursts_overlap(const channelizer_burst_t *a,
+                                  const channelizer_burst_t *b)
+{
+    uint32_t a_end = a->start_sample_idx + a->length_samples;
+    uint32_t b_end = b->start_sample_idx + b->length_samples;
+    return !(a_end <= b->start_sample_idx || b_end <= a->start_sample_idx);
+}
+
 // Emit the pending burst for channel k (covers cs->start_cycle ..
 // cs->last_active_cycle). Resets the channel to IDLE regardless of
 // whether the burst met MIN_BURST_CYCLES (too-short bursts are
 // dropped silently). Called from the COOLING-expiry path in
 // process_cycles.
+//
+// New burst goes into the single-slot dedup queue rather than
+// publishing immediately. If the slot is empty, we move in; if a
+// pending burst overlaps in time, we keep whichever has higher SNR;
+// if non-overlapping, we flush the pending one first.
 static void emit_burst(channelizer_detector_t *d, int k)
 {
     channel_state_t *cs = &d->st[k];
@@ -248,8 +299,22 @@ static void emit_burst(channelizer_detector_t *d, int k)
             .start_sample_idx = cs->start_cycle * (uint32_t)M,
             .length_samples   = length_cycles * (uint32_t)M,
         };
-        if (d->cb) d->cb(&b, d->user);
-        d->bursts_emitted++;
+        if (d->pending_valid && bursts_overlap(&d->pending, &b)) {
+            // Two emissions on the same physical burst — keep the
+            // winning channel's bounds (NOT the union). The winning
+            // channel had the strongest signal, so its time-domain
+            // boundary detection is most reliable; widening to the
+            // union dragged the UW correlator into noise prefix from
+            // a weaker adjacent-channel detection.
+            if (b.snr_db > d->pending.snr_db) d->pending = b;
+        } else {
+            // Slot has a non-overlapping burst — flush it first, then
+            // take the slot.
+            if (d->pending_valid) publish_pending(d);
+            d->pending = b;
+            d->pending_valid = true;
+        }
+        d->pending_last_touched_cycle = cs->last_active_cycle;
     }
     cs->phase      = CH_IDLE;
     cs->peak_power = 0.0f;
@@ -394,6 +459,13 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
         if ((uint32_t)n_active > d->channels_active_peak) {
             d->channels_active_peak = (uint32_t)n_active;
         }
+        // Time-out publish: release the held dedup burst once no
+        // overlapping candidate has arrived for DEDUP_HOLD_CYCLES.
+        if (d->pending_valid &&
+            this_cycle >= d->pending_last_touched_cycle +
+                              (uint32_t)DEDUP_HOLD_CYCLES) {
+            publish_pending(d);
+        }
     }
     d->cycle_count += (uint32_t)n_cycles;
 }
@@ -449,6 +521,8 @@ void channelizer_detector_flush(channelizer_detector_t *d)
             emit_burst(d, k);
         }
     }
+    // Flush the dedup queue too — no more cycles coming.
+    publish_pending(d);
 }
 
 void channelizer_detector_get_stats(channelizer_detector_t *d,
