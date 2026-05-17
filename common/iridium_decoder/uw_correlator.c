@@ -673,6 +673,94 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         burst_2sps, n_complex, peak_k + PREAMBLE_LENGTH * SYM_STRIDE);
 }
 
+// D13 burst-start finder constants (mirror gr-iridium defaults).
+// Their low-pass filter is firdes.low_pass_2(1, fs, 2.5e3, 5e3, 60dB)
+// which at 50 ksps yields ~33 taps. We use a simpler triangular
+// (Bartlett-windowed) moving average of 17 taps (≈0.34 ms = 8.5
+// symbol periods at 25 ksym/s) for the smoothing step — same
+// effective time-constant, much cheaper, doesn't ring on signal
+// onsets the way a sharp-cutoff LP would.
+#define START_LP_NTAPS         17
+#define START_THRESHOLD_FRAC   0.28f
+// gr-iridium's d_pre_start_samples is a small bias to back off from
+// the detected edge so we don't clip the preamble's first symbol.
+// They use 1-2 samples; we follow with 2.
+#define START_PRE_SAMPLES      2
+
+int uw_correlator_find_burst_start(const int16_t *burst_2sps,
+                                    int n_complex, int search_max)
+{
+    if (n_complex <= START_LP_NTAPS) return 0;
+    if (search_max > n_complex) search_max = n_complex;
+    if (search_max <= START_LP_NTAPS + 1) return 0;
+
+    // Use a static scratch — bursts are processed one at a time on
+    // worker_core1, so no reentrancy concern.
+    static float mag2[CORR_FFT_N];
+    static float smooth[CORR_FFT_N];
+    if (search_max > CORR_FFT_N) search_max = CORR_FFT_N;
+
+    // Step 1: per-sample magnitude² of complex burst.
+    for (int n = 0; n < search_max; n++) {
+        float r = (float)burst_2sps[n * 2 + 0];
+        float i = (float)burst_2sps[n * 2 + 1];
+        mag2[n] = r * r + i * i;
+    }
+
+    // Step 2: smooth with Bartlett-windowed moving average (acts as
+    // a near-LP filter; triangular shape reduces high-freq leakage).
+    // Coefficients: w[k] = 1 - |k - center|/center, normalised.
+    float wsum = 0;
+    float w[START_LP_NTAPS];
+    int half = START_LP_NTAPS / 2;
+    for (int k = 0; k < START_LP_NTAPS; k++) {
+        float d = (float)(k - half);
+        if (d < 0) d = -d;
+        w[k] = 1.0f - d / (float)half;
+        wsum += w[k];
+    }
+    for (int k = 0; k < START_LP_NTAPS; k++) w[k] /= wsum;
+    // Apply (valid mode): smooth[n] valid for n in [half, search_max-half-1].
+    // For n outside that, copy raw mag² (so threshold search still
+    // works at the very start of the burst).
+    for (int n = 0; n < search_max; n++) {
+        if (n >= half && n + half < search_max) {
+            float acc = 0;
+            for (int k = 0; k < START_LP_NTAPS; k++) {
+                acc += w[k] * mag2[n - half + k];
+            }
+            smooth[n] = acc;
+        } else {
+            smooth[n] = mag2[n];
+        }
+    }
+
+    // Step 3: max of smoothed envelope.
+    float max_val = 0;
+    for (int n = 0; n < search_max; n++) {
+        if (smooth[n] > max_val) max_val = smooth[n];
+    }
+    if (max_val <= 1.0f) return 0;     // essentially silence
+
+    // Step 4: first crossing of 28% of max.
+    float thr = max_val * START_THRESHOLD_FRAC;
+    int start = -1;
+    for (int n = 0; n < search_max; n++) {
+        if (smooth[n] >= thr) { start = n; break; }
+    }
+    if (start < 0) return 0;
+
+    // Step 5: back off by half_fir - pre_start_samples so we don't
+    // chop into the preamble. gr-iridium: `start = max(start +
+    // half_fir_size - d_pre_start_samples, 0)`. With our LP being
+    // a centred moving average, half_fir_size = (NTAPS-1)/2 = 8.
+    int adjust = (START_LP_NTAPS - 1) / 2 - START_PRE_SAMPLES;
+    start = start + adjust;
+    if (start < 0) start = 0;
+    if (start >= n_complex) start = n_complex - 1;
+    return start;
+}
+
 void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
                               int n_complex)
 {

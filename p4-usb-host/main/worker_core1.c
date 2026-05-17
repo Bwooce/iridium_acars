@@ -258,19 +258,30 @@ void worker_task(void *arg)
             // parabolic peak interpolation, NOT a continuous Gardner
             // loop. New uw_correlator module replaces this hook.)
 
-            // D10: gr-iridium-aligned pipeline.
-            //   1. RRC matched filter on the burst (proper matched-
-            //      filter SNR when correlated against RRC-shaped sync).
-            //   2. uw_correlator_find with RRC-shaped 28-symbol
-            //      preamble+UW reference + Blackman 16× FFT CFO.
-            //   3. (existing) peak-phase + omega pre-rotation, then
+            // D10+D13: gr-iridium-aligned pipeline.
+            //   1. RRC matched filter on the burst.
+            //   2. D13 burst-start finder: envelope-based onset
+            //      detection to sub-frame precision. The channelizer
+            //      gives start_sample_idx at threshold-cross
+            //      granularity; this refines to the actual preamble
+            //      onset within a few samples.
+            //   3. uw_correlator_find on the offset-trimmed burst.
+            //   4. (existing) peak-phase + omega pre-rotation, then
             //      qpsk_demod_process.
-            int total_int16 = out_samples_50k * 2;
             uw_correlator_apply_rrc(demod_interleaved, demod_interleaved,
                                      out_samples_50k);
+            // D13: trim leading noise/quiet so the preamble lands
+            // near sample 0. Search ~3× max-expected-burst-prefix.
+            int burst_start = uw_correlator_find_burst_start(
+                                  demod_interleaved, out_samples_50k,
+                                  /*search_max=*/256);
+            int16_t *adj_burst = demod_interleaved + burst_start * 2;
+            int adj_n = out_samples_50k - burst_start;
+            ESP_LOGI(TAG, "D13 burst start: %d (of %d samples)",
+                     burst_start, out_samples_50k);
             uw_corr_result_t uw_res;
-            uw_correlator_find(demod_interleaved, out_samples_50k,
-                                /*search_complex=*/out_samples_50k - 24,
+            uw_correlator_find(adj_burst, adj_n,
+                                /*search_complex=*/adj_n - 24,
                                 &uw_res);
             bool demod_ok = false;
             ESP_LOGI(TAG, "UW corr: dir=%s offset=%d corr=%.3f SNR=%.1f dB peak=%.2e omega=%.3f",
@@ -287,8 +298,11 @@ void worker_task(void *arg)
                 // the PLL starts with both phi and omega near zero.
                 float pmag = sqrtf(uw_res.peak_re * uw_res.peak_re
                                  + uw_res.peak_im * uw_res.peak_im);
-                int n_rot_int16 = total_int16 - int16_off;
-                int16_t *src = demod_interleaved + int16_off;
+                // uw_res.uw_offset is RELATIVE to adj_burst (post-D13
+                // trim), so src must start from adj_burst too. The
+                // n_rot length is what's left in adj_burst after the UW.
+                int n_rot_int16 = adj_n * 2 - int16_off;
+                int16_t *src = adj_burst + int16_off;
                 if (pmag > 1e-3f) {
                     // Constant phase factor (rotates burst back to UW axes).
                     float rot_re =  uw_res.peak_re / pmag;

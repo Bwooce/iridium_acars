@@ -118,6 +118,32 @@ float uw_correlator_estimate_cfo(const int16_t *burst_2sps, int n_complex,
 void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
                               int n_complex);
 
+// D13: sub-frame burst-edge detection. Ports gr-iridium's start-
+// finding algorithm (burst_downmix_impl.cc, lines 841-880):
+//   1. Compute |sample|² per complex sample.
+//   2. Low-pass-filter the magnitude² envelope.
+//   3. Find max, threshold = max × 0.28.
+//   4. First sample where filtered mag² ≥ threshold = burst start.
+//   5. Adjust by half_fir_size - pre_start_samples so we don't slice
+//      into the leading preamble.
+//
+// The channelizer's start_sample_idx is at the threshold-crossing
+// point on the cross-channel detector, which has frame-level
+// granularity (~25 µs at 2.56 MSPS) and tends to land somewhere
+// inside the burst envelope rather than at the leading edge. This
+// function refines the start to within ±1 sample of the actual
+// preamble onset, so the downstream UW correlator + CFO estimator
+// see the preamble at burst-head positions.
+//
+// burst_2sps   : interleaved int16 IQ (2-sps), 2 × n_complex bytes
+// n_complex    : total complex samples in burst
+// search_max   : maximum samples to search (clamped to n_complex);
+//                pass ~3× max-expected-preamble-position for safety
+// Returns the burst-start sample offset (in complex samples). Zero
+// if no clear envelope rise found (caller leaves burst unshifted).
+int uw_correlator_find_burst_start(const int16_t *burst_2sps,
+                                    int n_complex, int search_max);
+
 #ifdef __cplusplus
 }
 #endif
