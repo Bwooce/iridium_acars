@@ -307,6 +307,24 @@ int main(void)
                         iq2[i * 2 + 0] = src[i * 5 * 2 + 0];
                         iq2[i * 2 + 1] = src[i * 5 * 2 + 1];
                     }
+                    // Diag: dump first 24 symbols BEFORE qpsk_demod so we
+                    // can see preamble + UW symbols and check timing.
+                    // Hard-decision quadrant per symbol (no PLL applied).
+                    fprintf(stderr, "    pre-PLL syms[0..23]: ");
+                    int n_diag_syms = n_2sps / 2;
+                    if (n_diag_syms > 24) n_diag_syms = 24;
+                    for (int s = 0; s < n_diag_syms; s++) {
+                        int16_t r = iq2[s * 4 + 0];
+                        int16_t v = iq2[s * 4 + 1];
+                        int q;
+                        if (r >= 0 && v >= 0) q = 0;
+                        else if (r < 0 && v >= 0) q = 1;
+                        else if (r < 0 && v < 0) q = 2;
+                        else q = 3;
+                        fprintf(stderr, "%d ", q);
+                    }
+                    fprintf(stderr, "\n");
+
                     decoded_frame_t frame = {0};
                     int rc = qpsk_demod_process(iq2, n_2sps * 2, &frame);
                     if (rc) {
