@@ -454,12 +454,17 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
         int n_active = 0;
         for (int k = 0; k < M; k++) {
             channel_state_t *cs = &d->st[k];
-            float ema_thr = cs->phase == CH_IDLE
-                              ? d->channel_ema[k] * d->threshold_mult
-                              : 0.0f;
-            bool above_rise = (power[k] > rise_thr)
-                              && (cs->phase != CH_IDLE
-                                   || power[k] > ema_thr);
+            // D7+: per-channel EMA mask removed. It was added in commit
+            // d1604c7 to suppress DC-channel spurious bursts, but with
+            // 1+ sec of real-world Iridium traffic the EMA tracks burst
+            // power and self-suppresses subsequent bursts on the same
+            // channel — host test on the 1-sec ALBQ fixture showed
+            // 7 detections with the mask vs 116 without (= ALL 32
+            // expected gr-iridium-reference bursts found). DC masking
+            // is handled downstream: worker_core1 explicitly drops
+            // bin 1024 (the DC channel) bursts.
+            (void)cs;
+            bool above_rise = (power[k] > rise_thr);
 
             switch (cs->phase) {
             case CH_IDLE:
