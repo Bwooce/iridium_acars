@@ -411,11 +411,12 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
             float complex y = row[k];
             power[k] = crealf(y) * crealf(y) + cimagf(y) * cimagf(y);
             // Convert float channelizer output → int16 for the ring.
-            // /M-normalised float values stay well within int16 range
-            // (DC input INT16_MAX → output INT16_MAX), so direct cast
-            // with saturation is fine.
-            float re = crealf(y);
-            float im = cimagf(y);
+            // The float path scales input by 1/32768 (in feed_int16),
+            // so out_buf is in [-1, 1] range. Scale back up by
+            // INT16_MAX so the ring's int16 values match what the
+            // CHANNELIZER_USE_INT16_PATH would have produced directly.
+            float re = crealf(y) * (float)INT16_MAX;
+            float im = cimagf(y) * (float)INT16_MAX;
             if (re >  (float)INT16_MAX) re =  (float)INT16_MAX;
             if (re <  (float)INT16_MIN) re =  (float)INT16_MIN;
             if (im >  (float)INT16_MAX) im =  (float)INT16_MAX;

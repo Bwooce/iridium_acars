@@ -267,6 +267,26 @@ target_include_directories(test_uw_correlator_albq_ul PRIVATE
 )
 target_link_libraries(test_uw_correlator_albq_ul PRIVATE m)
 
+# End-to-end worker DSP pipeline on the shared ALBQ_RAW corpus —
+# host iteration analog of the on-target smoke. Runs channelizer +
+# new channelizer→worker→qpsk_demod chain (less the esp-dsp resampler,
+# replaced with a portable polyphase reference using the same filter
+# design). Tells us how close we are to gr-iridium's decode rate on
+# the same data without flashing.
+add_executable(test_worker_pipeline_albq
+    test_worker_pipeline_albq.c
+    ${COMMON_DIR}/channelizer_detector.c
+    ${COMMON_DIR}/polyphase_channelizer.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/qpsk_demod.c
+)
+target_include_directories(test_worker_pipeline_albq PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_worker_pipeline_albq PRIVATE m)
+
 # Per-stage SNR-gap measurement test (diagnostic, always-passes).
 # Feeds ALBQ_RAW_UINT8 — the same raw uint8 SDR data gr-iridium
 # decoded at known SNRs — through our channelizer and reports the
@@ -307,6 +327,7 @@ add_test(NAME sym_timing           COMMAND test_sym_timing)
 add_test(NAME uw_correlator_cfo    COMMAND test_uw_correlator_cfo)
 add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
+add_test(NAME worker_pipeline_albq COMMAND test_worker_pipeline_albq)
 add_test(NAME snr_gap_measurement  COMMAND test_snr_gap_measurement)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
