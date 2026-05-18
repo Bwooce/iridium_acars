@@ -45,17 +45,7 @@
 #endif
 
 #define M                    POLYCHAN_M
-// 10th percentile (6/64) instead of 25th. At LO=1625.5 MHz with a
-// dominant downlink on channel 15, the channelizer's -52 dB sidelobe
-// rejection leaves channels 16-30 with -50 dB spillover (~2e-3) which
-// is bigger than the actual receiver noise (~1e-4). The 25th
-// percentile lands in the spillover region instead of the true-noise
-// region, inflating the noise floor by ~10 dB and squashing the 12 dB
-// SNR margin of channel-33 bursts. The 10th percentile samples the
-// quietest channels (farthest from any active signal), closer to true
-// noise. Verified: brings ch-33 bursts at LO=1625.5 above the 16 dB
-// threshold without regressing the LO=1618.5 case.
-#define NOISE_FLOOR_PCTILE   6     // 6/64 = ~10th percentile
+#define NOISE_FLOOR_PCTILE   16    // 16/64 = 25th percentile
 // Hysteresis: a channel enters "burst" when its power crosses
 // threshold_mult × floor (e.g. 16 dB) but stays in burst until power
 // drops below threshold_mult × floor / HYSTERESIS_DROP (3 dB lower).
@@ -311,31 +301,12 @@ static void publish_pending(channelizer_detector_t *d)
 
 // Two bursts overlap if either starts inside the other's sample
 // range. Compare sample indices (post-converted from cycles).
-// Two bursts are considered the SAME physical event if they overlap
-// in time AND are on neighbouring channels. A single Iridium burst
-// spills into ~2-4 adjacent channels (per the comment block above),
-// so dedup matters within that range; bursts further apart are
-// distinct physical events even if they happen at the same time.
-// Without the channel-proximity check, a strong signal on channel K
-// time-overlapping a weaker signal on channel K+30 would erroneously
-// suppress the weaker one — observed at LO=1625.5 MHz where 3 ch-33
-// bursts (-1240 kHz) were dropped in favour of a stronger ch-15
-// (+600 kHz) burst.
-#define DEDUP_CHAN_PROXIMITY  3
 static inline bool bursts_overlap(const channelizer_burst_t *a,
                                   const channelizer_burst_t *b)
 {
     uint32_t a_end = a->start_sample_idx + a->length_samples;
     uint32_t b_end = b->start_sample_idx + b->length_samples;
-    bool time_overlap =
-        !(a_end <= b->start_sample_idx || b_end <= a->start_sample_idx);
-    if (!time_overlap) return false;
-    int dch = a->channel - b->channel;
-    if (dch < 0) dch = -dch;
-    // Modular distance (channels wrap at M=64).
-    int dch_wrap = M - dch;
-    int d_min = (dch < dch_wrap) ? dch : dch_wrap;
-    return d_min <= DEDUP_CHAN_PROXIMITY;
+    return !(a_end <= b->start_sample_idx || b_end <= a->start_sample_idx);
 }
 
 // Emit the pending burst for channel k (covers cs->start_cycle ..
