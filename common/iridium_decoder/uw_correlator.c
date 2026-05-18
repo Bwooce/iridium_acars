@@ -58,33 +58,21 @@ static float bessel_i0(float x)
 //   UL preamble = 8× (s1, s0)         → signs -1, +1, -1, +1, ...
 //   DL UW = { s0, s1, s1, s1, s1, s0, s0, s0, s1, s0, s0, s1 }
 //   UL UW = { s1, s1, s0, s0, s0, s1, s0, s0, s1, s0, s1, s1 }
-// Matched-filter sync templates with the preamble zeroed out. The DL
-// preamble is 16 constant-carrier symbols whose autocorrelation
-// against itself is a wide triangular plateau (~32 samples), not a
-// sharp BPSK peak — the argmax inside the plateau is fuzzy and the
-// PEAK MAGNITUDE is lower than the sharper UL correlator's peak on
-// the SAME signal. Result: DL bursts get misclassified as UL on
-// borderline SNR.
-//
-// Solution: drop the preamble from the matched filter altogether and
-// correlate only against the 12-symbol UW (a BPSK pattern for both
-// directions, with sharp autocorrelation). The two UW patterns are
-// orthogonal (their dot product is 0), so direction discrimination
-// is clean: DL UW correlator peaks on DL signals, UL UW correlator
-// peaks on UL signals; the other direction's response is near zero.
-//
-// Position semantics preserved: the matched filter still slides a
-// 28-symbol-wide window, with zero contribution from the leading 16
-// preamble samples. The peak shifts so that the UW portion of the
-// template lines up with the signal's UW. peak_k still = preamble
-// start, so uw_offset = peak_k + PREAMBLE_LENGTH * SYM_STRIDE works
-// unchanged.
+// Full preamble + UW sync templates, matching gr-iridium's
+// generate_sync_word() exactly. DL preamble is 16× constant +1
+// (broad triangular autocorrelation); UL preamble alternates ±1
+// (sharp BPSK autocorrelation). The triangular DL peak makes
+// direction discrimination noisier than ideal on borderline SNR
+// — a UW-only variant gives sharper peaks but DEVIATES from
+// gr-iridium and produced mixed results in testing (slight gain
+// on host, slight loss on P4). Reverted to preamble+UW for
+// gr-iridium alignment.
 static const int8_t SYNC_DL_SIGN[SYNC_LENGTH] = {
-     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // preamble: zero
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,   // preamble
     +1,-1,-1,-1,-1,+1,+1,+1,-1,+1,+1,-1                  // UW
 };
 static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
-     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // preamble: zero
+    -1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,   // preamble
     -1,-1,+1,+1,+1,-1,+1,+1,-1,+1,-1,-1                  // UW
 };
 
@@ -466,8 +454,20 @@ static void sync_init(void)
 static inline float parabolic_interp(float yl, float yc, float yr);
 
 static uint16_t s_cfo_brev[CFO_FFT_N];
-static int16_t  s_cfo_tw_re[CFO_FFT_N / 2];     // Q15 cos
-static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin
+static int16_t  s_cfo_tw_re[CFO_FFT_N / 2];     // Q15 cos (legacy, unused)
+static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin (legacy, unused)
+// Float twiddle factors for the CFO squared-FFT. The Q15 version
+// above is kept compiled (cfo_init sets it) but the CFO function now
+// uses float precision — gr-iridium uses float throughout the
+// squared-FFT path and our previous Q15 BFP version was losing
+// resolution at borderline SNR, picking noise peaks instead of the
+// real carrier residual. Cost is ~32 KB scratch + ~16 KB twiddles
+// in BSS, plus a few hundred microseconds per burst (acceptable —
+// the CFO step runs once per detected burst).
+static float    s_cfo_tw_re_f[CFO_FFT_N / 2];
+static float    s_cfo_tw_im_f[CFO_FFT_N / 2];
+static float    s_cfo_window_full_f[CFO_INPUT_N];
+static float    s_cfo_window_uw_f[CFO_UW_ONLY_N];
 // Blackman windows in Q15 (matches gr::fft::window::WIN_BLACKMAN):
 //   w[n] = 0.42 - 0.5·cos(2πn/(N-1)) + 0.08·cos(4πn/(N-1))
 // Window values are in [0, 1] → Q15 representation [0, INT16_MAX].
@@ -488,23 +488,69 @@ static void cfo_init(void)
     }
     for (int k = 0; k < CFO_FFT_N / 2; k++) {
         double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CFO_FFT_N;
-        s_cfo_tw_re[k] = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
-        s_cfo_tw_im[k] = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
+        s_cfo_tw_re[k]   = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
+        s_cfo_tw_im[k]   = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
+        s_cfo_tw_re_f[k] = (float)cos(ang);
+        s_cfo_tw_im_f[k] = (float)sin(ang);
     }
     const float PI = 3.14159265358979323846f;
     for (int i = 0; i < CFO_INPUT_N; i++) {
         float t = (float)i / (float)(CFO_INPUT_N - 1);
         float w = 0.42f - 0.5f * cosf(2.0f * PI * t)
                         + 0.08f * cosf(4.0f * PI * t);
-        s_cfo_window_full[i] = (int16_t)lrintf(w * (float)INT16_MAX);
+        s_cfo_window_full[i]   = (int16_t)lrintf(w * (float)INT16_MAX);
+        s_cfo_window_full_f[i] = w;
     }
     for (int i = 0; i < CFO_UW_ONLY_N; i++) {
         float t = (float)i / (float)(CFO_UW_ONLY_N - 1);
         float w = 0.42f - 0.5f * cosf(2.0f * PI * t)
                         + 0.08f * cosf(4.0f * PI * t);
-        s_cfo_window_uw[i] = (int16_t)lrintf(w * (float)INT16_MAX);
+        s_cfo_window_uw[i]   = (int16_t)lrintf(w * (float)INT16_MAX);
+        s_cfo_window_uw_f[i] = w;
     }
     s_cfo_inited = true;
+}
+
+// Forward declaration so cfo_fine_estimate can dispatch to the Q15
+// path when CFO_USE_Q15_FFT=1.
+static float cfo_fine_estimate_q15(const int16_t *burst_2sps,
+                                    int n_complex, int uw_offset_complex);
+
+// Float 4096-pt radix-2 DIT FFT — same butterfly structure as
+// cfo_fft_q15 below but with full float precision throughout. Used
+// by cfo_fine_estimate to match gr-iridium's float-precision squared-
+// FFT path (their volk_32fc_*_32fc + d_cfo_est_fft.execute()). The
+// Q15 BFP version below is kept for the optional CFO_USE_Q15_FFT
+// build path.
+static void cfo_fft_f32(float *re, float *im)
+{
+    // Bit-reverse permute.
+    for (int i = 0; i < CFO_FFT_N; i++) {
+        int j = s_cfo_brev[i];
+        if (j > i) {
+            float tr = re[i]; re[i] = re[j]; re[j] = tr;
+            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+    // Cooley-Tukey radix-2 DIT.
+    for (int stride = 1; stride < CFO_FFT_N; stride <<= 1) {
+        int span = stride << 1;
+        int step = (CFO_FFT_N / 2) / stride;
+        for (int k = 0; k < stride; k++) {
+            float wr = s_cfo_tw_re_f[k * step];
+            float wi = s_cfo_tw_im_f[k * step];
+            for (int i = k; i < CFO_FFT_N; i += span) {
+                float xr = re[i + stride];
+                float xi = im[i + stride];
+                float tr = wr * xr - wi * xi;
+                float ti = wr * xi + wi * xr;
+                re[i + stride] = re[i] - tr;
+                im[i + stride] = im[i] - ti;
+                re[i]          = re[i] + tr;
+                im[i]          = im[i] + ti;
+            }
+        }
+    }
 }
 
 // Q15 4096-pt block-floating-point FFT (same scheme as radix2_fft_q15
@@ -563,99 +609,87 @@ static int cfo_fft_q15(int32_t *re, int32_t *im)
 // the carrier offset becomes a single clean tone at Δω rad/sample
 // throughout the whole window. Returns omega_per_sym in rad/sym
 // (with the sign convention the worker expects, see end of function).
+// Select CFO FFT precision at compile-time. Default is float to match
+// gr-iridium's volk_32fc_*_32fc + fft_complex path exactly. Define
+// CFO_USE_Q15_FFT=1 to use the legacy Q15 BFP path (lower precision
+// but smaller scratch — useful for the eventual size-constrained
+// build profile if we ever revisit). Both paths are kept compiled
+// so the switch is a one-line change.
+#ifndef CFO_USE_Q15_FFT
+#define CFO_USE_Q15_FFT 0
+#endif
+
 static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
                                 int uw_offset_complex)
 {
     cfo_init();
 
-    // FFT scratch (BSS, single-threaded function): int32 buffers for
-    // BFP FFT.
-    static int32_t re[CFO_FFT_N], im[CFO_FFT_N];
+#if CFO_USE_Q15_FFT
+    return cfo_fine_estimate_q15(burst_2sps, n_complex, uw_offset_complex);
+#endif
+
+    // FFT scratch — float for the gr-iridium-aligned full-precision
+    // path. Q15 BFP was losing peak-vs-noise resolution at borderline
+    // SNR; float matches gr-iridium's volk_32fc_*_32fc + fft_complex
+    // exactly. ~32 KB scratch (acceptable — single-threaded function,
+    // and on P4 it lives in PSRAM-eligible BSS or the worker's stack).
+    static float re[CFO_FFT_N], im[CFO_FFT_N];
     memset(re, 0, sizeof(re));
     memset(im, 0, sizeof(im));
 
     // Decide preamble+UW vs UW-only based on what's in range.
     int start, n_in;
-    const int16_t *win;
+    const float *win;
     if (uw_offset_complex >= CFO_PREAMBLE_N &&
         uw_offset_complex - CFO_PREAMBLE_N + CFO_INPUT_N <= n_complex) {
         start = uw_offset_complex - CFO_PREAMBLE_N;
         n_in  = CFO_INPUT_N;
-        win   = s_cfo_window_full;
+        win   = s_cfo_window_full_f;
     } else if (uw_offset_complex + CFO_UW_ONLY_N <= n_complex) {
         start = uw_offset_complex;
         n_in  = CFO_UW_ONLY_N;
-        win   = s_cfo_window_uw;
+        win   = s_cfo_window_uw_f;
     } else {
         return 0.0f;       // burst too short, skip
     }
 
-    // Square the windowed region. (r + j·m)² = (r²-m²) + j·(2·r·m).
-    // Adaptive pre-shift: scan input window magnitude to choose SQ_SHIFT
-    // that maximises retained precision while keeping the squared+
-    // windowed output inside the BFP FFT's 2^28 input headroom.
-    //
-    // The fixed SQ_SHIFT=8 of the prior version was sized for input
-    // peak ≈ INT16_MAX (single-burst fixtures). Pipeline-test bursts
-    // out of the channelizer have peaks ~13 bits — after >>8 only 5
-    // bits remain, squared signal is quantised to noise and the
-    // squared-FFT finds DC instead of the carrier residual.
-    //
-    //   r' = r >> SQ_SHIFT,  with SQ_SHIFT chosen so max|r'| ≤ 2^11
-    //   r'² ≤ 2^22
-    //   out = (r'² × win_q15) >> 15   →  bounded by r'² ≤ 2^22
-    //   FFT BFP handles inputs up to 2^28 (see cfo_fft_q15 line 509)
-    //
-    // 2^11 leaves room for r'² × N for the FFT bin growth without
-    // saturating the int32 buffers.
-    int32_t peak_abs = 0;
+    // Square the windowed region (float precision). (r + j·m)² =
+    // (r²-m²) + j·(2·r·m). gr-iridium uses volk_32fc_s32f_power_32fc
+    // then volk_32fc_32f_multiply_32fc — same math, same precision.
+    // Input int16 values normalised to [-1, 1] before squaring keeps
+    // the squared magnitudes in a reasonable range for the FFT.
+    const float SCALE = 1.0f / 32768.0f;
     for (int i = 0; i < n_in; i++) {
-        int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0];
-        int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1];
-        if (r < 0) r = -r;
-        if (m < 0) m = -m;
-        if (r > peak_abs) peak_abs = r;
-        if (m > peak_abs) peak_abs = m;
-    }
-    int sq_shift = 0;
-    while ((peak_abs >> sq_shift) > (1 << 11)) sq_shift++;
-    for (int i = 0; i < n_in; i++) {
-        int64_t w = (int64_t)win[i];
-        int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0] >> sq_shift;
-        int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1] >> sq_shift;
-        int32_t sq_re = r * r - m * m;
-        int32_t sq_im = 2 * r * m;
-        // sq_re/sq_im can reach 2^22, win is Q15 (≤ 2^15), so the
-        // product can hit 2^37 — must use int64 to avoid overflow.
-        // No int16 cast — FFT input is int32 BFP, full int32 range OK.
-        re[i] = (int32_t)((sq_re * w) >> 15);
-        im[i] = (int32_t)((sq_im * w) >> 15);
+        float r = (float)burst_2sps[(start + i) * 2 + 0] * SCALE;
+        float m = (float)burst_2sps[(start + i) * 2 + 1] * SCALE;
+        float sq_re = r * r - m * m;
+        float sq_im = 2.0f * r * m;
+        re[i] = sq_re * win[i];
+        im[i] = sq_im * win[i];
     }
 
-    (void)cfo_fft_q15(re, im);
+    cfo_fft_f32(re, im);
 
     // Find peak (gr-iridium: std::max_element on magnitude²).
-    int64_t peak_mag = -1;
-    int     peak_k   = 0;
+    float peak_mag = -1.0f;
+    int   peak_k   = 0;
     for (int k = 0; k < CFO_FFT_N; k++) {
-        int64_t rr = re[k], ii = im[k];
-        int64_t m = rr * rr + ii * ii;
+        float rr = re[k], ii = im[k];
+        float m = rr * rr + ii * ii;
         if (m > peak_mag) { peak_mag = m; peak_k = k; }
     }
-    if (peak_mag <= 0) return 0.0f;
+    if (peak_mag <= 0.0f) return 0.0f;
 
 #ifdef UW_CORRELATOR_CFO_DEBUG
     {
-        // Dump top 5 peaks (signed bin, omega rad/sym, magnitude) for
-        // offline analysis: are we picking the carrier residual or
-        // getting fooled by a DC sidelobe / noise peak?
+        // Dump top 5 peaks (signed bin, omega rad/sym, magnitude).
         const int N = CFO_FFT_N;
-        typedef struct { int k; int64_t m; } pk_t;
+        typedef struct { int k; float m; } pk_t;
         pk_t top[5];
-        for (int i = 0; i < 5; i++) { top[i].k = 0; top[i].m = -1; }
+        for (int i = 0; i < 5; i++) { top[i].k = 0; top[i].m = -1.0f; }
         for (int k = 0; k < N; k++) {
-            int64_t rr = re[k], ii = im[k];
-            int64_t m = rr * rr + ii * ii;
+            float rr = re[k], ii = im[k];
+            float m = rr * rr + ii * ii;
             for (int i = 0; i < 5; i++) {
                 if (m > top[i].m) {
                     for (int j = 4; j > i; j--) top[j] = top[j-1];
@@ -665,14 +699,14 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
             }
         }
         fprintf(stderr, "[cfo] top peaks (n_in=%d, win=%s):", n_in,
-                (win == s_cfo_window_full) ? "full" : "uw-only");
+                (win == s_cfo_window_full_f) ? "full" : "uw-only");
         for (int i = 0; i < 5; i++) {
             int kf_dbg = top[i].k;
             if (kf_dbg >= N/2) kf_dbg -= N;
             float omega_dbg = -2.0f * 3.14159265358979323846f * kf_dbg / (float)N
                               * ((float)UW_SPS / 2.0f);
-            fprintf(stderr, "  k=%+5d ω=%+.3f m=%lld",
-                    kf_dbg, (double)omega_dbg, (long long)top[i].m);
+            fprintf(stderr, "  k=%+5d ω=%+.3f m=%.2e",
+                    kf_dbg, (double)omega_dbg, (double)top[i].m);
         }
         fprintf(stderr, "\n");
     }
@@ -681,9 +715,9 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     // Parabolic interpolation around the peak (with wrap).
     int km1 = (peak_k - 1 + CFO_FFT_N) % CFO_FFT_N;
     int kp1 = (peak_k + 1) % CFO_FFT_N;
-    float yl = (float)re[km1] * (float)re[km1] + (float)im[km1] * (float)im[km1];
-    float yc = (float)peak_mag;
-    float yr = (float)re[kp1] * (float)re[kp1] + (float)im[kp1] * (float)im[kp1];
+    float yl = re[km1] * re[km1] + im[km1] * im[km1];
+    float yc = peak_mag;
+    float yr = re[kp1] * re[kp1] + im[kp1] * im[kp1];
     float delta = parabolic_interp(yl, yc, yr);
 
     // Convert (signed) bin position to rad/sym.
@@ -724,6 +758,85 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     // bursts with SNR ≥6 dB get here; their squared-FFT peak is
     // dominated by signal). Symbol-rate aliasing kicks in past ±2π
     // (>50 kHz) which is outside any plausible channel.
+    const float CFO_CLAMP = 2.0f * 3.14159265358979323846f;
+    if (omega >  CFO_CLAMP) omega =  CFO_CLAMP;
+    if (omega < -CFO_CLAMP) omega = -CFO_CLAMP;
+    return omega;
+}
+
+// Q15 BFP CFO estimator — legacy path, selectable via
+// CFO_USE_Q15_FFT=1. Same algorithm as cfo_fine_estimate() above
+// but with int16 squared signal and int32 BFP FFT. Loses ~10 bits
+// of dynamic range vs the float path on borderline-SNR bursts;
+// kept compiled so the build can switch back to it if needed
+// (e.g. the eventual size-constrained profile).
+__attribute__((unused))
+static float cfo_fine_estimate_q15(const int16_t *burst_2sps,
+                                    int n_complex, int uw_offset_complex)
+{
+    static int32_t re[CFO_FFT_N], im[CFO_FFT_N];
+    memset(re, 0, sizeof(re));
+    memset(im, 0, sizeof(im));
+
+    int start, n_in;
+    const int16_t *win;
+    if (uw_offset_complex >= CFO_PREAMBLE_N &&
+        uw_offset_complex - CFO_PREAMBLE_N + CFO_INPUT_N <= n_complex) {
+        start = uw_offset_complex - CFO_PREAMBLE_N;
+        n_in  = CFO_INPUT_N;
+        win   = s_cfo_window_full;
+    } else if (uw_offset_complex + CFO_UW_ONLY_N <= n_complex) {
+        start = uw_offset_complex;
+        n_in  = CFO_UW_ONLY_N;
+        win   = s_cfo_window_uw;
+    } else {
+        return 0.0f;
+    }
+
+    // Adaptive pre-shift to keep r'² ≤ 2^22.
+    int32_t peak_abs = 0;
+    for (int i = 0; i < n_in; i++) {
+        int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0];
+        int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1];
+        if (r < 0) r = -r;
+        if (m < 0) m = -m;
+        if (r > peak_abs) peak_abs = r;
+        if (m > peak_abs) peak_abs = m;
+    }
+    int sq_shift = 0;
+    while ((peak_abs >> sq_shift) > (1 << 11)) sq_shift++;
+    for (int i = 0; i < n_in; i++) {
+        int64_t w = (int64_t)win[i];
+        int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0] >> sq_shift;
+        int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1] >> sq_shift;
+        int32_t sq_re = r * r - m * m;
+        int32_t sq_im = 2 * r * m;
+        re[i] = (int32_t)((sq_re * w) >> 15);
+        im[i] = (int32_t)((sq_im * w) >> 15);
+    }
+
+    (void)cfo_fft_q15(re, im);
+
+    int64_t peak_mag = -1;
+    int     peak_k   = 0;
+    for (int k = 0; k < CFO_FFT_N; k++) {
+        int64_t rr = re[k], ii = im[k];
+        int64_t m = rr * rr + ii * ii;
+        if (m > peak_mag) { peak_mag = m; peak_k = k; }
+    }
+    if (peak_mag <= 0) return 0.0f;
+
+    int km1 = (peak_k - 1 + CFO_FFT_N) % CFO_FFT_N;
+    int kp1 = (peak_k + 1) % CFO_FFT_N;
+    float yl = (float)re[km1] * (float)re[km1] + (float)im[km1] * (float)im[km1];
+    float yc = (float)peak_mag;
+    float yr = (float)re[kp1] * (float)re[kp1] + (float)im[kp1] * (float)im[kp1];
+    float delta = parabolic_interp(yl, yc, yr);
+
+    float kf = (float)peak_k + delta;
+    if (kf >= (float)CFO_FFT_N / 2.0f) kf -= (float)CFO_FFT_N;
+    float rad_per_sample = 2.0f * 3.14159265358979323846f * kf / (float)CFO_FFT_N;
+    float omega = -rad_per_sample * ((float)UW_SPS / 2.0f);
     const float CFO_CLAMP = 2.0f * 3.14159265358979323846f;
     if (omega >  CFO_CLAMP) omega =  CFO_CLAMP;
     if (omega < -CFO_CLAMP) omega = -CFO_CLAMP;
@@ -890,6 +1003,9 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     // Reject low-SNR peaks. Threshold of 6 dB is conservative —
     // legitimate Iridium UW correlation peaks are typically 12-20 dB
     // above the off-peak floor; 6 dB filters out noise events.
+    // (Tested 9 dB on the ALBQ corpus: lost more legitimate
+    // borderline bursts than it gained in noise rejection. 6 dB
+    // matches what gr-iridium tolerates in practice.)
     if (snr_db < 6.0f) {
         out_result->snr_estimate_db = snr_db;
         out_result->peak_value = peak_mag2;
