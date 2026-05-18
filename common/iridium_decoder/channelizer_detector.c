@@ -645,7 +645,15 @@ size_t channelizer_detector_extract_channel(channelizer_detector_t *d,
     if (length_cycles > d->ring_capacity_cycles) {
         length_cycles = (uint32_t)d->ring_capacity_cycles;
     }
-    // Copy out the channel's IQ from each cycle in the requested range.
+    // Copy out the channel's IQ from each cycle in the requested
+    // range. No gain compensation — the channelizer's /M FFT
+    // normalisation leaves channel outputs 36 dB below input
+    // amplitude, but applying an arbitrary post-extraction gain is
+    // a deviation from gr-iridium and didn't move decode rate in
+    // testing. Per-stage compare shows host post-D13 RMS 0.019 vs
+    // gr-iridium 0.048 — the 8 dB gap is real but propagates as
+    // SNR loss, not signal corruption. Better fixes are
+    // architectural (gain at the FFT step, not at extract).
     for (uint32_t i = 0; i < length_cycles; i++) {
         uint32_t cyc = (start_cycle + i) & d->ring_mask;
         const int16_t *row = &d->channel_ring[cyc * M * 2];
