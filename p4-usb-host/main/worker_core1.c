@@ -39,6 +39,66 @@ static volatile uint64_t s_t_resample_us = 0;
 static volatile uint64_t s_t_demod_us = 0;
 static volatile uint64_t s_t_bch_us = 0;
 
+// One-shot per-stage IQ dump. Triggers on the first burst with
+// channelizer SNR ≥ DIAG_SNR_TRIGGER_DB so we capture a high-quality
+// burst (not noise) for offline analysis. Each stage prints a
+// header line with (rms, peak, dc-bias) followed by full IQ at
+// stages 3-7, then an ENDDUMP marker. Stages 1-2 (raw + freq-
+// shifted, both at 2.56 MSPS) print stats only since they are
+// 40+ KB each and serial-bound.
+//
+// Parse with tests/scripts/parse_worker_diag.py (TBD) — extracts each
+// DUMP block as int16 IQ and writes a .cf32 file gr-iridium can ingest.
+#define DIAG_SNR_TRIGGER_DB  18.0f
+static volatile bool s_diag_armed = true;
+
+static void diag_stats(const char *name, int fs_hz, const int16_t *iq, int n_complex)
+{
+    if (n_complex <= 0) return;
+    int64_t sum_re = 0, sum_im = 0;
+    int64_t sum_sq = 0;
+    int32_t peak_abs = 0;
+    for (int i = 0; i < n_complex; i++) {
+        int32_t r = iq[i * 2 + 0];
+        int32_t q = iq[i * 2 + 1];
+        sum_re += r;
+        sum_im += q;
+        sum_sq += r * r + q * q;
+        int32_t ar = r < 0 ? -r : r;
+        int32_t aq = q < 0 ? -q : q;
+        if (ar > peak_abs) peak_abs = ar;
+        if (aq > peak_abs) peak_abs = aq;
+    }
+    double rms = (n_complex > 0) ? sqrt((double)sum_sq / (double)n_complex) : 0.0;
+    double dc_re = (double)sum_re / (double)n_complex;
+    double dc_im = (double)sum_im / (double)n_complex;
+    ESP_LOGI(TAG, "DIAG %s fs=%d n=%d rms=%.1f peak=%d dc=(%.1f,%.1f)",
+             name, fs_hz, n_complex, rms, (int)peak_abs, dc_re, dc_im);
+}
+
+static void diag_dump(const char *name, int fs_hz, const int16_t *iq, int n_complex)
+{
+    diag_stats(name, fs_hz, iq, n_complex);
+    // Bracketed dump that's easy to grep+parse offline. 4 IQ pairs/line
+    // keeps serial line lengths under 64 chars.
+    printf("DUMP %s n=%d\n", name, n_complex);
+    for (int i = 0; i < n_complex; i += 4) {
+        char line[96];
+        int len = 0;
+        len += snprintf(line + len, sizeof(line) - len, "DAT");
+        for (int j = 0; j < 4 && (i + j) < n_complex; j++) {
+            len += snprintf(line + len, sizeof(line) - len, " %d %d",
+                            iq[(i + j) * 2 + 0], iq[(i + j) * 2 + 1]);
+        }
+        puts(line);
+        // Pace serial output — 115200 baud is ~10 KB/sec, a long burst
+        // can flood the TX buffer and drop bytes.
+        if ((i & 0xff) == 0) vTaskDelay(1);
+    }
+    puts("ENDDUMP");
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
 // Decimation factor 32: 2.56 MHz -> 80 kHz
 #define DECIM_FACTOR 32
 #define FIR_TAPS 64
@@ -136,6 +196,18 @@ void worker_task(void *arg)
             signal_buffer_extract(burst.start_sample_idx, burst.length_samples, extract_buf);
             int64_t t_extract = esp_timer_get_time();
 
+            // Decide whether THIS burst gets the one-shot diagnostic.
+            bool diag = false;
+            if (s_diag_armed && burst.peak_snr_db >= DIAG_SNR_TRIGGER_DB) {
+                s_diag_armed = false;
+                diag = true;
+                ESP_LOGI(TAG, "=== DIAG BEGIN burst SNR=%.1f dB peak_bin=%d len=%lu ===",
+                         (double)burst.peak_snr_db, burst.peak_bin,
+                         (unsigned long)burst.length_samples);
+                diag_stats("01_raw_2560k", FS_IN_HZ,
+                           extract_buf, (int)burst.length_samples);
+            }
+
             // D8 alignment with gr-iridium: their burst_downmix pipeline
             // never tries to estimate residual carrier on the raw QPSK
             // burst. QPSK is suppressed-carrier — a plain FFT of QPSK
@@ -184,6 +256,11 @@ void worker_task(void *arg)
                 extract_buf[i * 2 + 1] = (int16_t)((x_re * p_im + x_im * p_re) >> 15);
             }
             int64_t t_freq = esp_timer_get_time();
+
+            if (diag) {
+                diag_stats("02_baseband_2560k", FS_IN_HZ,
+                           extract_buf, (int)burst.length_samples);
+            }
 
             // 3. FIR Decimation (32x) Stage 1 (2.56M -> 80k)
             memset(delay_i, 0, sizeof(delay_i));
@@ -239,6 +316,22 @@ void worker_task(void *arg)
                 demod_interleaved[i * 2 + 1] = resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS + i];
             }
 
+            if (diag) {
+                // Reinterleave stage-1 80k output for the dump so the
+                // parsing script gets consistent (I,Q) pairs across
+                // stages. decim_buf has separate I/Q arrays.
+                static int16_t diag_80k_tmp[8192 * 2];
+                int n80 = out_samples_80k > 8192 ? 8192 : out_samples_80k;
+                for (int i = 0; i < n80; i++) {
+                    diag_80k_tmp[i * 2 + 0] = decim_buf[i];
+                    diag_80k_tmp[i * 2 + 1] =
+                        decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS + i];
+                }
+                diag_dump("03_fir_80k", 80000, diag_80k_tmp, n80);
+                diag_dump("04_resamp_250k", 250000,
+                          demod_interleaved, out_samples_50k);
+            }
+
             // (D10 timing recovery wiring removed. Per gr-iridium's
             // burst_downmix_impl.cc, the correct approach for burst-
             // mode timing is one-shot UW cross-correlation with
@@ -265,6 +358,10 @@ void worker_task(void *arg)
             uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
             ESP_LOGI(TAG, "D13 burst start: %d (of %d samples)",
                      burst_start, out_samples_50k);
+
+            if (diag) {
+                diag_dump("05_post_rrc_250k", 250000, adj_burst, adj_n);
+            }
             uw_corr_result_t uw_res;
             uw_correlator_find(adj_burst, adj_n,
                                 /*search_complex=*/adj_n - 24,
@@ -373,6 +470,14 @@ void worker_task(void *arg)
                     post[i * 2 + 1] = src[j * 2 + 1];
                 }
                 int n_post_int16 = n_post_cplx * 2;
+                if (diag) {
+                    // Pre-rotated 10-sps buffer in `src` at length n_rot_cplx
+                    // is what the matched filter saw post-cancellation. The
+                    // 2-sps decimated buffer `post` is what qpsk_demod sees.
+                    diag_dump("06_post_prerot_250k", 250000, src, n_rot_cplx);
+                    diag_dump("07_decim_50k_2sps", 50000, post, n_post_cplx);
+                    ESP_LOGI(TAG, "=== DIAG END ===");
+                }
                 memset(&frame, 0, sizeof(frame));
                 if (qpsk_demod_process(post, n_post_int16, &frame)) {
                     demod_ok = true;
@@ -451,12 +556,9 @@ esp_err_t worker_core1_init()
         return ESP_ERR_NO_MEM;
     }
 
-    // Stage 1 Coefficients (LPF)
+    // Stage 1 Coefficients (LPF). Cutoff ±fs/(2M) = ±20 kHz at
+    // fs=2.56 MHz, M=64. Normalised angular freq = π / M.
     float coeffs_f32[FIR_TAPS];
-    dsps_fird_init_s16(&fir_i, coeffs, delay_i, FIR_TAPS, DECIM_FACTOR, 0, 15);
-    dsps_fird_init_s16(&fir_q, coeffs, delay_q, FIR_TAPS, DECIM_FACTOR, 0, 15);
-    // Stage 1 FIR cutoff: ±fs/(2M) = ±20 kHz at fs=2.56 MHz, M=64.
-    // Normalised angular freq = 2π × (fs/(2M)) / fs = π / M.
     float omega_c = (float)M_PI / (float)POLYCHAN_M;
     for (int i = 0; i < FIR_TAPS; i++) {
         float n = i - (FIR_TAPS - 1) / 2.0f;
@@ -464,9 +566,34 @@ esp_err_t worker_core1_init()
         float w = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (FIR_TAPS - 1)));
         coeffs_f32[i] = h * w;
     }
-    float sum = 0;
-    for (int i = 0; i < FIR_TAPS; i++) sum += coeffs_f32[i];
-    for (int i = 0; i < FIR_TAPS; i++) coeffs[i] = (int16_t)(coeffs_f32[i] / sum * (float)INT16_MAX);
+    // Canonical Q15: scale coeffs so sum = 2^15 (= INT16_MAX rounded
+    // up), pass shift_param = 0 to dsps_fird_init_s16 so the asm does
+    // output = acc >> 15 (Q15 × Q15 → Q15). The previous code passed
+    // shift_param = 15 which made the asm output = (int16_t)acc — a
+    // truncation of the int32 accumulator's low 16 bits, producing
+    // garbage for any input that put acc above 2^15. That was the
+    // source of the per-stage SNR loss seen in the diagnostic dump
+    // (stage 03 RMS 7 K → 27 K with saturated peaks).
+    float coeff_sum_f = 0;
+    for (int i = 0; i < FIR_TAPS; i++) coeff_sum_f += coeffs_f32[i];
+    // Sum target = 2^15. Use 2^15 - 1 to keep coeffs in int16 range
+    // when the centre tap is large relative to the sum.
+    const float SUM_TARGET = 32768.0f;
+    float coeff_scale = SUM_TARGET / coeff_sum_f;
+    int coeff_max_int = 0, coeff_sum_int = 0;
+    for (int i = 0; i < FIR_TAPS; i++) {
+        float v = coeffs_f32[i] * coeff_scale;
+        if (v > (float)INT16_MAX) v = (float)INT16_MAX;
+        if (v < (float)INT16_MIN) v = (float)INT16_MIN;
+        coeffs[i] = (int16_t)lrintf(v);
+        int a = coeffs[i] < 0 ? -coeffs[i] : coeffs[i];
+        if (a > coeff_max_int) coeff_max_int = a;
+        coeff_sum_int += coeffs[i];
+    }
+    ESP_LOGI(TAG, "Stage 1 FIR: shift=0 (Q15), max coeff=%d, sum=%d (target 32768)",
+             coeff_max_int, coeff_sum_int);
+    dsps_fird_init_s16(&fir_i, coeffs, delay_i, FIR_TAPS, DECIM_FACTOR, 0, 0);
+    dsps_fird_init_s16(&fir_q, coeffs, delay_q, FIR_TAPS, DECIM_FACTOR, 0, 0);
 
     // Stage 2 Coefficients (RRC/LPF for resampling)
     // For now, use simple LPF for resampler
@@ -485,19 +612,41 @@ esp_err_t worker_core1_init()
         float w = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (RESAMPLE_TAPS * RESAMPLE_INTERP - 1)));
         rcoeffs_f32[i] = h * w;
     }
-    sum = 0;
-    for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) sum += rcoeffs_f32[i];
-    for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) resample_coeffs[i] = (int16_t)(rcoeffs_f32[i] / sum * (float)INT16_MAX);
+    // Same overflow-safe normalisation as stage 1: pick the largest
+    // shift such that max coeff × scale fits in int16.
+    float rcoeff_sum = 0, rcoeff_max = 0;
+    const int rN = RESAMPLE_TAPS * RESAMPLE_INTERP;
+    for (int i = 0; i < rN; i++) {
+        rcoeff_sum += rcoeffs_f32[i];
+        float a = fabsf(rcoeffs_f32[i]);
+        if (a > rcoeff_max) rcoeff_max = a;
+    }
+    // Polyphase resampler: each output uses TAPS coeffs (one phase
+    // out of the INTERP-many polyphase banks). Scale TOTAL coeff sum
+    // to RESAMPLE_INTERP × 2^15 so each phase sums to ~2^15 → unity
+    // gain per output with shift_param = 0.
+    const float RSUM_TARGET = (float)RESAMPLE_INTERP * 32768.0f;
+    float rcoeff_scale = RSUM_TARGET / rcoeff_sum;
+    int rcoeff_max_int = 0, rcoeff_sum_int = 0;
+    for (int i = 0; i < rN; i++) {
+        float v = rcoeffs_f32[i] * rcoeff_scale;
+        if (v > (float)INT16_MAX) v = (float)INT16_MAX;
+        if (v < (float)INT16_MIN) v = (float)INT16_MIN;
+        resample_coeffs[i] = (int16_t)lrintf(v);
+        int a = resample_coeffs[i] < 0 ? -resample_coeffs[i] : resample_coeffs[i];
+        if (a > rcoeff_max_int) rcoeff_max_int = a;
+        rcoeff_sum_int += resample_coeffs[i];
+    }
+    ESP_LOGI(TAG, "Stage 2 resampler: shift=0 (Q15), max coeff=%d, sum=%d (target %d)",
+             rcoeff_max_int, rcoeff_sum_int, (int)RSUM_TARGET);
 
-    // Multi-rate FIR with interp=5, decim=8 → 5/8 ratio, 80 kHz → 50 kHz.
-    // length here is the total filter length (taps × interp = 64 × 5 = 320),
-    // matching the size of resample_coeffs and the per-channel delay arrays.
+    // Multi-rate FIR with interp=25, decim=8 → 80 kHz → 250 kHz.
     esp_err_t r_init_i = dsps_firmr_init_s16(&resampler_i, resample_coeffs, resample_delay_i,
-                                             RESAMPLE_TAPS * RESAMPLE_INTERP,
-                                             RESAMPLE_INTERP, RESAMPLE_DECIM, 0, 15);
+                                             rN,
+                                             RESAMPLE_INTERP, RESAMPLE_DECIM, 0, 0);
     esp_err_t r_init_q = dsps_firmr_init_s16(&resampler_q, resample_coeffs, resample_delay_q,
-                                             RESAMPLE_TAPS * RESAMPLE_INTERP,
-                                             RESAMPLE_INTERP, RESAMPLE_DECIM, 0, 15);
+                                             rN,
+                                             RESAMPLE_INTERP, RESAMPLE_DECIM, 0, 0);
     if (r_init_i != ESP_OK || r_init_q != ESP_OK) {
         ESP_LOGE(TAG, "Stage 2 resampler init failed: i=%d q=%d", r_init_i, r_init_q);
         return ESP_FAIL;
