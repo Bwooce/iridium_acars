@@ -45,9 +45,14 @@ CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
 
 # Watchdog tuning. The class_driver task on Core 0 is intentionally hot
 # (drains the USB ringbuffer continuously); IDLE0 effectively never runs.
-# Stop watching IDLE0 so legitimate full-load operation isn't false-positive.
-# IDLE1 stays watched as a sanity check.
+# Stop watching either IDLE task so legitimate full-load operation isn't a
+# false-positive. Worker (Core 1) processes 200+ bursts/sec under flood and
+# legitimately starves IDLE1; the previous "IDLE1 stays watched as a sanity
+# check" tripped TWDT panics that the USB-CDC log doesn't capture (the
+# panic dump goes to the dedicated UART pins). We don't use vTaskDelete,
+# idle hook, or power policy — nothing relies on idle running.
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 # Backtrace + coredump on real WDT events instead of silent reset.
 CONFIG_ESP_TASK_WDT_PANIC=y
 # Per-task heap usage for diagnosing leaks under load. Left off for now —

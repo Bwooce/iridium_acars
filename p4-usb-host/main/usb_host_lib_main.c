@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_intr_alloc.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "usb/usb_host.h"
 #include "sdkconfig.h"
@@ -100,6 +101,33 @@ static void host_lib_daemon_task(void *arg)
 
 void app_main(void)
 {
+    // Log the reset reason on every boot so we can see at a glance
+    // whether the previous run ended via a panic, brownout, watchdog,
+    // external reset, etc. Especially useful when the smoke test
+    // appears to reboot mid-Phase-2 with no panic dump on the serial
+    // line — distinguishes brownout (RST_BROWNOUT) from USB-CDC line-
+    // state reset (RST_EXT or RST_USB) from a silent abort.
+    {
+        esp_reset_reason_t r = esp_reset_reason();
+        const char *name = "?";
+        switch (r) {
+            case ESP_RST_POWERON:  name = "POWERON";        break;
+            case ESP_RST_EXT:      name = "EXT";            break;
+            case ESP_RST_SW:       name = "SW";             break;
+            case ESP_RST_PANIC:    name = "PANIC";          break;
+            case ESP_RST_INT_WDT:  name = "INT_WDT";        break;
+            case ESP_RST_TASK_WDT: name = "TASK_WDT";       break;
+            case ESP_RST_WDT:      name = "OTHER_WDT";      break;
+            case ESP_RST_DEEPSLEEP:name = "DEEPSLEEP";      break;
+            case ESP_RST_BROWNOUT: name = "BROWNOUT";       break;
+            case ESP_RST_SDIO:     name = "SDIO";           break;
+            case ESP_RST_USB:      name = "USB";            break;
+            case ESP_RST_JTAG:     name = "JTAG";           break;
+            case ESP_RST_UNKNOWN:  name = "UNKNOWN";        break;
+            default:               name = "(other)";        break;
+        }
+        ESP_LOGW("BOOT", "reset reason: %s (%d)", name, (int)r);
+    }
 #if CONFIG_SMOKE_TEST_MODE
     // Smoke test mode: bypass the USB stack entirely and run the
     // synthetic-IQ regression test on a single Core 0 task. The smoke

@@ -386,6 +386,19 @@ void worker_task(void *arg)
             s_t_demod_us      += (uint64_t)(t_demod - t_resamp);
             s_t_bch_us        += (uint64_t)(t_bch - t_demod);
         }
+        // Periodic yield to let lower-priority tasks run (especially
+        // the frame_decoder at prio 4 — worker is at prio 5 and would
+        // otherwise preempt it indefinitely under burst-flood). One
+        // vTaskDelay(1) every 8 bursts gives ~10 ms of frame_decoder
+        // CPU per 8 bursts processed, which is more than enough for
+        // it to drain its own queue (small per-frame cost). Idle WDT
+        // monitoring on Core 1 is disabled in sdkconfig so we don't
+        // need to feed idle here.
+        static int yield_counter = 0;
+        if (++yield_counter >= 8) {
+            yield_counter = 0;
+            vTaskDelay(1);
+        }
     }
 }
 
