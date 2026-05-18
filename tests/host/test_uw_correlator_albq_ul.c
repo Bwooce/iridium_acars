@@ -83,10 +83,10 @@ int main(void)
           "matched-filter SNR >= 6 dB production gate (got %.1f)",
           (double)res.snr_estimate_db);
 
-    // CFO bounded (sanity).
+    // CFO bounded (D8 clamp at ±π).
     float abs_omega = res.omega_per_sym < 0 ? -res.omega_per_sym : res.omega_per_sym;
-    CHECK(abs_omega <= 1.5f,
-          "CFO magnitude <= 1.5 rad/sym (got %.3f)",
+    CHECK(abs_omega < 3.14f,
+          "CFO magnitude inside clamp (got %.3f)",
           (double)res.omega_per_sym);
 
     free(burst);

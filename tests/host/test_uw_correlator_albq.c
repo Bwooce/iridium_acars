@@ -129,11 +129,12 @@ int main(void)
           "matched-filter SNR ≥ 6 dB production gate (got %.1f)",
           (double)res.snr_estimate_db);
 
-    // CFO must be bounded — anything beyond ±1.5 rad/sym indicates
-    // the FFT clipped to its clamp and didn't find a real tone.
+    // CFO must be inside the channelizer-bin-derived clamp (D8: ±π
+    // rad/sym ≈ ±25 kHz at 25 ksym/s, slightly wider than the 40
+    // kHz channelizer bin). Anything at the clamp is a noise peak.
     float abs_omega = res.omega_per_sym < 0 ? -res.omega_per_sym : res.omega_per_sym;
-    CHECK(abs_omega <= 1.5f,
-          "CFO magnitude ≤ 1.5 rad/sym (got %.3f)",
+    CHECK(abs_omega < 3.14f,
+          "CFO magnitude inside clamp (got %.3f)",
           (double)res.omega_per_sym);
 
     // Sanity: the complex peak value should be non-trivial (used
