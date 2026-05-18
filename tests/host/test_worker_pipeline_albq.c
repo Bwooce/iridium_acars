@@ -307,23 +307,25 @@ int main(void)
                         iq2[i * 2 + 0] = src[i * 5 * 2 + 0];
                         iq2[i * 2 + 1] = src[i * 5 * 2 + 1];
                     }
-                    // Diag: dump first 24 symbols BEFORE qpsk_demod so we
-                    // can see preamble + UW symbols and check timing.
-                    // Hard-decision quadrant per symbol (no PLL applied).
-                    fprintf(stderr, "    pre-PLL syms[0..23]: ");
+                    // Diag: dump I/Q values directly + per-symbol arg
+                    // for the first 12 symbols (= UW range). If the
+                    // signal is QPSK at the expected axis, |I| and |Q|
+                    // should be similar; if BPSK-only (a sign of a
+                    // genuine ±real-axis signal), |Q| << |I|. Phase
+                    // angle on the unit circle is what qpsk_demod's
+                    // hard-decider partitions; printing it shows
+                    // whether the constellation rotates symbol-to-
+                    // symbol (= residual carrier) or stays put.
+                    fprintf(stderr, "    syms[0..11] (I, Q, deg):\n");
                     int n_diag_syms = n_2sps / 2;
-                    if (n_diag_syms > 24) n_diag_syms = 24;
+                    if (n_diag_syms > 12) n_diag_syms = 12;
                     for (int s = 0; s < n_diag_syms; s++) {
                         int16_t r = iq2[s * 4 + 0];
                         int16_t v = iq2[s * 4 + 1];
-                        int q;
-                        if (r >= 0 && v >= 0) q = 0;
-                        else if (r < 0 && v >= 0) q = 1;
-                        else if (r < 0 && v < 0) q = 2;
-                        else q = 3;
-                        fprintf(stderr, "%d ", q);
+                        float deg = atan2f((float)v, (float)r) * 180.0f / 3.14159f;
+                        fprintf(stderr, "      [%2d]  I=%6d  Q=%6d  ang=%+7.1f°\n",
+                                s, (int)r, (int)v, (double)deg);
                     }
-                    fprintf(stderr, "\n");
 
                     decoded_frame_t frame = {0};
                     int rc = qpsk_demod_process(iq2, n_2sps * 2, &frame);
