@@ -168,7 +168,7 @@ struct channelizer_detector {
     size_t           out_capacity_cycles;
     float complex   *in_buf;
     float complex   *out_buf;
-#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+#if CHANNELIZER_USE_INT16_PATH
     int16_t         *out_buf_i16;             // interleaved IQ
 #endif
 
@@ -237,7 +237,7 @@ channelizer_detector_t *channelizer_detector_create(uint32_t fs_in_hz,
         free(d);
         return NULL;
     }
-#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+#if CHANNELIZER_USE_INT16_PATH
     d->out_buf_i16 = malloc(d->out_capacity_cycles * M * 2 * sizeof(int16_t));
     if (!d->out_buf_i16) {
         free(d->in_buf);
@@ -260,7 +260,7 @@ channelizer_detector_t *channelizer_detector_create(uint32_t fs_in_hz,
     if (!d->channel_ring) {
         free(d->in_buf);
         free(d->out_buf);
-#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+#if CHANNELIZER_USE_INT16_PATH
         if (d->out_buf_i16) free(d->out_buf_i16);
 #endif
         polyphase_channelizer_destroy(d->ch);
@@ -276,7 +276,7 @@ void channelizer_detector_destroy(channelizer_detector_t *d)
     if (d->ch)      polyphase_channelizer_destroy(d->ch);
     if (d->in_buf)  free(d->in_buf);
     if (d->out_buf) free(d->out_buf);
-#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+#if CHANNELIZER_USE_INT16_PATH
     if (d->out_buf_i16) free(d->out_buf_i16);
 #endif
     if (d->channel_ring) free(d->channel_ring);
@@ -397,7 +397,7 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
         // directly (D7+ architectural alignment with gr-iridium).
         float power[M];
         int16_t *ring_row = &d->channel_ring[(this_cycle & d->ring_mask) * M * 2];
-#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+#if CHANNELIZER_USE_INT16_PATH
         const int16_t *row = &d->out_buf_i16[cyc * M * 2];
         for (int k = 0; k < M; k++) {
             int32_t re = row[k * 2 + 0];
@@ -551,7 +551,15 @@ void channelizer_detector_feed_int16(channelizer_detector_t *d,
         size_t whole = (want / M) * M;
         if (whole == 0) break;
 
-#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+#if CHANNELIZER_USE_INT16_PATH
+        // Use the int16 channelizer path on host AND target. Previously
+        // host took the float path while P4 took the int16 path, which
+        // produced subtly different channelizer outputs that propagated
+        // into the burst detector (4× more bursts detected on P4 from
+        // the same data) and the worker pipeline (host 0/64 vs P4 14/64
+        // decode rate on the same fixture). The int16 path is portable
+        // C — only its esp-dsp FFT call is platform-gated inside
+        // polyphase_channelizer.c.
         size_t got = polyphase_channelizer_process_int16(
             d->ch, &iq[consumed * 2], whole, d->out_buf_i16);
 #else

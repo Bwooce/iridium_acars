@@ -64,7 +64,13 @@ static int16_t *u8_to_int16_iq(const uint8_t *u8, unsigned int n_bytes,
 }
 
 // Burst collector via channelizer_detector callback.
-#define MAX_BURSTS 64
+// Sized to cover the ~250 bursts the detector emits on the 1-sec
+// ALBQ fixture (P4 sees the same count — `worker stats: queued=249`
+// in the smoke summary). The previous 64-slot cap silently dropped
+// everything past the first 64 emissions, making it look like the
+// detector was emitting far fewer bursts on host than on P4 when
+// in fact the cap was the divergence.
+#define MAX_BURSTS 512
 typedef struct {
     int n;
     channelizer_burst_t bursts[MAX_BURSTS];
