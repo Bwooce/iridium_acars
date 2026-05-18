@@ -300,6 +300,7 @@ add_executable(test_worker_pipeline_albq
     ${COMMON_DIR}/polyphase_channelizer.c
     ${COMMON_DIR}/uw_correlator.c
     ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/firmr_s16.c
 )
 target_include_directories(test_worker_pipeline_albq PRIVATE
     ${COMMON_DIR}

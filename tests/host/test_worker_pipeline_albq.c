@@ -36,6 +36,7 @@
 #include "qpsk_demod.h"
 #include "polyphase_channelizer.h"
 #include "burst_pipeline.h"
+#include "firmr_s16.h"
 
 #define FS_IN         2560000u
 #define POLYCHAN_M_   64
@@ -75,52 +76,43 @@ static void collect_cb(const channelizer_burst_t *b, void *user)
     if (c->n < MAX_BURSTS) c->bursts[c->n++] = *b;
 }
 
-// Portable polyphase resampler INTERP=25, DECIM=4. Same filter design
-// as worker_core1.c (sinc * Hamming, RESAMPLE_TAPS=64 taps per phase).
-// Returns number of output complex samples.
+// 40 kHz → 250 kHz polyphase resampler. Coefficients laid out in
+// esp-dsp's `dsps_firmr_s16` convention: coeffs[tap_pos * INTERP +
+// phase], same as worker_core1.c's resample_coeffs feeding
+// dsps_firmr_init_s16. Then we drive firmr_s16_process (a portable
+// port of dsps_firmr_s16_ansi) so the resampler math is bit-identical
+// between host and P4.
 #define R_TAPS 64
-static void build_resampler_taps(float *taps)
+static void build_resampler_taps_q15(int16_t *coeffs_q15)
 {
     const int rN = R_TAPS * INTERP;
     const float poly_rate = (float)CHANNEL_HZ * (float)INTERP;   // 1 MHz
     const float half_bw   = (float)FS_IN / (2.0f * POLYCHAN_M_); // 20 kHz
     const float omega_c = 2.0f * (float)M_PI * half_bw / poly_rate;
+    float taps_f[R_TAPS * INTERP];
     float sum = 0.0f;
     for (int i = 0; i < rN; i++) {
         float n = i - (rN - 1) / 2.0f;
         float h = (fabsf(n) < 1e-9f) ? (omega_c / (float)M_PI)
                                      : (sinf(omega_c * n) / ((float)M_PI * n));
         float w = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (rN - 1)));
-        taps[i] = h * w;
-        sum += taps[i];
+        taps_f[i] = h * w;
+        sum += taps_f[i];
     }
-    // Scale so each polyphase phase sums to ~1 (unity DC gain per output)
-    float scale = (float)INTERP / sum;
-    for (int i = 0; i < rN; i++) taps[i] *= scale;
-}
-
-// Polyphase resample: y[k] uses input samples i_in = k*DECIM/INTERP and
-// phase = (k*DECIM) % INTERP, then convolves R_TAPS taps with delayed
-// inputs. Returns number of output samples.
-static int polyphase_resample(const int16_t *in, int n_in,
-                               const float *taps,
-                               float *out, int max_out)
-{
-    int n_out = 0;
-    for (long long k = 0; k < (long long)max_out; k++) {
-        long long phase_idx = (k * DECIM_2);   // counter at intermediate rate
-        long long phase = phase_idx % INTERP;
-        long long base  = phase_idx / INTERP;
-        if (base + R_TAPS - 1 >= n_in) break;
-        const float *phase_taps = &taps[phase * R_TAPS];
-        float acc = 0.0f;
-        for (int t = 0; t < R_TAPS; t++) {
-            acc += phase_taps[t] * (float)in[base + R_TAPS - 1 - t];
-        }
-        out[k] = acc;
-        n_out++;
+    // Match worker_core1 scaling exactly: target SUM = INTERP × 32768
+    // so each phase (every-INTERP-th tap) sums to ~32768 = unity Q15.
+    const float RSUM_TARGET = (float)INTERP * 32768.0f;
+    float scale = RSUM_TARGET / sum;
+    // Lay out in esp-dsp's transposed-polyphase order:
+    //   coeffs_q15[tap_pos * INTERP + phase] = h_linear[tap_pos * INTERP + phase]
+    // (which is just the linear order — the indexing convention is
+    // baked into the firmr_s16 reader, not the writer.)
+    for (int i = 0; i < rN; i++) {
+        float v = taps_f[i] * scale;
+        if (v >  32767.0f) v =  32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        coeffs_q15[i] = (int16_t)lrintf(v);
     }
-    return n_out;
 }
 
 static int s_passed = 0, s_failed = 0;
@@ -174,9 +166,9 @@ int main(void)
                coll.bursts[i].length_samples);
     }
 
-    // 2. Build resampler taps once
-    static float r_taps[R_TAPS * INTERP];
-    build_resampler_taps(r_taps);
+    // 2. Build resampler taps once (Q15, esp-dsp layout)
+    static int16_t r_coeffs[R_TAPS * INTERP];
+    build_resampler_taps_q15(r_coeffs);
 
     // 3. Process each burst
     printf("\nPer-burst worker pipeline results:\n");
@@ -229,7 +221,9 @@ int main(void)
             }
         }
 
-        // Residual freq-shift on the 40 kHz signal.
+        // Residual freq-shift to Iridium grid — kept for now to isolate
+        // whether the firmr_s16 port is the regression source vs the
+        // freq-shift removal. P4 worker dropped this step.
         int signed_ch = (bb->channel > POLYCHAN_M_ / 2)
                         ? bb->channel - POLYCHAN_M_ : bb->channel;
         float ch_centre_hz = (float)signed_ch * (float)CHANNEL_HZ;
@@ -246,43 +240,49 @@ int main(void)
             phi += dphi;
         }
 
-        // Resample 40 kHz -> 250 kHz.
-        int max_out = (n_ch * INTERP / DECIM_2) + 4;
-        float *re_buf = malloc(max_out * sizeof(float));
-        float *im_buf = malloc(max_out * sizeof(float));
-        int16_t *in_re = malloc(n_ch * sizeof(int16_t));
-        int16_t *in_im = malloc(n_ch * sizeof(int16_t));
+        // Resample 40 kHz -> 250 kHz via the same polyphase rational-
+        // rate FIR (firmr_s16) the P4 worker uses (esp-dsp's
+        // dsps_firmr_s16 with shift=0 for canonical Q15). Run twice:
+        // once for I, once for Q. Independent delay lines so each
+        // call's state is isolated to its channel.
+        int max_out = ((int)n_ch * INTERP / DECIM_2) + INTERP + 4;
+        int16_t *out_re = malloc(max_out * sizeof(int16_t));
+        int16_t *out_im = malloc(max_out * sizeof(int16_t));
+        int16_t *in_re  = malloc(n_ch * sizeof(int16_t));
+        int16_t *in_im  = malloc(n_ch * sizeof(int16_t));
         for (size_t i = 0; i < n_ch; i++) {
             in_re[i] = ch_iq[i * 2 + 0];
             in_im[i] = ch_iq[i * 2 + 1];
         }
-        int n_250k = polyphase_resample(in_re, (int)n_ch, r_taps, re_buf, max_out);
-        polyphase_resample(in_im, (int)n_ch, r_taps, im_buf, max_out);
+        firmr_s16_t fir_re, fir_im;
+        int16_t delay_re[R_TAPS], delay_im[R_TAPS];
+        firmr_s16_init(&fir_re, r_coeffs, delay_re,
+                       R_TAPS, INTERP, DECIM_2, 0, 0);
+        firmr_s16_init(&fir_im, r_coeffs, delay_im,
+                       R_TAPS, INTERP, DECIM_2, 0, 0);
+        int n_250k_re = (int)firmr_s16_process(&fir_re, in_re, out_re, (int)n_ch);
+        int n_250k_im = (int)firmr_s16_process(&fir_im, in_im, out_im, (int)n_ch);
+        int n_250k = (n_250k_re < n_250k_im) ? n_250k_re : n_250k_im;
         // Stage 2 stats
         double s2 = 0, s2max = 0;
         for (int i = 0; i < n_250k; i++) {
-            double m = re_buf[i] * re_buf[i] + im_buf[i] * im_buf[i];
+            double m = (double)out_re[i] * out_re[i] + (double)out_im[i] * out_im[i];
             s2 += m;
             double mag = sqrt(m);
             if (mag > s2max) s2max = mag;
         }
-        double rms2 = sqrt(s2 / n_250k);
+        double rms2 = (n_250k > 0) ? sqrt(s2 / n_250k) : 0.0;
         printf("    [diag] burst ch=%d: ch_iq n=%zu rms=%.0f peak=%.0f; resamp n=%d rms=%.0f peak=%.0f\n",
                bb->channel, n_ch, rms1, s1max, n_250k, rms2, s2max);
         free(in_re); free(in_im); free(ch_iq);
 
-        // Convert back to int16 IQ for uw_correlator
+        // Pack into interleaved IQ for uw_correlator / burst_pipeline.
         int16_t *iq250 = malloc(n_250k * 2 * sizeof(int16_t));
         for (int i = 0; i < n_250k; i++) {
-            float r = re_buf[i], v = im_buf[i];
-            if (r >  INT16_MAX) r =  INT16_MAX;
-            if (r <  INT16_MIN) r =  INT16_MIN;
-            if (v >  INT16_MAX) v =  INT16_MAX;
-            if (v <  INT16_MIN) v =  INT16_MIN;
-            iq250[i * 2 + 0] = (int16_t)lrintf(r);
-            iq250[i * 2 + 1] = (int16_t)lrintf(v);
+            iq250[i * 2 + 0] = out_re[i];
+            iq250[i * 2 + 1] = out_im[i];
         }
-        free(re_buf); free(im_buf);
+        free(out_re); free(out_im);
 
         // Hand off to the shared per-burst pipeline (same code path
         // the P4 worker uses). Eliminates the drift between host and
