@@ -208,43 +208,75 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
 #define CORR_FFT_N   1024
 #define CORR_FFT_LOG 10
 static uint16_t s_corr_brev[CORR_FFT_N];
-static float    s_corr_tw_re[CORR_FFT_N / 2];
-static float    s_corr_tw_im[CORR_FFT_N / 2];
+static int16_t  s_corr_tw_re[CORR_FFT_N / 2];   // Q15 cos
+static int16_t  s_corr_tw_im[CORR_FFT_N / 2];   // Q15 sin
 // Pre-computed FFTs of the reversed-conjugated RC-shaped sync
 // references, zero-padded to CORR_FFT_N. Used by the burst-
 // correlation FFT path. gr-iridium pattern: `volk_32fc_conjugate`
 // + `std::reverse` + FFT, stored as `d_dl_preamble_reversed_conj_fft`.
-static float    s_sync_dl_fft_re[CORR_FFT_N];
-static float    s_sync_dl_fft_im[CORR_FFT_N];
-static float    s_sync_ul_fft_re[CORR_FFT_N];
-static float    s_sync_ul_fft_im[CORR_FFT_N];
+// Stored as int32 to match the radix2_fft_q15 internal precision
+// (no per-stage shifting). Memory: 4 × CORR_FFT_N × 4B = 16 KB.
+static int32_t  s_sync_dl_fft_re[CORR_FFT_N];
+static int32_t  s_sync_dl_fft_im[CORR_FFT_N];
+static int32_t  s_sync_ul_fft_re[CORR_FFT_N];
+static int32_t  s_sync_ul_fft_im[CORR_FFT_N];
 
-// Generic radix-2 DIT FFT. Used at both CFO and correlation scales
-// (CFO_FFT_N and CORR_FFT_N are both 1024 in this build; if they
-// ever diverge, give each its own table set).
-static void radix2_fft(float *re, float *im, int N, int log_N,
-                        const uint16_t *brev,
-                        const float *tw_re, const float *tw_im)
+// Block-floating-point Q15 radix-2 DIT FFT. Buffers are int32 to
+// allow growth between stages without truncation; after each stage
+// the max magnitude is checked and the whole buffer right-shifted
+// just enough to keep values bounded. The shift count is returned
+// as `exp_shift` — the true value of bin k is buf[k] × 2^exp_shift.
+//
+// For peak-finding within a single FFT, exp_shift cancels out (all
+// bins share it). For comparing two FFT outputs (e.g. the matched
+// filter's burst × sync product), the caller adds the exponents.
+//
+// Typical case: sparse burst input (280 samples in 1024-pt buffer)
+// barely grows per stage, so only a handful of shifts are needed
+// and precision stays at ~14 bits. Worst case (DC input) shifts
+// every stage, behaving like the standard per-stage-shift FFT.
+static int radix2_fft_q15(int32_t *re, int32_t *im, int N, int log_N,
+                           const uint16_t *brev,
+                           const int16_t *tw_re, const int16_t *tw_im)
 {
     for (int i = 0; i < N; i++) {
         int j = brev[i];
         if (j > i) {
-            float tr = re[i]; re[i] = re[j]; re[j] = tr;
-            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+            int32_t tr = re[i]; re[i] = re[j]; re[j] = tr;
+            int32_t ti = im[i]; im[i] = im[j]; im[j] = ti;
         }
     }
     (void)log_N;
+    int exp_shift = 0;
     for (int stride = 1; stride < N; stride <<= 1) {
+        // Block-float: scan for max abs, shift down if approaching
+        // the int32 ceiling. We pick threshold 2^28 so the next
+        // stage's worst-case 2× growth (→ 2^29) stays well below
+        // INT32_MAX (2^31).
+        int32_t max_abs = 0;
+        for (int i = 0; i < N; i++) {
+            int32_t v = re[i]; if (v < 0) v = -v; if (v > max_abs) max_abs = v;
+            v = im[i];          if (v < 0) v = -v; if (v > max_abs) max_abs = v;
+        }
+        int shift_now = 0;
+        while (max_abs > (1 << 28)) { max_abs >>= 1; shift_now++; }
+        if (shift_now) {
+            for (int i = 0; i < N; i++) {
+                re[i] >>= shift_now;
+                im[i] >>= shift_now;
+            }
+            exp_shift += shift_now;
+        }
         int span = stride << 1;
         int step = (N / 2) / stride;
         for (int k = 0; k < stride; k++) {
-            float wr = tw_re[k * step];
-            float wi = tw_im[k * step];
+            int64_t wr = (int64_t)tw_re[k * step];
+            int64_t wi = (int64_t)tw_im[k * step];
             for (int i = k; i < N; i += span) {
-                float xr = re[i + stride];
-                float xi = im[i + stride];
-                float tr = wr * xr - wi * xi;
-                float ti = wr * xi + wi * xr;
+                int64_t xr = (int64_t)re[i + stride];
+                int64_t xi = (int64_t)im[i + stride];
+                int32_t tr = (int32_t)((wr * xr - wi * xi) >> 15);
+                int32_t ti = (int32_t)((wr * xi + wi * xr) >> 15);
                 re[i + stride] = re[i] - tr;
                 im[i + stride] = im[i] - ti;
                 re[i]          = re[i] + tr;
@@ -252,18 +284,19 @@ static void radix2_fft(float *re, float *im, int N, int log_N,
             }
         }
     }
+    return exp_shift;
 }
 
-// Inverse FFT via conj-FFT-conj/N (gr-iridium uses VOLK's IFFT but
-// this is mathematically identical).
-static void radix2_ifft(float *re, float *im, int N, int log_N,
-                         const uint16_t *brev,
-                         const float *tw_re, const float *tw_im)
+// Inverse FFT via conjugate-FFT-conjugate. Returns the cumulative
+// shift exponent (same convention as radix2_fft_q15).
+static int radix2_ifft_q15(int32_t *re, int32_t *im, int N, int log_N,
+                            const uint16_t *brev,
+                            const int16_t *tw_re, const int16_t *tw_im)
 {
     for (int i = 0; i < N; i++) im[i] = -im[i];
-    radix2_fft(re, im, N, log_N, brev, tw_re, tw_im);
-    float inv = 1.0f / (float)N;
-    for (int i = 0; i < N; i++) { re[i] *= inv; im[i] = -im[i] * inv; }
+    int e = radix2_fft_q15(re, im, N, log_N, brev, tw_re, tw_im);
+    for (int i = 0; i < N; i++) im[i] = -im[i];
+    return e;
 }
 
 static void sync_init(void)
@@ -296,8 +329,8 @@ static void sync_init(void)
     }
     for (int k = 0; k < CORR_FFT_N / 2; k++) {
         double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CORR_FFT_N;
-        s_corr_tw_re[k] = (float)cos(ang);
-        s_corr_tw_im[k] = (float)sin(ang);
+        s_corr_tw_re[k] = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
+        s_corr_tw_im[k] = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
     }
 
     // Pre-compute reversed-conjugated sync FFTs. gr-iridium does:
@@ -306,28 +339,74 @@ static void sync_init(void)
     //   fft_engine.execute(sync_padded → store_buf)
     // For our purposes, the RC-shaped sync is real-imag (1+j axis),
     // so reversed-conjugate is: out[n] = conj(sync[L-1-n]).
-    float tmp_re[CORR_FFT_N], tmp_im[CORR_FFT_N];
+    //
+    // Quantise sync ref to int16 (raw, range up to ±INT16_MAX since
+    // s_sync_*_re/im are in [-1, 1]). FFT into int32 storage so the
+    // full dynamic range is preserved across all stages. After FFT
+    // we renormalise both DL and UL sync FFTs to a common max
+    // magnitude — otherwise the BFP FFT's per-FFT exp_shift would
+    // differ between DL (has a strong DC bin from the all-positive
+    // preamble) and UL (alternating preamble, near-zero DC),
+    // breaking the peak_DL vs peak_UL discrimination in the matched
+    // filter.
+    static int32_t tmp_re[CORR_FFT_N], tmp_im[CORR_FFT_N];
     const int L = SYNC_RRC_LEN;
+    // Target magnitude after sync FFT renormalisation: 2^24 leaves
+    // 7 bits of headroom for the burst×sync multiply (burst FFT max
+    // ~ 2^21, product ~ 2^45, >>15 = 2^30 — fits int32 with margin).
+    const int32_t SYNC_TARGET_MAX = 1 << 24;
     // DL
     memset(tmp_re, 0, sizeof(tmp_re));
     memset(tmp_im, 0, sizeof(tmp_im));
     for (int n = 0; n < L; n++) {
-        tmp_re[n] =  s_sync_dl_re[L - 1 - n];
-        tmp_im[n] = -s_sync_dl_im[L - 1 - n];      // conjugate
+        float r =  s_sync_dl_re[L - 1 - n];
+        float i = -s_sync_dl_im[L - 1 - n];      // conjugate
+        tmp_re[n] = (int32_t)lrintf(r * (float)INT16_MAX);
+        tmp_im[n] = (int32_t)lrintf(i * (float)INT16_MAX);
     }
-    radix2_fft(tmp_re, tmp_im, CORR_FFT_N, CORR_FFT_LOG,
-                s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    (void)radix2_fft_q15(tmp_re, tmp_im, CORR_FFT_N, CORR_FFT_LOG,
+                          s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    {
+        int32_t max_abs = 0;
+        for (int k = 0; k < CORR_FFT_N; k++) {
+            int32_t v = tmp_re[k]; if (v < 0) v = -v; if (v > max_abs) max_abs = v;
+            v = tmp_im[k];          if (v < 0) v = -v; if (v > max_abs) max_abs = v;
+        }
+        if (max_abs > 0) {
+            int64_t scale = ((int64_t)SYNC_TARGET_MAX << 15) / (int64_t)max_abs;
+            for (int k = 0; k < CORR_FFT_N; k++) {
+                tmp_re[k] = (int32_t)(((int64_t)tmp_re[k] * scale) >> 15);
+                tmp_im[k] = (int32_t)(((int64_t)tmp_im[k] * scale) >> 15);
+            }
+        }
+    }
     memcpy(s_sync_dl_fft_re, tmp_re, sizeof(tmp_re));
     memcpy(s_sync_dl_fft_im, tmp_im, sizeof(tmp_im));
     // UL
     memset(tmp_re, 0, sizeof(tmp_re));
     memset(tmp_im, 0, sizeof(tmp_im));
     for (int n = 0; n < L; n++) {
-        tmp_re[n] =  s_sync_ul_re[L - 1 - n];
-        tmp_im[n] = -s_sync_ul_im[L - 1 - n];
+        float r =  s_sync_ul_re[L - 1 - n];
+        float i = -s_sync_ul_im[L - 1 - n];
+        tmp_re[n] = (int32_t)lrintf(r * (float)INT16_MAX);
+        tmp_im[n] = (int32_t)lrintf(i * (float)INT16_MAX);
     }
-    radix2_fft(tmp_re, tmp_im, CORR_FFT_N, CORR_FFT_LOG,
-                s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    (void)radix2_fft_q15(tmp_re, tmp_im, CORR_FFT_N, CORR_FFT_LOG,
+                          s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    {
+        int32_t max_abs = 0;
+        for (int k = 0; k < CORR_FFT_N; k++) {
+            int32_t v = tmp_re[k]; if (v < 0) v = -v; if (v > max_abs) max_abs = v;
+            v = tmp_im[k];          if (v < 0) v = -v; if (v > max_abs) max_abs = v;
+        }
+        if (max_abs > 0) {
+            int64_t scale = ((int64_t)SYNC_TARGET_MAX << 15) / (int64_t)max_abs;
+            for (int k = 0; k < CORR_FFT_N; k++) {
+                tmp_re[k] = (int32_t)(((int64_t)tmp_re[k] * scale) >> 15);
+                tmp_im[k] = (int32_t)(((int64_t)tmp_im[k] * scale) >> 15);
+            }
+        }
+    }
     memcpy(s_sync_ul_fft_re, tmp_re, sizeof(tmp_re));
     memcpy(s_sync_ul_fft_im, tmp_im, sizeof(tmp_im));
 
@@ -362,13 +441,13 @@ static void sync_init(void)
 static inline float parabolic_interp(float yl, float yc, float yr);
 
 static uint16_t s_cfo_brev[CFO_FFT_N];
-static float    s_cfo_tw_re[CFO_FFT_N / 2];
-static float    s_cfo_tw_im[CFO_FFT_N / 2];
-// Blackman windows (matches gr::fft::window::WIN_BLACKMAN):
+static int16_t  s_cfo_tw_re[CFO_FFT_N / 2];     // Q15 cos
+static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin
+// Blackman windows in Q15 (matches gr::fft::window::WIN_BLACKMAN):
 //   w[n] = 0.42 - 0.5·cos(2πn/(N-1)) + 0.08·cos(4πn/(N-1))
-// One for the full preamble+UW window, one for the UW-only fallback.
-static float    s_cfo_window_full[CFO_INPUT_N];
-static float    s_cfo_window_uw[CFO_UW_ONLY_N];
+// Window values are in [0, 1] → Q15 representation [0, INT16_MAX].
+static int16_t  s_cfo_window_full[CFO_INPUT_N];
+static int16_t  s_cfo_window_uw[CFO_UW_ONLY_N];
 static bool     s_cfo_inited = false;
 
 static void cfo_init(void)
@@ -384,44 +463,63 @@ static void cfo_init(void)
     }
     for (int k = 0; k < CFO_FFT_N / 2; k++) {
         double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CFO_FFT_N;
-        s_cfo_tw_re[k] = (float)cos(ang);
-        s_cfo_tw_im[k] = (float)sin(ang);
+        s_cfo_tw_re[k] = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
+        s_cfo_tw_im[k] = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
     }
-    // Blackman windows (gr::fft::window::WIN_BLACKMAN definition).
     const float PI = 3.14159265358979323846f;
     for (int i = 0; i < CFO_INPUT_N; i++) {
         float t = (float)i / (float)(CFO_INPUT_N - 1);
-        s_cfo_window_full[i] = 0.42f - 0.5f * cosf(2.0f * PI * t)
-                                     + 0.08f * cosf(4.0f * PI * t);
+        float w = 0.42f - 0.5f * cosf(2.0f * PI * t)
+                        + 0.08f * cosf(4.0f * PI * t);
+        s_cfo_window_full[i] = (int16_t)lrintf(w * (float)INT16_MAX);
     }
     for (int i = 0; i < CFO_UW_ONLY_N; i++) {
         float t = (float)i / (float)(CFO_UW_ONLY_N - 1);
-        s_cfo_window_uw[i] = 0.42f - 0.5f * cosf(2.0f * PI * t)
-                                   + 0.08f * cosf(4.0f * PI * t);
+        float w = 0.42f - 0.5f * cosf(2.0f * PI * t)
+                        + 0.08f * cosf(4.0f * PI * t);
+        s_cfo_window_uw[i] = (int16_t)lrintf(w * (float)INT16_MAX);
     }
     s_cfo_inited = true;
 }
 
-static void cfo_fft(float *re, float *im)
+// Q15 4096-pt block-floating-point FFT (same scheme as radix2_fft_q15
+// — int32 buffers, scan max before each stage, shift only as needed).
+// Returns the cumulative shift exponent.
+static int cfo_fft_q15(int32_t *re, int32_t *im)
 {
     for (int i = 0; i < CFO_FFT_N; i++) {
         int j = s_cfo_brev[i];
         if (j > i) {
-            float tr = re[i]; re[i] = re[j]; re[j] = tr;
-            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+            int32_t tr = re[i]; re[i] = re[j]; re[j] = tr;
+            int32_t ti = im[i]; im[i] = im[j]; im[j] = ti;
         }
     }
+    int exp_shift = 0;
     for (int stride = 1; stride < CFO_FFT_N; stride <<= 1) {
+        int32_t max_abs = 0;
+        for (int i = 0; i < CFO_FFT_N; i++) {
+            int32_t v = re[i]; if (v < 0) v = -v; if (v > max_abs) max_abs = v;
+            v = im[i];          if (v < 0) v = -v; if (v > max_abs) max_abs = v;
+        }
+        int shift_now = 0;
+        while (max_abs > (1 << 28)) { max_abs >>= 1; shift_now++; }
+        if (shift_now) {
+            for (int i = 0; i < CFO_FFT_N; i++) {
+                re[i] >>= shift_now;
+                im[i] >>= shift_now;
+            }
+            exp_shift += shift_now;
+        }
         int span = stride << 1;
         int step = (CFO_FFT_N / 2) / stride;
         for (int k = 0; k < stride; k++) {
-            float wr = s_cfo_tw_re[k * step];
-            float wi = s_cfo_tw_im[k * step];
+            int64_t wr = (int64_t)s_cfo_tw_re[k * step];
+            int64_t wi = (int64_t)s_cfo_tw_im[k * step];
             for (int i = k; i < CFO_FFT_N; i += span) {
-                float xr = re[i + stride];
-                float xi = im[i + stride];
-                float tr = wr * xr - wi * xi;
-                float ti = wr * xi + wi * xr;
+                int64_t xr = (int64_t)re[i + stride];
+                int64_t xi = (int64_t)im[i + stride];
+                int32_t tr = (int32_t)((wr * xr - wi * xi) >> 15);
+                int32_t ti = (int32_t)((wr * xi + wi * xr) >> 15);
                 re[i + stride] = re[i] - tr;
                 im[i + stride] = im[i] - ti;
                 re[i]          = re[i] + tr;
@@ -429,6 +527,7 @@ static void cfo_fft(float *re, float *im)
             }
         }
     }
+    return exp_shift;
 }
 
 // Square-then-FFT CFO estimator. Uses preamble + UW (~56 samples)
@@ -444,16 +543,15 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
 {
     cfo_init();
 
-    // FFT scratch in BSS — at N=1024 it's 8 KB per array, too big
-    // for stack on the worker task. Function is single-threaded so
-    // static is fine.
-    static float re[CFO_FFT_N], im[CFO_FFT_N];
+    // FFT scratch (BSS, single-threaded function): int32 buffers for
+    // BFP FFT.
+    static int32_t re[CFO_FFT_N], im[CFO_FFT_N];
     memset(re, 0, sizeof(re));
     memset(im, 0, sizeof(im));
 
     // Decide preamble+UW vs UW-only based on what's in range.
     int start, n_in;
-    const float *win;
+    const int16_t *win;
     if (uw_offset_complex >= CFO_PREAMBLE_N &&
         uw_offset_complex - CFO_PREAMBLE_N + CFO_INPUT_N <= n_complex) {
         start = uw_offset_complex - CFO_PREAMBLE_N;
@@ -467,35 +565,49 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
         return 0.0f;       // burst too short, skip
     }
 
-    // Square the windowed region. (re + j·im)² = (re²-im²) + j·(2·re·im).
-    // Normalise by 1/32768 to keep magnitudes in float range and so the
-    // window shape, not amplitude, dominates the FFT spectrum.
-    const float inv_full = 1.0f / 32768.0f;
+    // Square the windowed region. (r + j·m)² = (r²-m²) + j·(2·r·m).
+    // Input samples are int16. Pre-shift them down so squaring then
+    // windowing doesn't overflow int16:
+    //   r' = r >> SQ_SHIFT, |r'| ≤ 2^15/2^SQ_SHIFT
+    //   sq_re = r'² - m'², |sq_re| ≤ 2^(31-2·SQ_SHIFT)
+    //   out  = (sq_re × win_q15) >> 15
+    // For SQ_SHIFT = 8: r' ≤ 128, sq_re ≤ 32768 → multiply by Q15
+    // window, then >> 15 → max ~ 32k, fits in int16 after saturate.
+    const int SQ_SHIFT = 8;
     for (int i = 0; i < n_in; i++) {
-        float w = win[i];
-        float r = (float)burst_2sps[(start + i) * 2 + 0] * inv_full;
-        float m = (float)burst_2sps[(start + i) * 2 + 1] * inv_full;
-        re[i] = (r * r - m * m) * w;
-        im[i] = (2.0f * r * m)   * w;
+        int32_t w = (int32_t)win[i];
+        int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0] >> SQ_SHIFT;
+        int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1] >> SQ_SHIFT;
+        int32_t sq_re = r * r - m * m;
+        int32_t sq_im = 2 * r * m;
+        int32_t out_re = (sq_re * w) >> 15;
+        int32_t out_im = (sq_im * w) >> 15;
+        if (out_re > INT16_MAX) out_re = INT16_MAX;
+        if (out_re < INT16_MIN) out_re = INT16_MIN;
+        if (out_im > INT16_MAX) out_im = INT16_MAX;
+        if (out_im < INT16_MIN) out_im = INT16_MIN;
+        re[i] = (int16_t)out_re;
+        im[i] = (int16_t)out_im;
     }
 
-    cfo_fft(re, im);
+    (void)cfo_fft_q15(re, im);
 
     // Find peak (gr-iridium: std::max_element on magnitude²).
-    float peak_mag = -1.0f;
-    int   peak_k   = 0;
+    int64_t peak_mag = -1;
+    int     peak_k   = 0;
     for (int k = 0; k < CFO_FFT_N; k++) {
-        float m = re[k] * re[k] + im[k] * im[k];
+        int64_t rr = re[k], ii = im[k];
+        int64_t m = rr * rr + ii * ii;
         if (m > peak_mag) { peak_mag = m; peak_k = k; }
     }
-    if (peak_mag <= 1e-9f) return 0.0f;
+    if (peak_mag <= 0) return 0.0f;
 
     // Parabolic interpolation around the peak (with wrap).
     int km1 = (peak_k - 1 + CFO_FFT_N) % CFO_FFT_N;
     int kp1 = (peak_k + 1) % CFO_FFT_N;
-    float yl = re[km1] * re[km1] + im[km1] * im[km1];
-    float yc = peak_mag;
-    float yr = re[kp1] * re[kp1] + im[kp1] * im[kp1];
+    float yl = (float)re[km1] * (float)re[km1] + (float)im[km1] * (float)im[km1];
+    float yc = (float)peak_mag;
+    float yr = (float)re[kp1] * (float)re[kp1] + (float)im[kp1] * (float)im[kp1];
     float delta = parabolic_interp(yl, yc, yr);
 
     // Convert (signed) bin position to rad/sym.
@@ -577,72 +689,86 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     //      (d_dl_preamble_reversed_conj_fft / _ul_).
     //   4. Inverse FFT (d_corr_dl_ifft / _ul_).
     //   5. Find peak of magnitude² (std::max_element).
-    static float burst_re[CORR_FFT_N], burst_im[CORR_FFT_N];
-    static float ifft_re[CORR_FFT_N], ifft_im[CORR_FFT_N];
+    //
+    // int32 buffers throughout. Burst int16 samples are loaded into
+    // int32 slots (still raw scale, e.g. ±32k). Forward FFT preserves
+    // full precision. The burst_fft × sync_fft multiply produces
+    // int64 intermediates that we right-shift by 15 (the Q15 twiddle
+    // scale used inside FFT means the two FFT outputs both carry an
+    // implicit ×1 from twiddle quantisation; the multiply's >>15
+    // normalises one of them out so the IFFT operates on values
+    // comparable to a single-FFT output).
+    static int32_t burst_re[CORR_FFT_N], burst_im[CORR_FFT_N];
+    static int32_t ifft_re[CORR_FFT_N], ifft_im[CORR_FFT_N];
     memset(burst_re, 0, sizeof(burst_re));
     memset(burst_im, 0, sizeof(burst_im));
     int load_n = n_complex < CORR_FFT_N ? n_complex : CORR_FFT_N;
     for (int i = 0; i < load_n; i++) {
-        burst_re[i] = (float)burst_2sps[i * 2 + 0];
-        burst_im[i] = (float)burst_2sps[i * 2 + 1];
+        burst_re[i] = burst_2sps[i * 2 + 0];
+        burst_im[i] = burst_2sps[i * 2 + 1];
     }
-    radix2_fft(burst_re, burst_im, CORR_FFT_N, CORR_FFT_LOG,
-                s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    (void)radix2_fft_q15(burst_re, burst_im, CORR_FFT_N, CORR_FFT_LOG,
+                          s_corr_brev, s_corr_tw_re, s_corr_tw_im);
 
     // The convolution peak for cross-correlation (sync * conj(reversed)
     // ⊛ burst) lands at k = search_position + (L-1) where L = sync
     // length. We compensate by shifting the peak index by -(L-1) when
     // reporting, so peak_k becomes the burst-sample offset where the
     // sync STARTS.
-    float best_dl = 0.0f, best_ul = 0.0f;
-    int   best_dl_k = 0, best_ul_k = 0;
-    float best_dl_re = 0, best_dl_im = 0;
-    float best_ul_re = 0, best_ul_im = 0;
-    double sum_dl = 0, sum_ul = 0;
+    int64_t best_dl = 0, best_ul = 0;
+    int     best_dl_k = 0, best_ul_k = 0;
+    int32_t best_dl_re = 0, best_dl_im = 0;
+    int32_t best_ul_re = 0, best_ul_im = 0;
+    int64_t sum_dl = 0, sum_ul = 0;
     int valid_count = 0;
     const int L_minus_1 = SYNC_RRC_LEN - 1;
 
-    // DL path: multiply burst_fft × sync_dl_fft (elementwise complex),
-    // IFFT, magnitude-find.
+    // DL path: burst_fft × sync_dl_fft (complex multiply), IFFT,
+    // magnitude-find. burst_FFT values bounded by BFP at ≤ 2^28;
+    // sync_FFT values renormalised in sync_init to SYNC_TARGET_MAX =
+    // 2^24. Product ≤ 2^52, so >>21 yields ≤ 2^31 (fits int32 with
+    // no headroom; the IFFT's BFP scan then shifts down further if
+    // needed).
+    const int MUL_SHIFT = 21;
     for (int k = 0; k < CORR_FFT_N; k++) {
-        float ar = burst_re[k], ai = burst_im[k];
-        float br = s_sync_dl_fft_re[k], bi = s_sync_dl_fft_im[k];
-        ifft_re[k] = ar * br - ai * bi;
-        ifft_im[k] = ar * bi + ai * br;
+        int64_t ar = burst_re[k], ai = burst_im[k];
+        int64_t br = s_sync_dl_fft_re[k], bi = s_sync_dl_fft_im[k];
+        ifft_re[k] = (int32_t)((ar * br - ai * bi) >> MUL_SHIFT);
+        ifft_im[k] = (int32_t)((ar * bi + ai * br) >> MUL_SHIFT);
     }
-    radix2_ifft(ifft_re, ifft_im, CORR_FFT_N, CORR_FFT_LOG,
-                 s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    (void)radix2_ifft_q15(ifft_re, ifft_im, CORR_FFT_N, CORR_FFT_LOG,
+                     s_corr_brev, s_corr_tw_re, s_corr_tw_im);
     for (int k = 0; k < search_complex; k++) {
         int idx = k + L_minus_1;
         if (idx >= CORR_FFT_N) break;
-        float re = ifft_re[idx], im = ifft_im[idx];
-        float m2 = re * re + im * im;
+        int64_t re = ifft_re[idx], im = ifft_im[idx];
+        int64_t m2 = re * re + im * im;
         sum_dl += m2;
         if (k == 0) valid_count = 0;
         valid_count++;
         if (m2 > best_dl) {
             best_dl = m2; best_dl_k = k;
-            best_dl_re = re; best_dl_im = im;
+            best_dl_re = ifft_re[idx]; best_dl_im = ifft_im[idx];
         }
     }
     // UL path: same with sync_ul_fft.
     for (int k = 0; k < CORR_FFT_N; k++) {
-        float ar = burst_re[k], ai = burst_im[k];
-        float br = s_sync_ul_fft_re[k], bi = s_sync_ul_fft_im[k];
-        ifft_re[k] = ar * br - ai * bi;
-        ifft_im[k] = ar * bi + ai * br;
+        int64_t ar = burst_re[k], ai = burst_im[k];
+        int64_t br = s_sync_ul_fft_re[k], bi = s_sync_ul_fft_im[k];
+        ifft_re[k] = (int32_t)((ar * br - ai * bi) >> MUL_SHIFT);
+        ifft_im[k] = (int32_t)((ar * bi + ai * br) >> MUL_SHIFT);
     }
-    radix2_ifft(ifft_re, ifft_im, CORR_FFT_N, CORR_FFT_LOG,
-                 s_corr_brev, s_corr_tw_re, s_corr_tw_im);
+    (void)radix2_ifft_q15(ifft_re, ifft_im, CORR_FFT_N, CORR_FFT_LOG,
+                     s_corr_brev, s_corr_tw_re, s_corr_tw_im);
     for (int k = 0; k < search_complex; k++) {
         int idx = k + L_minus_1;
         if (idx >= CORR_FFT_N) break;
-        float re = ifft_re[idx], im = ifft_im[idx];
-        float m2 = re * re + im * im;
+        int64_t re = ifft_re[idx], im = ifft_im[idx];
+        int64_t m2 = re * re + im * im;
         sum_ul += m2;
         if (m2 > best_ul) {
             best_ul = m2; best_ul_k = k;
-            best_ul_re = re; best_ul_im = im;
+            best_ul_re = ifft_re[idx]; best_ul_im = ifft_im[idx];
         }
     }
     if (valid_count <= 1) return;

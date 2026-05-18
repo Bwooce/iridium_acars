@@ -351,9 +351,12 @@ size_t polyphase_channelizer_process(polyphase_channelizer_t *ch,
 
         fft_64(fft_buf);
 
-        // Write out the M channels for this cycle.
+        // Normalise by 1/M so a DC input concentrates at channel 0 with
+        // unity gain (matches gr-iridium's fft_channelizer_impl.cc and
+        // the int16 path's dsps_fft2r_sc16 per-stage scaling).
+        const float fft_norm = 1.0f / (float)M;
         for (int k = 0; k < M; k++) {
-            out_block[cycle * M + k] = fft_buf[k];
+            out_block[cycle * M + k] = fft_buf[k] * fft_norm;
         }
     }
     return n_cycles;
@@ -480,15 +483,19 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
 #else
         // Host fallback: convert int16 → float complex → fft_64 →
         // back to int16 with saturation. Keeps host tests free of
-        // esp-dsp.
+        // esp-dsp. The fft_64 output is NOT normalised, so we divide
+        // by M after to match the target's dsps_fft2r_sc16_arp4
+        // behaviour (per-stage right-shift = /N total). Without this
+        // the int16 path saturates on any real input.
         for (int p = 0; p < M; p++) {
             fft_buf_fc32[p] = (float)fft_buf_i16[p * 2 + 0]
                             + (float)fft_buf_i16[p * 2 + 1] * I;
         }
         fft_64(fft_buf_fc32);
+        const float fft_norm = 1.0f / (float)M;
         for (int k = 0; k < M; k++) {
-            int32_t re = (int32_t)lrintf(crealf(fft_buf_fc32[k]));
-            int32_t im = (int32_t)lrintf(cimagf(fft_buf_fc32[k]));
+            int32_t re = (int32_t)lrintf(crealf(fft_buf_fc32[k]) * fft_norm);
+            int32_t im = (int32_t)lrintf(cimagf(fft_buf_fc32[k]) * fft_norm);
             if      (re > INT16_MAX) re = INT16_MAX;
             else if (re < INT16_MIN) re = INT16_MIN;
             if      (im > INT16_MAX) im = INT16_MAX;

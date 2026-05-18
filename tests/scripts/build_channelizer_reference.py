@@ -71,7 +71,10 @@ def channelize(input_samples, h_phase):
                 idx = (head + n) % N_TAPS_PER_PHASE
                 acc += h_phase[p, n] * dl[p, idx]
             fft_buf[p] = acc
-        out[cycle] = np.fft.fft(fft_buf)
+        # Normalise by 1/M to match gr-iridium's fft_channelizer_impl.cc
+        # and the C channelizer's per-stage scaling (dsps_fft2r_sc16
+        # divides by 2 per stage on target).
+        out[cycle] = np.fft.fft(fft_buf) / float(M)
     return out
 
 def main():
