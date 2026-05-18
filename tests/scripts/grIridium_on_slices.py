@@ -81,16 +81,27 @@ def parse_macro(header_path: Path, name: str) -> int:
 
 
 def run_iridium_extractor(cu8_path: Path, center_hz: int) -> dict:
-    """Run iridium-extractor on a .cu8 file. Returns parsed counts."""
+    """Run iridium-extractor on a .cu8 file. iridium-extractor requires
+    sample_rate divisible by 100000; 2.56 MSPS isn't. We resample the
+    .cu8 to 2.5 MSPS (factor 125/128) using scipy before running."""
+    import numpy as np
+    from scipy.signal import resample_poly
+    cu8 = np.fromfile(cu8_path, dtype=np.uint8)
+    iq = (cu8.astype(np.float32) - 128.0) / 128.0
+    cf = iq[0::2] + 1j * iq[1::2]
+    cf_25 = resample_poly(cf, up=125, down=128).astype(np.complex64)
+    cf32_path = cu8_path.with_suffix(".cf32")
+    cf_25.tofile(cf32_path)
+
     cmd = [
         "iridium-extractor",
         "-c", str(center_hz),
-        "-r", str(SAMPLE_RATE_HZ),
-        "-f", "cu8",
+        "-r", "2500000",
+        "-f", "cf32_le",
         "--offline",
-        str(cu8_path),
+        str(cf32_path),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     stdout = res.stdout
     stderr = res.stderr
     # iridium-extractor writes RAW: lines for each decoded burst to stdout.
