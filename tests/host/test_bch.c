@@ -141,6 +141,97 @@ int main(void)
         failed++;
     }
 
+    // Test 5: Chase-2 soft-decision decoder on clean inputs. Soft
+    // inputs are +/- 1000 with sign matching the codeword bit. K=3
+    // tries 8 hypotheses; on a clean codeword the unflipped one wins
+    // with distance 0.
+    printf("Test 5: Chase-2 clean codeword decode\n");
+    for (unsigned seed = 1; seed <= 4; seed++) {
+        uint8_t msg[21], cw[31], out_msg[21];
+        int16_t soft[31];
+        random_message(msg, seed);
+        bch_encode(msg, cw);
+        for (int i = 0; i < 31; i++) soft[i] = cw[i] ? -1000 : +1000;
+        int rc = bch_decode_block_soft(soft, out_msg, 3);
+        if (rc >= 0 && bits_eq(msg, out_msg, 21)) passed++; else {
+            failed++; printf("  FAIL: seed=%u rc=%d\n", seed, rc);
+        }
+    }
+
+    // Test 6: Chase-2 corrects 3 errors (beyond hard's t=2 limit) when
+    // the LCBs are positioned correctly. We flip 3 bits but mark them
+    // as "least reliable" by giving them small magnitude soft values.
+    // K=3 should find them and decode correctly.
+    printf("Test 6: Chase-2 corrects 3-bit errors at LCBs (K=3)\n");
+    srand(123);
+    for (int trial = 0; trial < 50; trial++) {
+        uint8_t msg[21], cw[31], out_msg[21];
+        int16_t soft[31];
+        random_message(msg, trial + 1);
+        bch_encode(msg, cw);
+        // Pick 3 distinct positions for errors.
+        int errs[3];
+        for (int i = 0; i < 3; i++) {
+            int p;
+            do { p = rand() % 31; } while (
+                (i > 0 && p == errs[0]) ||
+                (i > 1 && p == errs[1]));
+            errs[i] = p;
+        }
+        // Build soft: high magnitude where correct, low magnitude at
+        // error positions (= LCBs), with sign matching the CORRUPTED bit.
+        for (int i = 0; i < 31; i++) {
+            int bit = cw[i];
+            int err = (i == errs[0] || i == errs[1] || i == errs[2]);
+            if (err) bit ^= 1;
+            soft[i] = bit ? -50 : +50;   // low magnitude = LCB
+            if (!err) soft[i] *= 20;     // high magnitude = trustworthy
+        }
+        int rc = bch_decode_block_soft(soft, out_msg, 3);
+        // Hard decode of the corrupted word should FAIL (or mis-decode);
+        // Chase-2 should recover.
+        if (rc >= 0 && bits_eq(msg, out_msg, 21)) passed++; else {
+            failed++;
+            printf("  FAIL: trial %d errs=[%d,%d,%d] rc=%d\n",
+                   trial, errs[0], errs[1], errs[2], rc);
+        }
+    }
+
+    // Test 7: Chase-2 with K=4 corrects 4 errors at LCBs.
+    printf("Test 7: Chase-2 corrects 4-bit errors at LCBs (K=4)\n");
+    srand(456);
+    for (int trial = 0; trial < 50; trial++) {
+        uint8_t msg[21], cw[31], out_msg[21];
+        int16_t soft[31];
+        random_message(msg, trial + 100);
+        bch_encode(msg, cw);
+        int errs[4];
+        for (int i = 0; i < 4; i++) {
+            int p;
+            do {
+                p = rand() % 31;
+            } while (
+                (i > 0 && p == errs[0]) ||
+                (i > 1 && p == errs[1]) ||
+                (i > 2 && p == errs[2]));
+            errs[i] = p;
+        }
+        for (int i = 0; i < 31; i++) {
+            int bit = cw[i];
+            int err = (i == errs[0] || i == errs[1] ||
+                       i == errs[2] || i == errs[3]);
+            if (err) bit ^= 1;
+            soft[i] = bit ? -50 : +50;
+            if (!err) soft[i] *= 20;
+        }
+        int rc = bch_decode_block_soft(soft, out_msg, 4);
+        if (rc >= 0 && bits_eq(msg, out_msg, 21)) passed++; else {
+            failed++;
+            printf("  FAIL: trial %d errs=[%d,%d,%d,%d] rc=%d\n",
+                   trial, errs[0], errs[1], errs[2], errs[3], rc);
+        }
+    }
+
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }
