@@ -255,6 +255,18 @@ target_include_directories(test_uw_correlator_albq PRIVATE
 )
 target_link_libraries(test_uw_correlator_albq PRIVATE m)
 
+# Same pipeline on the (only) UL burst in the Albuquerque corpus —
+# exercises uw_correlator's UL sync pattern + direction discrimination.
+add_executable(test_uw_correlator_albq_ul
+    test_uw_correlator_albq_ul.c
+    ${COMMON_DIR}/uw_correlator.c
+)
+target_include_directories(test_uw_correlator_albq_ul PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_uw_correlator_albq_ul PRIVATE m)
+
 # Per-stage SNR-gap measurement test (diagnostic, always-passes).
 # Feeds ALBQ_RAW_UINT8 — the same raw uint8 SDR data gr-iridium
 # decoded at known SNRs — through our channelizer and reports the
@@ -294,6 +306,7 @@ add_test(NAME freq_estimator       COMMAND test_freq_estimator)
 add_test(NAME sym_timing           COMMAND test_sym_timing)
 add_test(NAME uw_correlator_cfo    COMMAND test_uw_correlator_cfo)
 add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
+add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
 add_test(NAME snr_gap_measurement  COMMAND test_snr_gap_measurement)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
