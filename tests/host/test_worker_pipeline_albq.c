@@ -208,11 +208,22 @@ int main(void)
         }
         double rms1 = sqrt(s1 / n_ch);
 
-        // Save first ≥300-sample burst's channelizer output for
-        // spectrum analysis in Python. Diagnostic — one shot.
-        static int diag_dump_done = 0;
-        if (!diag_dump_done && n_ch >= 300) {
-            FILE *f = fopen("/tmp/host_burst_ch40k.cf32", "wb");
+        // Per-stage host signal dumps for the gr-iridium stagewise
+        // comparison. Set HOST_DIAG_CH=<ch> in the env to dump
+        // /tmp/host_signals/<stage>.cf32 for the first burst on that
+        // channel (matches gr-iridium's signal-{stage}-{burst_id}.cfile
+        // dumps from its d_debug path). All dumps are interleaved
+        // float32 IQ in [-1, +1] (after int16 scaling), same as
+        // gr-iridium's .cfile format.
+        static int host_diag_ch = -2;   // -2 = uninit, -1 = disabled
+        static int host_diag_done = 0;
+        if (host_diag_ch == -2) {
+            const char *env = getenv("HOST_DIAG_CH");
+            host_diag_ch = env ? atoi(env) : -1;
+        }
+        if (!host_diag_done && bb->channel == host_diag_ch) {
+            system("mkdir -p /tmp/host_signals");
+            FILE *f = fopen("/tmp/host_signals/01_channelizer_40k.cf32", "wb");
             if (f) {
                 for (size_t i = 0; i < n_ch; i++) {
                     float fr = (float)ch_iq[i*2+0] / 32768.0f;
@@ -221,10 +232,10 @@ int main(void)
                     fwrite(&fi, 4, 1, f);
                 }
                 fclose(f);
-                fprintf(stderr, "    [dump] saved %zu cplx samples (40 kHz, burst ch=%d) to /tmp/host_burst_ch40k.cf32\n",
-                        n_ch, bb->channel);
-                diag_dump_done = 1;
+                fprintf(stderr, "    [host-diag] ch=%d 40k: %zu cplx → /tmp/host_signals/01_channelizer_40k.cf32\n",
+                        bb->channel, n_ch);
             }
+            host_diag_done = 1;
         }
 
         // Residual freq-shift to Iridium grid — kept for now to isolate
@@ -289,6 +300,25 @@ int main(void)
             iq250[i * 2 + 1] = out_im[i];
         }
         free(out_re); free(out_im);
+
+        // Per-stage diag dump (HOST_DIAG_CH-matched bursts only).
+        // Dumps the resampled 250 kHz signal which is what gr-iridium's
+        // "signal-filtered-deci-{id}.cfile" captures.
+        if (host_diag_ch >= 0 && bb->channel == host_diag_ch && host_diag_done == 1) {
+            FILE *f = fopen("/tmp/host_signals/03_resamp_250k.cf32", "wb");
+            if (f) {
+                for (int i = 0; i < n_250k; i++) {
+                    float fr = (float)iq250[i*2+0] / 32768.0f;
+                    float fi = (float)iq250[i*2+1] / 32768.0f;
+                    fwrite(&fr, 4, 1, f);
+                    fwrite(&fi, 4, 1, f);
+                }
+                fclose(f);
+                fprintf(stderr, "    [host-diag] ch=%d 250k: %d cplx → /tmp/host_signals/03_resamp_250k.cf32\n",
+                        bb->channel, n_250k);
+            }
+            host_diag_done = 2;       // advance past resample stage
+        }
 
         // Hand off to the shared per-burst pipeline (same code path
         // the P4 worker uses). Eliminates the drift between host and

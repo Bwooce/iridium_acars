@@ -80,7 +80,8 @@ def parse_macro(header_path: Path, name: str) -> int:
     return int(val, 0)
 
 
-def run_iridium_extractor(cu8_path: Path, center_hz: int) -> dict:
+def run_iridium_extractor(cu8_path: Path, center_hz: int,
+                           extra_args=None) -> dict:
     """Run iridium-extractor on a .cu8 file. iridium-extractor requires
     sample_rate divisible by 100000; 2.56 MSPS isn't. We resample the
     .cu8 to 2.5 MSPS (factor 125/128) using scipy before running."""
@@ -101,6 +102,11 @@ def run_iridium_extractor(cu8_path: Path, center_hz: int) -> dict:
         "--offline",
         str(cf32_path),
     ]
+    # Optional: pass --debug-id <id> through. When set, gr-iridium dumps
+    # per-stage signal files for that burst into /tmp/signals/. Used by
+    # tests/scripts/stagewise_compare.py to diff against host pipeline.
+    if extra_args:
+        cmd.extend(extra_args)
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     stdout = res.stdout
     stderr = res.stderr

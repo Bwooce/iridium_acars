@@ -27,3 +27,4 @@ p4_performance.log
 esp32p4-usb-host-benchmark/tests/host/build/
 build-host*/
 tests/host/build_*/
+tests/scripts/__pycache__/
