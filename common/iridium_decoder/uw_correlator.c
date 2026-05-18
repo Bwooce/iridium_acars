@@ -599,14 +599,16 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     int sq_shift = 0;
     while ((peak_abs >> sq_shift) > (1 << 11)) sq_shift++;
     for (int i = 0; i < n_in; i++) {
-        int32_t w = (int32_t)win[i];
+        int64_t w = (int64_t)win[i];
         int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0] >> sq_shift;
         int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1] >> sq_shift;
         int32_t sq_re = r * r - m * m;
         int32_t sq_im = 2 * r * m;
+        // sq_re/sq_im can reach 2^22, win is Q15 (≤ 2^15), so the
+        // product can hit 2^37 — must use int64 to avoid overflow.
         // No int16 cast — FFT input is int32 BFP, full int32 range OK.
-        re[i] = (sq_re * w) >> 15;
-        im[i] = (sq_im * w) >> 15;
+        re[i] = (int32_t)((sq_re * w) >> 15);
+        im[i] = (int32_t)((sq_im * w) >> 15);
     }
 
     (void)cfo_fft_q15(re, im);

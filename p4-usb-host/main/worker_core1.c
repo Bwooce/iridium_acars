@@ -308,13 +308,22 @@ void worker_task(void *arg)
             // parabolic peak interpolation, NOT a continuous Gardner
             // loop. New uw_correlator module replaces this hook.)
 
-            // gr-iridium-aligned order (burst_downmix_impl.cc lines
-            // 841-880 then 584-650):
+            // gr-iridium-aligned order (burst_downmix_impl.cc
+            // ::process_next_frame, lines 506-594):
             //   1. D13 start_finder on the raw resampled burst.
-            //   2. RRC matched filter on the trimmed burst.
-            //   3. uw_correlator_find on the trimmed+RRC'd burst.
-            //   4. (existing) peak-phase + omega pre-rotation, then
-            //      qpsk_demod_process.
+            //   2. Squared-FFT CFO on PRE-RRC signal anchored at
+            //      D13 burst start.
+            //   3. Freq-correct adj_burst by the coarse omega.
+            //   4. RRC matched filter on the corrected burst.
+            //   5. uw_correlator_find — its internal squared-FFT now
+            //      finds a small residual.
+            //   6. (existing) peak-phase + residual omega pre-rotation,
+            //      then qpsk_demod_process.
+            //
+            // The coarse CFO must precede RRC: the 2f_c tone of a
+            // band-edge carrier is outside the RRC passband and would
+            // be attenuated post-RRC, leaving the squared-FFT picking
+            // DC leakage instead of the carrier residual.
             //
             // Search the whole burst for the envelope onset — gr-iridium
             // uses d_search_depth ~1000-3000 samples; we pass the full
@@ -325,6 +334,45 @@ void worker_task(void *arg)
                                   /*search_max=*/out_samples_50k);
             int16_t *adj_burst = demod_interleaved + burst_start * 2;
             int adj_n = out_samples_50k - burst_start;
+
+            // Pre-RRC squared-FFT CFO estimate.
+            float omega_coarse = uw_correlator_estimate_cfo(adj_burst, adj_n);
+            if (omega_coarse != 0.0f) {
+                // Phase-correct adj_burst in place by exp(+j·omega/sps·n).
+                // Sign convention matches uw_correlator's returned omega:
+                // negative of the actual offset, so multiplying by
+                // exp(+j·omega/sps·n) cancels the residual.
+                float dphi = omega_coarse / (float)UW_SPS;
+                #define Q15F_LOCAL(x)  ((int16_t)lrintf((x) * 32767.0f))
+                int16_t pr_q = Q15F_LOCAL(1.0f);
+                int16_t pi_q = Q15F_LOCAL(0.0f);
+                int16_t cs_q = Q15F_LOCAL(cosf(dphi));
+                int16_t ss_q = Q15F_LOCAL(sinf(dphi));
+                #undef Q15F_LOCAL
+                for (int i = 0; i < adj_n; i++) {
+                    int32_t r = adj_burst[i * 2 + 0];
+                    int32_t v = adj_burst[i * 2 + 1];
+                    int32_t nr = ((int32_t)r * pr_q - (int32_t)v * pi_q) >> 15;
+                    int32_t ni = ((int32_t)r * pi_q + (int32_t)v * pr_q) >> 15;
+                    if (nr > INT16_MAX) nr = INT16_MAX;
+                    if (nr < INT16_MIN) nr = INT16_MIN;
+                    if (ni > INT16_MAX) ni = INT16_MAX;
+                    if (ni < INT16_MIN) ni = INT16_MIN;
+                    adj_burst[i * 2 + 0] = (int16_t)nr;
+                    adj_burst[i * 2 + 1] = (int16_t)ni;
+                    int32_t npr = ((int32_t)pr_q * cs_q
+                                 - (int32_t)pi_q * ss_q) >> 15;
+                    int32_t npi = ((int32_t)pr_q * ss_q
+                                 + (int32_t)pi_q * cs_q) >> 15;
+                    if (npr > INT16_MAX) npr = INT16_MAX;
+                    if (npr < INT16_MIN) npr = INT16_MIN;
+                    if (npi > INT16_MAX) npi = INT16_MAX;
+                    if (npi < INT16_MIN) npi = INT16_MIN;
+                    pr_q = (int16_t)npr;
+                    pi_q = (int16_t)npi;
+                }
+            }
+
             uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
             ESP_LOGI(TAG, "D13 burst start: %d (of %d samples)",
                      burst_start, out_samples_50k);
