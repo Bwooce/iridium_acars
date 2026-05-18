@@ -268,7 +268,9 @@ int main(void)
         int bstart = uw_correlator_find_burst_start(iq250, n_250k, n_250k);
         int16_t *adj = iq250 + bstart * 2;
         int adj_n = n_250k - bstart;
+#ifndef SKIP_RRC
         uw_correlator_apply_rrc(adj, adj, adj_n);
+#endif
         uw_corr_result_t uw;
         uw_correlator_find(adj, adj_n, adj_n - 24, &uw);
 
