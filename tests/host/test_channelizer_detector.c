@@ -77,8 +77,13 @@ static void run_detector_on_fixture(uint32_t fs_hz,
     printf("Test: detector on %s (%d gr-iridium bursts expected)\n",
            label, n_expected);
     burst_collector_t coll = {0};
+    // Per-test override of the global threshold via env var (set in
+    // the failing case to bisect whether the miss is "burst not seen"
+    // vs "burst seen but threshold too high").
+    const char *env_thr = getenv("DETECTOR_DB");
+    float thr_db = env_thr ? (float)atof(env_thr) : 16.0f;
     channelizer_detector_t *d = channelizer_detector_create(
-        fs_hz, 16.0f, collect_cb, &coll);
+        fs_hz, thr_db, collect_cb, &coll);
     CHECK(d != NULL, "create");
 
     size_t n_complex = 0;
