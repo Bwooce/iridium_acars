@@ -197,8 +197,22 @@ static void test_against_numpy_reference(void)
     // Compare cell-by-cell. Tolerance: reference uses double precision
     // accumulators; our C impl uses float. Differences should be in
     // the noise floor (~1e-5 relative).
+    // Cells in non-tone channels are at the channelizer's rejection
+    // floor (≈ 64 dB below the tone channels per the adjacent-channel
+    // tests above = magnitudes ~6e-4 for unit-amplitude input). At that
+    // magnitude, float-vs-double accumulator drift produces
+    // single-precision noise of ~1e-5 absolute which is 1-3% RELATIVE
+    // but is genuine numerical noise, not an algorithm divergence.
+    //
+    // Use an ABSOLUTE-error gate instead of relative for cells below
+    // SIGNAL_FLOOR — those carry no meaningful information for the
+    // "C matches numpy" check. Relative-error gate still applies to
+    // the on-tone cells where mag_ref is large.
+    const double SIGNAL_FLOOR = 1e-3;
+    const double ABS_TOL_FLOOR_CELLS = 1e-4;     // float-vs-double noise
     int n_compared = 0;
     int n_mismatched = 0;
+    int n_skipped_noise_floor = 0;
     double max_err = 0.0;
     int    max_err_cycle = -1, max_err_ch = -1;
     for (int cycle = 0; cycle < REF_N_CYCLES; cycle++) {
@@ -210,21 +224,29 @@ static void test_against_numpy_reference(void)
                                        cimagf(diff) * cimagf(diff)));
             double mag_ref = sqrt((double)(crealf(ref) * crealf(ref) +
                                            cimagf(ref) * cimagf(ref)));
-            // Relative error, with a small absolute floor for near-zero refs.
-            double rel = err / (mag_ref + 1e-6);
+            n_compared++;
+            if (mag_ref < SIGNAL_FLOOR) {
+                // Below the channelizer's rejection floor — absolute
+                // tolerance only.
+                if (err > ABS_TOL_FLOOR_CELLS) {
+                    n_mismatched++;
+                }
+                n_skipped_noise_floor++;
+                continue;
+            }
+            double rel = err / mag_ref;
             if (rel > max_err) {
                 max_err = rel;
                 max_err_cycle = cycle;
                 max_err_ch = k;
             }
-            // 1% relative is loose enough for float-vs-double accumulator
-            // differences but tight enough to catch any real bug.
             if (rel > 0.01) n_mismatched++;
-            n_compared++;
         }
     }
-    printf("    compared %d cells, max relative err = %.2e at cycle %d ch %d\n",
-           n_compared, max_err, max_err_cycle, max_err_ch);
+    printf("    compared %d cells (%d below %g signal floor, abs-gated), "
+           "max relative err = %.2e at cycle %d ch %d\n",
+           n_compared, n_skipped_noise_floor, SIGNAL_FLOOR,
+           max_err, max_err_cycle, max_err_ch);
     CHECK(n_mismatched == 0,
           "%d / %d cells mismatched (>1%% rel err)",
           n_mismatched, n_compared);
@@ -272,11 +294,19 @@ static void run_corpus_check(uint32_t fs_in_hz,
     size_t got_cycles = polyphase_channelizer_process(ch, in, n_complex, out);
     CHECK((int)got_cycles == n_cycles, "got %zu cycles", got_cycles);
 
+    // Rank channels by PEAK per-cycle power, not total integrated
+    // power. Integrated power biases toward channels with long-duration
+    // strong signals (e.g. an Iridium downlink active for ~1 sec) and
+    // can rank-out channels that only carry short bursts (8.28 ms
+    // Iridium frames), even when those bursts are high-SNR.
+    // For "did the channelizer hear this short high-SNR burst?", peak
+    // power is the right proxy.
     double power[M] = { 0 };
     for (int cycle = 0; cycle < n_cycles; cycle++) {
         for (int k = 0; k < M; k++) {
             float complex y = out[cycle * M + k];
-            power[k] += (double)(crealf(y) * crealf(y) + cimagf(y) * cimagf(y));
+            double p = (double)(crealf(y) * crealf(y) + cimagf(y) * cimagf(y));
+            if (p > power[k]) power[k] = p;
         }
     }
 

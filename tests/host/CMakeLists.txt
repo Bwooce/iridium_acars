@@ -4,6 +4,26 @@ project(p4_usb_host_tests C)
 set(CMAKE_C_STANDARD 11)
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -O2 -g)
 
+# UBSan: runtime trap on signed-integer overflow and related UB. Caught
+# a real bug in cfo_fine_estimate (sq_re×Q15 window overflowing int32).
+# Off by default — the firmware build doesn't need the runtime overhead,
+# and the channelizer's overflow-on-extreme-input is itself test
+# fixture data not real-RF. Enable with `cmake -DHOST_TESTS_UBSAN=ON`.
+option(HOST_TESTS_UBSAN "Build host tests with -fsanitize=signed-integer-overflow,shift,bounds" OFF)
+if(HOST_TESTS_UBSAN)
+    add_compile_options(
+        -fsanitize=signed-integer-overflow
+        -fsanitize=shift
+        -fsanitize=bounds
+        -fno-sanitize-recover=signed-integer-overflow,shift,bounds
+    )
+    add_link_options(
+        -fsanitize=signed-integer-overflow
+        -fsanitize=shift
+        -fsanitize=bounds
+    )
+endif()
+
 # Pull production sources directly from common/iridium_decoder/ so the
 # host tests exercise the exact code that runs on the target. The
 # decoder lives in common/ so it can be shared with the future worker
