@@ -71,3 +71,17 @@ typedef struct {
 // free when demod_ok).
 bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
                                     burst_pipeline_result_t *result);
+
+// Diagnostic: when non-NULL, the pipeline writes intermediate
+// signals (as interleaved float32 IQ in [-1, +1]) to the given
+// directory before/after each major stage. Filenames match the
+// /tmp/host_signals/ layout that tests/scripts/stagewise_compare.py
+// expects:
+//   04_post_d13_250k.cf32   — after start_finder trim, pre-CFO
+//   05_post_cfo_250k.cf32   — after coarse omega freq-correction
+//   06_post_rrc_250k.cf32   — after RRC matched filter
+//   07_post_prerot_250k.cf32 — after peak-phase + linear-ramp rotation
+// Call burst_pipeline_set_dump_dir(NULL) to disable. Single global
+// state — only the next call to burst_pipeline_process_250khz dumps,
+// then auto-disables (to avoid dumping every burst).
+void burst_pipeline_set_dump_once(const char *dir);

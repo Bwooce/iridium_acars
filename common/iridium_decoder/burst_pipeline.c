@@ -3,8 +3,45 @@
 #include "burst_pipeline.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// One-shot diagnostic dump state. Set via burst_pipeline_set_dump_once();
+// after the next process_250khz call consumes it, it's auto-cleared so
+// only one burst gets dumped.
+static char s_dump_dir[256] = {0};
+static int  s_dump_pending = 0;
+
+void burst_pipeline_set_dump_once(const char *dir)
+{
+    if (dir) {
+        strncpy(s_dump_dir, dir, sizeof(s_dump_dir) - 1);
+        s_dump_dir[sizeof(s_dump_dir) - 1] = 0;
+        s_dump_pending = 1;
+    } else {
+        s_dump_dir[0] = 0;
+        s_dump_pending = 0;
+    }
+}
+
+static void dump_iq_cf32(const char *fname, const int16_t *iq, int n_complex)
+{
+    if (!s_dump_pending || s_dump_dir[0] == 0) return;
+    char path[400];
+    snprintf(path, sizeof(path), "%s/%s.cf32", s_dump_dir, fname);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    for (int i = 0; i < n_complex; i++) {
+        float fr = (float)iq[i * 2 + 0] / 32768.0f;
+        float fi = (float)iq[i * 2 + 1] / 32768.0f;
+        fwrite(&fr, 4, 1, f);
+        fwrite(&fi, 4, 1, f);
+    }
+    fclose(f);
+    fprintf(stderr, "    [burst-pipeline-dump] %s: %d cplx\n",
+            path, n_complex);
+}
 
 #ifndef UW_SPS
 // Tests/host stubs don't always pull the same UW_SPS source as the
@@ -72,6 +109,8 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
         return false;
     }
 
+    dump_iq_cf32("04_post_d13_250k", adj_burst, adj_n);
+
     // 2. Pre-RRC squared-FFT CFO estimate on the trimmed burst.
     float omega_coarse = uw_correlator_estimate_cfo(adj_burst, adj_n);
     result->omega_coarse = omega_coarse;
@@ -89,8 +128,12 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
                                q15_from_float(sinf(dphi)));
     }
 
+    dump_iq_cf32("05_post_cfo_250k", adj_burst, adj_n);
+
     // 4. RRC matched filter.
     uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
+
+    dump_iq_cf32("06_post_rrc_250k", adj_burst, adj_n);
 
     // 5. UW correlator (matched filter peak + direction + residual CFO).
     //    Limit the search range to (PREAMBLE_LONG + UW + 8 syms) × sps
@@ -176,6 +219,11 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
         }
     }
 
+    // Dump POST-rotation 10 sps stream (before decim) so the
+    // stagewise compare can see what qpsk_demod sees pre-decimation.
+    dump_iq_cf32("07_post_prerot_250k", src,
+                 n_rot - 1 > 0 ? n_rot - 1 : 0);
+
     // 7. 5:1 decimation 10 sps → 2 sps. In-place: read every 5th
     //    complex sample, write back to the start of `src`.
     //    Use `n_rot` (not `n_rot - 1`) to match the legacy worker's
@@ -188,9 +236,13 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     }
     result->n_post_2sps = n_post_cplx;
 
+    dump_iq_cf32("08_decim_2sps", src, n_post_cplx);
+
     // 8. qpsk_demod.
     if (qpsk_demod_process(src, n_post_cplx * 2, &result->frame)) {
         result->demod_ok = true;
     }
+    // Clear the one-shot dump trigger so subsequent bursts don't dump.
+    s_dump_pending = 0;
     return true;
 }

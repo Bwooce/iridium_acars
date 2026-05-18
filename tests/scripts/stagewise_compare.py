@@ -136,21 +136,29 @@ def main():
     host_dir = Path("/tmp/host_signals")
 
     # The stages we have host dumps for currently.
+    bid = args.burst_id
     pairs = [
         # (label, gr-iridium file, host file, sample_rate_hz)
         ("post-resample 250k",
-         gr_dir / f"signal-filtered-deci-{args.burst_id}.cfile",
+         gr_dir / f"signal-filtered-deci-{bid}.cfile",
          host_dir / "03_resamp_250k.cf32",
          250_000),
-        # Future host-side dumps:
-        # ("post start_finder",  ".../...-cut-start-{id}.cfile",
-        #  host_dir / "04_post_d13_250k.cf32",  250_000),
-        # ("post CFO shift",
-        #  ".../...-cut-start-shift-{id}.cfile",
-        #  host_dir / "05_post_cfo_250k.cf32",  250_000),
-        # ("post RRC",
-        #  ".../...-cut-start-shift-rrc-{id}.cfile",
-        #  host_dir / "06_post_rrc_250k.cf32",  250_000),
+        ("post start_finder",
+         gr_dir / f"signal-filtered-deci-cut-start-{bid}.cfile",
+         host_dir / "04_post_d13_250k.cf32",
+         250_000),
+        ("post CFO shift",
+         gr_dir / f"signal-filtered-deci-cut-start-shift-{bid}.cfile",
+         host_dir / "05_post_cfo_250k.cf32",
+         250_000),
+        ("post RRC",
+         gr_dir / f"signal-filtered-deci-cut-start-shift-rrc-{bid}.cfile",
+         host_dir / "06_post_rrc_250k.cf32",
+         250_000),
+        ("post phase-rot",
+         gr_dir / f"signal-filtered-deci-cut-start-shift-rrc-rotate-{bid}.cfile",
+         host_dir / "07_post_prerot_250k.cf32",
+         250_000),
     ]
 
     print(f"Comparing gr-iridium burst {args.burst_id} vs host channel "

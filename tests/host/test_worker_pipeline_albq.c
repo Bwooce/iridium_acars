@@ -321,7 +321,8 @@ int main(void)
 
         // Per-stage diag dump (HOST_DIAG_CH-matched bursts only).
         // Dumps the resampled 250 kHz signal which is what gr-iridium's
-        // "signal-filtered-deci-{id}.cfile" captures.
+        // "signal-filtered-deci-{id}.cfile" captures, then arms
+        // burst_pipeline to dump its internal stages (04..08).
         if (host_diag_ch >= 0 && bb->channel == host_diag_ch && host_diag_done == 1) {
             FILE *f = fopen("/tmp/host_signals/03_resamp_250k.cf32", "wb");
             if (f) {
@@ -332,6 +333,7 @@ int main(void)
                     fwrite(&fi, 4, 1, f);
                 }
                 fclose(f);
+                burst_pipeline_set_dump_once("/tmp/host_signals");
                 fprintf(stderr, "    [host-diag] ch=%d 250k: %d cplx → /tmp/host_signals/03_resamp_250k.cf32\n",
                         bb->channel, n_250k);
             }
