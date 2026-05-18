@@ -374,15 +374,20 @@ void smoke_test_run(void)
     // SDR tuned to ALBQ_RAW_LO_HZ would actually emit. Bursts at their
     // natural offsets in the 2.56 MHz subband, no per-burst pre-shift,
     // so worker_core1's peak_bin -> freq-centre chain can demod them.
-    ESP_LOGI(TAG, "Phase 2 (raw-mode @ %u Hz): 3× %u-byte transfers (%u expected bursts)",
-             ALBQ_RAW_LO_HZ, TRANSFER_BYTES, ALBQ_RAW_EXPECTED_BURSTS);
-    for (int t = 0; t < 3; t++) {
+    //
+    // D7+: fixture is now ~1 sec at 2.56 MSPS (5 MB) so we have parity
+    // with gr-iridium's fft_burst_tagger setup latency. gr-iridium
+    // decodes ~32 IDA frames from this time window at 12 MSPS, of
+    // which ~15 are in our subband — that's the decode target.
+    const unsigned int n_xfers = ALBQ_RAW_UINT8_LEN / TRANSFER_BYTES;
+    ESP_LOGI(TAG, "Phase 2 (raw-mode @ %u Hz): %u× %u-byte transfers "
+                  "(~%u ms, %u expected bursts in subband)",
+             ALBQ_RAW_LO_HZ, n_xfers, TRANSFER_BYTES,
+             (n_xfers * TRANSFER_BYTES) / (2u * 2560u),  // ms at 2.56 MSPS
+             ALBQ_RAW_EXPECTED_BURSTS);
+    for (unsigned int t = 0; t < n_xfers; t++) {
         unsigned int off = t * TRANSFER_BYTES;
-        if (off + TRANSFER_BYTES <= ALBQ_RAW_UINT8_LEN) {
-            memcpy(synth, ALBQ_RAW_UINT8 + off, TRANSFER_BYTES);
-        } else {
-            memset(synth, 128, TRANSFER_BYTES);
-        }
+        memcpy(synth, ALBQ_RAW_UINT8 + off, TRANSFER_BYTES);
         prev_slot = drive_transfer(synth, prev_slot);
         vTaskDelay(1);
     }

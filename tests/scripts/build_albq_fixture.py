@@ -425,16 +425,37 @@ def main() -> int:
          "Albuquerque cf32 @ LO=1625.5 MHz (catches the 1625.27 MHz IDA-DL "
          "high-SNR burst used by test_demod_albq)"),
     ]
+    # Long-mode raw fixture: 1 sec slice (vs the 9.6 ms used for the
+    # channelizer cross-check). gr-iridium's fft_burst_tagger needs
+    # ~87 ms of FFT history before it'll emit bursts (see
+    # tests/scripts/grIridium_on_slices.py — 0 frames decoded from any
+    # 200 ms window). 1 sec at 2.56 MSPS = 5 MB uint8 IQ, fits in the
+    # 12 MB app partition with margin and lets the on-target smoke test
+    # exercise the full decode chain at parity with gr-iridium running
+    # offline on the same recording.
+    # 1 sec window ending at or near the selected burst (recording is
+    # only 1.25 sec total so we clamp from the start).
+    raw_target_duration_s = 1.0
+    raw_t_end   = min(len(cf32), int(round((burst_time_s + 0.05) * src_rate)))
+    raw_t_start = max(0, raw_t_end - int(raw_target_duration_s * src_rate))
+    raw_cf32_slice = cf32[raw_t_start:raw_t_end].astype(np.complex64)
+    raw_win_lo_ms = raw_t_start / src_rate * 1000.0
+    raw_win_hi_ms = raw_t_end   / src_rate * 1000.0
+    # 1 sec at 2.56 MSPS = 2_560_000 complex samples × 2 bytes = 5_120_000 bytes.
+    # Round to a 16 KB transfer boundary so the smoke test's chunked feed
+    # divides evenly (16 KB = TRANSFER_BYTES in smoke_test.c).
+    RAW_TARGET_BYTES = 5_120_000 - (5_120_000 % (16 * 1024))   # = 5,111,808
+
     raw_emitted = []
     for raw_lo_hz, sym_prefix, raw_filename, comment in raw_lo_specs:
-        print(f"raw-mode fixture: LO={raw_lo_hz/1e6:.3f} MHz (covers "
-              f"{(raw_lo_hz - target_rate/2)/1e6:.3f}-"
+        print(f"raw-mode fixture: LO={raw_lo_hz/1e6:.3f} MHz "
+              f"({raw_win_lo_ms:.0f}-{raw_win_hi_ms:.0f} ms, "
+              f"covers {(raw_lo_hz - target_rate/2)/1e6:.3f}-"
               f"{(raw_lo_hz + target_rate/2)/1e6:.3f} MHz)")
-        raw_slice = cf32[t_start:t_end].astype(np.complex64)
         raw_shift = center_freq - raw_lo_hz
-        n_raw = np.arange(len(raw_slice), dtype=np.float64)
+        n_raw = np.arange(len(raw_cf32_slice), dtype=np.float64)
         raw_phasor = np.exp(-2j * np.pi * (-raw_shift) / src_rate * n_raw).astype(np.complex64)
-        raw_shifted = raw_slice * raw_phasor
+        raw_shifted = raw_cf32_slice * raw_phasor
         raw_dec = resample_poly(raw_shifted, up=up_t, down=down_t).astype(np.complex64)
         raw_scale = 100.0 / max(0.5, float(np.max(np.abs(raw_dec))))
         raw_re = np.clip(np.real(raw_dec) * raw_scale + 128.5, 0, 255).astype(np.uint8)
@@ -442,10 +463,10 @@ def main() -> int:
         raw_bytes = np.zeros(2 * len(raw_dec), dtype=np.uint8)
         raw_bytes[0::2] = raw_re
         raw_bytes[1::2] = raw_im
-        if len(raw_bytes) >= TARGET_BYTES:
-            raw_bytes = raw_bytes[:TARGET_BYTES]
+        if len(raw_bytes) >= RAW_TARGET_BYTES:
+            raw_bytes = raw_bytes[:RAW_TARGET_BYTES]
         else:
-            pad = np.full(TARGET_BYTES - len(raw_bytes), 128, dtype=np.uint8)
+            pad = np.full(RAW_TARGET_BYTES - len(raw_bytes), 128, dtype=np.uint8)
             raw_bytes = np.concatenate([raw_bytes, pad])
 
         # Bursts in this LO's subband: collect (time, freq, snr, conf) for
@@ -457,11 +478,13 @@ def main() -> int:
         # on high-conf, reports on low-conf without failing).
         in_subband = [
             b for b in bursts
-            if win_lo_ms <= b["time_ms"] <= win_hi_ms
+            if raw_win_lo_ms <= b["time_ms"] <= raw_win_hi_ms
             and abs(b["freq_hz"] - raw_lo_hz) <= 1_280_000
         ]
         in_subband.sort(key=lambda b: -b["snr"])
-        in_subband = in_subband[:8]
+        # Cap at 32 — a 1 sec slice with 82 frames/sec / band gives ~10-20
+        # in any given 2.56 MHz subband; 32 is comfortable margin.
+        in_subband = in_subband[:32]
         print(f"  expected bursts in subband: {len(in_subband)}")
 
         raw_path = FIXTURE_DIR / raw_filename
