@@ -64,6 +64,21 @@
 // rejecting 1-3 cycle flickers from PRBS / quantisation.
 #define MIN_BURST_CYCLES     4     // ~100 us at 40 ksps
 
+// Burst-window padding — matches gr-iridium burst_downmix exactly:
+//   burst_pre_len  = 2 × FFT_size = 4096 samples @ 2.56 MSPS = ~1.6 ms
+//   burst_post_len = 16 ms = 40960 samples @ 2.56 MSPS
+// At our 40 kHz channelizer cycle rate (= fs/M) these are:
+//   BURST_PRE_CYCLES  = 4096 / 64 =  64 cycles
+//   BURST_POST_CYCLES = 40960 / 64 = 640 cycles
+// The pre-padding gives CFO + RRC run-up; the post-padding catches
+// the burst's tail when the detection envelope drops early. Wide
+// post means a busy channel may contain multiple bursts within one
+// emission window — downstream needs to use burst_start_hint or a
+// position-constrained D13 to lock onto the right one rather than
+// a later burst that happens to clear envelope first.
+#define BURST_PRE_CYCLES     64    // ~1.6 ms at 40 ksps
+#define BURST_POST_CYCLES   640    // ~16 ms at 40 ksps (gr-iridium-aligned)
+
 // Burst-merging cooldown. After a channel's power drops below the
 // hysteresis exit threshold, the channel state is "cooling" for this
 // many cycles. If power rises back above the entry threshold during
@@ -327,12 +342,22 @@ static void emit_burst(channelizer_detector_t *d, int k)
         float snr_db = 10.0f * log10f(cs->peak_power
                                        / (cs->peak_floor + 1e-30f));
         int spacing  = (int)d->fs_in_hz / M;
+        // Pad burst window with BURST_PRE/POST cycles on each side
+        // (matches gr-iridium's burst_pre_len/burst_post_len) to give
+        // downstream stages more data for CFO + matched filter +
+        // qpsk_demod. Clamp pre-padding to cycle 0; post-padding
+        // doesn't need explicit clamping since extract_channel caps
+        // length_cycles to the ring capacity.
+        uint32_t pad_pre = BURST_PRE_CYCLES;
+        if (pad_pre > cs->start_cycle) pad_pre = cs->start_cycle;
+        uint32_t padded_start = cs->start_cycle - pad_pre;
+        uint32_t padded_len   = length_cycles + pad_pre + BURST_POST_CYCLES;
         channelizer_burst_t b = {
             .channel          = k,
             .rel_freq_hz      = signed_channel_offset(k) * spacing,
             .snr_db           = snr_db,
-            .start_sample_idx = cs->start_cycle * (uint32_t)M,
-            .length_samples   = length_cycles * (uint32_t)M,
+            .start_sample_idx = padded_start * (uint32_t)M,
+            .length_samples   = padded_len   * (uint32_t)M,
         };
         if (d->pending_valid && bursts_overlap(&d->pending, &b)) {
             // Two emissions on the same physical burst — keep the

@@ -95,11 +95,21 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
 {
     memset(result, 0, sizeof(*result));
 
-    // 1. D13 envelope start_finder. Search the entire burst (the
-    //    start_finder's internal LP filter smooths noise, so wider
-    //    search doesn't add false positives).
+    // 1. D13 envelope start_finder. Search depth matches gr-iridium's
+    //    burst_downmix exactly: 0.007 × burst_sample_rate = 1750
+    //    samples at 250 ksps (= ~7 ms). With our 17.6 ms padded
+    //    window (gr-iridium-aligned: 1.6 ms pre + 16 ms post) a wider
+    //    search lets D13 lock onto a SECOND burst that happens to
+    //    follow the original within the post-padding window — its
+    //    envelope peak then becomes the argmax → wrong start position
+    //    → matched filter operates on the wrong burst → 0 decodes.
+    //    Cap at 7 ms so start_finder always finds the FIRST envelope
+    //    rise (the actual burst we got tagged for).
+    const int SEARCH_DEPTH_SAMPLES = 1750;
+    int search_depth = SEARCH_DEPTH_SAMPLES;
+    if (search_depth > n_complex) search_depth = n_complex;
     int burst_start = uw_correlator_find_burst_start(
-                          iq250, n_complex, /*search_max=*/n_complex);
+                          iq250, n_complex, /*search_max=*/search_depth);
     result->burst_start = burst_start;
     int16_t *adj_burst = iq250 + burst_start * 2;
     int adj_n = n_complex - burst_start;
