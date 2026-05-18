@@ -307,6 +307,9 @@ int main(void)
                         iq2[i * 2 + 0] = src[i * 5 * 2 + 0];
                         iq2[i * 2 + 1] = src[i * 5 * 2 + 1];
                     }
+                    fprintf(stderr, "    uw_offset=%d, mod UW_SPS(10)=%d, correction=%.3f\n",
+                            (int)uw.uw_offset, (int)uw.uw_offset % 10,
+                            (double)uw.correction);
                     // Diag: dump I/Q values directly + per-symbol arg
                     // for the first 12 symbols (= UW range). If the
                     // signal is QPSK at the expected axis, |I| and |Q|
