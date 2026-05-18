@@ -122,7 +122,19 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     if (pmag > 1e-3f) {
         float rot_re = result->uw_res.peak_re / pmag;
         float rot_im = result->uw_res.peak_im / pmag;
-        float dphi   = result->uw_res.omega_per_sym / (float)UW_SPS;
+        // Skip the post-RRC residual omega — the pre-RRC coarse step
+        // (step 3 above) already cancelled the bulk of the carrier.
+        // gr-iridium applies CFO ONCE (pre-RRC). Our previous code
+        // applied BOTH the pre-RRC omega_coarse AND the post-RRC
+        // uw_res.omega_per_sym, which double-corrected: the post-RRC
+        // squared-FFT on band-limited data picks up noise peaks
+        // (host channel 58 results showed omegas ±0.06 to ±1.18 on
+        // bursts whose carrier was already cancelled by the coarse
+        // step). Only the single burst with post-RRC omega ≈ 0 (i.e.
+        // residual happened to be near zero) decoded. Setting dphi=0
+        // means we trust the coarse step and let qpsk_demod's PLL
+        // soak up any final residual.
+        float dphi   = 0.0f;
 
         int16_t pr_q = q15_from_float(rot_re);
         int16_t pi_q = q15_from_float(rot_im);

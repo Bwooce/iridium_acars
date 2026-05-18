@@ -305,11 +305,12 @@ int main(void)
             free(bres.frame.bits);
         }
 
-        printf("  %-3d %-7.1f  %-8.1f  %-8s %-+9.3f %-8d %s\n",
+        printf("  %-3d %-7.1f  %-8.1f  %-8s ω_pre=%-+6.3f ω_post=%-+6.3f %-8d %s\n",
                bb->channel, (double)bb->snr_db,
                (double)uw.snr_estimate_db,
                uw.direction == UW_DIR_DOWNLINK ? "DL" :
                uw.direction == UW_DIR_UPLINK   ? "UL" : "UNK",
+               (double)bres.omega_coarse,
                (double)uw.omega_per_sym,
                (int)uw.uw_offset, qpsk_str);
 
