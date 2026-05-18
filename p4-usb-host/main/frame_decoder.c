@@ -20,6 +20,8 @@
 #include "sbd_reassembler.h"
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
+#include <libacars/reassembly.h>
+#include <sys/time.h>
 
 static const char *TAG = "FRMDEC";
 
@@ -44,6 +46,13 @@ static _Atomic uint64_t s_class_lw_other = 0;
 static sbd_reassembler_t s_sbd;
 static _Atomic uint64_t  s_sbd_complete = 0;     // SBD messages reassembled
 static _Atomic uint64_t  s_acars_decoded = 0;    // ACARS messages successfully parsed
+static _Atomic uint64_t  s_acars_fragments = 0;  // ACARS fragments awaiting reassembly
+
+// D14: libacars reassembly context. Maintains per-flight-id session
+// state so multi-block ACARS messages (block_id > 0, more_blocks_follow)
+// arriving across multiple SBD messages get joined. Created once at
+// decoder init.
+static la_reasm_ctx *s_reasm_ctx = NULL;
 
 // Walk a la_proto_node tree to find the la_acars_msg payload.
 extern la_type_descriptor const la_DEF_acars_message;
@@ -64,19 +73,43 @@ static void try_acars(const sbd_message_t *msg)
 {
     if (!msg || msg->payload_len < 8) return;
     la_msg_dir dir = msg->uplink ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
-    la_proto_node *node = la_acars_parse(msg->payload, msg->payload_len, dir);
+    // D14: use la_acars_parse_and_reassemble with our persistent
+    // la_reasm_ctx so multi-block ACARS messages (block_id 1-5 with
+    // more_blocks_follow set) accumulate across SBD packets. The
+    // returned la_acars_msg has reasm_status set:
+    //   LA_REASM_COMPLETE      → fully reassembled, log + emit
+    //   LA_REASM_IN_PROGRESS   → fragment buffered, return silently
+    //   LA_REASM_SKIPPED       → single-block (immediate complete)
+    //   LA_REASM_DUPLICATE     → already-seen fragment, drop
+    //   LA_REASM_FRAG_OUT_OF_SEQUENCE → unrecoverable, drop
+    struct timeval rx_time = {
+        .tv_sec  = (time_t)(msg->timestamp_us / 1000000ULL),
+        .tv_usec = (suseconds_t)(msg->timestamp_us % 1000000ULL),
+    };
+    la_proto_node *node = la_acars_parse_and_reassemble(
+        msg->payload, msg->payload_len, dir, s_reasm_ctx, rx_time);
     if (!node) return;
     la_acars_msg *a = find_acars_msg(node);
     if (a) {
-        atomic_fetch_add_explicit(&s_acars_decoded, 1, memory_order_relaxed);
-        ESP_LOGI(TAG, "ACARS: %s mode=%c label='%.2s' block=%c msgnum='%.4s' "
-                 "flight='%.6s' crc=%s txt=\"%s\"",
-                 msg->uplink ? "UL" : "DL",
-                 a->mode ? a->mode : '?',
-                 a->label, a->block_id ? a->block_id : '?',
-                 a->msg_num, a->flight_id,
-                 a->crc_ok ? "OK" : "BAD",
-                 a->txt ? a->txt : "");
+        if (a->reasm_status == LA_REASM_COMPLETE ||
+            a->reasm_status == LA_REASM_SKIPPED) {
+            atomic_fetch_add_explicit(&s_acars_decoded, 1, memory_order_relaxed);
+            ESP_LOGI(TAG, "ACARS: %s mode=%c label='%.2s' block=%c msgnum='%.4s' "
+                     "flight='%.6s' crc=%s txt=\"%s\"",
+                     msg->uplink ? "UL" : "DL",
+                     a->mode ? a->mode : '?',
+                     a->label, a->block_id ? a->block_id : '?',
+                     a->msg_num, a->flight_id,
+                     a->crc_ok ? "OK" : "BAD",
+                     a->txt ? a->txt : "");
+        } else if (a->reasm_status == LA_REASM_IN_PROGRESS) {
+            atomic_fetch_add_explicit(&s_acars_fragments, 1, memory_order_relaxed);
+            ESP_LOGD(TAG, "ACARS fragment buffered: label='%.2s' block=%c "
+                     "msgnum='%.4s' flight='%.6s'",
+                     a->label, a->block_id ? a->block_id : '?',
+                     a->msg_num, a->flight_id);
+        }
+        // DUPLICATE / OUT_OF_SEQUENCE / ARGS_INVALID: silent drop.
     }
     la_proto_tree_destroy(node);
 }
@@ -208,6 +241,14 @@ esp_err_t frame_decoder_init(void)
         return ESP_ERR_NO_MEM;
     }
     sbd_reassembler_init(&s_sbd);
+    // D14: libacars reassembly context for multi-block ACARS messages.
+    s_reasm_ctx = la_reasm_ctx_new();
+    if (!s_reasm_ctx) {
+        ESP_LOGE(TAG, "la_reasm_ctx_new() failed");
+        frame_queue_destroy(s_queue);
+        s_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 
     BaseType_t ok = xTaskCreatePinnedToCore(decoder_task, "frame_decoder",
                                             DECODER_STACK, NULL,
