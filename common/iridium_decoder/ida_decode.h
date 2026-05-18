@@ -60,6 +60,13 @@ typedef struct {
 
     // CRC field at bits[180..195] (= 9*20..9*20+16).
     uint16_t da_crc_reported;
+    // CRC validation (D12). crc_computed is the CRC-16/CCITT-FALSE
+    // computed over (header + 12 zeros + bits[20..195]), matching
+    // iridium-toolkit's bitsparser.py:IridiumDAMessage. Because the
+    // computation includes the received CRC, a valid frame yields
+    // crc_computed == 0 (CCITT-FALSE residual property).
+    uint16_t da_crc_computed;
+    bool     crc_ok;
 } ida_decoded_t;
 
 // Run the IDA-specific decode chain on `frame`. Caller must have already

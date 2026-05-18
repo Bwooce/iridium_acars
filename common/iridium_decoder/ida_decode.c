@@ -19,6 +19,23 @@
 // (NOT BCH(31,21) — that's the ringalert variant for IBC frames.)
 #define BCH_MSG_BITS     20
 
+// CRC-16/CCITT-FALSE (a.k.a. CRC-16/IBM-3740):
+//   poly = 0x1021, init = 0xFFFF, refin = false, refout = false, xorout = 0.
+// Matches `crcmod.predefined.mkPredefinedCrcFun("crc-ccitt-false")` used in
+// iridium-toolkit/bitsparser.py:IridiumDAMessage.
+static uint16_t crc16_ccitt_false(const uint8_t *data, size_t n_bytes)
+{
+    uint16_t crc = 0xFFFFu;
+    for (size_t i = 0; i < n_bytes; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u)
+                                   : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
 // Pair-swap bits in-place: r[0]<->r[1], r[2]<->r[3], ...
 // Mirrors iridium-toolkit/bitsparser.py:symbol_reverse(). qpsk_demod
 // emits bits in (high, low) per-symbol order; the parser pair-swaps
@@ -175,6 +192,38 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
 
     // CRC field at bits[9*20 .. 9*20+16] = bits[180..196].
     out->da_crc_reported = (uint16_t)PACKBITS_N(180, 16);
+
+    // D12: validate CRC. Reconstruct the iridium-toolkit byte stream
+    //   crcstream = bits[0..20] + "0"*12 + bits[20..-4]
+    //             = header + 12 zeros + (data + CRC field bits)
+    // i.e. 20 header bits + 12 zero pad + bits[20..195] = 208 bits = 26 bytes.
+    // CRC-16/CCITT-FALSE over this stream returns 0 for a valid frame
+    // (the CRC's "residual" property: CRC(message || CRC) == 0).
+    //
+    // iridium-toolkit only computes CRC when da_len > 0 (empty frames
+    // have no meaningful CRC). We compute it unconditionally for
+    // diagnostic purposes but expose `crc_ok` as false when da_len == 0.
+    {
+        uint8_t crc_buf[26];
+        memset(crc_buf, 0, sizeof(crc_buf));
+        // Bits 0..19 (header) → crc_buf[0], crc_buf[1] high nibble.
+        for (int b = 0; b < 20; b++) {
+            int byte_i = b / 8;
+            int bit_i  = 7 - (b % 8);
+            crc_buf[byte_i] |= (out->bits[b] & 1) << bit_i;
+        }
+        // Bits 20..31 of crc_buf = 12 zeros (already 0 from memset).
+        // Bits 32..207 = out->bits[20..195] (176 bits).
+        for (int b = 0; b < 176; b++) {
+            int src = 20 + b;
+            int dst = 32 + b;
+            int byte_i = dst / 8;
+            int bit_i  = 7 - (dst % 8);
+            if (out->bits[src]) crc_buf[byte_i] |= 1 << bit_i;
+        }
+        out->da_crc_computed = crc16_ccitt_false(crc_buf, 26);
+        out->crc_ok = (out->da_len > 0) && (out->da_crc_computed == 0);
+    }
     #undef PACKBITS_N
 
     return 0;

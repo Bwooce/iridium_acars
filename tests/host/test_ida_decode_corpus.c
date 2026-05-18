@@ -25,6 +25,9 @@ int main(void)
     int n_decode_bad     = 0;        // <8 blocks decoded
     int total_blocks_ok  = 0;
     int total_errors     = 0;
+    int n_crc_ok_clean   = 0;        // CRC valid among 10/10 BCH-decoded
+    int n_crc_ok_partial = 0;        // CRC valid among 8-9/10 BCH-decoded
+    int n_with_payload   = 0;        // frames with da_len > 0 (subject to CRC check)
 
     printf("Test: ida_decode on every IDA frame in the Albuquerque corpus (n=%u total entries)\n",
            ALBQ_FRAME_CORPUS_LEN);
@@ -54,9 +57,16 @@ int main(void)
         total_blocks_ok += d.blocks_ok;
         total_errors    += d.total_errors;
 
-        if (d.blocks_ok == 10)      n_decode_ok++;
-        else if (d.blocks_ok >= 8)  n_decode_partial++;
-        else                        n_decode_bad++;
+        if (d.blocks_ok == 10) {
+            n_decode_ok++;
+            if (d.da_len > 0) n_with_payload++;
+            if (d.crc_ok) n_crc_ok_clean++;
+        } else if (d.blocks_ok >= 8) {
+            n_decode_partial++;
+            if (d.crc_ok) n_crc_ok_partial++;
+        } else {
+            n_decode_bad++;
+        }
     }
 
     printf("\nResults (over %d IDA frames):\n", n_ida_classified);
@@ -85,7 +95,24 @@ int main(void)
         return 1;
     }
 
-    printf("\nPASS: all %d IDA frames decoded with ≥8/10 BCH blocks\n",
+    printf("\nCRC (D12) validation across the same frames:\n");
+    printf("  10/10 BCH-decoded frames with da_len>0: %d / %d (CRC applicable)\n",
+           n_with_payload, n_decode_ok);
+    printf("  Of those, CRC valid: %d / %d (%.1f%%)\n",
+           n_crc_ok_clean, n_with_payload,
+           n_with_payload ? 100.0 * n_crc_ok_clean / n_with_payload : 0.0);
+
+    // Clean BCH frames with da_len > 0 MUST pass CRC — they're the
+    // gr-iridium-decoded ground-truth frames in our corpus.
+    // (Frames with da_len == 0 are handshake/null frames with no
+    // meaningful CRC; iridium-toolkit skips CRC for those.)
+    if (n_with_payload > 0 && n_crc_ok_clean != n_with_payload) {
+        printf("\nFAIL: %d payload-bearing frames failed CRC validation\n",
+               n_with_payload - n_crc_ok_clean);
+        return 1;
+    }
+
+    printf("\nPASS: all %d IDA frames decoded with ≥8/10 BCH blocks; all clean frames pass CRC\n",
            n_ida_classified);
     return 0;
 }
