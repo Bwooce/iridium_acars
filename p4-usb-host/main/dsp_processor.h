@@ -19,6 +19,8 @@ typedef struct {
     uint32_t start_sample_idx;
     uint32_t length_samples;
     int peak_bin;
+    int channel;           // 0..POLYCHAN_M-1 — index into the channelizer
+                           //  retention ring (D7+ direct extract path)
     float peak_snr_db;
 } detected_burst_t;
 
@@ -41,5 +43,17 @@ typedef struct {
 } dsp_stage_stats_t;
 
 void dsp_processor_get_stage_stats(dsp_stage_stats_t *out);
+
+// Extract one channel's int16 IQ from the channelizer's retention ring
+// for the time span specified by start_sample_idx (input-rate coords —
+// same units as detected_burst_t.start_sample_idx). Returns the number
+// of COMPLEX samples written (= length_samples / POLYCHAN_M, capped to
+// ring depth). The worker uses this to pull the burst's channel stream
+// directly, replacing the legacy raw-extract + freq-shift + stage-1
+// FIR path. See D7+ alignment notes in the implementation plan.
+size_t dsp_processor_extract_channel(int channel,
+                                      uint32_t start_sample_idx,
+                                      uint32_t length_samples,
+                                      int16_t *out_iq);
 
 #endif

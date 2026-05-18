@@ -187,6 +187,20 @@ struct channelizer_detector {
     bool              pending_valid;
     channelizer_burst_t pending;
     uint32_t          pending_last_touched_cycle;
+
+    // D7+: per-channel output ringbuffer. The worker pipeline used to
+    // re-extract from the raw signal buffer and apply its own FIR +
+    // freq-shift to recover the burst's channel — duplicating work the
+    // channelizer already did, AND with a coarser filter. We now retain
+    // the channelizer's per-channel int16 output here so the worker
+    // can pull the target channel directly. Cycle-major layout:
+    //   ring[cycle_mod * M * 2 + ch * 2 + (0|1)]  (Re | Im, int16)
+    // RING_CYCLES sized so the ring depth covers the maximum burst
+    // latency (~100 ms = 4096 cycles at 40 kHz cycle rate).
+    int16_t          *channel_ring;          // M × ring_capacity × 2 int16
+    size_t            ring_capacity_cycles;  // power of two for fast wrap
+    // ring_capacity_cycles - 1 mask
+    uint32_t          ring_mask;
 };
 
 channelizer_detector_t *channelizer_detector_create(uint32_t fs_in_hz,
@@ -233,6 +247,26 @@ channelizer_detector_t *channelizer_detector_create(uint32_t fs_in_hz,
         return NULL;
     }
 #endif
+
+    // D7+: per-channel retention ringbuffer. 4096 cycles × M × 2 ×
+    // sizeof(int16_t) = 1 MB on the ESP32-P4 (allocated from generic
+    // heap; PSRAM if available via the build allocator). For 40 kHz
+    // cycle rate that's ~100 ms — far more than the worst-case burst
+    // emission latency (~30 ms for the COOLING state to expire).
+    d->ring_capacity_cycles = 4096;
+    d->ring_mask = (uint32_t)(d->ring_capacity_cycles - 1);
+    size_t ring_bytes = d->ring_capacity_cycles * M * 2 * sizeof(int16_t);
+    d->channel_ring = calloc(1, ring_bytes);
+    if (!d->channel_ring) {
+        free(d->in_buf);
+        free(d->out_buf);
+#if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
+        if (d->out_buf_i16) free(d->out_buf_i16);
+#endif
+        polyphase_channelizer_destroy(d->ch);
+        free(d);
+        return NULL;
+    }
     return d;
 }
 
@@ -245,6 +279,7 @@ void channelizer_detector_destroy(channelizer_detector_t *d)
 #if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
     if (d->out_buf_i16) free(d->out_buf_i16);
 #endif
+    if (d->channel_ring) free(d->channel_ring);
     free(d);
 }
 
@@ -356,7 +391,12 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
         //     existing percentile / threshold logic (which is ratio-based,
         //     so absolute scale is irrelevant).
         //   - Float: channelizer wrote complex float to out_buf.
+        //
+        // We also copy this cycle's int16 IQ into the channel retention
+        // ring so the worker can pull the target channel's stream
+        // directly (D7+ architectural alignment with gr-iridium).
         float power[M];
+        int16_t *ring_row = &d->channel_ring[(this_cycle & d->ring_mask) * M * 2];
 #if defined(ESP_PLATFORM) && CHANNELIZER_USE_INT16_PATH
         const int16_t *row = &d->out_buf_i16[cyc * M * 2];
         for (int k = 0; k < M; k++) {
@@ -364,11 +404,24 @@ static void process_cycles(channelizer_detector_t *d, size_t n_cycles)
             int32_t im = row[k * 2 + 1];
             power[k] = (float)(re * re + im * im);
         }
+        memcpy(ring_row, row, M * 2 * sizeof(int16_t));
 #else
         const float complex *row = &d->out_buf[cyc * M];
         for (int k = 0; k < M; k++) {
             float complex y = row[k];
             power[k] = crealf(y) * crealf(y) + cimagf(y) * cimagf(y);
+            // Convert float channelizer output → int16 for the ring.
+            // /M-normalised float values stay well within int16 range
+            // (DC input INT16_MAX → output INT16_MAX), so direct cast
+            // with saturation is fine.
+            float re = crealf(y);
+            float im = cimagf(y);
+            if (re >  (float)INT16_MAX) re =  (float)INT16_MAX;
+            if (re <  (float)INT16_MIN) re =  (float)INT16_MIN;
+            if (im >  (float)INT16_MAX) im =  (float)INT16_MAX;
+            if (im <  (float)INT16_MIN) im =  (float)INT16_MIN;
+            ring_row[k * 2 + 0] = (int16_t)lrintf(re);
+            ring_row[k * 2 + 1] = (int16_t)lrintf(im);
         }
 #endif
 
@@ -534,4 +587,31 @@ void channelizer_detector_get_stats(channelizer_detector_t *d,
     out->channels_active_peak = d->channels_active_peak;
     d->bursts_emitted         = 0;
     d->channels_active_peak   = 0;
+}
+
+size_t channelizer_detector_extract_channel(channelizer_detector_t *d,
+                                             int channel,
+                                             uint32_t start_sample_idx,
+                                             uint32_t length_samples,
+                                             int16_t *out_iq)
+{
+    if (!d || !out_iq || channel < 0 || channel >= M) return 0;
+    // Convert input-rate coords to cycle-rate. Cycle index = sample / M
+    // (truncates to floor — burst start that falls mid-cycle gets the
+    // cycle it started in, which is what we want).
+    uint32_t start_cycle  = start_sample_idx / (uint32_t)M;
+    uint32_t length_cycles = length_samples  / (uint32_t)M;
+    if (length_cycles == 0) return 0;
+    // Cap to ring depth; older samples have been overwritten.
+    if (length_cycles > d->ring_capacity_cycles) {
+        length_cycles = (uint32_t)d->ring_capacity_cycles;
+    }
+    // Copy out the channel's IQ from each cycle in the requested range.
+    for (uint32_t i = 0; i < length_cycles; i++) {
+        uint32_t cyc = (start_cycle + i) & d->ring_mask;
+        const int16_t *row = &d->channel_ring[cyc * M * 2];
+        out_iq[i * 2 + 0] = row[channel * 2 + 0];
+        out_iq[i * 2 + 1] = row[channel * 2 + 1];
+    }
+    return (size_t)length_cycles;
 }

@@ -73,9 +73,22 @@ static void on_channelizer_burst(const channelizer_burst_t *cb,
         .start_sample_idx = cb->start_sample_idx,
         .length_samples   = cb->length_samples,
         .peak_bin         = peak_bin,
+        .channel          = cb->channel,
         .peak_snr_db      = cb->snr_db,
     };
     s_user_cb(&out);
+}
+
+size_t dsp_processor_extract_channel(int channel,
+                                      uint32_t start_sample_idx,
+                                      uint32_t length_samples,
+                                      int16_t *out_iq)
+{
+    if (!s_det) return 0;
+    return channelizer_detector_extract_channel(s_det, channel,
+                                                 start_sample_idx,
+                                                 length_samples,
+                                                 out_iq);
 }
 
 esp_err_t dsp_processor_init(burst_detected_cb_t cb)

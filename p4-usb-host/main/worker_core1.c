@@ -99,15 +99,19 @@ static void diag_dump(const char *name, int fs_hz, const int16_t *iq, int n_comp
     vTaskDelay(pdMS_TO_TICKS(20));
 }
 
-// Decimation factor 32: 2.56 MHz -> 80 kHz
-#define DECIM_FACTOR 32
-#define FIR_TAPS 64
+// D7+ architectural change: worker consumes channelizer output (40 kHz
+// per channel) directly via dsp_processor_extract_channel(). No more
+// stage-1 FIR / freq-shift from the raw 2.56 MSPS signal buffer — the
+// channelizer already filtered the burst's channel through a 1024-tap
+// polyphase, much sharper than the 64-tap Hamming we had at stage 1.
+// Matches gr-iridium's burst_downmix architecture.
+#define CHANNEL_SAMPLE_HZ (FS_IN_HZ / POLYCHAN_M)   // 40000 Hz
 
-// Resample 80 kHz -> 250 kHz (Interp 25, Decim 8 — gives 80 × 25/8 =
+// Resample 40 kHz -> 250 kHz (Interp 25, Decim 4 — gives 40 × 25/4 =
 // 250 kHz = 10 sps × 25 ksym/s). 10 sps matches gr-iridium's
 // burst_downmix internal rate; uw_correlator's UW_SPS = 10.
 #define RESAMPLE_INTERP 25
-#define RESAMPLE_DECIM 8
+#define RESAMPLE_DECIM 4
 #define RESAMPLE_TAPS 64
 
 // After matched filter + pre-rotation we decimate 5× back to 50 kHz
@@ -130,10 +134,10 @@ static int16_t *stage1_in_i = NULL;
 static int16_t *stage1_in_q = NULL;
 static int16_t *demod_interleaved = NULL;
 
-static fir_s16_t fir_i, fir_q;
-static int16_t coeffs[FIR_TAPS] __attribute__((aligned(16)));
-static int16_t delay_i[FIR_TAPS] __attribute__((aligned(16)));
-static int16_t delay_q[FIR_TAPS] __attribute__((aligned(16)));
+// Stage-1 FIR removed (D7+): the channelizer's 1024-tap polyphase filter
+// has already shaped this channel's burst better than any 64-tap FIR we
+// could put here. Kept the symbol so the linker doesn't complain about
+// any dangling reference; will fully delete in a follow-up cleanup.
 
 // Stage 2: 80 kHz -> 50 kHz polyphase resample (interp 5, decim 8). We use the
 // lower-level dsps_firmr_* directly because dsps_resampler_mr_init() rejects
@@ -191,63 +195,65 @@ void worker_task(void *arg)
                 continue;
             }
 
-            // 1. Extract from Circular Buffer
+            // 1. Extract the burst's channel from the channelizer's
+            // retention ring. The channelizer has already filtered and
+            // downconverted this channel through its 1024-tap polyphase
+            // (sharper than any per-burst FIR we could afford); pull
+            // its int16 IQ directly at the 40 kHz channel rate. No
+            // separate freq-shift / stage-1 FIR needed — that path
+            // was the legacy single-FFT-detector inheritance.
             int64_t ts = esp_timer_get_time();
-            signal_buffer_extract(burst.start_sample_idx, burst.length_samples, extract_buf);
+            size_t n_channel_cplx = dsp_processor_extract_channel(
+                burst.channel, burst.start_sample_idx,
+                burst.length_samples, extract_buf);
             int64_t t_extract = esp_timer_get_time();
+            if (n_channel_cplx == 0) {
+                ESP_LOGW(TAG, "extract_channel returned 0 samples for burst");
+                s_bursts_skipped++;
+                continue;
+            }
 
             // Decide whether THIS burst gets the one-shot diagnostic.
             bool diag = false;
             if (s_diag_armed && burst.peak_snr_db >= DIAG_SNR_TRIGGER_DB) {
                 s_diag_armed = false;
                 diag = true;
-                ESP_LOGI(TAG, "=== DIAG BEGIN burst SNR=%.1f dB peak_bin=%d len=%lu ===",
-                         (double)burst.peak_snr_db, burst.peak_bin,
-                         (unsigned long)burst.length_samples);
-                diag_stats("01_raw_2560k", FS_IN_HZ,
-                           extract_buf, (int)burst.length_samples);
+                ESP_LOGI(TAG, "=== DIAG BEGIN burst SNR=%.1f dB ch=%d len=%lu (%zu @ 40k) ===",
+                         (double)burst.peak_snr_db, burst.channel,
+                         (unsigned long)burst.length_samples, n_channel_cplx);
+                diag_dump("01_channelizer_40k", CHANNEL_SAMPLE_HZ,
+                          extract_buf, (int)n_channel_cplx);
             }
 
-            // D8 alignment with gr-iridium: their burst_downmix pipeline
-            // never tries to estimate residual carrier on the raw QPSK
-            // burst. QPSK is suppressed-carrier — a plain FFT of QPSK
-            // samples returns a noise-driven peak that detunes the
-            // burst by random kHz. gr-iridium relies entirely on the
-            // per-burst squared-FFT inside burst_downmix (= our
-            // uw_correlator's CFO estimate, run on the BPSK preamble+UW
-            // window where squaring removes modulation).
-            //
-            // Channelizer bin centre may be off the actual Iridium
-            // carrier by up to ±20 kHz (worst case at bin edge between
-            // two Iridium channels). Snap the freq_offset to the
-            // nearest Iridium-grid carrier (41.666... kHz multiple from
-            // the SDR LO) so the worker mixes the burst exactly to DC
-            // rather than to bin-centre-with-Iridium-offset. This is
-            // task #41 step 1 — companion to the wider channelizer
-            // passband (polyphase_channelizer.c) so the energy actually
-            // reaches the worker.
-            // FFT bin spacing = FS_IN_HZ / FFT_SIZE (= 1250 Hz at the
-            // 2.56 MHz / 2048-pt config). Bin FFT_SIZE/2 = DC.
-            float coarse_offset_hz = (burst.peak_bin - FFT_SIZE / 2)
-                                     * ((float)FS_IN_HZ / (float)FFT_SIZE);
-            float n_iridium = roundf(coarse_offset_hz / IRIDIUM_CHANNEL_HZ);
-            float freq_offset = n_iridium * IRIDIUM_CHANNEL_HZ;
-            ESP_LOGD(TAG, "freq: bin=%.0f → Iridium grid %.0f Hz (peak_bin=%d)",
-                     (double)coarse_offset_hz, (double)freq_offset,
-                     burst.peak_bin);
-            float norm_freq = -freq_offset / (float)FS_IN_HZ;
-            // dsps_cplx_gen accepts normalised frequency in (-1, 1) exclusive.
-            // Clamp defensively in case detector ever emits an unusual peak_bin.
-            float gen_freq = norm_freq * 2.0f;
-            if (gen_freq >= 1.0f)  gen_freq = 0.999f;
+            // 2. Residual freq-shift on the 40 kHz channelized signal.
+            // The channel center is at k × FS_IN_HZ / POLYCHAN_M (signed
+            // for k > M/2); the true Iridium carrier is at the nearest
+            // Iridium grid point (41.666... kHz multiple). Residual is
+            // bounded by ±(40k - 41.667k)/2 ≈ ±0.833 kHz worst case
+            // for the channel-center vs Iridium-grid mismatch, plus up
+            // to ±20 kHz if the burst is at the channel edge. The
+            // uw_correlator's squared-FFT will pull the remainder (D8
+            // ±π rad/sym clamp = ±25 kHz).
+            int signed_ch = (burst.channel > POLYCHAN_M / 2)
+                            ? burst.channel - POLYCHAN_M
+                            : burst.channel;
+            float channel_center_hz = (float)signed_ch *
+                                       ((float)FS_IN_HZ / (float)POLYCHAN_M);
+            float n_iridium = roundf(channel_center_hz / IRIDIUM_CHANNEL_HZ);
+            float iridium_freq_hz = n_iridium * IRIDIUM_CHANNEL_HZ;
+            float residual_hz = channel_center_hz - iridium_freq_hz;
+            // dsps_cplx_gen normalised freq is (-1, 1); for cancellation
+            // we mix with -residual at the CHANNEL sample rate.
+            float gen_freq = -residual_hz * 2.0f / (float)CHANNEL_SAMPLE_HZ;
+            if (gen_freq >=  1.0f) gen_freq =  0.999f;
             if (gen_freq <= -1.0f) gen_freq = -0.999f;
-            // Reuse the pre-initialised generator (LUT allocated once at init).
-            // Switching frequency on an already-initialised generator avoids
-            // the per-burst malloc that was costing ~10 ms on the previous path.
+            ESP_LOGD(TAG, "freq: ch=%d centre=%.0f Hz, Iridium=%.0f Hz, residual=%+.0f Hz",
+                     burst.channel, (double)channel_center_hz,
+                     (double)iridium_freq_hz, (double)residual_hz);
             dsps_cplx_gen_freq_set(&s_phasor_gen, gen_freq);
-            dsps_cplx_gen(&s_phasor_gen, phasor_buf, burst.length_samples);
+            dsps_cplx_gen(&s_phasor_gen, phasor_buf, n_channel_cplx);
 
-            for (uint32_t i = 0; i < burst.length_samples; i++) {
+            for (size_t i = 0; i < n_channel_cplx; i++) {
                 int32_t x_re = extract_buf[i * 2 + 0];
                 int32_t x_im = extract_buf[i * 2 + 1];
                 int32_t p_re = phasor_buf[i * 2 + 0];
@@ -256,57 +262,47 @@ void worker_task(void *arg)
                 extract_buf[i * 2 + 1] = (int16_t)((x_re * p_im + x_im * p_re) >> 15);
             }
             int64_t t_freq = esp_timer_get_time();
+            // No stage-1 FIR — channelizer already did the filtering.
+            int64_t t_fir = t_freq;
 
             if (diag) {
-                diag_stats("02_baseband_2560k", FS_IN_HZ,
-                           extract_buf, (int)burst.length_samples);
+                diag_stats("02_residual_shifted_40k", CHANNEL_SAMPLE_HZ,
+                           extract_buf, (int)n_channel_cplx);
             }
 
-            // 3. FIR Decimation (32x) Stage 1 (2.56M -> 80k)
-            memset(delay_i, 0, sizeof(delay_i));
-            memset(delay_q, 0, sizeof(delay_q));
-            fir_i.d_pos = 0;
-            fir_q.d_pos = 0;
-
-            for (uint32_t i = 0; i < burst.length_samples; i++) {
+            // 3. Resample 40 kHz -> 250 kHz (interp 25, decim 4).
+            // Split interleaved IQ into separate I and Q for the
+            // single-channel firmr. extract_buf holds n_channel_cplx
+            // complex samples interleaved; stage1_in_i/q are scratch.
+            for (size_t i = 0; i < n_channel_cplx; i++) {
                 stage1_in_i[i] = extract_buf[i * 2 + 0];
                 stage1_in_q[i] = extract_buf[i * 2 + 1];
             }
-
-            // dsps_fird_s16's length parameter is the OUTPUT length (input/decim).
-            // Passing the input length would cause a massive out-of-bounds read.
-            int expected_out_80k = burst.length_samples / DECIM_FACTOR;
-
-            // Note: dsps_fird_s16_arp4 on P4 has a bug where it returns an uninitialized
-            // register (a6) instead of the output count. We use the expected count.
-            dsps_fird_s16_arp4(&fir_i, stage1_in_i, &decim_buf[0], expected_out_80k);
-            dsps_fird_s16_arp4(&fir_q, stage1_in_q, &decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], expected_out_80k);
-            int out_samples_80k = expected_out_80k;
-            int64_t t_fir = esp_timer_get_time();
-
-            if (out_samples_80k <= 2) {
-                ESP_LOGD(TAG, "Stage 1 produced %d samples (input %lu) — too short, dropping",
-                         out_samples_80k, burst.length_samples);
-                s_bursts_skipped++;
-                continue;
-            }
-
-            // 4. Resample Stage 2 (80k -> 50k via interp=5, decim=8)
-            // Note: dsps_firmr_s16's length parameter is the INPUT length.
-            int out_samples_50k = dsps_firmr_s16(&resampler_i, &decim_buf[0], &resample_buf[0], out_samples_80k);
-            dsps_firmr_s16(&resampler_q, &decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], &resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS], out_samples_80k);
+            int out_samples_250k = dsps_firmr_s16(&resampler_i,
+                                                   stage1_in_i,
+                                                   &resample_buf[0],
+                                                   (int)n_channel_cplx);
+            dsps_firmr_s16(&resampler_q,
+                           stage1_in_q,
+                           &resample_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS],
+                           (int)n_channel_cplx);
             int64_t t_resamp = esp_timer_get_time();
 
-            // Group delay guard: polyphase resampler takes some samples to fill its taps.
-            // Drop bursts where resampler didn't have enough samples to emit data.
-            if (out_samples_50k <= (RESAMPLE_TAPS / RESAMPLE_DECIM)) {
-                ESP_LOGD(TAG, "Stage 2 produced %d samples — too short for demod, skipping", out_samples_50k);
+            // Group delay guard: polyphase resampler takes a few cycles
+            // to fill its tap line.
+            if (out_samples_250k <= (RESAMPLE_TAPS / RESAMPLE_DECIM)) {
+                ESP_LOGD(TAG, "Resampler produced %d samples — too short for demod, skipping",
+                         out_samples_250k);
                 s_bursts_skipped++;
                 continue;
             }
+            int out_samples_50k = out_samples_250k;   // legacy name kept
+                                                       // for the rest of
+                                                       // the function
 
-            ESP_LOGI(TAG, "Burst processed: 80k=%d 50k=%d (input len=%lu)",
-                     out_samples_80k, out_samples_50k, burst.length_samples);
+            ESP_LOGI(TAG, "Burst processed: ch=%d 40k=%zu 250k=%d (raw_len=%lu)",
+                     burst.channel, n_channel_cplx, out_samples_50k,
+                     burst.length_samples);
 
             // 5. QPSK Demodulation
             decoded_frame_t frame;
@@ -318,17 +314,10 @@ void worker_task(void *arg)
 
             if (diag) {
                 // Reinterleave stage-1 80k output for the dump so the
-                // parsing script gets consistent (I,Q) pairs across
-                // stages. decim_buf has separate I/Q arrays.
-                static int16_t diag_80k_tmp[8192 * 2];
-                int n80 = out_samples_80k > 8192 ? 8192 : out_samples_80k;
-                for (int i = 0; i < n80; i++) {
-                    diag_80k_tmp[i * 2 + 0] = decim_buf[i];
-                    diag_80k_tmp[i * 2 + 1] =
-                        decim_buf[MAX_EXTRACT_SAMPLES + DSP_PADDING_ELEMS + i];
-                }
-                diag_dump("03_fir_80k", 80000, diag_80k_tmp, n80);
-                diag_dump("04_resamp_250k", 250000,
+                // Stage-1 FIR removed (D7+). Just dump the resampler
+                // output at 250 kHz; the channelizer-output dump
+                // covered the 40 kHz stage upstream.
+                diag_dump("03_resamp_250k", 250000,
                           demod_interleaved, out_samples_50k);
             }
 
@@ -556,54 +545,20 @@ esp_err_t worker_core1_init()
         return ESP_ERR_NO_MEM;
     }
 
-    // Stage 1 Coefficients (LPF). Cutoff ±fs/(2M) = ±20 kHz at
-    // fs=2.56 MHz, M=64. Normalised angular freq = π / M.
-    float coeffs_f32[FIR_TAPS];
-    float omega_c = (float)M_PI / (float)POLYCHAN_M;
-    for (int i = 0; i < FIR_TAPS; i++) {
-        float n = i - (FIR_TAPS - 1) / 2.0f;
-        float h = (fabsf(n) < 1e-9f) ? (omega_c / M_PI) : (sinf(omega_c * n) / (M_PI * n));
-        float w = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (FIR_TAPS - 1)));
-        coeffs_f32[i] = h * w;
-    }
-    // Canonical Q15: scale coeffs so sum = 2^15 (= INT16_MAX rounded
-    // up), pass shift_param = 0 to dsps_fird_init_s16 so the asm does
-    // output = acc >> 15 (Q15 × Q15 → Q15). The previous code passed
-    // shift_param = 15 which made the asm output = (int16_t)acc — a
-    // truncation of the int32 accumulator's low 16 bits, producing
-    // garbage for any input that put acc above 2^15. That was the
-    // source of the per-stage SNR loss seen in the diagnostic dump
-    // (stage 03 RMS 7 K → 27 K with saturated peaks).
-    float coeff_sum_f = 0;
-    for (int i = 0; i < FIR_TAPS; i++) coeff_sum_f += coeffs_f32[i];
-    // Sum target = 2^15. Use 2^15 - 1 to keep coeffs in int16 range
-    // when the centre tap is large relative to the sum.
-    const float SUM_TARGET = 32768.0f;
-    float coeff_scale = SUM_TARGET / coeff_sum_f;
-    int coeff_max_int = 0, coeff_sum_int = 0;
-    for (int i = 0; i < FIR_TAPS; i++) {
-        float v = coeffs_f32[i] * coeff_scale;
-        if (v > (float)INT16_MAX) v = (float)INT16_MAX;
-        if (v < (float)INT16_MIN) v = (float)INT16_MIN;
-        coeffs[i] = (int16_t)lrintf(v);
-        int a = coeffs[i] < 0 ? -coeffs[i] : coeffs[i];
-        if (a > coeff_max_int) coeff_max_int = a;
-        coeff_sum_int += coeffs[i];
-    }
-    ESP_LOGI(TAG, "Stage 1 FIR: shift=0 (Q15), max coeff=%d, sum=%d (target 32768)",
-             coeff_max_int, coeff_sum_int);
-    dsps_fird_init_s16(&fir_i, coeffs, delay_i, FIR_TAPS, DECIM_FACTOR, 0, 0);
-    dsps_fird_init_s16(&fir_q, coeffs, delay_q, FIR_TAPS, DECIM_FACTOR, 0, 0);
+    // Stage 1 FIR removed (D7+). The channelizer already filters and
+    // decimates this channel through a 1024-tap polyphase; the legacy
+    // 64-tap Hamming stage-1 FIR was both redundant AND coarser. The
+    // worker now consumes channelizer output directly.
 
-    // Stage 2 Coefficients (RRC/LPF for resampling)
-    // For now, use simple LPF for resampler
+    // Stage 2 Coefficients: polyphase resampler 40k -> 250k (interp=25,
+    // decim=4). Input rate is now CHANNEL_SAMPLE_HZ (= FS_IN_HZ /
+    // POLYCHAN_M = 40 kHz); intermediate polyphase rate = 1 MHz; output
+    // 250 kHz. Cutoff stays at ±20 kHz (half channel BW) which is
+    // Nyquist for the 40 kHz input — so the filter is mostly an
+    // interpolation/imaging filter rather than an anti-alias filter.
     float rcoeffs_f32[RESAMPLE_TAPS * RESAMPLE_INTERP];
-    // Stage 2 polyphase resampler cutoff: same ±20 kHz passband at
-    // the polyphase rate = stage1_rate × RESAMPLE_INTERP = (fs / DECIM_FACTOR)
-    // × INTERP. Normalised: 2π × half_bw / poly_rate.
-    const float stage2_poly_rate_hz = (float)FS_IN_HZ
-                                      / (float)DECIM_FACTOR
-                                      * (float)RESAMPLE_INTERP;
+    const float stage2_poly_rate_hz = (float)CHANNEL_SAMPLE_HZ
+                                      * (float)RESAMPLE_INTERP;       // 1 MHz
     const float channel_half_bw_hz = (float)FS_IN_HZ / (2.0f * (float)POLYCHAN_M);
     float r_omega_c = 2.0f * (float)M_PI * channel_half_bw_hz / stage2_poly_rate_hz;
     for (int i = 0; i < RESAMPLE_TAPS * RESAMPLE_INTERP; i++) {

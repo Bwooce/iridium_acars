@@ -74,6 +74,28 @@ typedef struct {
 void channelizer_detector_get_stats(channelizer_detector_t *d,
                                      channelizer_detector_stats_t *out);
 
+// Per-channel extract — pulls one channel's IQ samples from the
+// channelizer's internal ringbuffer for the time span specified by
+// `start_sample_idx` and `length_samples` (input-rate coords; the
+// same fields the burst event carries). Returns the number of
+// COMPLEX samples written to out_iq (= length_samples / M, capped to
+// the ring depth).
+//
+// Architectural note (D7+): the worker pipeline was historically
+// re-extracting from the raw signal buffer and re-channelizing via
+// a stage-1 FIR + freq-shift. That duplicated the work the channelizer
+// already does, AND added a 64-tap Hamming filter that's strictly
+// worse than the channelizer's 1024-tap polyphase. Routing channelizer
+// output directly to the worker removes both — matches gr-iridium's
+// burst_downmix architecture.
+//
+// `out_iq` must hold at least 2 × (length_samples / M) int16_t.
+size_t channelizer_detector_extract_channel(channelizer_detector_t *d,
+                                             int channel,
+                                             uint32_t start_sample_idx,
+                                             uint32_t length_samples,
+                                             int16_t *out_iq);
+
 #ifdef __cplusplus
 }
 #endif
