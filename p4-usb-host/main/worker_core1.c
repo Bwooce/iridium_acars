@@ -225,42 +225,23 @@ void worker_task(void *arg)
                           extract_buf, (int)n_channel_cplx);
             }
 
-            // 2. Residual freq-shift on the 40 kHz channelized signal.
-            // The channel center is at k × FS_IN_HZ / POLYCHAN_M (signed
-            // for k > M/2); the true Iridium carrier is at the nearest
-            // Iridium grid point (41.666... kHz multiple). Residual is
-            // bounded by ±(40k - 41.667k)/2 ≈ ±0.833 kHz worst case
-            // for the channel-center vs Iridium-grid mismatch, plus up
-            // to ±20 kHz if the burst is at the channel edge. The
-            // uw_correlator's squared-FFT will pull the remainder (D8
-            // ±π rad/sym clamp = ±25 kHz).
-            int signed_ch = (burst.channel > POLYCHAN_M / 2)
-                            ? burst.channel - POLYCHAN_M
-                            : burst.channel;
-            float channel_center_hz = (float)signed_ch *
-                                       ((float)FS_IN_HZ / (float)POLYCHAN_M);
-            float n_iridium = roundf(channel_center_hz / IRIDIUM_CHANNEL_HZ);
-            float iridium_freq_hz = n_iridium * IRIDIUM_CHANNEL_HZ;
-            float residual_hz = channel_center_hz - iridium_freq_hz;
-            // dsps_cplx_gen normalised freq is (-1, 1); for cancellation
-            // we mix with -residual at the CHANNEL sample rate.
-            float gen_freq = -residual_hz * 2.0f / (float)CHANNEL_SAMPLE_HZ;
-            if (gen_freq >=  1.0f) gen_freq =  0.999f;
-            if (gen_freq <= -1.0f) gen_freq = -0.999f;
-            ESP_LOGD(TAG, "freq: ch=%d centre=%.0f Hz, Iridium=%.0f Hz, residual=%+.0f Hz",
-                     burst.channel, (double)channel_center_hz,
-                     (double)iridium_freq_hz, (double)residual_hz);
-            dsps_cplx_gen_freq_set(&s_phasor_gen, gen_freq);
-            dsps_cplx_gen(&s_phasor_gen, phasor_buf, n_channel_cplx);
-
-            for (size_t i = 0; i < n_channel_cplx; i++) {
-                int32_t x_re = extract_buf[i * 2 + 0];
-                int32_t x_im = extract_buf[i * 2 + 1];
-                int32_t p_re = phasor_buf[i * 2 + 0];
-                int32_t p_im = phasor_buf[i * 2 + 1];
-                extract_buf[i * 2 + 0] = (int16_t)((x_re * p_re - x_im * p_im) >> 15);
-                extract_buf[i * 2 + 1] = (int16_t)((x_re * p_im + x_im * p_re) >> 15);
-            }
+            // 2. Worker freq-shift removed: actual Iridium carriers
+            // scatter ±5-10 kHz around the nominal 41.667 kHz grid (see
+            // iridium.bits in the corpus), so grid-snapping leaves
+            // unpredictable residual that uw_correlator's ±π clamp
+            // can't always cover. Per-burst pre-PLL diagnostic on the
+            // 1-sec ALBQ fixture showed period-5 (=5 kHz residual)
+            // tones in the post-rotation signal — meaning >5 kHz left
+            // uncancelled. Cleaner approach: pass the signal straight
+            // through and let uw_correlator's squared-FFT measure and
+            // cancel the FULL residual carrier (worker channel offset
+            // + Iridium-grid mismatch + actual scatter). Channels sit
+            // at ±20 kHz of LO; squared-FFT measures across ±π rad/sym
+            // = ±12.5 kHz at 25 ksym/s. For bursts past ±12.5 kHz of
+            // channel centre, uw_correlator's clamp truncates and the
+            // PLL has to chase the remainder — same risk as before
+            // but now the burst-by-burst measurement is honest.
+            (void)burst.channel;   // no longer used for freq math
             int64_t t_freq = esp_timer_get_time();
             // No stage-1 FIR — channelizer already did the filtering.
             int64_t t_fir = t_freq;
