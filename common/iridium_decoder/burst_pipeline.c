@@ -93,8 +93,17 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
 
     // 5. UW correlator (matched filter peak + direction + residual CFO).
+    //    Limit the search range to (PREAMBLE_LONG + UW + 8 syms) × sps
+    //    = (64 + 12 + 8) × 10 = 840 samples, matching gr-iridium's
+    //    d_sync_search_len exactly. Wider search lets noise beat the
+    //    real UW peak — particularly painful for DL whose constant-
+    //    carrier preamble gives a wide triangular autocorrelation
+    //    plateau (~32 samples wide) instead of a sharp peak.
+    const int SYNC_SEARCH_LEN = (64 + 12 + 8) * UW_SPS;     // 840
+    int search_complex = SYNC_SEARCH_LEN;
+    if (search_complex > adj_n - 24) search_complex = adj_n - 24;
     uw_correlator_find(adj_burst, adj_n,
-                       /*search_complex=*/adj_n - 24,
+                       search_complex,
                        &result->uw_res);
     if (result->uw_res.direction == UW_DIR_UNKNOWN) {
         return true;            // pipeline ran, no decode

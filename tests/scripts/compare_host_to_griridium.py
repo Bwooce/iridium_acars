@@ -62,9 +62,10 @@ def host_bursts():
         r"^\s+burst\s+(\d+):\s+ch=(\d+)\s+\(rel\s+([+-]?\d+)\s+kHz\)\s+"
         r"snr=([\d.]+)\s+dB\s+len=(\d+)")
     # Pipeline result line uses fixed-width columns:
-    #   "  62  20.6     7.6       UL       -0.611    654      no-UW"
+    #   "  62  20.6     7.6       UL       ω_pre=-0.611 ω_post=+0.005 654      no-UW"
     pipeline_re = re.compile(
-        r"^\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\S+)\s+([+-][\d.]+)\s+(\d+)\s+(\S+)")
+        r"^\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\S+)\s+"
+        r"ω_pre=([+-][\d.]+)\s+ω_post=([+-][\d.]+)\s+(\d+)\s+(\S+)")
     detections = {}
     pipeline_idx = 0
     for line in p.stdout.splitlines():
