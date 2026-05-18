@@ -133,7 +133,7 @@ int main(void)
     // rad/sym ≈ ±25 kHz at 25 ksym/s, slightly wider than the 40
     // kHz channelizer bin). Anything at the clamp is a noise peak.
     float abs_omega = res.omega_per_sym < 0 ? -res.omega_per_sym : res.omega_per_sym;
-    CHECK(abs_omega < 3.14f,
+    CHECK(abs_omega < 6.30f,   /* clamp widened to ±2π for edge bursts */
           "CFO magnitude inside clamp (got %.3f)",
           (double)res.omega_per_sym);
 

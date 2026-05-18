@@ -635,14 +635,20 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     // multiply the burst sample by exp(+j·omega_per_sym/sps·n) to
     // CANCEL it.
     float omega = -rad_per_sample * ((float)UW_SPS / 2.0f);
-    // D8: clamp to ±π rad/sym. This is the maximum representable
-    // per-symbol CFO before symbol-rate aliasing kicks in. Channelizer
-    // bins are ±20 kHz wide which at 25 ksym/s = ±5 rad/sym — so any
-    // real signal in our channel is within ±π. Previous tighter
-    // clamp (±1.5 rad/sym ≈ ±6 kHz) was much narrower than the bin
-    // and clipped legitimate off-centre carriers, leaving the PLL
-    // to chase residuals it can't lock to.
-    const float CFO_CLAMP = 3.14159265358979323846f;
+    // D8 widened: clamp at ±2π rad/sym = ±25 kHz residual carrier at
+    // 25 ksym/s. Channels are ±20 kHz wide and Iridium carriers in
+    // iridium.bits scatter ±17 kHz from channel centres. The previous
+    // ±π clamp (= ±12.5 kHz) left ~4-5 kHz uncancelled for edge
+    // bursts — visible as a period-5 residual in pre-PLL hd output.
+    //
+    // The squared-FFT runs at 250 kHz with 4096-pt FFT covering
+    // ±125 kHz (Nyquist), so ±2π is well within its measurement
+    // range. The risk of catching a noise peak past ±π is bounded
+    // by the matched-filter SNR threshold above this CFO step (only
+    // bursts with SNR ≥6 dB get here; their squared-FFT peak is
+    // dominated by signal). Symbol-rate aliasing kicks in past ±2π
+    // (>50 kHz) which is outside any plausible channel.
+    const float CFO_CLAMP = 2.0f * 3.14159265358979323846f;
     if (omega >  CFO_CLAMP) omega =  CFO_CLAMP;
     if (omega < -CFO_CLAMP) omega = -CFO_CLAMP;
     return omega;
