@@ -155,6 +155,7 @@ target_include_directories(test_sbd_reassembler PRIVATE ${COMMON_DIR})
 add_executable(test_polyphase_channelizer
     test_polyphase_channelizer.c
     ${COMMON_DIR}/polyphase_channelizer.c
+    ${COMMON_DIR}/fft_sc16_64.c
 )
 target_include_directories(test_polyphase_channelizer PRIVATE
     ${COMMON_DIR}
@@ -172,6 +173,7 @@ target_compile_options(test_polyphase_channelizer PRIVATE
 add_executable(test_polyphase_int16
     test_polyphase_int16.c
     ${COMMON_DIR}/polyphase_channelizer.c
+    ${COMMON_DIR}/fft_sc16_64.c
 )
 target_include_directories(test_polyphase_int16 PRIVATE ${COMMON_DIR})
 target_link_libraries(test_polyphase_int16 PRIVATE m)
@@ -182,6 +184,7 @@ target_link_libraries(test_polyphase_int16 PRIVATE m)
 add_executable(test_channelizer_detector
     test_channelizer_detector.c
     ${COMMON_DIR}/polyphase_channelizer.c
+    ${COMMON_DIR}/fft_sc16_64.c
     ${COMMON_DIR}/channelizer_detector.c
 )
 target_include_directories(test_channelizer_detector PRIVATE
@@ -298,6 +301,7 @@ add_executable(test_worker_pipeline_albq
     ${COMMON_DIR}/burst_pipeline.c
     ${COMMON_DIR}/channelizer_detector.c
     ${COMMON_DIR}/polyphase_channelizer.c
+    ${COMMON_DIR}/fft_sc16_64.c
     ${COMMON_DIR}/uw_correlator.c
     ${COMMON_DIR}/qpsk_demod.c
     ${COMMON_DIR}/firmr_s16.c
@@ -318,6 +322,7 @@ add_executable(test_snr_gap_measurement
     test_snr_gap_measurement.c
     ${COMMON_DIR}/channelizer_detector.c
     ${COMMON_DIR}/polyphase_channelizer.c
+    ${COMMON_DIR}/fft_sc16_64.c
 )
 target_include_directories(test_snr_gap_measurement PRIVATE
     ${COMMON_DIR}

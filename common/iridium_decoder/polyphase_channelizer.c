@@ -10,6 +10,7 @@
 
 #include "polyphase_channelizer.h"
 #include "q14_fixed.h"
+#include "fft_sc16_64.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -400,9 +401,6 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
 
     // FFT scratch — interleaved IQ.
     int16_t fft_buf_i16[POLYCHAN_M * 2];
-#ifndef ESP_PLATFORM
-    float complex fft_buf_fc32[POLYCHAN_M];
-#endif
 
     for (size_t cycle = 0; cycle < n_cycles; cycle++) {
         // 1. Write M input IQ pairs to the 2-copy delay line.
@@ -481,28 +479,15 @@ size_t polyphase_channelizer_process_int16(polyphase_channelizer_t *ch,
         // Else: leave the (MAC-only, no-FFT) data through. Tests
         // would fail loudly; production gates on init success.
 #else
-        // Host fallback: convert int16 → float complex → fft_64 →
-        // back to int16 with saturation. Keeps host tests free of
-        // esp-dsp. The fft_64 output is NOT normalised, so we divide
-        // by M after to match the target's dsps_fft2r_sc16_arp4
-        // behaviour (per-stage right-shift = /N total). Without this
-        // the int16 path saturates on any real input.
-        for (int p = 0; p < M; p++) {
-            fft_buf_fc32[p] = (float)fft_buf_i16[p * 2 + 0]
-                            + (float)fft_buf_i16[p * 2 + 1] * I;
-        }
-        fft_64(fft_buf_fc32);
-        const float fft_norm = 1.0f / (float)M;
-        for (int k = 0; k < M; k++) {
-            int32_t re = (int32_t)lrintf(crealf(fft_buf_fc32[k]) * fft_norm);
-            int32_t im = (int32_t)lrintf(cimagf(fft_buf_fc32[k]) * fft_norm);
-            if      (re > INT16_MAX) re = INT16_MAX;
-            else if (re < INT16_MIN) re = INT16_MIN;
-            if      (im > INT16_MAX) im = INT16_MAX;
-            else if (im < INT16_MIN) im = INT16_MIN;
-            fft_buf_i16[k * 2 + 0] = (int16_t)re;
-            fft_buf_i16[k * 2 + 1] = (int16_t)im;
-        }
+        // Host: portable Q15 64-pt FFT. Direct port of esp-dsp's
+        // dsps_fft2r_sc16_ansi reference (same butterfly math, same
+        // per-stage right-shift, same twiddle layout) — produces
+        // bit-equivalent output to the dsps_fft2r_sc16_arp4 we call
+        // on target. Previously the host went int16 → float → fft_64
+        // → /M → int16, which gave numerically-close-but-not-equal
+        // output and made the channelizer detector see different
+        // bursts than the P4 worker on identical input.
+        fft_sc16_64(fft_buf_i16);
 #endif
 
         // 4. Write out the M channels for this cycle (interleaved).

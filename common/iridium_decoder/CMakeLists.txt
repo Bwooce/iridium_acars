@@ -38,6 +38,12 @@ idf_component_register(
         # and the host pipeline test. Single source of truth for the
         # gr-iridium-aligned D13 → CFO → RRC → UW → demod chain.
         "burst_pipeline.c"
+        # Portable Q15 64-pt FFT used by the host channelizer (target
+        # uses esp-dsp's hardware-accelerated dsps_fft2r_sc16_arp4
+        # instead — this file's fft_sc16_64() symbol is dead code on
+        # target but still compiled to keep the build target list
+        # uniform).
+        "fft_sc16_64.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board
