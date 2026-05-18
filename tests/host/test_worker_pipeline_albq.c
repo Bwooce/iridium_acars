@@ -340,14 +340,35 @@ int main(void)
                 float rot_re = uw.peak_re / pmag;
                 float rot_im = uw.peak_im / pmag;
                 float dphi_pll = uw.omega_per_sym / 10.0f;   // UW_SPS=10
-                int16_t *src = adj + (int)uw.uw_offset * 2;
-                int n_rot = adj_n - (int)uw.uw_offset;
+                // Sub-sample timing correction (mirrors worker_core1
+                // lines 401-450). uw_res.correction is the parabolic-
+                // interpolated fractional sample offset around the
+                // matched-filter peak; ignoring it lands qpsk_demod's
+                // stride-2 sampler up to ±0.05 symbol off the true
+                // centre, which collapses the UW match on most bursts.
+                // Splitting into integer base + fractional and linear-
+                // interpolating in the pre-rotation loop gives qpsk_demod
+                // the same true-centre alignment as the P4 worker.
+                float true_pos = (float)uw.uw_offset + uw.correction;
+                int   int_base = (int)floorf(true_pos);
+                float interp_frac = true_pos - (float)int_base;   // [0, 1)
+                if (int_base < 0) { int_base = 0; interp_frac = 0.0f; }
+                int16_t *src = adj + int_base * 2;
+                int n_rot = adj_n - int_base;
                 if (n_rot > 1) {
                     float pr = rot_re, pi = rot_im;
                     float c_step = cosf(dphi_pll), s_step = sinf(dphi_pll);
-                    for (int i = 0; i < n_rot; i++) {
-                        float re = src[i * 2 + 0];
-                        float im = src[i * 2 + 1];
+                    float a = 1.0f - interp_frac;
+                    float b = interp_frac;
+                    // Need src[i+1] for the linear interp.
+                    int n_cplx = n_rot - 1;
+                    for (int i = 0; i < n_cplx; i++) {
+                        // Linear-interpolate to the true sub-sample
+                        // symbol-centre position, then pre-rotate.
+                        float re = a * (float)src[i * 2 + 0]
+                                 + b * (float)src[(i + 1) * 2 + 0];
+                        float im = a * (float)src[i * 2 + 1]
+                                 + b * (float)src[(i + 1) * 2 + 1];
                         float nr = re * pr - im * pi;
                         float ni = re * pi + im * pr;
                         if (nr >  INT16_MAX) nr =  INT16_MAX;
@@ -360,6 +381,7 @@ int main(void)
                         float npi = pr * s_step + pi * c_step;
                         pr = npr; pi = npi;
                     }
+                    n_rot = n_cplx;       // src now has n_cplx valid pre-rotated samples
                     // Decim 5×
                     int n_2sps = n_rot / 5;
                     int16_t *iq2 = malloc(n_2sps * 2 * sizeof(int16_t));
