@@ -58,12 +58,33 @@ static float bessel_i0(float x)
 //   UL preamble = 8× (s1, s0)         → signs -1, +1, -1, +1, ...
 //   DL UW = { s0, s1, s1, s1, s1, s0, s0, s0, s1, s0, s0, s1 }
 //   UL UW = { s1, s1, s0, s0, s0, s1, s0, s0, s1, s0, s1, s1 }
+// Matched-filter sync templates with the preamble zeroed out. The DL
+// preamble is 16 constant-carrier symbols whose autocorrelation
+// against itself is a wide triangular plateau (~32 samples), not a
+// sharp BPSK peak — the argmax inside the plateau is fuzzy and the
+// PEAK MAGNITUDE is lower than the sharper UL correlator's peak on
+// the SAME signal. Result: DL bursts get misclassified as UL on
+// borderline SNR.
+//
+// Solution: drop the preamble from the matched filter altogether and
+// correlate only against the 12-symbol UW (a BPSK pattern for both
+// directions, with sharp autocorrelation). The two UW patterns are
+// orthogonal (their dot product is 0), so direction discrimination
+// is clean: DL UW correlator peaks on DL signals, UL UW correlator
+// peaks on UL signals; the other direction's response is near zero.
+//
+// Position semantics preserved: the matched filter still slides a
+// 28-symbol-wide window, with zero contribution from the leading 16
+// preamble samples. The peak shifts so that the UW portion of the
+// template lines up with the signal's UW. peak_k still = preamble
+// start, so uw_offset = peak_k + PREAMBLE_LENGTH * SYM_STRIDE works
+// unchanged.
 static const int8_t SYNC_DL_SIGN[SYNC_LENGTH] = {
-    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,   // preamble
+     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // preamble: zero
     +1,-1,-1,-1,-1,+1,+1,+1,-1,+1,+1,-1                  // UW
 };
 static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
-    -1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,-1,+1,   // preamble
+     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // preamble: zero
     -1,-1,+1,+1,+1,-1,+1,+1,-1,+1,-1,-1                  // UW
 };
 
