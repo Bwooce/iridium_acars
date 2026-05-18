@@ -81,6 +81,10 @@ static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
 // taps approach unity and Q15(1.0) = 32768 doesn't fit in int16.
 #include "q14_fixed.h"
 
+#ifdef UW_CORRELATOR_CFO_DEBUG
+#include <stdio.h>
+#endif
+
 // Q14 burst-side FIR taps (RRC). Used by uw_correlator_apply_rrc.
 static int16_t s_rrc_taps_q14[RRC_NTAPS];
 
@@ -601,6 +605,40 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
         if (m > peak_mag) { peak_mag = m; peak_k = k; }
     }
     if (peak_mag <= 0) return 0.0f;
+
+#ifdef UW_CORRELATOR_CFO_DEBUG
+    {
+        // Dump top 5 peaks (signed bin, omega rad/sym, magnitude) for
+        // offline analysis: are we picking the carrier residual or
+        // getting fooled by a DC sidelobe / noise peak?
+        const int N = CFO_FFT_N;
+        typedef struct { int k; int64_t m; } pk_t;
+        pk_t top[5];
+        for (int i = 0; i < 5; i++) { top[i].k = 0; top[i].m = -1; }
+        for (int k = 0; k < N; k++) {
+            int64_t rr = re[k], ii = im[k];
+            int64_t m = rr * rr + ii * ii;
+            for (int i = 0; i < 5; i++) {
+                if (m > top[i].m) {
+                    for (int j = 4; j > i; j--) top[j] = top[j-1];
+                    top[i].k = k; top[i].m = m;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[cfo] top peaks (n_in=%d, win=%s):", n_in,
+                (win == s_cfo_window_full) ? "full" : "uw-only");
+        for (int i = 0; i < 5; i++) {
+            int kf_dbg = top[i].k;
+            if (kf_dbg >= N/2) kf_dbg -= N;
+            float omega_dbg = -2.0f * 3.14159265358979323846f * kf_dbg / (float)N
+                              * ((float)UW_SPS / 2.0f);
+            fprintf(stderr, "  k=%+5d ω=%+.3f m=%lld",
+                    kf_dbg, (double)omega_dbg, (long long)top[i].m);
+        }
+        fprintf(stderr, "\n");
+    }
+#endif
 
     // Parabolic interpolation around the peak (with wrap).
     int km1 = (peak_k - 1 + CFO_FFT_N) % CFO_FFT_N;
