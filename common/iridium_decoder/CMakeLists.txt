@@ -34,6 +34,10 @@ idf_component_register(
         # D10 (gr-iridium-style): UW cross-correlator for one-shot
         # timing + direction estimation.
         "uw_correlator.c"
+        # Per-burst pipeline orchestration shared between worker_core1
+        # and the host pipeline test. Single source of truth for the
+        # gr-iridium-aligned D13 → CFO → RRC → UW → demod chain.
+        "burst_pipeline.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board

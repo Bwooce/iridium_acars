@@ -295,6 +295,7 @@ target_link_libraries(test_uw_correlator_albq_ul PRIVATE m)
 # the same data without flashing.
 add_executable(test_worker_pipeline_albq
     test_worker_pipeline_albq.c
+    ${COMMON_DIR}/burst_pipeline.c
     ${COMMON_DIR}/channelizer_detector.c
     ${COMMON_DIR}/polyphase_channelizer.c
     ${COMMON_DIR}/uw_correlator.c

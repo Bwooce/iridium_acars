@@ -35,6 +35,7 @@
 #include "uw_correlator.h"
 #include "qpsk_demod.h"
 #include "polyphase_channelizer.h"
+#include "burst_pipeline.h"
 
 #define FS_IN         2560000u
 #define POLYCHAN_M_   64
@@ -283,147 +284,19 @@ int main(void)
         }
         free(re_buf); free(im_buf);
 
-        // gr-iridium order: D13 burst start → squared-FFT CFO (pre-RRC,
-        // mirroring burst_downmix_impl.cc::process_next_frame which runs
-        // the CFO estimate on the input_fir output before applying RRC) →
-        // freq-correct → RRC → uw_correlator (matched filter).
-        //
-        // The pre-RRC squared-FFT sees the carrier residual at its
-        // natural 2f_c position even for band-edge carriers, where
-        // post-RRC the 2f_c tone would be attenuated by the matched
-        // filter's RC envelope.
-        int bstart = uw_correlator_find_burst_start(iq250, n_250k, n_250k);
-        int16_t *adj = iq250 + bstart * 2;
-        int adj_n = n_250k - bstart;
-
-        // Coarse CFO on PRE-RRC signal.
-        float omega_coarse = uw_correlator_estimate_cfo(adj, adj_n);
-        if (omega_coarse != 0.0f) {
-            // Phase-correct in place: burst[n] *= exp(+j·omega/sps·n).
-            // Sign: uw_correlator_estimate_cfo returns omega with the
-            // convention "worker multiplies by exp(+j·omega/sps·n) to
-            // CANCEL it", so we apply omega/10 per sample at 10 sps.
-            float dphi_cs = omega_coarse / 10.0f;
-            float pr = 1.0f, pi = 0.0f;
-            float c_step = cosf(dphi_cs), s_step = sinf(dphi_cs);
-            for (int i = 0; i < adj_n; i++) {
-                float r = adj[i * 2 + 0];
-                float v = adj[i * 2 + 1];
-                float nr = r * pr - v * pi;
-                float ni = r * pi + v * pr;
-                if (nr > INT16_MAX) nr = INT16_MAX;
-                if (nr < INT16_MIN) nr = INT16_MIN;
-                if (ni > INT16_MAX) ni = INT16_MAX;
-                if (ni < INT16_MIN) ni = INT16_MIN;
-                adj[i * 2 + 0] = (int16_t)lrintf(nr);
-                adj[i * 2 + 1] = (int16_t)lrintf(ni);
-                float npr = pr * c_step - pi * s_step;
-                float npi = pr * s_step + pi * c_step;
-                pr = npr; pi = npi;
-            }
-        }
-
-#ifndef SKIP_RRC
-        uw_correlator_apply_rrc(adj, adj, adj_n);
-#endif
-        uw_corr_result_t uw;
-        uw_correlator_find(adj, adj_n, adj_n - 24, &uw);
-        // uw.omega_per_sym is now a small RESIDUAL — the coarse step
-        // already cancelled the bulk on the whole adj_burst; do not
-        // double-apply it in the post-UW linear ramp below.
-
-        // Pre-rotation + decim 5 (we use float pre-rot here for clarity)
-        const char *qpsk_str = "no-decode";
-        if (uw.direction != UW_DIR_UNKNOWN) {
-            float pmag = sqrtf(uw.peak_re * uw.peak_re + uw.peak_im * uw.peak_im);
-            if (pmag > 1e-3f) {
-                float rot_re = uw.peak_re / pmag;
-                float rot_im = uw.peak_im / pmag;
-                float dphi_pll = uw.omega_per_sym / 10.0f;   // UW_SPS=10
-                // Sub-sample timing correction (mirrors worker_core1
-                // lines 401-450). uw_res.correction is the parabolic-
-                // interpolated fractional sample offset around the
-                // matched-filter peak; ignoring it lands qpsk_demod's
-                // stride-2 sampler up to ±0.05 symbol off the true
-                // centre, which collapses the UW match on most bursts.
-                // Splitting into integer base + fractional and linear-
-                // interpolating in the pre-rotation loop gives qpsk_demod
-                // the same true-centre alignment as the P4 worker.
-                float true_pos = (float)uw.uw_offset + uw.correction;
-                int   int_base = (int)floorf(true_pos);
-                float interp_frac = true_pos - (float)int_base;   // [0, 1)
-                if (int_base < 0) { int_base = 0; interp_frac = 0.0f; }
-                int16_t *src = adj + int_base * 2;
-                int n_rot = adj_n - int_base;
-                if (n_rot > 1) {
-                    float pr = rot_re, pi = rot_im;
-                    float c_step = cosf(dphi_pll), s_step = sinf(dphi_pll);
-                    float a = 1.0f - interp_frac;
-                    float b = interp_frac;
-                    // Need src[i+1] for the linear interp.
-                    int n_cplx = n_rot - 1;
-                    for (int i = 0; i < n_cplx; i++) {
-                        // Linear-interpolate to the true sub-sample
-                        // symbol-centre position, then pre-rotate.
-                        float re = a * (float)src[i * 2 + 0]
-                                 + b * (float)src[(i + 1) * 2 + 0];
-                        float im = a * (float)src[i * 2 + 1]
-                                 + b * (float)src[(i + 1) * 2 + 1];
-                        float nr = re * pr - im * pi;
-                        float ni = re * pi + im * pr;
-                        if (nr >  INT16_MAX) nr =  INT16_MAX;
-                        if (nr <  INT16_MIN) nr =  INT16_MIN;
-                        if (ni >  INT16_MAX) ni =  INT16_MAX;
-                        if (ni <  INT16_MIN) ni =  INT16_MIN;
-                        src[i * 2 + 0] = (int16_t)lrintf(nr);
-                        src[i * 2 + 1] = (int16_t)lrintf(ni);
-                        float npr = pr * c_step - pi * s_step;
-                        float npi = pr * s_step + pi * c_step;
-                        pr = npr; pi = npi;
-                    }
-                    n_rot = n_cplx;       // src now has n_cplx valid pre-rotated samples
-                    // Decim 5×
-                    int n_2sps = n_rot / 5;
-                    int16_t *iq2 = malloc(n_2sps * 2 * sizeof(int16_t));
-                    for (int i = 0; i < n_2sps; i++) {
-                        iq2[i * 2 + 0] = src[i * 5 * 2 + 0];
-                        iq2[i * 2 + 1] = src[i * 5 * 2 + 1];
-                    }
-                    fprintf(stderr, "    uw_offset=%d, mod UW_SPS(10)=%d, correction=%.3f\n",
-                            (int)uw.uw_offset, (int)uw.uw_offset % 10,
-                            (double)uw.correction);
-                    // Diag: dump I/Q values directly + per-symbol arg
-                    // for the first 12 symbols (= UW range). If the
-                    // signal is QPSK at the expected axis, |I| and |Q|
-                    // should be similar; if BPSK-only (a sign of a
-                    // genuine ±real-axis signal), |Q| << |I|. Phase
-                    // angle on the unit circle is what qpsk_demod's
-                    // hard-decider partitions; printing it shows
-                    // whether the constellation rotates symbol-to-
-                    // symbol (= residual carrier) or stays put.
-                    fprintf(stderr, "    syms[0..11] (I, Q, deg):\n");
-                    int n_diag_syms = n_2sps / 2;
-                    if (n_diag_syms > 12) n_diag_syms = 12;
-                    for (int s = 0; s < n_diag_syms; s++) {
-                        int16_t r = iq2[s * 4 + 0];
-                        int16_t v = iq2[s * 4 + 1];
-                        float deg = atan2f((float)v, (float)r) * 180.0f / 3.14159f;
-                        fprintf(stderr, "      [%2d]  I=%6d  Q=%6d  ang=%+7.1f°\n",
-                                s, (int)r, (int)v, (double)deg);
-                    }
-
-                    decoded_frame_t frame = {0};
-                    int rc = qpsk_demod_process(iq2, n_2sps * 2, &frame);
-                    if (rc) {
-                        qpsk_str = "OK";
-                        n_ok_decode++;
-                        n_uw_match++;
-                    } else {
-                        qpsk_str = "no-UW";
-                    }
-                    free(iq2);
-                }
-            }
+        // Hand off to the shared per-burst pipeline (same code path
+        // the P4 worker uses). Eliminates the drift between host and
+        // worker orchestrations that previously cost 10× decode rate.
+        burst_pipeline_result_t bres;
+        burst_pipeline_process_250khz(iq250, n_250k, &bres);
+        uw_corr_result_t uw = bres.uw_res;
+        const char *qpsk_str = bres.demod_ok ? "OK"
+                              : (uw.direction == UW_DIR_UNKNOWN ? "no-decode"
+                                                                : "no-UW");
+        if (bres.demod_ok) {
+            n_ok_decode++;
+            n_uw_match++;
+            free(bres.frame.bits);
         }
 
         printf("  %-3d %-7.1f  %-8.1f  %-8s %-+9.3f %-8d %s\n",

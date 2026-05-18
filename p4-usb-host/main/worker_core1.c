@@ -16,6 +16,7 @@
 #include "qpsk_demod.h"
 #include "polyphase_channelizer.h"   // POLYCHAN_M
 #include "uw_correlator.h"
+#include "burst_pipeline.h"
 #include "bch_decoder.h"
 #include "frame_decoder.h"
 
@@ -286,7 +287,6 @@ void worker_task(void *arg)
                      burst.length_samples);
 
             // 5. QPSK Demodulation
-            decoded_frame_t frame;
             // Pack I and Q back into interleaved for demod
             for (int i = 0; i < out_samples_50k; i++) {
                 demod_interleaved[i * 2 + 0] = resample_buf[i];
@@ -308,199 +308,35 @@ void worker_task(void *arg)
             // parabolic peak interpolation, NOT a continuous Gardner
             // loop. New uw_correlator module replaces this hook.)
 
-            // gr-iridium-aligned order (burst_downmix_impl.cc
-            // ::process_next_frame, lines 506-594):
-            //   1. D13 start_finder on the raw resampled burst.
-            //   2. Squared-FFT CFO on PRE-RRC signal anchored at
-            //      D13 burst start.
-            //   3. Freq-correct adj_burst by the coarse omega.
-            //   4. RRC matched filter on the corrected burst.
-            //   5. uw_correlator_find — its internal squared-FFT now
-            //      finds a small residual.
-            //   6. (existing) peak-phase + residual omega pre-rotation,
-            //      then qpsk_demod_process.
-            //
-            // The coarse CFO must precede RRC: the 2f_c tone of a
-            // band-edge carrier is outside the RRC passband and would
-            // be attenuated post-RRC, leaving the squared-FFT picking
-            // DC leakage instead of the carrier residual.
-            //
-            // Search the whole burst for the envelope onset — gr-iridium
-            // uses d_search_depth ~1000-3000 samples; we pass the full
-            // burst length (the start_finder's internal LP filter
-            // smooths noise, so wider search doesn't add false positives).
-            int burst_start = uw_correlator_find_burst_start(
-                                  demod_interleaved, out_samples_50k,
-                                  /*search_max=*/out_samples_50k);
-            int16_t *adj_burst = demod_interleaved + burst_start * 2;
-            int adj_n = out_samples_50k - burst_start;
-
-            // Pre-RRC squared-FFT CFO estimate.
-            float omega_coarse = uw_correlator_estimate_cfo(adj_burst, adj_n);
-            if (omega_coarse != 0.0f) {
-                // Phase-correct adj_burst in place by exp(+j·omega/sps·n).
-                // Sign convention matches uw_correlator's returned omega:
-                // negative of the actual offset, so multiplying by
-                // exp(+j·omega/sps·n) cancels the residual.
-                float dphi = omega_coarse / (float)UW_SPS;
-                #define Q15F_LOCAL(x)  ((int16_t)lrintf((x) * 32767.0f))
-                int16_t pr_q = Q15F_LOCAL(1.0f);
-                int16_t pi_q = Q15F_LOCAL(0.0f);
-                int16_t cs_q = Q15F_LOCAL(cosf(dphi));
-                int16_t ss_q = Q15F_LOCAL(sinf(dphi));
-                #undef Q15F_LOCAL
-                for (int i = 0; i < adj_n; i++) {
-                    int32_t r = adj_burst[i * 2 + 0];
-                    int32_t v = adj_burst[i * 2 + 1];
-                    int32_t nr = ((int32_t)r * pr_q - (int32_t)v * pi_q) >> 15;
-                    int32_t ni = ((int32_t)r * pi_q + (int32_t)v * pr_q) >> 15;
-                    if (nr > INT16_MAX) nr = INT16_MAX;
-                    if (nr < INT16_MIN) nr = INT16_MIN;
-                    if (ni > INT16_MAX) ni = INT16_MAX;
-                    if (ni < INT16_MIN) ni = INT16_MIN;
-                    adj_burst[i * 2 + 0] = (int16_t)nr;
-                    adj_burst[i * 2 + 1] = (int16_t)ni;
-                    int32_t npr = ((int32_t)pr_q * cs_q
-                                 - (int32_t)pi_q * ss_q) >> 15;
-                    int32_t npi = ((int32_t)pr_q * ss_q
-                                 + (int32_t)pi_q * cs_q) >> 15;
-                    if (npr > INT16_MAX) npr = INT16_MAX;
-                    if (npr < INT16_MIN) npr = INT16_MIN;
-                    if (npi > INT16_MAX) npi = INT16_MAX;
-                    if (npi < INT16_MIN) npi = INT16_MIN;
-                    pr_q = (int16_t)npr;
-                    pi_q = (int16_t)npi;
-                }
-            }
-
-            uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
+            // Hand off to the shared per-burst pipeline (common/
+            // iridium_decoder/burst_pipeline.c). Single source of truth
+            // for D13 → coarse CFO → freq-correct → RRC → UW correlator
+            // → pre-rotation → decim → qpsk_demod; was previously
+            // duplicated between this file and test_worker_pipeline_albq.c
+            // with subtle drift (sub-sample correction, precision).
+            burst_pipeline_result_t bres;
+            burst_pipeline_process_250khz(demod_interleaved, out_samples_50k,
+                                           &bres);
             ESP_LOGI(TAG, "D13 burst start: %d (of %d samples)",
-                     burst_start, out_samples_50k);
-
-            if (diag) {
-                diag_dump("05_post_rrc_250k", 250000, adj_burst, adj_n);
-            }
-            uw_corr_result_t uw_res;
-            uw_correlator_find(adj_burst, adj_n,
-                                /*search_complex=*/adj_n - 24,
-                                &uw_res);
-            bool demod_ok = false;
+                     bres.burst_start, out_samples_50k);
             ESP_LOGI(TAG, "UW corr: dir=%s offset=%d corr=%.3f SNR=%.1f dB peak=%.2e omega=%.3f",
-                     uw_res.direction == UW_DIR_DOWNLINK ? "DL" :
-                     uw_res.direction == UW_DIR_UPLINK   ? "UL" : "UNKNOWN",
-                     uw_res.uw_offset, (double)uw_res.correction,
-                     (double)uw_res.snr_estimate_db, (double)uw_res.peak_value,
-                     (double)uw_res.omega_per_sym);
-            if (uw_res.direction != UW_DIR_UNKNOWN) {
-                // D10b + #46: sub-sample timing correction.
-                // True peak position = uw_offset + correction (fractional).
-                // Split into integer base + fractional residue ∈ [0, 1),
-                // then linear-interpolate in the pre-rotation loop so
-                // qpsk_demod's fixed-decim sees samples at the TRUE
-                // symbol centres rather than the nearest integer.
-                float true_pos = (float)uw_res.uw_offset + uw_res.correction;
-                int   int_base = (int)floorf(true_pos);
-                float interp_frac = true_pos - (float)int_base;   // [0, 1)
-                if (int_base < 0) { int_base = 0; interp_frac = 0.0f; }
-                int int16_off = int_base * 2;
-                // Pre-rotate burst by exp(+j·peak_phase) AND apply a
-                // linear phase ramp to cancel the residual carrier omega
-                // estimated from the UW two-half phase diff. After this,
-                // the PLL starts with both phi and omega near zero.
-                float pmag = sqrtf(uw_res.peak_re * uw_res.peak_re
-                                 + uw_res.peak_im * uw_res.peak_im);
-                // uw_res.uw_offset is RELATIVE to adj_burst (post-D13
-                // trim), so src must start from adj_burst too. The
-                // n_rot length is what's left in adj_burst after the UW.
-                int n_rot_int16 = adj_n * 2 - int16_off;
-                int16_t *src = adj_burst + int16_off;
-                if (pmag > 1e-3f) {
-                    // Q15 pre-rotation + linear sub-sample interp.
-                    // Phasor pr/pi and step c_step/s_step live in Q15
-                    // (range [-1,1] → int16 [-INT16_MAX, INT16_MAX]).
-                    // Interp blends in Q15 too. Per sample:
-                    //   re = (a × src[i].re + b × src[i+1].re) >> 15   [int16]
-                    //   nr = (re × pr - im × pi) >> 15                 [int16]
-                    //   pr' = (pr × cs - pi × ss) >> 15
-                    // Magnitude of |phasor| drifts by ~ε per step; for
-                    // ≤1100-sample bursts the cumulative drift is well
-                    // under 4% and harmless for downstream demod (PLL
-                    // pulls it back).
-                    float rot_re =  uw_res.peak_re / pmag;
-                    float rot_im =  uw_res.peak_im / pmag;
-                    float dphi = uw_res.omega_per_sym / (float)UW_SPS;
-                    float c_step = cosf(dphi);
-                    float s_step = sinf(dphi);
-
-                    #define Q15F(x)  ((int16_t)lrintf((x) * 32767.0f))
-                    int16_t pr_q = Q15F(rot_re);
-                    int16_t pi_q = Q15F(rot_im);
-                    int16_t cs_q = Q15F(c_step);
-                    int16_t ss_q = Q15F(s_step);
-                    int16_t a_q  = Q15F(1.0f - interp_frac);
-                    int16_t b_q  = Q15F(interp_frac);
-                    #undef Q15F
-
-                    int n_cplx = n_rot_int16 / 2;
-                    if (n_cplx > 0) n_cplx -= 1;   // need src[i+1] for interp
-                    for (int i = 0; i < n_cplx; i++) {
-                        int32_t re = ((int32_t)a_q * (int32_t)src[i * 2 + 0]
-                                    + (int32_t)b_q * (int32_t)src[(i + 1) * 2 + 0]) >> 15;
-                        int32_t im = ((int32_t)a_q * (int32_t)src[i * 2 + 1]
-                                    + (int32_t)b_q * (int32_t)src[(i + 1) * 2 + 1]) >> 15;
-                        int32_t nr = ((int32_t)re * (int32_t)pr_q
-                                    - (int32_t)im * (int32_t)pi_q) >> 15;
-                        int32_t ni = ((int32_t)re * (int32_t)pi_q
-                                    + (int32_t)im * (int32_t)pr_q) >> 15;
-                        if (nr > INT16_MAX) nr = INT16_MAX;
-                        if (nr < INT16_MIN) nr = INT16_MIN;
-                        if (ni > INT16_MAX) ni = INT16_MAX;
-                        if (ni < INT16_MIN) ni = INT16_MIN;
-                        src[i * 2 + 0] = (int16_t)nr;
-                        src[i * 2 + 1] = (int16_t)ni;
-                        // Advance phasor: p ← p · exp(j·dphi).
-                        int32_t npr = ((int32_t)pr_q * (int32_t)cs_q
-                                     - (int32_t)pi_q * (int32_t)ss_q) >> 15;
-                        int32_t npi = ((int32_t)pr_q * (int32_t)ss_q
-                                     + (int32_t)pi_q * (int32_t)cs_q) >> 15;
-                        if (npr > INT16_MAX) npr = INT16_MAX;
-                        if (npr < INT16_MIN) npr = INT16_MIN;
-                        if (npi > INT16_MAX) npi = INT16_MAX;
-                        if (npi < INT16_MIN) npi = INT16_MIN;
-                        pr_q = (int16_t)npr;
-                        pi_q = (int16_t)npi;
-                    }
-                }
-                // Decimate 10 sps → 2 sps for qpsk_demod (which still
-                // expects 2 sps interleaved IQ). 5:1 decimation by
-                // picking every 5th complex sample — matches what
-                // qpsk_demod's internal i*4 stride already does at
-                // sps=2 once it sees 2-sps input. Pre-rotation +
-                // sub-sample interpolation above already aligned
-                // symbol centres to integer sample positions.
-                int n_rot_cplx = n_rot_int16 / 2;
-                int n_post_cplx = n_rot_cplx / POST_CORR_DECIM;
-                int16_t *post = src;        // in-place: src has 10 sps,
-                                            // we write 2 sps to same buf
-                for (int i = 0; i < n_post_cplx; i++) {
-                    int j = i * POST_CORR_DECIM;
-                    post[i * 2 + 0] = src[j * 2 + 0];
-                    post[i * 2 + 1] = src[j * 2 + 1];
-                }
-                int n_post_int16 = n_post_cplx * 2;
-                if (diag) {
-                    // Pre-rotated 10-sps buffer in `src` at length n_rot_cplx
-                    // is what the matched filter saw post-cancellation. The
-                    // 2-sps decimated buffer `post` is what qpsk_demod sees.
-                    diag_dump("06_post_prerot_250k", 250000, src, n_rot_cplx);
-                    diag_dump("07_decim_50k_2sps", 50000, post, n_post_cplx);
-                    ESP_LOGI(TAG, "=== DIAG END ===");
-                }
-                memset(&frame, 0, sizeof(frame));
-                if (qpsk_demod_process(post, n_post_int16, &frame)) {
-                    demod_ok = true;
-                }
+                     bres.uw_res.direction == UW_DIR_DOWNLINK ? "DL" :
+                     bres.uw_res.direction == UW_DIR_UPLINK   ? "UL" : "UNKNOWN",
+                     bres.uw_res.uw_offset, (double)bres.uw_res.correction,
+                     (double)bres.uw_res.snr_estimate_db,
+                     (double)bres.uw_res.peak_value,
+                     (double)bres.uw_res.omega_per_sym);
+            if (diag && bres.uw_res.direction != UW_DIR_UNKNOWN) {
+                // Best-effort: the shared pipeline left the burst's
+                // 2-sps decimated stream at adj_burst+int_base, but
+                // there's no longer a separate dump hook for the
+                // intermediate buffers. Skip the per-step dumps.
+                ESP_LOGI(TAG, "=== DIAG END (shared pipeline) ===");
             }
+            uw_corr_result_t uw_res = bres.uw_res;
+            bool demod_ok = bres.demod_ok;
+            decoded_frame_t frame = bres.frame;
+            (void)uw_res;
             int64_t t_demod = esp_timer_get_time();
             int64_t t_bch = t_demod;
             if (demod_ok) {
