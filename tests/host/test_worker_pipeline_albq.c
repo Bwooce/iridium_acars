@@ -209,6 +209,25 @@ int main(void)
         }
         double rms1 = sqrt(s1 / n_ch);
 
+        // Save first ≥300-sample burst's channelizer output for
+        // spectrum analysis in Python. Diagnostic — one shot.
+        static int diag_dump_done = 0;
+        if (!diag_dump_done && n_ch >= 300) {
+            FILE *f = fopen("/tmp/host_burst_ch40k.cf32", "wb");
+            if (f) {
+                for (size_t i = 0; i < n_ch; i++) {
+                    float fr = (float)ch_iq[i*2+0] / 32768.0f;
+                    float fi = (float)ch_iq[i*2+1] / 32768.0f;
+                    fwrite(&fr, 4, 1, f);
+                    fwrite(&fi, 4, 1, f);
+                }
+                fclose(f);
+                fprintf(stderr, "    [dump] saved %zu cplx samples (40 kHz, burst ch=%d) to /tmp/host_burst_ch40k.cf32\n",
+                        n_ch, bb->channel);
+                diag_dump_done = 1;
+            }
+        }
+
         // Residual freq-shift on the 40 kHz signal.
         int signed_ch = (bb->channel > POLYCHAN_M_ / 2)
                         ? bb->channel - POLYCHAN_M_ : bb->channel;
