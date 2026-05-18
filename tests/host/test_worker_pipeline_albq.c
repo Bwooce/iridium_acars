@@ -166,10 +166,11 @@ int main(void)
     }
     printf("Channelizer detected %d bursts:\n", coll.n);
     for (int i = 0; i < coll.n; i++) {
-        printf("  burst %d: ch=%d (rel %+d kHz) snr=%.1f dB len=%u\n",
+        printf("  burst %d: ch=%d (rel %+d kHz) snr=%.1f dB len=%u start=%u\n",
                i, coll.bursts[i].channel, coll.bursts[i].rel_freq_hz/1000,
                (double)coll.bursts[i].snr_db,
-               coll.bursts[i].length_samples);
+               coll.bursts[i].length_samples,
+               coll.bursts[i].start_sample_idx);
     }
 
     // 2. Build resampler taps once (Q15, esp-dsp layout)
