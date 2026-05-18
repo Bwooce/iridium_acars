@@ -283,15 +283,54 @@ int main(void)
         }
         free(re_buf); free(im_buf);
 
-        // D13 burst start + RRC + uw_correlator
+        // gr-iridium order: D13 burst start → squared-FFT CFO (pre-RRC,
+        // mirroring burst_downmix_impl.cc::process_next_frame which runs
+        // the CFO estimate on the input_fir output before applying RRC) →
+        // freq-correct → RRC → uw_correlator (matched filter).
+        //
+        // The pre-RRC squared-FFT sees the carrier residual at its
+        // natural 2f_c position even for band-edge carriers, where
+        // post-RRC the 2f_c tone would be attenuated by the matched
+        // filter's RC envelope.
         int bstart = uw_correlator_find_burst_start(iq250, n_250k, n_250k);
         int16_t *adj = iq250 + bstart * 2;
         int adj_n = n_250k - bstart;
+
+        // Coarse CFO on PRE-RRC signal.
+        float omega_coarse = uw_correlator_estimate_cfo(adj, adj_n);
+        if (omega_coarse != 0.0f) {
+            // Phase-correct in place: burst[n] *= exp(+j·omega/sps·n).
+            // Sign: uw_correlator_estimate_cfo returns omega with the
+            // convention "worker multiplies by exp(+j·omega/sps·n) to
+            // CANCEL it", so we apply omega/10 per sample at 10 sps.
+            float dphi_cs = omega_coarse / 10.0f;
+            float pr = 1.0f, pi = 0.0f;
+            float c_step = cosf(dphi_cs), s_step = sinf(dphi_cs);
+            for (int i = 0; i < adj_n; i++) {
+                float r = adj[i * 2 + 0];
+                float v = adj[i * 2 + 1];
+                float nr = r * pr - v * pi;
+                float ni = r * pi + v * pr;
+                if (nr > INT16_MAX) nr = INT16_MAX;
+                if (nr < INT16_MIN) nr = INT16_MIN;
+                if (ni > INT16_MAX) ni = INT16_MAX;
+                if (ni < INT16_MIN) ni = INT16_MIN;
+                adj[i * 2 + 0] = (int16_t)lrintf(nr);
+                adj[i * 2 + 1] = (int16_t)lrintf(ni);
+                float npr = pr * c_step - pi * s_step;
+                float npi = pr * s_step + pi * c_step;
+                pr = npr; pi = npi;
+            }
+        }
+
 #ifndef SKIP_RRC
         uw_correlator_apply_rrc(adj, adj, adj_n);
 #endif
         uw_corr_result_t uw;
         uw_correlator_find(adj, adj_n, adj_n - 24, &uw);
+        // uw.omega_per_sym is now a small RESIDUAL — the coarse step
+        // already cancelled the bulk on the whole adj_burst; do not
+        // double-apply it in the post-UW linear ramp below.
 
         // Pre-rotation + decim 5 (we use float pre-rot here for clarity)
         const char *qpsk_str = "no-decode";

@@ -570,28 +570,43 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     }
 
     // Square the windowed region. (r + j·m)² = (r²-m²) + j·(2·r·m).
-    // Input samples are int16. Pre-shift them down so squaring then
-    // windowing doesn't overflow int16:
-    //   r' = r >> SQ_SHIFT, |r'| ≤ 2^15/2^SQ_SHIFT
-    //   sq_re = r'² - m'², |sq_re| ≤ 2^(31-2·SQ_SHIFT)
-    //   out  = (sq_re × win_q15) >> 15
-    // For SQ_SHIFT = 8: r' ≤ 128, sq_re ≤ 32768 → multiply by Q15
-    // window, then >> 15 → max ~ 32k, fits in int16 after saturate.
-    const int SQ_SHIFT = 8;
+    // Adaptive pre-shift: scan input window magnitude to choose SQ_SHIFT
+    // that maximises retained precision while keeping the squared+
+    // windowed output inside the BFP FFT's 2^28 input headroom.
+    //
+    // The fixed SQ_SHIFT=8 of the prior version was sized for input
+    // peak ≈ INT16_MAX (single-burst fixtures). Pipeline-test bursts
+    // out of the channelizer have peaks ~13 bits — after >>8 only 5
+    // bits remain, squared signal is quantised to noise and the
+    // squared-FFT finds DC instead of the carrier residual.
+    //
+    //   r' = r >> SQ_SHIFT,  with SQ_SHIFT chosen so max|r'| ≤ 2^11
+    //   r'² ≤ 2^22
+    //   out = (r'² × win_q15) >> 15   →  bounded by r'² ≤ 2^22
+    //   FFT BFP handles inputs up to 2^28 (see cfo_fft_q15 line 509)
+    //
+    // 2^11 leaves room for r'² × N for the FFT bin growth without
+    // saturating the int32 buffers.
+    int32_t peak_abs = 0;
+    for (int i = 0; i < n_in; i++) {
+        int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0];
+        int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1];
+        if (r < 0) r = -r;
+        if (m < 0) m = -m;
+        if (r > peak_abs) peak_abs = r;
+        if (m > peak_abs) peak_abs = m;
+    }
+    int sq_shift = 0;
+    while ((peak_abs >> sq_shift) > (1 << 11)) sq_shift++;
     for (int i = 0; i < n_in; i++) {
         int32_t w = (int32_t)win[i];
-        int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0] >> SQ_SHIFT;
-        int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1] >> SQ_SHIFT;
+        int32_t r = (int32_t)burst_2sps[(start + i) * 2 + 0] >> sq_shift;
+        int32_t m = (int32_t)burst_2sps[(start + i) * 2 + 1] >> sq_shift;
         int32_t sq_re = r * r - m * m;
         int32_t sq_im = 2 * r * m;
-        int32_t out_re = (sq_re * w) >> 15;
-        int32_t out_im = (sq_im * w) >> 15;
-        if (out_re > INT16_MAX) out_re = INT16_MAX;
-        if (out_re < INT16_MIN) out_re = INT16_MIN;
-        if (out_im > INT16_MAX) out_im = INT16_MAX;
-        if (out_im < INT16_MIN) out_im = INT16_MIN;
-        re[i] = (int16_t)out_re;
-        im[i] = (int16_t)out_im;
+        // No int16 cast — FFT input is int32 BFP, full int32 range OK.
+        re[i] = (sq_re * w) >> 15;
+        im[i] = (sq_im * w) >> 15;
     }
 
     (void)cfo_fft_q15(re, im);
