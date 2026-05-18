@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_random.h"
+#include "esp_task_wdt.h"
 #include "sdkconfig.h"
 #include "ingest_core1.h"
 #include "signal_buffer.h"
@@ -385,11 +386,57 @@ void smoke_test_run(void)
              ALBQ_RAW_LO_HZ, n_xfers, TRANSFER_BYTES,
              (n_xfers * TRANSFER_BYTES) / (2u * 2560u),  // ms at 2.56 MSPS
              ALBQ_RAW_EXPECTED_BURSTS);
+    // Register the smoke task with the task watchdog and reset it
+    // every loop iteration. Without this the smoke task can starve
+    // class_driver / frame_decoder / ingest on Core 1 under load —
+    // the TWDT then panics one of those (not the smoke task itself)
+    // and the device silently reboots before reaching the end-of-
+    // Phase-2 summary. Registering here makes the smoke task's CPU
+    // usage explicit to the WDT and the per-iteration reset is the
+    // cheap way to keep it happy.
+    esp_err_t wdt_rc = esp_task_wdt_add(NULL);
+    if (wdt_rc != ESP_OK && wdt_rc != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "esp_task_wdt_add: %s", esp_err_to_name(wdt_rc));
+    }
     for (unsigned int t = 0; t < n_xfers; t++) {
         unsigned int off = t * TRANSFER_BYTES;
         memcpy(synth, ALBQ_RAW_UINT8 + off, TRANSFER_BYTES);
         prev_slot = drive_transfer(synth, prev_slot);
         vTaskDelay(1);
+        esp_task_wdt_reset();
+    }
+    esp_task_wdt_delete(NULL);
+
+    // End-of-Phase-2 summary: drain the queues then read worker and
+    // frame_decoder stats so the user can see whether bursts were
+    // dropped (queue overflow) vs failed UW match.
+    ESP_LOGI(TAG, "Phase 2 complete — draining queues for 2 s");
+    for (int i = 0; i < 20; i++) {
+        if (frame_decoder_queue_count() == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    {
+        worker_stats_t ws;
+        worker_core1_get_stats(&ws);
+        ESP_LOGI(TAG, "Worker stats: queued=%u processed=%u dropped=%u "
+                 "skipped=%u high_water=%u avg=%.0f us",
+                 (unsigned)ws.bursts_queued,
+                 (unsigned)ws.bursts_processed,
+                 (unsigned)ws.bursts_dropped,
+                 (unsigned)ws.bursts_skipped,
+                 (unsigned)ws.queue_high_water,
+                 (double)ws.avg_burst_us);
+        if (ws.bursts_dropped > 0) {
+            ESP_LOGW(TAG, "  %u bursts dropped — queue overflow",
+                     (unsigned)ws.bursts_dropped);
+        }
+        frame_decoder_class_counts_t fc;
+        frame_decoder_get_class_counts(&fc);
+        ESP_LOGI(TAG, "Frame-decoder counts: UNKNOWN=%llu MS=%llu TL=%llu "
+                 "BC=%llu LW.DA=%llu LW.other=%llu",
+                 (unsigned long long)fc.unknown, (unsigned long long)fc.ms,
+                 (unsigned long long)fc.tl, (unsigned long long)fc.bc,
+                 (unsigned long long)fc.lw_da, (unsigned long long)fc.lw_other);
     }
 #elif CONFIG_SMOKE_TEST_REAL_IRIDIUM
     // Multi-stripe hardware-in-the-loop test: 8 stripes covering 1615.7-

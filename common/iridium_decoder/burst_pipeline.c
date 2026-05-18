@@ -113,42 +113,53 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
 
     float pmag = sqrtf(result->uw_res.peak_re * result->uw_res.peak_re
                      + result->uw_res.peak_im * result->uw_res.peak_im);
-    if (pmag <= 1e-3f) {
-        return true;            // pipeline ran, peak too weak to rotate
-    }
-    float rot_re = result->uw_res.peak_re / pmag;
-    float rot_im = result->uw_res.peak_im / pmag;
-    float dphi   = result->uw_res.omega_per_sym / (float)UW_SPS;
+    // Match the legacy worker exactly: even when pmag is too small
+    // to derive a clean rotation, still run the decim + qpsk_demod
+    // on the un-rotated data — a peak with near-zero phase already
+    // sits on the constellation, and the demod's own PLL can pull
+    // small residuals. Losing those rare cases moved decode count
+    // ~1 between runs.
+    if (pmag > 1e-3f) {
+        float rot_re = result->uw_res.peak_re / pmag;
+        float rot_im = result->uw_res.peak_im / pmag;
+        float dphi   = result->uw_res.omega_per_sym / (float)UW_SPS;
 
-    int16_t pr_q = q15_from_float(rot_re);
-    int16_t pi_q = q15_from_float(rot_im);
-    int16_t cs_q = q15_from_float(cosf(dphi));
-    int16_t ss_q = q15_from_float(sinf(dphi));
-    int16_t a_q  = q15_from_float(1.0f - interp_frac);
-    int16_t b_q  = q15_from_float(interp_frac);
+        int16_t pr_q = q15_from_float(rot_re);
+        int16_t pi_q = q15_from_float(rot_im);
+        int16_t cs_q = q15_from_float(cosf(dphi));
+        int16_t ss_q = q15_from_float(sinf(dphi));
+        int16_t a_q  = q15_from_float(1.0f - interp_frac);
+        int16_t b_q  = q15_from_float(interp_frac);
 
-    // n_rot includes src[0..n_rot-1]; the linear interp uses src[i+1]
-    // so the loop bound is n_rot - 1.
-    int n_cplx = n_rot - 1;
-    if (n_cplx < 0) n_cplx = 0;
-    for (int i = 0; i < n_cplx; i++) {
-        int32_t re = ((int32_t)a_q * src[i * 2 + 0]
-                    + (int32_t)b_q * src[(i + 1) * 2 + 0]) >> 15;
-        int32_t im = ((int32_t)a_q * src[i * 2 + 1]
-                    + (int32_t)b_q * src[(i + 1) * 2 + 1]) >> 15;
-        int32_t nr = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
-        int32_t ni = ((int32_t)re * pi_q + (int32_t)im * pr_q) >> 15;
-        src[i * 2 + 0] = q15_saturate(nr);
-        src[i * 2 + 1] = q15_saturate(ni);
-        int32_t npr = ((int32_t)pr_q * cs_q - (int32_t)pi_q * ss_q) >> 15;
-        int32_t npi = ((int32_t)pr_q * ss_q + (int32_t)pi_q * cs_q) >> 15;
-        pr_q = q15_saturate(npr);
-        pi_q = q15_saturate(npi);
+        // n_rot includes src[0..n_rot-1]; the linear interp uses
+        // src[i+1] so the in-place rotation bound is n_rot - 1.
+        // (The decim count below still uses n_rot — matches legacy
+        // worker behaviour where the un-rotated final sample is
+        // included in the decimation count even though it was not
+        // written by the interp loop.)
+        int n_rot_cplx_interp = n_rot - 1;
+        if (n_rot_cplx_interp < 0) n_rot_cplx_interp = 0;
+        for (int i = 0; i < n_rot_cplx_interp; i++) {
+            int32_t re = ((int32_t)a_q * src[i * 2 + 0]
+                        + (int32_t)b_q * src[(i + 1) * 2 + 0]) >> 15;
+            int32_t im = ((int32_t)a_q * src[i * 2 + 1]
+                        + (int32_t)b_q * src[(i + 1) * 2 + 1]) >> 15;
+            int32_t nr = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
+            int32_t ni = ((int32_t)re * pi_q + (int32_t)im * pr_q) >> 15;
+            src[i * 2 + 0] = q15_saturate(nr);
+            src[i * 2 + 1] = q15_saturate(ni);
+            int32_t npr = ((int32_t)pr_q * cs_q - (int32_t)pi_q * ss_q) >> 15;
+            int32_t npi = ((int32_t)pr_q * ss_q + (int32_t)pi_q * cs_q) >> 15;
+            pr_q = q15_saturate(npr);
+            pi_q = q15_saturate(npi);
+        }
     }
 
     // 7. 5:1 decimation 10 sps → 2 sps. In-place: read every 5th
     //    complex sample, write back to the start of `src`.
-    int n_post_cplx = n_cplx / POST_CORR_DECIM;
+    //    Use `n_rot` (not `n_rot - 1`) to match the legacy worker's
+    //    decim count exactly.
+    int n_post_cplx = n_rot / POST_CORR_DECIM;
     for (int i = 0; i < n_post_cplx; i++) {
         int j = i * POST_CORR_DECIM;
         src[i * 2 + 0] = src[j * 2 + 0];
