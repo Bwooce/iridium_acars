@@ -209,33 +209,50 @@ int main(void)
         double rms1 = sqrt(s1 / n_ch);
 
         // Per-stage host signal dumps for the gr-iridium stagewise
-        // comparison. Set HOST_DIAG_CH=<ch> in the env to dump
-        // /tmp/host_signals/<stage>.cf32 for the first burst on that
-        // channel (matches gr-iridium's signal-{stage}-{burst_id}.cfile
-        // dumps from its d_debug path). All dumps are interleaved
-        // float32 IQ in [-1, +1] (after int16 scaling), same as
-        // gr-iridium's .cfile format.
-        static int host_diag_ch = -2;   // -2 = uninit, -1 = disabled
+        // comparison. Set HOST_DIAG_CH=<ch> (and optionally HOST_DIAG_BURST_N=<n>
+        // to skip the first N bursts on that channel before dumping) to
+        // dump /tmp/host_signals/<stage>.cf32. Matches gr-iridium's
+        // signal-{stage}-{burst_id}.cfile dumps from its d_debug path.
+        // Format: interleaved float32 IQ in [-1, +1] (after int16
+        // scaling), same as gr-iridium's .cfile format.
+        static int host_diag_ch = -2;       // -2 = uninit, -1 = disabled
+        static int host_diag_burst_skip = 0;
+        static int host_diag_burst_seen = 0;
         static int host_diag_done = 0;
         if (host_diag_ch == -2) {
-            const char *env = getenv("HOST_DIAG_CH");
-            host_diag_ch = env ? atoi(env) : -1;
+            const char *env_ch = getenv("HOST_DIAG_CH");
+            host_diag_ch = env_ch ? atoi(env_ch) : -1;
+            const char *env_n = getenv("HOST_DIAG_BURST_N");
+            host_diag_burst_skip = env_n ? atoi(env_n) : 0;
         }
         if (!host_diag_done && bb->channel == host_diag_ch) {
-            system("mkdir -p /tmp/host_signals");
-            FILE *f = fopen("/tmp/host_signals/01_channelizer_40k.cf32", "wb");
-            if (f) {
-                for (size_t i = 0; i < n_ch; i++) {
-                    float fr = (float)ch_iq[i*2+0] / 32768.0f;
-                    float fi = (float)ch_iq[i*2+1] / 32768.0f;
-                    fwrite(&fr, 4, 1, f);
-                    fwrite(&fi, 4, 1, f);
+            int idx = host_diag_burst_seen++;
+            // Print abs freq of each candidate burst so the user can pick
+            // which one to compare against gr-iridium.
+            int signed_k = (bb->channel > POLYCHAN_M_ / 2) ?
+                           (bb->channel - POLYCHAN_M_) : bb->channel;
+            uint64_t abs_freq = ALBQ_RAW_LO_HZ + (uint64_t)signed_k * CHANNEL_HZ;
+            fprintf(stderr, "    [host-diag-candidate] ch=%d burst#%d "
+                    "ch_centre≈%llu Hz len=%zu start=%u\n",
+                    bb->channel, idx, (unsigned long long)abs_freq,
+                    n_ch, bb->start_sample_idx);
+            if (idx == host_diag_burst_skip) {
+                system("mkdir -p /tmp/host_signals");
+                FILE *f = fopen("/tmp/host_signals/01_channelizer_40k.cf32", "wb");
+                if (f) {
+                    for (size_t i = 0; i < n_ch; i++) {
+                        float fr = (float)ch_iq[i*2+0] / 32768.0f;
+                        float fi = (float)ch_iq[i*2+1] / 32768.0f;
+                        fwrite(&fr, 4, 1, f);
+                        fwrite(&fi, 4, 1, f);
+                    }
+                    fclose(f);
+                    fprintf(stderr, "    [host-diag] dumped ch=%d burst#%d 40k: "
+                            "%zu cplx → /tmp/host_signals/01_channelizer_40k.cf32\n",
+                            bb->channel, idx, n_ch);
                 }
-                fclose(f);
-                fprintf(stderr, "    [host-diag] ch=%d 40k: %zu cplx → /tmp/host_signals/01_channelizer_40k.cf32\n",
-                        bb->channel, n_ch);
+                host_diag_done = 1;
             }
-            host_diag_done = 1;
         }
 
         // Residual freq-shift to Iridium grid — kept for now to isolate
