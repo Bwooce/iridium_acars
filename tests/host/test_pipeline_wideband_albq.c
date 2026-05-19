@@ -181,7 +181,14 @@ int main(void) {
 
     int16_t *window_25 = malloc(2 * BURST_WINDOW_LEN * sizeof(int16_t));
     int16_t *window_250 = malloc(2 * BURST_WINDOW_250K * sizeof(int16_t));
-    if (!window_25 || !window_250) {
+    // Scratch buffers for direct_if_decim_process_split. Caller-provided
+    // so the same buffers can be reused across bursts (PSRAM on P4).
+    int16_t *scr_in_i  = malloc(BURST_WINDOW_LEN * sizeof(int16_t));
+    int16_t *scr_in_q  = malloc(BURST_WINDOW_LEN * sizeof(int16_t));
+    int16_t *scr_out_i = malloc(BURST_WINDOW_250K * sizeof(int16_t));
+    int16_t *scr_out_q = malloc(BURST_WINDOW_250K * sizeof(int16_t));
+    if (!window_25 || !window_250 || !scr_in_i || !scr_in_q
+        || !scr_out_i || !scr_out_q) {
         fprintf(stderr, "alloc\n"); return 2;
     }
 
@@ -229,9 +236,17 @@ int main(void) {
                                                               FBT_FFT_SIZE);
         rotate_to_dc_q15_simd(window_25, BURST_WINDOW_LEN, phase_step);
 
-        // Decim 10×
-        int n_out = direct_if_decim_process(&dec, window_25,
-                                              BURST_WINDOW_LEN, window_250);
+        // Decim 10× via the split (deinterleave + real-FIR ×2) path —
+        // same I/O as direct_if_decim_process but uses streaming
+        // delay-line FIR that maps directly to dsps_fird_s16_arp4 on
+        // P4. Reset state between bursts so leftover history from a
+        // previous burst doesn't leak in.
+        direct_if_decim_reset_state(&dec);
+        int n_out = direct_if_decim_process_split(&dec, window_25,
+                                                    BURST_WINDOW_LEN,
+                                                    window_250,
+                                                    scr_in_i, scr_in_q,
+                                                    scr_out_i, scr_out_q);
         if (n_out <= 0) continue;
 
         // Pipeline
@@ -278,6 +293,8 @@ int main(void) {
     fft_burst_tagger_destroy(t);
     free(window_250);
     free(window_25);
+    free(scr_in_i);  free(scr_in_q);
+    free(scr_out_i); free(scr_out_q);
     free(iq25);
 
     return 0;       // always pass — this is a measurement, not a gate

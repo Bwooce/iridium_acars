@@ -7,6 +7,15 @@
 #include <string.h>
 #include <stdint.h>
 
+#ifdef ESP_PLATFORM
+// Target build: route the per-channel real-FIR through esp-dsp's
+// PIE-accelerated dsps_fird_s16_arp4. The same delay-line semantics
+// as the portable C inner loop below, so the swap is mechanical
+// and produces equivalent output to the host's direct_if_decim_process_split.
+#include "dsps_fir.h"
+#define USE_DSPS_FIRD_ARP4 1
+#endif
+
 // Modified Bessel function of the first kind, order 0. Used to
 // generate Kaiser window weights. Series converges quickly for
 // |β| < 20 (we use β ≈ 5.5).
@@ -86,6 +95,152 @@ void direct_if_decim_init(direct_if_decim_t *d)
         if (v < -(double)INT16_MAX) v = -(double)INT16_MAX;
         d->taps[k] = (int16_t)lrint(v);
     }
+
+    // Reset the streaming FIR delay lines / decimation counters so
+    // _process_split can be called immediately after init without
+    // first having to call _reset_state. Idempotent — re-init clears
+    // the state too.
+    direct_if_decim_reset_state(d);
+
+#ifdef USE_DSPS_FIRD_ARP4
+    if (!d->fir_dsp_inited) {
+        // Init the two dsps_fird_s16 instances. We pass NULL for the
+        // delay buffer because the arp4 path allocates its own
+        // (memalign'd, +8 slots padding); see dsps_fird_init_s16.c.
+        // shift=0 → output is straight Q15 (acc >> 15).
+        dsps_fird_init_s16(&d->fir_dsp_i, d->taps, NULL,
+                            DIDECIM_NTAPS, DIDECIM_DECIM, 0, 0);
+        dsps_fird_init_s16(&d->fir_dsp_q, d->taps, NULL,
+                            DIDECIM_NTAPS, DIDECIM_DECIM, 0, 0);
+        d->fir_dsp_inited = 1;
+    } else {
+        // Re-init across calls: zero the internal delay lines. The
+        // delay pointer was set up by the first init; we just clear
+        // it back to silence so the next burst starts clean.
+        for (int i = 0; i < DIDECIM_NTAPS; i++) {
+            d->fir_dsp_i.delay[i] = 0;
+            d->fir_dsp_q.delay[i] = 0;
+        }
+        d->fir_dsp_i.pos = 0;
+        d->fir_dsp_q.pos = 0;
+        d->fir_dsp_i.d_pos = 0;
+        d->fir_dsp_q.d_pos = 0;
+    }
+#endif
+}
+
+// Reset the streaming delay-line state for both I and Q FIRs. Called
+// implicitly by direct_if_decim_init() and exposed for callers that
+// need to drop history between unrelated bursts.
+void direct_if_decim_reset_state(direct_if_decim_t *d)
+{
+    memset(d->fir_i.delay, 0, sizeof(d->fir_i.delay));
+    memset(d->fir_q.delay, 0, sizeof(d->fir_q.delay));
+    d->fir_i.pos = 0;
+    d->fir_q.pos = 0;
+    d->fir_i.d_pos = 0;
+    d->fir_q.d_pos = 0;
+
+#ifdef USE_DSPS_FIRD_ARP4
+    // Also reset the esp-dsp delay lines for the PIE path. dsps_fird's
+    // delay buffer is allocated internally by init; we just zero its
+    // contents and reset positions. Only valid if init has run.
+    if (d->fir_dsp_inited) {
+        for (int i = 0; i < DIDECIM_NTAPS; i++) {
+            d->fir_dsp_i.delay[i] = 0;
+            d->fir_dsp_q.delay[i] = 0;
+        }
+        d->fir_dsp_i.pos = 0;
+        d->fir_dsp_q.pos = 0;
+        d->fir_dsp_i.d_pos = 0;
+        d->fir_dsp_q.d_pos = 0;
+    }
+#endif
+}
+
+// Portable Q15 real-FIR with circular delay line. Same semantics as
+// dsps_fird_s16_ansi (esp-dsp): for each output sample, push DECIM
+// new samples into the delay line then compute one MAC of delay ×
+// reversed-coeffs, shift back to Q15.
+//
+// On target this gets replaced by dsps_fird_s16_arp4 inside
+// direct_if_decim_process_split — same struct semantics so the swap
+// is mechanical. Keeping the portable version here lets the host
+// build exercise the same data path the firmware uses.
+static int didecim_real_fir(didecim_fir_state_t *fs, const int16_t *taps,
+                             const int16_t *in, int n_in, int16_t *out)
+{
+    const int N = DIDECIM_NTAPS;
+    const int n_out = n_in / DIDECIM_DECIM;
+    int written = 0;
+    int in_pos = 0;
+    for (int i = 0; i < n_out; i++) {
+        // Push DECIM (or DECIM - d_pos on the first iteration after a
+        // partial chunk; we always start aligned so d_pos == 0 here)
+        // new samples into the delay line.
+        int n_push = DIDECIM_DECIM - fs->d_pos;
+        for (int j = 0; j < n_push; j++) {
+            if (fs->pos >= N) fs->pos = 0;
+            fs->delay[fs->pos++] = in[in_pos++];
+        }
+        fs->d_pos = 0;
+
+        // Inner product: delay[pos..N) × coeffs[N-1..N-1-(N-pos)]
+        // then delay[0..pos) × coeffs[N-1-(N-pos)..0]. The reverse
+        // walk on coeffs matches the linear FIR convention.
+        int64_t acc = 0;
+        int coeff_pos = N - 1;
+        for (int n = fs->pos; n < N; n++) {
+            acc += (int32_t)taps[coeff_pos--] * (int32_t)fs->delay[n];
+        }
+        for (int n = 0; n < fs->pos; n++) {
+            acc += (int32_t)taps[coeff_pos--] * (int32_t)fs->delay[n];
+        }
+        out[written++] = (int16_t)(acc >> 15);
+    }
+    return written;
+}
+
+int direct_if_decim_process_split(direct_if_decim_t *d,
+                                   const int16_t *input, int n_in,
+                                   int16_t *out,
+                                   int16_t *scratch_in_i, int16_t *scratch_in_q,
+                                   int16_t *scratch_out_i, int16_t *scratch_out_q)
+{
+    if (n_in < DIDECIM_DECIM) return 0;
+    const int n_out = n_in / DIDECIM_DECIM;
+
+    // Deinterleave IQ → two real streams.
+    for (int k = 0; k < n_in; k++) {
+        scratch_in_i[k] = input[k * 2 + 0];
+        scratch_in_q[k] = input[k * 2 + 1];
+    }
+
+    // Per-stream FIR + decim. On target the inner call uses
+    // dsps_fird_s16_arp4 (PIE-accelerated); on host we use the
+    // portable C inner FIR that matches dsps_fird_s16_ansi's
+    // semantics. Both produce the same numerical output to within
+    // Q15 rounding.
+#ifdef USE_DSPS_FIRD_ARP4
+    // arp4 takes the OUTPUT count (input length / decim). The
+    // function's return value is unreliable on this esp-dsp release
+    // (see hardware-notes section of the plan); we use the explicit
+    // n_out we computed instead.
+    (void)dsps_fird_s16_arp4(&d->fir_dsp_i, scratch_in_i,
+                              scratch_out_i, n_out);
+    (void)dsps_fird_s16_arp4(&d->fir_dsp_q, scratch_in_q,
+                              scratch_out_q, n_out);
+#else
+    didecim_real_fir(&d->fir_i, d->taps, scratch_in_i, n_in, scratch_out_i);
+    didecim_real_fir(&d->fir_q, d->taps, scratch_in_q, n_in, scratch_out_q);
+#endif
+
+    // Re-interleave into the caller's output buffer.
+    for (int k = 0; k < n_out; k++) {
+        out[k * 2 + 0] = scratch_out_i[k];
+        out[k * 2 + 1] = scratch_out_q[k];
+    }
+    return n_out;
 }
 
 int direct_if_decim_process(const direct_if_decim_t *d,

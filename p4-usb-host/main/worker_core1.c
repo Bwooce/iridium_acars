@@ -76,6 +76,12 @@ static volatile uint64_t s_t_bch_us     = 0;
 
 static int16_t          *s_extract_buf  = NULL;   // 2.5 MSPS wideband window
 static int16_t          *s_decim_buf    = NULL;   // 250 ksps post-decim
+// Deinterleave scratch for direct_if_decim_process_split (PSRAM —
+// no DMA so plain heap_caps_malloc with MALLOC_CAP_SPIRAM is fine).
+static int16_t          *s_decim_scr_in_i  = NULL;
+static int16_t          *s_decim_scr_in_q  = NULL;
+static int16_t          *s_decim_scr_out_i = NULL;
+static int16_t          *s_decim_scr_out_q = NULL;
 static direct_if_decim_t s_decim;
 
 // (Absolute-phase rotation lives in common/iridium_decoder/rotate_to_dc.{h,c}
@@ -135,11 +141,21 @@ void worker_task(void *arg)
             int64_t t_rot1 = esp_timer_get_time();
             s_t_rotate_us += (uint64_t)(t_rot1 - t_rot0);
 
-            // 3. 10× decim 2.5 MSPS → 250 ksps with gri's 279-tap Kaiser.
+            // 3. 10× decim 2.5 MSPS → 250 ksps via the split
+            // (deinterleave + real-FIR ×2) path. On target this uses
+            // esp-dsp's PIE-accelerated dsps_fird_s16_arp4 internally;
+            // on host the same code path uses portable C. Reset
+            // streaming FIR state between unrelated bursts so leftover
+            // history from a previous burst doesn't bleed into this one.
             int64_t t_dec0 = esp_timer_get_time();
-            int n_250k = direct_if_decim_process(&s_decim,
-                                                  s_extract_buf, (int)ext_len,
-                                                  s_decim_buf);
+            direct_if_decim_reset_state(&s_decim);
+            int n_250k = direct_if_decim_process_split(&s_decim,
+                                                        s_extract_buf, (int)ext_len,
+                                                        s_decim_buf,
+                                                        s_decim_scr_in_i,
+                                                        s_decim_scr_in_q,
+                                                        s_decim_scr_out_i,
+                                                        s_decim_scr_out_q);
             int64_t t_dec1 = esp_timer_get_time();
             s_t_decim_us += (uint64_t)(t_dec1 - t_dec0);
 
@@ -219,13 +235,20 @@ esp_err_t worker_core1_init(void)
     // Wideband buffers in PSRAM. The decim buffer can be smaller
     // (10× decimation) but is sized generously since PSRAM is
     // plentiful.
-    size_t ext_bytes  = (size_t)WB_EXTRACT_MAX * 2 * sizeof(int16_t);
-    size_t dec_bytes  = (size_t)WB_DECIM_MAX   * 2 * sizeof(int16_t);
-    s_extract_buf = heap_caps_malloc(ext_bytes, MALLOC_CAP_SPIRAM);
-    s_decim_buf   = heap_caps_malloc(dec_bytes, MALLOC_CAP_SPIRAM);
-    if (!s_extract_buf || !s_decim_buf) {
-        ESP_LOGE(TAG, "Worker buffer alloc failed (ext=%p dec=%p)",
-                 s_extract_buf, s_decim_buf);
+    size_t ext_bytes      = (size_t)WB_EXTRACT_MAX * 2 * sizeof(int16_t);
+    size_t dec_bytes      = (size_t)WB_DECIM_MAX   * 2 * sizeof(int16_t);
+    size_t scr_in_bytes   = (size_t)WB_EXTRACT_MAX     * sizeof(int16_t);
+    size_t scr_out_bytes  = (size_t)WB_DECIM_MAX       * sizeof(int16_t);
+    s_extract_buf      = heap_caps_malloc(ext_bytes,     MALLOC_CAP_SPIRAM);
+    s_decim_buf        = heap_caps_malloc(dec_bytes,     MALLOC_CAP_SPIRAM);
+    s_decim_scr_in_i   = heap_caps_malloc(scr_in_bytes,  MALLOC_CAP_SPIRAM);
+    s_decim_scr_in_q   = heap_caps_malloc(scr_in_bytes,  MALLOC_CAP_SPIRAM);
+    s_decim_scr_out_i  = heap_caps_malloc(scr_out_bytes, MALLOC_CAP_SPIRAM);
+    s_decim_scr_out_q  = heap_caps_malloc(scr_out_bytes, MALLOC_CAP_SPIRAM);
+    if (!s_extract_buf || !s_decim_buf
+        || !s_decim_scr_in_i || !s_decim_scr_in_q
+        || !s_decim_scr_out_i || !s_decim_scr_out_q) {
+        ESP_LOGE(TAG, "Worker buffer alloc failed");
         return ESP_ERR_NO_MEM;
     }
 

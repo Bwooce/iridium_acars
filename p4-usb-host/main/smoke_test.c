@@ -433,13 +433,16 @@ void smoke_test_run(void)
     esp_task_wdt_delete(NULL);
 
     // End-of-Phase-2 summary: drain the queues then read worker and
-    // frame_decoder stats so the user can see whether bursts were
-    // dropped (queue overflow) vs failed UW match.
-    ESP_LOGI(TAG, "Phase 2 complete — draining queues for 2 s");
-    for (int i = 0; i < 20; i++) {
-        if (frame_decoder_queue_count() == 0) break;
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
+    // frame_decoder stats. We sleep a fixed 30 s rather than
+    // polling frame_decoder_queue_count() because frame_decoder
+    // empties immediately when the WORKER isn't pushing (over-budget
+    // worker queue is upstream of frame_decoder, not visible to it).
+    // Fixed sleep lets the worker churn through its 16-deep backlog
+    // before we sample stats. Trim back to ~2 s once worker is
+    // real-time and we don't need to wait for backlog drain.
+    ESP_LOGI(TAG, "Phase 2 complete — draining queues for 30 s "
+                  "(worker backlog + frame_decoder)");
+    vTaskDelay(pdMS_TO_TICKS(30000));
     {
         worker_stats_t ws;
         worker_core1_get_stats(&ws);
