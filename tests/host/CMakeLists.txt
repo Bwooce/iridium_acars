@@ -168,6 +168,17 @@ target_compile_options(test_polyphase_channelizer PRIVATE
     -Wno-unused-but-set-variable
 )
 
+# Phase 3.6.M: cross-validate the new Q15 2048-pt FFT (for the wideband
+# fft_burst_tagger) against a textbook direct-DFT reference. Same
+# algorithm as fft_sc16_64.c just resized for N=2048; the test catches
+# bit-reversal / twiddle / butterfly regressions.
+add_executable(test_fft_sc16_2048
+    test_fft_sc16_2048.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_fft_sc16_2048 PRIVATE ${COMMON_DIR})
+target_link_libraries(test_fft_sc16_2048 PRIVATE m)
+
 # Cross-validate int16/Q14 channelizer path against the float reference.
 # No fixtures — synthesises inputs at runtime.
 add_executable(test_polyphase_int16
@@ -391,5 +402,6 @@ add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME polyphase_channelizer COMMAND test_polyphase_channelizer)
 add_test(NAME polyphase_int16       COMMAND test_polyphase_int16)
+add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME channelizer_detector  COMMAND test_channelizer_detector)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
