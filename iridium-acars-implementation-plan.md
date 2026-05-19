@@ -714,6 +714,24 @@ the test data. No antenna improvement closes the gap.
 
 ---
 
+## Phase 3.6: gr-iridium parity tooling (DONE)
+
+Single unified DSP comparison tool: `tests/scripts/dsp_compare.py`.
+Replaces four scattered scripts with one CLI exposing three modes
+(`--mode stagewise`, `--mode squared-fft`, `--mode raw`) plus
+`--save-golden` / `--check-golden` for regression vectors stored under
+`tests/fixtures/*.npz`. All FFTs are numpy/scipy (no hand-rolled DFTs)
+and burst alignment uses `/tmp/host_direct_if/manifest.csv`.
+
+Per-stage thresholds (NMSE-dB, phase coherence, peak-frequency Hz) are
+hard-coded in the script's `THRESHOLDS_*` dicts from the conventional
+gr-iridium-port engineering targets — channelizer ≤ −50 dB NMSE, RRC
+≤ −40 dB, etc. Not empirically tuned to pass the current run.
+
+Reference: [docs/host-vs-griridium-testing.md](docs/host-vs-griridium-testing.md).
+
+---
+
 ## Phase 4: Live RF Validation (NEXT — blocked on hardware)
 *Requires: 1620 MHz QFH antenna (Scan Iridium GO! recommended) + Nooelec SAWbird+ IR.*
 
