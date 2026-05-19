@@ -42,6 +42,12 @@ typedef void (*burst_detected_cb_t)(const detected_burst_t *burst);
 esp_err_t dsp_processor_init(burst_detected_cb_t cb);
 void dsp_processor_feed(const int16_t *samples, size_t n_samples);
 
+// End-of-stream flush. Forces still-active bursts to emit their
+// gone callback with stop = current sample index. Use at end of
+// an offline fixture / when the SDR source closes. Not needed on
+// a live feed: real bursts naturally time out via burst_post_len.
+void dsp_processor_flush(void);
+
 // Diagnostic stats: average per-frame time in each stage (microseconds),
 // computed over frames seen since the last call. Calling this resets the
 // internal accumulators so the next call covers a fresh window.

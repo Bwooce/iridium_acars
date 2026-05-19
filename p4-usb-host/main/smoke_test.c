@@ -442,6 +442,14 @@ void smoke_test_run(void)
     }
     esp_task_wdt_delete(NULL);
 
+    // End-of-fixture flush: emit gone events for any still-active
+    // bursts so the worker sees the trailing portion of the fixture.
+    // Without this, bursts whose last_active is within burst_post_len
+    // of end-of-fixture never reach the worker. Matches what gri's
+    // GNU Radio stop-callback would do. Adds ~7 decodes on the ALBQ
+    // fixture (measured on the host wideband test).
+    dsp_processor_flush();
+
     // End-of-Phase-2 summary: drain the queues then read worker and
     // frame_decoder stats. We sleep a fixed 30 s rather than
     // polling frame_decoder_queue_count() because frame_decoder

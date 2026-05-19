@@ -54,25 +54,29 @@ static volatile uint64_t s_t_decim_us   = 0;
 static volatile uint64_t s_t_pipeline_us = 0;
 static volatile uint64_t s_t_bch_us     = 0;
 
-// Buffer sizes derived from the wideband path's burst window. At
-// FS_DETECT_HZ = 2.5 MSPS the tagger publishes length_samples =
-// FBT_BURST_POST_LEN (40000 ≈ 16 ms). Add NTAPS-1 of pre-pad so the
-// FIR transient lands before the burst proper.
+// Buffer sizes for the wideband per-burst window. The tagger
+// publishes variable-length bursts via gri's gone-event semantics
+// (start → stop = last_active + burst_post_len). Single-frame
+// bursts span ~16 ms; multi-frame bursts (gri's
+// handle_multiple_frames_per_burst case) often run 50-100 ms, with
+// gri capping at max_burst_len = sample_rate * 0.09 = 225 ms.
+// We size to 250 ms (multiple of 16 complex = 64-byte aligned) so
+// any realistic burst fits without truncation.
 //
 // Cache alignment: tagger reports burst.start_sample_idx as a
 // multiple of FBT_FFT_SIZE (2048), so the address (start × 4 bytes
 // per complex) is naturally 64-byte aligned. We subtract
 // WB_PRE_PAD_SAMPLES; making that subtraction a multiple of 16
-// complex samples (= 64 bytes = 1 cache line) keeps the extract
-// address aligned for esp_cache_msync. DIDECIM_NTAPS - 1 = 278;
-// round up to 288 — the 10-extra-sample pad is harmless (extends
-// the FIR transient prelude, burst proper still starts cleanly).
-#define WB_PRE_PAD_SAMPLES   288     // 18 × 16, ≥ DIDECIM_NTAPS - 1
-#define WB_EXTRACT_SAFETY    1024
-#define WB_EXTRACT_MAX       (40000 + WB_PRE_PAD_SAMPLES + WB_EXTRACT_SAFETY)
+// complex samples (= 64 bytes) keeps the extract address aligned
+// for esp_cache_msync. DIDECIM_NTAPS - 1 = 279; round up to 288.
+#define WB_PRE_PAD_SAMPLES    288     // 18 × 16, ≥ DIDECIM_NTAPS - 1
+#define WB_MAX_BURST_SAMPLES  ((int)(FS_DETECT_HZ / 4))   // 250 ms = 625000
+#define WB_EXTRACT_SAFETY     1024
+#define WB_EXTRACT_MAX        (WB_MAX_BURST_SAMPLES + WB_PRE_PAD_SAMPLES \
+                                + WB_EXTRACT_SAFETY)
 
 // 250 ksps output is at most WB_EXTRACT_MAX / 10 + 1.
-#define WB_DECIM_MAX         ((WB_EXTRACT_MAX / DIDECIM_DECIM) + 8)
+#define WB_DECIM_MAX          ((WB_EXTRACT_MAX / DIDECIM_DECIM) + 8)
 
 static int16_t          *s_extract_buf  = NULL;   // 2.5 MSPS wideband window
 static int16_t          *s_decim_buf    = NULL;   // 250 ksps post-decim
@@ -103,15 +107,24 @@ void worker_task(void *arg)
                      (double)burst.rel_freq_hz,
                      (double)burst.peak_snr_db);
 
-            // Length guard — need enough samples to reach the FIR
-            // transient plus the burst content. Wideband detector
-            // publishes the gri-default post_len of 40000 samples
-            // (~16 ms at 2.5 MSPS), so this is normally fine.
+            // Length guard. Tagger emits stop - start as length, which
+            // can range from ~30 ms (single frame) to ~250 ms
+            // (multi-frame). Clamp to WB_MAX_BURST_SAMPLES so we never
+            // exceed the PSRAM scratch capacity, and reject bursts too
+            // short to survive FIR transients.
             if (burst.length_samples < 128) {
                 s_bursts_skipped++;
                 continue;
             }
-            uint32_t ext_len = burst.length_samples + WB_PRE_PAD_SAMPLES;
+            uint32_t safe_len = burst.length_samples;
+            if (safe_len > (uint32_t)WB_MAX_BURST_SAMPLES) {
+                safe_len = (uint32_t)WB_MAX_BURST_SAMPLES;
+            }
+            // Round to multiple of DIDECIM_DECIM for a clean integer
+            // output count from the decim. Also keeps cache alignment
+            // when combined with the 16-aligned WB_PRE_PAD_SAMPLES.
+            safe_len -= safe_len % DIDECIM_DECIM;
+            uint32_t ext_len = safe_len + WB_PRE_PAD_SAMPLES;
             if (ext_len > WB_EXTRACT_MAX) {
                 ext_len = WB_EXTRACT_MAX;
             }

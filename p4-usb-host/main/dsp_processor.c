@@ -86,27 +86,38 @@ static volatile uint32_t s_acc_input_samples = 0;
 static volatile uint32_t s_acc_new_bursts    = 0;
 static volatile uint32_t s_acc_gone_bursts   = 0;
 
-// Push one new burst out to the user callback. Converts fbt_burst_t
+// Push one gone burst out to the user callback. Converts fbt_burst_t
 // (FFT bin space, uint64 sample idx) into detected_burst_t (signed
 // rel_freq_hz, uint32 sample idx for signal_buffer).
-static void dispatch_new_burst(const fbt_burst_t *b)
+//
+// Dispatch fires on GONE events (not new) to match gr-iridium's
+// tagged_burst_to_pdu_impl.cc:205-227 semantics. The gone event
+// carries `stop = last_active + burst_post_len`, so the burst
+// length passed to the worker is variable — long enough for
+// multi-frame bursts where gri's handle_multiple_frames_per_burst
+// would publish the whole PDU. Previously we triggered on new
+// with a fixed 16 ms length and truncated multi-frame bursts to
+// their first frame.
+static void dispatch_gone_burst(const fbt_burst_t *b)
 {
     if (!s_user_cb) return;
 
-    // FFT-bin → Hz. center_bin is in fft-shift space (DC-centred); the
-    // signed offset from band centre is (center_bin - FFT_SIZE/2).
     int signed_bin = b->center_bin - FBT_FFT_SIZE / 2;
     float rel_freq_hz = (float)signed_bin * (float)FS_DETECT_HZ
                          / (float)FBT_FFT_SIZE;
 
+    // length = stop - start, variable per burst. Clamp at uint32 max
+    // to be safe; the worker further clamps to WB_EXTRACT_MAX.
+    uint64_t length = b->stop - b->start;
+    uint32_t length_u32 = length > 0xFFFFFFFFu
+                          ? 0xFFFFFFFFu : (uint32_t)length;
+
     // fft_burst_tagger's magnitude_db is ALREADY the SNR
     // (10·log10(mag² · HISTORY / baseline_sum) — see
-    // fft_burst_tagger.c:244-246). noise_db is the absolute noise
-    // floor in raw mag² units (different scale). Don't subtract them
-    // — magnitude_db is the SNR.
+    // fft_burst_tagger.c). Don't subtract noise_db.
     detected_burst_t out = {
         .start_sample_idx = (uint32_t)b->start,
-        .length_samples   = FBT_BURST_POST_LEN,
+        .length_samples   = length_u32,
         .rel_freq_hz      = rel_freq_hz,
         .peak_snr_db      = b->magnitude_db,
         .magnitude_db     = b->magnitude_db,
@@ -117,7 +128,7 @@ static void dispatch_new_burst(const fbt_burst_t *b)
 }
 
 // Process one FFT-aligned chunk: hand it to the tagger, advance the
-// sample index.
+// sample index, dispatch gone-burst events.
 static void process_chunk(const int16_t *chunk_iq)
 {
     fbt_burst_t new_bursts [FBT_NEW_BUF_SIZE];
@@ -133,12 +144,28 @@ static void process_chunk(const int16_t *chunk_iq)
     s_acc_step_us += (uint64_t)(t1 - t0);
 
     if (ok) {
-        for (int i = 0; i < n_new; i++) dispatch_new_burst(&new_bursts[i]);
+        for (int i = 0; i < n_gone; i++) dispatch_gone_burst(&gone_bursts[i]);
         s_acc_new_bursts  += (uint32_t)n_new;
         s_acc_gone_bursts += (uint32_t)n_gone;
     }
 
     s_next_sample_idx += FBT_FFT_SIZE;
+}
+
+// End-of-stream flush. Forces any still-active bursts to emit their
+// gone-event with stop = current d_index. Use at end of an offline
+// fixture or when the SDR source closes; on a live RF feed, bursts
+// naturally time out and reach the gone callback in the steady-state
+// step loop — no flush needed.
+void dsp_processor_flush(void)
+{
+    if (!s_tagger) return;
+    fbt_burst_t flushed[FBT_GONE_BUF_SIZE];
+    int n = FBT_GONE_BUF_SIZE;
+    fft_burst_tagger_flush(s_tagger, flushed, &n);
+    for (int i = 0; i < n; i++) dispatch_gone_burst(&flushed[i]);
+    s_acc_gone_bursts += (uint32_t)n;
+    ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
 
 esp_err_t dsp_processor_init(burst_detected_cb_t cb)
