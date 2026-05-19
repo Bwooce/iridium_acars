@@ -206,6 +206,28 @@ add_executable(test_direct_if_decim
 target_include_directories(test_direct_if_decim PRIVATE ${COMMON_DIR})
 target_link_libraries(test_direct_if_decim PRIVATE m)
 
+# Phase 3.6.M step 4: full wideband-path-A integration test. Runs the
+# raw 2.5 MSPS fixture through the C burst tagger + per-burst
+# direct-IF mixer + burst_pipeline, end-to-end. Reports decoded
+# count for comparison against path A's 17/99 (channelizer) and
+# path C's 64/65 (Python front end). Always passes — measurement only.
+add_executable(test_pipeline_wideband_albq
+    test_pipeline_wideband_albq.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_pipeline_wideband_albq PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_pipeline_wideband_albq PRIVATE m)
+
 # Cross-validate int16/Q14 channelizer path against the float reference.
 # No fixtures — synthesises inputs at runtime.
 add_executable(test_polyphase_int16
