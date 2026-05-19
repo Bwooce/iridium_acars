@@ -9,13 +9,27 @@
 #include "esp_heap_caps.h"
 #include "ingest_core1.h"
 #include "signal_buffer.h"
+#include "resample_256_to_250.h"
 
 static const char *TAG = "INGEST";
 
 // Per-slot state. Two slots alternated per consumer cycle.
 static uint8_t *s_raw[INGEST_NUM_SLOTS];     // raw uint8 USB ingress, internal SRAM, DMA-aligned
-static int16_t *s_conv[INGEST_NUM_SLOTS];    // converted int16 Q15, internal SRAM, DMA-aligned
-static size_t   s_filled_bytes[INGEST_NUM_SLOTS];
+static int16_t *s_conv[INGEST_NUM_SLOTS];    // converted int16 Q15 @ 2.56 MSPS (scratch, internal SRAM)
+static int16_t *s_resamp[INGEST_NUM_SLOTS];  // resampled int16 Q15 @ 2.5 MSPS (downstream feed, internal SRAM)
+static size_t   s_resamp_n_int16[INGEST_NUM_SLOTS];  // int16 element count in s_resamp
+
+// 125/128 polyphase rational resampler (2.56 → 2.5 MSPS). gri's
+// wideband fft_burst_tagger expects 2.5 MSPS exactly; the entire
+// downstream tagger / direct_if_decim / burst_pipeline tuning is
+// against gri's defaults at that rate. Resample once here so
+// signal_buffer and dsp_processor both see the gri-aligned rate.
+//
+// Resampler instance is shared across slots (its delay line is
+// stateful — each call advances the polyphase phase counter). At
+// 8192 complex input per call the output is ~8000 complex, varying
+// by ±1 with phase tracking.
+static resample_256_to_250_t s_rs;
 
 // Semaphores per slot. ready[i]: given by ingest task when conversion +
 // signal_buffer_push for slot i are complete; taken by class_driver before
@@ -86,14 +100,27 @@ static void ingest_task(void *arg)
         int64_t t1 = esp_timer_get_time();
         s_acc_convert_us += (uint64_t)(t1 - t0);
 
-        // 2. Push converted samples into the PSRAM circular buffer.
+        // 2. Resample 2.56 → 2.5 MSPS (125/128 polyphase). gri's
+        // wideband tagger / direct_if_decim are tuned at 2.5 MSPS;
+        // performing this once here keeps the entire downstream chain
+        // (signal_buffer, dsp_processor, worker) at the gri-aligned
+        // rate. Input is n/2 complex samples (interleaved IQ in
+        // s_conv); output is ~n/2 × 125/128 complex into s_resamp.
+        int n_in_complex = (int)(n / 2);
+        int n_out_complex = resample_256_to_250_process(&s_rs,
+                                                         dst,
+                                                         n_in_complex,
+                                                         s_resamp[msg.slot]);
+        int n_out_int16 = n_out_complex * 2;
+        s_resamp_n_int16[msg.slot] = (size_t)n_out_int16;
+
+        // 3. Push resampled samples into the PSRAM circular buffer.
         // signal_buffer_push is itself async (AXI-GDMA from Step 2) so the
         // CPU cost here is just descriptor programming + cache flush.
-        signal_buffer_push(dst, n / 2);
+        signal_buffer_push(s_resamp[msg.slot], (size_t)n_out_complex);
         int64_t t2 = esp_timer_get_time();
         s_acc_push_us += (uint64_t)(t2 - t1);
 
-        s_filled_bytes[msg.slot] = n;
         s_acc_dispatches++;
         xSemaphoreGive(s_ready[msg.slot]);
     }
@@ -102,17 +129,22 @@ static void ingest_task(void *arg)
 esp_err_t ingest_core1_init(void)
 {
     // Allocate ping-pong buffers in DMA-capable internal SRAM with
-    // 64-byte cache-line alignment.
+    // 64-byte cache-line alignment. s_resamp is sized the same as
+    // s_conv even though 125/128 < 1 produces a slightly smaller
+    // output; the headroom avoids edge-case checks in the hot path.
     for (int i = 0; i < INGEST_NUM_SLOTS; i++) {
         s_raw[i] = heap_caps_aligned_alloc(64, 16 * 1024,
                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         s_conv[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-        if (!s_raw[i] || !s_conv[i]) {
-            ESP_LOGE(TAG, "Slot %d alloc failed (raw=%p conv=%p)", i, s_raw[i], s_conv[i]);
+        s_resamp[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
+                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (!s_raw[i] || !s_conv[i] || !s_resamp[i]) {
+            ESP_LOGE(TAG, "Slot %d alloc failed (raw=%p conv=%p resamp=%p)",
+                     i, s_raw[i], s_conv[i], s_resamp[i]);
             return ESP_ERR_NO_MEM;
         }
-        s_filled_bytes[i] = 0;
+        s_resamp_n_int16[i] = 0;
 
         s_ready[i] = xSemaphoreCreateBinary();
         s_free[i]  = xSemaphoreCreateBinary();
@@ -120,6 +152,10 @@ esp_err_t ingest_core1_init(void)
         // Initially: free=1 (slot available), ready=0 (no data yet).
         xSemaphoreGive(s_free[i]);
     }
+
+    // Shared 125/128 resampler (state persists across slots — see
+    // module-level comment).
+    resample_256_to_250_init(&s_rs);
 
     s_dispatch = xQueueCreate(4, sizeof(dispatch_msg_t));
     if (!s_dispatch) return ESP_ERR_NO_MEM;
@@ -168,8 +204,10 @@ void ingest_core1_dispatch(int slot, size_t bytes_filled)
 int16_t *ingest_core1_take_converted(int slot, size_t *out_n_int16)
 {
     xSemaphoreTake(s_ready[slot], portMAX_DELAY);
-    if (out_n_int16) *out_n_int16 = s_filled_bytes[slot];
-    return s_conv[slot];
+    // Returns the RESAMPLED buffer (2.5 MSPS) and its int16 count —
+    // post-Phase 3.6.M cutover this is what downstream DSP wants.
+    if (out_n_int16) *out_n_int16 = s_resamp_n_int16[slot];
+    return s_resamp[slot];
 }
 
 void ingest_core1_release(int slot)
