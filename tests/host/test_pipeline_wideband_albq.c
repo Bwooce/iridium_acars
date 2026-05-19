@@ -33,6 +33,7 @@
 #include "fft_burst_tagger.h"
 #include "fft_sc16_2048.h"
 #include "direct_if_decim.h"
+#include "rotate_to_dc.h"
 #include "burst_pipeline.h"
 #include "qpsk_demod.h"
 #include "uw_correlator.h"
@@ -98,51 +99,10 @@ static int load_25msps_cf32(const char *path, int16_t **out_iq) {
     return n;
 }
 
-// Compute the per-sample phase step for a tagged burst.
-// relative_frequency = (center_bin - N/2) / N (cycles/sample)
-// dphi = -2π × relative_frequency.
-static double compute_phase_step(int center_bin) {
-    double rel_f = ((double)center_bin - (double)FBT_FFT_SIZE / 2.0)
-                   / (double)FBT_FFT_SIZE;
-    return -2.0 * 3.14159265358979323846 * rel_f;
-}
-
-// Rotate `iq` by exp(j·phase_step·n). Computes the phasor from
-// ABSOLUTE phase each sample — same as gr-iridium's underlying volk
-// rotator (which uses float32 sin/cos) and our Python
-// direct_if_dump.py (which uses np.exp with float64 indices).
-//
-// A naïve Q15 incremental phasor `p ← p · exp(j·phase_step)` drifts
-// magnitude by ~0.01%/sample due to the `>>15` rounding in each
-// multiplication. Over a 44k-sample burst window that's |phasor| ≈
-// 0.99988^44096 ≈ 2e-7 — the burst amplitude collapses to noise. The
-// 3 dB host-vs-gri amplitude divergence we measured was exactly that
-// cumulative phasor magnitude decay (the loss is per-sample, so it
-// integrates over the window length).
-//
-// Computing from absolute phase per sample is what gri does. P4 cost
-// is two trig ops per sample (cosf/sinf); at our burst window of
-// 44096 samples × per-burst-overhead this is ~1ms/burst, negligible
-// vs the FFT cost.
-static void q15_rotate(int16_t *iq, int n, double phase_step) {
-    for (int k = 0; k < n; k++) {
-        double phase = phase_step * (double)k;
-        double cs = cos(phase);
-        double ss = sin(phase);
-        int32_t r = iq[2 * k + 0];
-        int32_t v = iq[2 * k + 1];
-        // out = in × (cs + j·ss) — no Q15 quantisation of (cs, ss)
-        // so the rotation is unit-magnitude across all k.
-        double nr = (double)r * cs - (double)v * ss;
-        double ni = (double)r * ss + (double)v * cs;
-        if (nr >  32767.0) nr =  32767.0;
-        if (nr < -32768.0) nr = -32768.0;
-        if (ni >  32767.0) ni =  32767.0;
-        if (ni < -32768.0) ni = -32768.0;
-        iq[2 * k + 0] = (int16_t)lrint(nr);
-        iq[2 * k + 1] = (int16_t)lrint(ni);
-    }
-}
+// (Absolute-phase rotation moved to common/iridium_decoder/rotate_to_dc.{h,c}
+// — shared with worker_core1.c on the firmware side. See the header
+// there for the Q15-magnitude-decay trap that makes this contract
+// load-bearing.)
 
 // When DUMP_TARGET_BIN env var is set, the burst whose center_bin is
 // closest to that value gets its burst_pipeline stages dumped to
@@ -245,9 +205,10 @@ int main(void) {
         memcpy(window_25, iq25 + begin * 2,
                BURST_WINDOW_LEN * 2 * sizeof(int16_t));
 
-        // Rotate by -relative_frequency
-        double phase_step = compute_phase_step(center_bin);
-        q15_rotate(window_25, BURST_WINDOW_LEN, phase_step);
+        // Rotate by -relative_frequency (shared helper)
+        double phase_step = rotate_to_dc_phase_step_from_bin(center_bin,
+                                                              FBT_FFT_SIZE);
+        rotate_to_dc(window_25, BURST_WINDOW_LEN, phase_step);
 
         // Decim 10×
         int n_out = direct_if_decim_process(&dec, window_25,

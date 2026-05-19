@@ -54,6 +54,11 @@ idf_component_register(
         "fft_burst_tagger.c"
         "direct_if_decim.c"
         "resample_256_to_250.c"
+        # Absolute-phase IQ rotation shared with the host wideband
+        # test. Lives here (not in worker_core1 / the test) because
+        # both call sites need the SAME Q15-magnitude-decay-avoiding
+        # implementation; the header explains the trap.
+        "rotate_to_dc.c"
         # firmr_s16 was previously host-only (P4 called esp-dsp's
         # dsps_firmr_s16 directly). resample_256_to_250 depends on
         # it, so compile firmr_s16.c into the IDF target too. Same

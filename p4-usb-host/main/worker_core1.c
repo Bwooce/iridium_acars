@@ -31,6 +31,7 @@
 #include "uw_correlator.h"
 #include "burst_pipeline.h"
 #include "direct_if_decim.h"
+#include "rotate_to_dc.h"
 #include "bch_decoder.h"
 #include "frame_decoder.h"
 
@@ -69,34 +70,10 @@ static int16_t          *s_extract_buf  = NULL;   // 2.5 MSPS wideband window
 static int16_t          *s_decim_buf    = NULL;   // 250 ksps post-decim
 static direct_if_decim_t s_decim;
 
-// Absolute-phase Q15 rotation. Multiplies iq[k] by exp(-j·2π·k·freq/fs)
-// in place. Uses per-sample cosf/sinf — over long windows this matches
-// the gr-iridium volk path. The incremental Q15 phasor in
-// burst_pipeline:q15_freq_shift_inplace decays magnitude by 0.012%/sample
-// (memory/feedback_q15_incremental_phasor_decays.md), which collapses
-// the 100k-sample window of a wideband burst to noise. Per-sample
-// cosf/sinf on P4's scalar FPU is acceptable for first cutover; task #58
-// covers a cordic/table replacement if profiling shows it dominates.
-static void rotate_to_dc(int16_t *iq, int n_complex, double rel_freq_hz,
-                          double fs_hz)
-{
-    const double dphi = -2.0 * M_PI * rel_freq_hz / fs_hz;
-    for (int k = 0; k < n_complex; k++) {
-        double phase = dphi * (double)k;
-        double cs = cos(phase);
-        double ss = sin(phase);
-        int32_t r = iq[k * 2 + 0];
-        int32_t v = iq[k * 2 + 1];
-        double nr = (double)r * cs - (double)v * ss;
-        double ni = (double)r * ss + (double)v * cs;
-        if (nr >  32767.0) nr =  32767.0;
-        if (nr < -32768.0) nr = -32768.0;
-        if (ni >  32767.0) ni =  32767.0;
-        if (ni < -32768.0) ni = -32768.0;
-        iq[k * 2 + 0] = (int16_t)lrint(nr);
-        iq[k * 2 + 1] = (int16_t)lrint(ni);
-    }
-}
+// (Absolute-phase rotation lives in common/iridium_decoder/rotate_to_dc.{h,c}
+// — shared with the host wideband test. Per-sample cosf/sinf on P4's
+// scalar FPU is acceptable for first cutover; task #58 covers a
+// cordic/table replacement if profiling shows it dominates.)
 
 void worker_task(void *arg)
 {
@@ -140,9 +117,9 @@ void worker_task(void *arg)
             // (2.5 MSPS in step 1 cutover; ingest_core1 resamples
             // 2.56 → 2.5 before signal_buffer_push).
             int64_t t_rot0 = esp_timer_get_time();
-            rotate_to_dc(s_extract_buf, (int)ext_len,
-                         (double)burst.rel_freq_hz,
-                         (double)FS_DETECT_HZ);
+            double phase_step = -2.0 * M_PI * (double)burst.rel_freq_hz
+                                 / (double)FS_DETECT_HZ;
+            rotate_to_dc(s_extract_buf, (int)ext_len, phase_step);
             int64_t t_rot1 = esp_timer_get_time();
             s_t_rotate_us += (uint64_t)(t_rot1 - t_rot0);
 

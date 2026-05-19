@@ -218,6 +218,7 @@ add_executable(test_pipeline_wideband_albq
     ${COMMON_DIR}/direct_if_decim.c
     ${COMMON_DIR}/resample_256_to_250.c
     ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/rotate_to_dc.c
     ${COMMON_DIR}/burst_pipeline.c
     ${COMMON_DIR}/uw_correlator.c
     ${COMMON_DIR}/qpsk_demod.c
