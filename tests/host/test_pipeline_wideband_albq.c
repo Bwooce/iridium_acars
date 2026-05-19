@@ -33,12 +33,25 @@
 #include "fft_burst_tagger.h"
 #include "fft_sc16_2048.h"
 #include "direct_if_decim.h"
-#include "resample_256_to_250.h"
 #include "burst_pipeline.h"
 #include "qpsk_demod.h"
 #include "uw_correlator.h"
 
-#include "fixture_albq_raw.h"
+// We do NOT pull in fixture_albq_raw.h (the 2.56 MSPS u8 fixture) any
+// more — instead we read /tmp/host_direct_if/fixture_albq_raw_2500k.cf32
+// which is the SAME 2.5 MSPS cf32 stream that gr-iridium consumes
+// in this fixture's reference flow. That input file is produced by
+// `python3 tests/scripts/direct_if_dump.py` (which runs
+// scipy.signal.resample_poly(u8_data, 125, 128) once and writes the
+// result for both gri-iridium-extractor and our C wideband test to
+// share).
+//
+// Why: the wideband-tagger comparison was confounded by us doing an
+// independent 2.56→2.5 MSPS resample in C while gri saw scipy's
+// resample output. Different filters → different input to the
+// tagger → guaranteed amplitude/shape divergence we'd then chase as
+// downstream bugs. Reading the same cf32 makes "be the same as
+// gr-iridium" trivially true at the input boundary.
 
 // Match gr-iridium: 2.5 MSPS, 2048-pt FFT every 2048 samples.
 // Our fixture is 2.56 MSPS — close enough for the wideband detector
@@ -53,57 +66,81 @@
 
 static int32_t s_baseline_history[FBT_HISTORY_SIZE * FBT_FFT_SIZE];
 
-// Resample 2.56 MSPS uint8 IQ → 2.5 MSPS int16 IQ via the gri-aligned
-// 125/128 polyphase Kaiser resampler (resample_256_to_250 / firmr_s16).
-//
-// We first convert u8 → int16 with the scale gri uses (cu8 - 128) × 256,
-// then run the resampler. Output length ≈ n_in × 125 / 128.
-static int resample_2_56_to_2_5(const uint8_t *in_u8, int n_in_complex,
-                                  int16_t *out_iq) {
-    int16_t *in_s16 = (int16_t *)malloc(2 * n_in_complex * sizeof(int16_t));
-    if (!in_s16) return 0;
-    for (int k = 0; k < 2 * n_in_complex; k++) {
-        in_s16[k] = ((int16_t)in_u8[k] - 128) << 8;     // ±127 → ±32512
+// Read the 2.5 MSPS cf32 (gri's input format) and convert to int16
+// with the SAME scale gri's volk path implicitly uses on cf32 → mag²
+// (= multiply by 32768, clamp). Returns number of complex samples.
+static int load_25msps_cf32(const char *path, int16_t **out_iq) {
+    FILE *fh = fopen(path, "rb");
+    if (!fh) {
+        fprintf(stderr,
+                "Could not open %s\n"
+                "Run: python3 tests/scripts/direct_if_dump.py\n", path);
+        return -1;
     }
-    static resample_256_to_250_t r;
-    resample_256_to_250_init(&r);
-    int n_out = resample_256_to_250_process(&r, in_s16, n_in_complex, out_iq);
-    free(in_s16);
-    return n_out;
+    fseek(fh, 0, SEEK_END);
+    long bytes = ftell(fh);
+    fseek(fh, 0, SEEK_SET);
+    int n = (int)(bytes / 8);   // 2 × float32 per complex sample
+    float *cf32 = malloc(2 * n * sizeof(float));
+    int16_t *s16 = malloc(2 * n * sizeof(int16_t));
+    if (!cf32 || !s16) { free(cf32); free(s16); fclose(fh); return -1; }
+    size_t got = fread(cf32, sizeof(float), 2 * n, fh);
+    fclose(fh);
+    if ((int)got != 2 * n) { free(cf32); free(s16); return -1; }
+    for (int k = 0; k < 2 * n; k++) {
+        float v = cf32[k] * 32768.0f;
+        if (v >  32767.0f) v =  32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        s16[k] = (int16_t)lrintf(v);
+    }
+    free(cf32);
+    *out_iq = s16;
+    return n;
 }
 
-// Compute Q15 rotation parameters for a tagged burst.
-// relative_frequency = (center_bin - N/2) / N (cycles/sample at input fs)
-// Phase increment per sample = -2π × relative_frequency rad.
-static void compute_rotation(int center_bin, int n_total_samples,
-                              int16_t *cs_q, int16_t *ss_q) {
+// Compute the per-sample phase step for a tagged burst.
+// relative_frequency = (center_bin - N/2) / N (cycles/sample)
+// dphi = -2π × relative_frequency.
+static double compute_phase_step(int center_bin) {
     double rel_f = ((double)center_bin - (double)FBT_FFT_SIZE / 2.0)
                    / (double)FBT_FFT_SIZE;
-    double dphi  = -2.0 * 3.14159265358979323846 * rel_f;
-    *cs_q = (int16_t)lrint(cos(dphi) * 32767.0);
-    *ss_q = (int16_t)lrint(sin(dphi) * 32767.0);
-    (void)n_total_samples;
+    return -2.0 * 3.14159265358979323846 * rel_f;
 }
 
-// q15_freq_shift_inplace is defined static inside burst_pipeline.c;
-// we replicate the same math here so this test doesn't link to
-// burst_pipeline's private symbols. Multiply iq[k] by phasor
-// p_init * exp(j·dphi)^k.
-static void q15_rotate(int16_t *iq, int n,
-                        int16_t cs_q, int16_t ss_q) {
-    int16_t pr = 32767, pi = 0;     // phase starts at exp(j·0)
+// Rotate `iq` by exp(j·phase_step·n). Computes the phasor from
+// ABSOLUTE phase each sample — same as gr-iridium's underlying volk
+// rotator (which uses float32 sin/cos) and our Python
+// direct_if_dump.py (which uses np.exp with float64 indices).
+//
+// A naïve Q15 incremental phasor `p ← p · exp(j·phase_step)` drifts
+// magnitude by ~0.01%/sample due to the `>>15` rounding in each
+// multiplication. Over a 44k-sample burst window that's |phasor| ≈
+// 0.99988^44096 ≈ 2e-7 — the burst amplitude collapses to noise. The
+// 3 dB host-vs-gri amplitude divergence we measured was exactly that
+// cumulative phasor magnitude decay (the loss is per-sample, so it
+// integrates over the window length).
+//
+// Computing from absolute phase per sample is what gri does. P4 cost
+// is two trig ops per sample (cosf/sinf); at our burst window of
+// 44096 samples × per-burst-overhead this is ~1ms/burst, negligible
+// vs the FFT cost.
+static void q15_rotate(int16_t *iq, int n, double phase_step) {
     for (int k = 0; k < n; k++) {
+        double phase = phase_step * (double)k;
+        double cs = cos(phase);
+        double ss = sin(phase);
         int32_t r = iq[2 * k + 0];
         int32_t v = iq[2 * k + 1];
-        int32_t nr = (r * pr - v * pi) >> 15;
-        int32_t ni = (r * pi + v * pr) >> 15;
-        iq[2 * k + 0] = (int16_t)(nr > 32767 ? 32767 : nr < -32768 ? -32768 : nr);
-        iq[2 * k + 1] = (int16_t)(ni > 32767 ? 32767 : ni < -32768 ? -32768 : ni);
-        // Advance phasor by cs_q + j·ss_q
-        int32_t npr = (pr * cs_q - pi * ss_q) >> 15;
-        int32_t npi = (pr * ss_q + pi * cs_q) >> 15;
-        pr = (int16_t)(npr > 32767 ? 32767 : npr < -32768 ? -32768 : npr);
-        pi = (int16_t)(npi > 32767 ? 32767 : npi < -32768 ? -32768 : npi);
+        // out = in × (cs + j·ss) — no Q15 quantisation of (cs, ss)
+        // so the rotation is unit-magnitude across all k.
+        double nr = (double)r * cs - (double)v * ss;
+        double ni = (double)r * ss + (double)v * cs;
+        if (nr >  32767.0) nr =  32767.0;
+        if (nr < -32768.0) nr = -32768.0;
+        if (ni >  32767.0) ni =  32767.0;
+        if (ni < -32768.0) ni = -32768.0;
+        iq[2 * k + 0] = (int16_t)lrint(nr);
+        iq[2 * k + 1] = (int16_t)lrint(ni);
     }
 }
 
@@ -120,11 +157,13 @@ static int parse_dump_target_bin(void) {
 }
 
 int main(void) {
-    // 1) Load raw fixture, resample to 2.5 MSPS int16 IQ.
-    size_t n_in_u8 = ALBQ_RAW_UINT8_LEN / 2;
-    int16_t *iq25 = malloc(2 * (n_in_u8 * 125 / 128 + 1) * sizeof(int16_t));
-    if (!iq25) { fprintf(stderr, "malloc failed\n"); return 2; }
-    int n25 = resample_2_56_to_2_5(ALBQ_RAW_UINT8, (int)n_in_u8, iq25);
+    // 1) Load the 2.5 MSPS cf32 — same stream gr-iridium consumes via
+    //    iridium-extractor on this fixture. Generated by
+    //    tests/scripts/direct_if_dump.py via scipy.signal.resample_poly.
+    int16_t *iq25 = NULL;
+    int n25 = load_25msps_cf32(
+        "/tmp/host_direct_if/fixture_albq_raw_2500k.cf32", &iq25);
+    if (n25 <= 0) return 2;
     printf("Loaded fixture: %d complex samples at 2.5 MSPS (%.2f ms)\n",
            n25, (double)n25 / 2.5e3);
 
@@ -207,9 +246,8 @@ int main(void) {
                BURST_WINDOW_LEN * 2 * sizeof(int16_t));
 
         // Rotate by -relative_frequency
-        int16_t cs_q, ss_q;
-        compute_rotation(center_bin, BURST_WINDOW_LEN, &cs_q, &ss_q);
-        q15_rotate(window_25, BURST_WINDOW_LEN, cs_q, ss_q);
+        double phase_step = compute_phase_step(center_bin);
+        q15_rotate(window_25, BURST_WINDOW_LEN, phase_step);
 
         // Decim 10×
         int n_out = direct_if_decim_process(&dec, window_25,
