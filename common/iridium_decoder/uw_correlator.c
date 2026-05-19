@@ -1188,8 +1188,18 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
         s_start_lp_inited = true;
     }
     // Apply (valid mode): smooth[n] valid for n in [half, search_max-half-1].
-    // For n outside that, copy raw mag² (so threshold search still
-    // works at the very start of the burst).
+    // gr-iridium uses filterN which writes only valid samples — they
+    // never look at edge samples. We do the same. Edge samples are
+    // explicitly set to 0 so they cannot beat the threshold search.
+    //
+    // BUG fixed May 2026: previously we copied raw mag² into the edge
+    // slots so the threshold search "still worked at the very start
+    // of the burst". But the unsmoothed mag² is dominated by noise
+    // spikes that easily exceed 28% of max, causing D13 to fire ~300
+    // samples (1.2 ms) earlier than gri's start_finder. That put
+    // noise into the squared-FFT CFO window and produced ω ≈ ±2π
+    // saturation on most bursts. Matching gri exactly: only search
+    // the LP-valid range.
     for (int n = 0; n < search_max; n++) {
         if (n >= half && n + half < search_max) {
             int64_t acc = 0;
@@ -1201,24 +1211,28 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
             if (acc < 0)         acc = 0;        // negative ringing on edges
             smooth[n] = (int32_t)acc;
         } else {
-            smooth[n] = mag2[n];
+            smooth[n] = 0;
         }
     }
 
-    // Step 3: max of smoothed envelope.
+    // Step 3: max of smoothed envelope — search ONLY the LP-valid range,
+    // matching gr-iridium's filterN output (start_finder_impl, post-FIR
+    // output has length N - fir_size + 1 valid samples).
+    int valid_lo = half;
+    int valid_hi = search_max - half;
+    if (valid_hi <= valid_lo) return 0;     // no valid samples
     int32_t max_val = 0;
-    for (int n = 0; n < search_max; n++) {
+    for (int n = valid_lo; n < valid_hi; n++) {
         if (smooth[n] > max_val) max_val = smooth[n];
     }
     if (max_val <= 1) return 0;     // essentially silence
 
-    // Step 4: first crossing of START_THRESHOLD_FRAC of max. Compute
-    // threshold via int64 to avoid overflow at large mag² values:
-    // max_val × 28% = max_val × (0.28 × 2^15) >> 15.
+    // Step 4: first crossing of START_THRESHOLD_FRAC of max — search
+    // the SAME valid range only.
     const int32_t thr_q15 = (int32_t)lrintf(START_THRESHOLD_FRAC * (float)(1 << 15));
     int32_t thr = (int32_t)(((int64_t)max_val * (int64_t)thr_q15) >> 15);
     int start = -1;
-    for (int n = 0; n < search_max; n++) {
+    for (int n = valid_lo; n < valid_hi; n++) {
         if (smooth[n] >= thr) { start = n; break; }
     }
     if (start < 0) return 0;
