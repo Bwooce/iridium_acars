@@ -245,6 +245,21 @@ target_include_directories(test_pipeline_wideband_resampled PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 target_link_libraries(test_pipeline_wideband_resampled PRIVATE m)
+
+# Per-layer gri-equivalence check at the TAGGER level. Counts at
+# the end of the pipeline (decode count) have been misleading before
+# (gri's "65 decoded" was frames; our "138 tagged" wasn't comparable);
+# this test compares the wideband tagger's gone-event output against
+# gr-iridium's per-burst manifest using bipartite matching by
+# (start_sample, center_bin). Assertion: recall ≥ a fixed threshold
+# of gri's 65 ground-truth bursts.
+add_executable(test_tagger_vs_manifest
+    test_tagger_vs_manifest.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_tagger_vs_manifest PRIVATE ${COMMON_DIR})
+target_link_libraries(test_tagger_vs_manifest PRIVATE m)
 target_include_directories(test_pipeline_wideband_albq PRIVATE
     ${COMMON_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
