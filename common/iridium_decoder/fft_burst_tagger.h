@@ -1,0 +1,127 @@
+// fft_burst_tagger.h — C port of gr-iridium's fft_burst_tagger block,
+// reduced to the surface area we actually need on P4.
+//
+// What it does: takes a stream of int16 IQ samples at the input
+// sample rate (2.5 MSPS), runs a 2048-pt FFT every 2048 samples
+// (no overlap, matching gri's set_output_multiple(d_fft_size)), tracks
+// a per-bin noise-floor estimate via a rolling EMA, and reports
+// detected bursts as (start_sample, center_bin) tuples.
+//
+// Differences from gr-iridium's gnuradio block (deliberate):
+//   - Single-call API instead of a streaming block — caller hands one
+//     FFT-size chunk at a time, gets new/gone bursts via output
+//     arrays. Removes GNU Radio scheduler dependency.
+//   - Q15/sc16 hot path (window-mul, FFT, magnitude², EMA) so it fits
+//     in the P4's PIE-int16 SIMD budget (~18% core load at N=2048 vs
+//     ~110% at fc32 — see Phase 3.6.M feasibility report in the plan).
+//   - baseline_history buffer is the caller's allocation (so it can
+//     be placed in PSRAM on P4, the per-FFT working buffers stay in
+//     internal SRAM).
+//   - Threshold expressed as a multiplier of the EMA (e.g. 32× = 15
+//     dB above noise floor) rather than gri's dB-with-ENBW formula
+//     — equivalent at fixed window/history params, simpler in fixed
+//     point.
+//
+// Algorithm summary (gri lib/fft_burst_tagger_impl.cc:213-356):
+//   per FFT step:
+//     1. window-multiply input × Blackman window
+//     2. radix-2 FFT (fft_sc16_2048)
+//     3. FFT-shift the output and compute magnitude² per bin
+//     4. update each existing burst's last_active if its center_bin
+//        (or ±1) is above threshold × baseline_sum[bin]
+//     5. for each bin, if magnitude² > threshold × baseline_sum AND
+//        the bin isn't masked by an active burst, declare a new burst
+//     6. erase bursts whose last_active is older than burst_post_len
+//     7. if no bursts are currently active (or always, depending on
+//        the gri "force noise update" path), update baseline_sum by
+//        an EMA step: subtract baseline_history[history_index],
+//        add the current magnitude², store the current magnitude²
+//        at baseline_history[history_index], advance index.
+//
+// Output: caller polls `out_new_bursts` and `out_gone_bursts` after
+// each step. Each new-burst record carries the absolute start_sample
+// (caller's frame of reference, set via fft_burst_tagger_set_start)
+// and the FFT bin index. Caller converts bin → relative_frequency
+// = (center_bin - fft_size/2) / fft_size (cycles/sample) and from
+// that to Hz at the input sample rate.
+
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+
+#define FBT_FFT_SIZE        2048   // matches fft_sc16_2048
+#define FBT_MAX_BURSTS      64     // gri default at fs=2.5MHz / burst_width=40k * 0.8 = 50, round up
+#define FBT_HISTORY_SIZE    512    // gri default (set in iridium_extractor_flowgraph.py)
+
+// One detected burst (output record).
+typedef struct {
+    uint64_t id;             // monotonically increasing, +10 per detection
+    uint64_t start;          // absolute sample index in caller's frame
+                             //  (= d_index - burst_pre_len, see gri:306)
+    uint64_t last_active;    // last FFT step where the burst was seen above threshold
+    uint64_t stop;           // set when the burst is removed (last_active + burst_post_len)
+    int      center_bin;     // FFT bin, 0..N-1 (DC-centred after FFT-shift)
+    float    magnitude_db;   // 10·log10(peak relative magnitude)
+    float    noise_db;       // 10·log10(EMA baseline at center_bin)
+} fbt_burst_t;
+
+typedef struct fft_burst_tagger_s fft_burst_tagger_t;
+
+// Allocate + init a tagger. `baseline_history_ext` must point to an
+// int32_t[FBT_FFT_SIZE * FBT_HISTORY_SIZE] buffer that the caller
+// owns (4 MB at the default params — place in PSRAM on P4). All
+// other working buffers are allocated internally (~120 KB internal
+// SRAM total).
+//
+// `burst_pre_len` and `burst_post_len` are in INPUT samples (at the
+// caller's sample rate). gri defaults: pre = 2*fft_size = 4096,
+// post = sample_rate * 16e-3 = 40000 at 2.5 MSPS.
+//
+// `burst_width` is in FFT bins (= input_sample_rate / fft_bin_width
+// / 2 gives the half-width of one Iridium channel). For 40 kHz channels
+// at 2.5 MSPS with 2048-pt FFT → bin_width = 1220 Hz → 40e3/1220 ≈ 32
+// bins. gri default formula matches.
+//
+// `threshold_mult_db` is in dB. gri uses ~10 dB by default for
+// Iridium; bursts must be >threshold_mult_db above the baseline EMA
+// to be tagged.
+//
+// Returns NULL on allocation failure.
+fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
+                                           int burst_post_len,
+                                           int burst_width,
+                                           float threshold_mult_db,
+                                           int32_t *baseline_history_ext);
+
+void fft_burst_tagger_destroy(fft_burst_tagger_t *t);
+
+// Set the caller's absolute starting sample. The first FFT step will
+// be tagged with sample positions starting at this value. Subsequent
+// steps advance by FBT_FFT_SIZE each. Call once after init.
+void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start);
+
+// Process one FFT-size chunk of complex int16 samples.
+//
+// `input` must point to 2*FBT_FFT_SIZE int16 (FBT_FFT_SIZE complex IQ).
+// `lookback` must point to 2*burst_pre_len int16 — the
+// `burst_pre_len` samples IMMEDIATELY PRECEDING `input`. (gri's
+// `set_history(burst_pre_len + 1)` provides this from the GR
+// scheduler; here the caller manages it.) lookback is currently
+// unused in the detection math itself; it's reserved for a future
+// PDU-cut step.
+//
+// On return:
+//   - `out_new_bursts` is filled with up to *n_new (in/out) bursts
+//     that crossed threshold this step
+//   - `out_gone_bursts` is filled with up to *n_gone bursts that
+//     timed out this step (last_active + burst_post_len <= d_index)
+//   - *n_new and *n_gone are updated to the actual counts emitted
+//
+// Returns true on success, false if FFT history isn't primed yet
+// (first HISTORY_SIZE steps) — caller should just keep feeding and
+// the EMA will fill in.
+bool fft_burst_tagger_step(fft_burst_tagger_t *t,
+                            const int16_t *input,
+                            const int16_t *lookback,
+                            fbt_burst_t *out_new_bursts,  int *n_new,
+                            fbt_burst_t *out_gone_bursts, int *n_gone);

@@ -179,6 +179,21 @@ add_executable(test_fft_sc16_2048
 target_include_directories(test_fft_sc16_2048 PRIVATE ${COMMON_DIR})
 target_link_libraries(test_fft_sc16_2048 PRIVATE m)
 
+# Phase 3.6.M: wideband fft_burst_tagger smoke test. Feeds the ALBQ
+# raw fixture through the tagger and checks the burst-count + bin
+# distribution looks sane (≥30 bursts emitted, multiple bins hit, EMA
+# primes correctly). Compares loosely against gri's 65 decoded bursts.
+add_executable(test_fft_burst_tagger
+    test_fft_burst_tagger.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_fft_burst_tagger PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_fft_burst_tagger PRIVATE m)
+
 # Cross-validate int16/Q14 channelizer path against the float reference.
 # No fixtures — synthesises inputs at runtime.
 add_executable(test_polyphase_int16
@@ -403,5 +418,6 @@ add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME polyphase_channelizer COMMAND test_polyphase_channelizer)
 add_test(NAME polyphase_int16       COMMAND test_polyphase_int16)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
+add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 add_test(NAME channelizer_detector  COMMAND test_channelizer_detector)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
