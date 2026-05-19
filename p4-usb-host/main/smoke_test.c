@@ -61,12 +61,20 @@ static const char *TAG = "SMOKE";
 
 // Phases of the synthetic stream:
 //   PRIMING noise transfers — let the baseline EMA settle before injecting
-//     the tone. dsp_processor's PRIMING_FRAMES=16 means we need ≥16/4=4
-//     transfers (each contains 4 FFT frames). Use 8 for margin.
+//     the tone. The wideband fft_burst_tagger keeps a HISTORY_SIZE=512
+//     chunk rolling window per bin; each FBT chunk is FFT_SIZE=2048
+//     complex samples at 2.5 MSPS post-resample. So priming needs
+//     ≥512 chunks × 2048 = 1,048,576 complex samples through the
+//     detector. At 2.56 MSPS USB × 16 KB transfers = 8192 complex per
+//     transfer, post-125/128 resample = ~8000 complex post-resample,
+//     so ~131 transfers fully prime the history. Use 144 for margin.
+//     (The previous channelizer detector primed in ~16 FFT frames,
+//     hence the historic value of 8 transfers — too few for the
+//     wideband path.)
 //   TONE transfers — drive a strong tone for the burst to fire.
 //   TRAILER noise transfer(s) — terminate the burst (detector logs
 //     BURST DETECTED only on the tone -> noise transition).
-#define PRIMING_TRANSFERS 8
+#define PRIMING_TRANSFERS 144
 #define TONE_TRANSFERS    4
 #define TRAILER_TRANSFERS 2
 

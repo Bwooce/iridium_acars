@@ -57,9 +57,17 @@ static volatile uint64_t s_t_bch_us     = 0;
 // Buffer sizes derived from the wideband path's burst window. At
 // FS_DETECT_HZ = 2.5 MSPS the tagger publishes length_samples =
 // FBT_BURST_POST_LEN (40000 ≈ 16 ms). Add NTAPS-1 of pre-pad so the
-// FIR transient lands before the burst proper, then a small safety
-// margin.
-#define WB_PRE_PAD_SAMPLES   (DIDECIM_NTAPS - 1)
+// FIR transient lands before the burst proper.
+//
+// Cache alignment: tagger reports burst.start_sample_idx as a
+// multiple of FBT_FFT_SIZE (2048), so the address (start × 4 bytes
+// per complex) is naturally 64-byte aligned. We subtract
+// WB_PRE_PAD_SAMPLES; making that subtraction a multiple of 16
+// complex samples (= 64 bytes = 1 cache line) keeps the extract
+// address aligned for esp_cache_msync. DIDECIM_NTAPS - 1 = 278;
+// round up to 288 — the 10-extra-sample pad is harmless (extends
+// the FIR transient prelude, burst proper still starts cleanly).
+#define WB_PRE_PAD_SAMPLES   288     // 18 × 16, ≥ DIDECIM_NTAPS - 1
 #define WB_EXTRACT_SAFETY    1024
 #define WB_EXTRACT_MAX       (40000 + WB_PRE_PAD_SAMPLES + WB_EXTRACT_SAFETY)
 

@@ -107,11 +107,16 @@ static void dispatch_new_burst(const fbt_burst_t *b)
     float rel_freq_hz = (float)signed_bin * (float)FS_DETECT_HZ
                          / (float)FBT_FFT_SIZE;
 
+    // fft_burst_tagger's magnitude_db is ALREADY the SNR
+    // (10·log10(mag² · HISTORY / baseline_sum) — see
+    // fft_burst_tagger.c:244-246). noise_db is the absolute noise
+    // floor in raw mag² units (different scale). Don't subtract them
+    // — magnitude_db is the SNR.
     detected_burst_t out = {
         .start_sample_idx = (uint32_t)b->start,
-        .length_samples   = FBT_BURST_POST_LEN,  // see note above
+        .length_samples   = FBT_BURST_POST_LEN,
         .rel_freq_hz      = rel_freq_hz,
-        .peak_snr_db      = b->magnitude_db - b->noise_db,
+        .peak_snr_db      = b->magnitude_db,
         .magnitude_db     = b->magnitude_db,
         .noise_db         = b->noise_db,
         .peak_bin         = b->center_bin,
