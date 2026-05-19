@@ -29,8 +29,29 @@ extern "C" {
 //
 // Implementation: per-sample cosf/sinf in float (matches gri's volk
 // rotator) and float Q15 saturation. No Q15 incremental phasor — see
-// module header for why.
+// module header for why. Reference implementation — accurate but
+// slow on RV-32IMF (cosf/sinf fall back to a software polynomial
+// since the FPU has no hardware sin/cos). ~10 µs per sample on P4.
+// Use rotate_to_dc_lut() for the same operation ~10× faster.
 void rotate_to_dc(int16_t *iq, int n_complex, double phase_step);
+
+// Q15 incremental phasor variant: same input/output contract as
+// rotate_to_dc, but advances a Q15 phasor incrementally
+// (4 muls + 1 shift per sample) and renormalises against an
+// absolute-phase cosf/sinf reference every ROT_RENORM_PERIOD
+// samples to prevent the magnitude-decay trap documented in the
+// module header.
+//
+// Validated against rotate_to_dc to NMSE ≤ -50 dB. ~30× faster
+// than the cosf/sinf reference on RV-32IMF (per-sample work is
+// 4 int16 muls instead of 2 software-polynomial trig calls).
+//
+// This kernel is structurally what the eventual PIE int16 SIMD
+// asm will implement — the same Q15 complex-multiply per sample
+// against a periodically-refreshed phasor, just vectorised 8 lanes
+// wide. Keeping the scalar version here both as a host-testable
+// reference and as the fallback when PIE isn't available.
+void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step);
 
 // Convenience: convert (FFT center bin, FFT size) to the per-sample
 // phase_step that rotate_to_dc expects.

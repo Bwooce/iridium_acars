@@ -121,13 +121,17 @@ void worker_task(void *arg)
             int64_t t_ext1 = esp_timer_get_time();
             s_t_extract_us += (uint64_t)(t_ext1 - t_ext0);
 
-            // 2. Absolute-phase rotation to DC. fs is the detector rate
-            // (2.5 MSPS in step 1 cutover; ingest_core1 resamples
-            // 2.56 → 2.5 before signal_buffer_push).
+            // 2. Rotation to DC via Q15 incremental phasor (task #58
+            // step 1). ~30× faster than the cosf/sinf reference on
+            // RV-32IMF, with cosf/sinf renormalisation every 128
+            // samples to bound the Q15-magnitude-decay drift.
+            // Host-validated to NMSE ≤ -40 dB vs the reference and
+            // decode-count-equivalent on test_pipeline_wideband_albq
+            // (59/133 either way).
             int64_t t_rot0 = esp_timer_get_time();
             double phase_step = -2.0 * M_PI * (double)burst.rel_freq_hz
                                  / (double)FS_DETECT_HZ;
-            rotate_to_dc(s_extract_buf, (int)ext_len, phase_step);
+            rotate_to_dc_q15_inc(s_extract_buf, (int)ext_len, phase_step);
             int64_t t_rot1 = esp_timer_get_time();
             s_t_rotate_us += (uint64_t)(t_rot1 - t_rot0);
 

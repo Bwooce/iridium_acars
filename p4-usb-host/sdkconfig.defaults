@@ -65,6 +65,14 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 # Backtrace + coredump on real WDT events instead of silent reset.
 CONFIG_ESP_TASK_WDT_PANIC=y
+# Bumped from the 5 s default to give the smoke task headroom while
+# we work through Phase 3.6.M perf items (notably the rotate_to_dc
+# cosf/sinf cost — task #58). The smoke task subscribes to the task
+# WDT for Phase 2 and blocks inside ingest_core1_take_converted's
+# xSemaphoreTake(portMAX_DELAY) when ingest+worker fall behind; at
+# 5 s the smoke task panics before reaching its esp_task_wdt_reset()
+# call. Revert to 5 once the rotation rewrite + ingest perf land.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # Per-task heap usage for diagnosing leaks under load. Left off for now —
 # initial enable triggered an Interrupt WDT timeout on CPU1 during boot,
 # probably from per-alloc critical sections piling up during the worker's

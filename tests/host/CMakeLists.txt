@@ -206,6 +206,18 @@ add_executable(test_direct_if_decim
 target_include_directories(test_direct_if_decim PRIVATE ${COMMON_DIR})
 target_link_libraries(test_direct_if_decim PRIVATE m)
 
+# Phase 3.6.M task #58 step 1: validate rotate_to_dc_q15_inc against
+# the cosf/sinf reference (rotate_to_dc) on synthetic tones. Asserts
+# NMSE ≤ -50 dB and amplitude-stability ratio in [0.98, 1.02] across
+# short/medium/long windows. Catches Q15-magnitude-decay regressions
+# in the renormalisation logic (see rotate_to_dc.h header).
+add_executable(test_rotate_to_dc
+    test_rotate_to_dc.c
+    ${COMMON_DIR}/rotate_to_dc.c
+)
+target_include_directories(test_rotate_to_dc PRIVATE ${COMMON_DIR})
+target_link_libraries(test_rotate_to_dc PRIVATE m)
+
 # Phase 3.6.M step 4: full wideband-path-A integration test. Runs the
 # raw 2.5 MSPS fixture through the C burst tagger + per-burst
 # direct-IF mixer + burst_pipeline, end-to-end. Reports decoded
@@ -459,4 +471,5 @@ add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
 add_test(NAME channelizer_detector  COMMAND test_channelizer_detector)
+add_test(NAME rotate_to_dc          COMMAND test_rotate_to_dc)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
