@@ -238,6 +238,21 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
 // qpsk_demod saw noise.
 #define CORR_FFT_N   2048
 #define CORR_FFT_LOG 11
+
+// Matched-filter precision selector.
+//   0 → Q15 BFP path (legacy, P4-friendly; kept for the embedded build)
+//   1 → float32 path (mirrors gr-iridium's volk_32fc_*_32fc chain;
+//        used to diagnose Q15 BFP precision loss as a source of
+//        peak-position divergence vs gr-iridium)
+//
+// On the host we default to float to match gr-iridium exactly. On the
+// P4 build we keep Q15 (cheaper, no scalar FPU pressure during the
+// matched filter). Final P4 path is decided after the audit and
+// measurement under Phase 3.6.P.
+#ifndef CORR_USE_FLOAT_FFT
+#define CORR_USE_FLOAT_FFT 1
+#endif
+
 static uint16_t s_corr_brev[CORR_FFT_N];
 static int16_t  s_corr_tw_re[CORR_FFT_N / 2];   // Q15 cos
 static int16_t  s_corr_tw_im[CORR_FFT_N / 2];   // Q15 sin
@@ -251,6 +266,18 @@ static int32_t  s_sync_dl_fft_re[CORR_FFT_N];
 static int32_t  s_sync_dl_fft_im[CORR_FFT_N];
 static int32_t  s_sync_ul_fft_re[CORR_FFT_N];
 static int32_t  s_sync_ul_fft_im[CORR_FFT_N];
+
+#if CORR_USE_FLOAT_FFT
+// Parallel float-precision matched filter state. Twiddles built at
+// init time; sync FFTs computed from the same s_sync_*_re/im sources
+// but kept in float32. Memory: 4 × CORR_FFT_N × 4B = 32 KB.
+static float    s_corr_tw_re_f[CORR_FFT_N / 2];
+static float    s_corr_tw_im_f[CORR_FFT_N / 2];
+static float    s_sync_dl_fft_re_f[CORR_FFT_N];
+static float    s_sync_dl_fft_im_f[CORR_FFT_N];
+static float    s_sync_ul_fft_re_f[CORR_FFT_N];
+static float    s_sync_ul_fft_im_f[CORR_FFT_N];
+#endif
 
 // Block-floating-point Q15 radix-2 DIT FFT. Buffers are int32 to
 // allow growth between stages without truncation; after each stage
@@ -330,6 +357,57 @@ static int radix2_ifft_q15(int32_t *re, int32_t *im, int N, int log_N,
     return e;
 }
 
+#if CORR_USE_FLOAT_FFT
+// Generic float radix-2 DIT FFT. Same butterfly structure as
+// cfo_fft_f32 but parameterised by N — used by both the CFO path
+// (N=4096) and the matched-filter path (N=2048) when running the
+// float-precision build.
+static void radix2_fft_f32(float *re, float *im, int N, int log_N,
+                            const uint16_t *brev,
+                            const float *tw_re, const float *tw_im)
+{
+    (void)log_N;
+    for (int i = 0; i < N; i++) {
+        int j = brev[i];
+        if (j > i) {
+            float tr = re[i]; re[i] = re[j]; re[j] = tr;
+            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+    for (int stride = 1; stride < N; stride <<= 1) {
+        int span = stride << 1;
+        int step = (N / 2) / stride;
+        for (int k = 0; k < stride; k++) {
+            float wr = tw_re[k * step];
+            float wi = tw_im[k * step];
+            for (int i = k; i < N; i += span) {
+                float xr = re[i + stride];
+                float xi = im[i + stride];
+                float tr = wr * xr - wi * xi;
+                float ti = wr * xi + wi * xr;
+                re[i + stride] = re[i] - tr;
+                im[i + stride] = im[i] - ti;
+                re[i]          = re[i] + tr;
+                im[i]          = im[i] + ti;
+            }
+        }
+    }
+}
+
+static void radix2_ifft_f32(float *re, float *im, int N, int log_N,
+                             const uint16_t *brev,
+                             const float *tw_re, const float *tw_im)
+{
+    for (int i = 0; i < N; i++) im[i] = -im[i];
+    radix2_fft_f32(re, im, N, log_N, brev, tw_re, tw_im);
+    for (int i = 0; i < N; i++) im[i] = -im[i];
+    // gr-iridium's IFFT (volk fft_complex_rev) does NOT divide by N —
+    // they rely on the FFT/IFFT pair being conjugate-symmetric in
+    // magnitude. We omit the /N for the same reason (the peak finder
+    // operates on magnitude², so any constant scale cancels out).
+}
+#endif
+
 static void sync_init(void)
 {
     if (s_sync_inited) return;
@@ -362,6 +440,10 @@ static void sync_init(void)
         double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CORR_FFT_N;
         s_corr_tw_re[k] = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
         s_corr_tw_im[k] = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
+#if CORR_USE_FLOAT_FFT
+        s_corr_tw_re_f[k] = (float)cos(ang);
+        s_corr_tw_im_f[k] = (float)sin(ang);
+#endif
     }
 
     // Pre-compute reversed-conjugated sync FFTs. gr-iridium does:
@@ -440,6 +522,40 @@ static void sync_init(void)
     }
     memcpy(s_sync_ul_fft_re, tmp_re, sizeof(tmp_re));
     memcpy(s_sync_ul_fft_im, tmp_im, sizeof(tmp_im));
+
+#if CORR_USE_FLOAT_FFT
+    // Float-precision sync FFTs — mirror gr-iridium exactly:
+    //   reversed + conjugated sync (in float, no quantisation),
+    //   zero-padded into a CORR_FFT_N buffer, forward FFT, stored
+    //   verbatim. No SYNC_TARGET_MAX renormalisation (the Q15 BFP
+    //   path's renorm has no gri equivalent and is potentially
+    //   biasing peak position; the float path skips it).
+    {
+        static float ftmp_re[CORR_FFT_N], ftmp_im[CORR_FFT_N];
+        // DL
+        memset(ftmp_re, 0, sizeof(ftmp_re));
+        memset(ftmp_im, 0, sizeof(ftmp_im));
+        for (int n = 0; n < L; n++) {
+            ftmp_re[n] =  s_sync_dl_re[L - 1 - n];
+            ftmp_im[n] = -s_sync_dl_im[L - 1 - n];   // conjugate
+        }
+        radix2_fft_f32(ftmp_re, ftmp_im, CORR_FFT_N, CORR_FFT_LOG,
+                       s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
+        memcpy(s_sync_dl_fft_re_f, ftmp_re, sizeof(ftmp_re));
+        memcpy(s_sync_dl_fft_im_f, ftmp_im, sizeof(ftmp_im));
+        // UL
+        memset(ftmp_re, 0, sizeof(ftmp_re));
+        memset(ftmp_im, 0, sizeof(ftmp_im));
+        for (int n = 0; n < L; n++) {
+            ftmp_re[n] =  s_sync_ul_re[L - 1 - n];
+            ftmp_im[n] = -s_sync_ul_im[L - 1 - n];
+        }
+        radix2_fft_f32(ftmp_re, ftmp_im, CORR_FFT_N, CORR_FFT_LOG,
+                       s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
+        memcpy(s_sync_ul_fft_re_f, ftmp_re, sizeof(ftmp_re));
+        memcpy(s_sync_ul_fft_im_f, ftmp_im, sizeof(ftmp_im));
+    }
+#endif
 
     s_sync_inited = true;
 }
@@ -924,6 +1040,79 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     // implicit ×1 from twiddle quantisation; the multiply's >>15
     // normalises one of them out so the IFFT operates on values
     // comparable to a single-FFT output).
+    int64_t best_dl = 0, best_ul = 0;
+    int     best_dl_k = 0, best_ul_k = 0;
+    int32_t best_dl_re = 0, best_dl_im = 0;
+    int32_t best_ul_re = 0, best_ul_im = 0;
+    int64_t sum_dl = 0, sum_ul = 0;
+    int valid_count = 0;
+    const int L_minus_1 = SYNC_RRC_LEN - 1;
+
+#if CORR_USE_FLOAT_FFT
+    // Float-precision matched filter — mirrors gr-iridium's volk-based
+    // chain exactly (no BFP, no SYNC_TARGET_MAX renormalisation).
+    static float fburst_re[CORR_FFT_N], fburst_im[CORR_FFT_N];
+    static float fifft_re[CORR_FFT_N], fifft_im[CORR_FFT_N];
+    memset(fburst_re, 0, sizeof(fburst_re));
+    memset(fburst_im, 0, sizeof(fburst_im));
+    int load_n = n_complex < CORR_FFT_N ? n_complex : CORR_FFT_N;
+    for (int i = 0; i < load_n; i++) {
+        fburst_re[i] = (float)burst_2sps[i * 2 + 0];
+        fburst_im[i] = (float)burst_2sps[i * 2 + 1];
+    }
+    radix2_fft_f32(fburst_re, fburst_im, CORR_FFT_N, CORR_FFT_LOG,
+                   s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
+
+    // DL path (float)
+    for (int k = 0; k < CORR_FFT_N; k++) {
+        float ar = fburst_re[k], ai = fburst_im[k];
+        float br = s_sync_dl_fft_re_f[k], bi = s_sync_dl_fft_im_f[k];
+        fifft_re[k] = ar * br - ai * bi;
+        fifft_im[k] = ar * bi + ai * br;
+    }
+    radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
+                    s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
+    for (int k = 0; k < search_complex; k++) {
+        int idx = k + L_minus_1;
+        if (idx >= CORR_FFT_N) break;
+        float re = fifft_re[idx], im = fifft_im[idx];
+        double m2 = (double)re * re + (double)im * im;
+        sum_dl += (int64_t)m2;
+        if (k == 0) valid_count = 0;
+        valid_count++;
+        if ((int64_t)m2 > best_dl) {
+            best_dl = (int64_t)m2; best_dl_k = k;
+            // Stash the complex peak as scaled int32 — the downstream
+            // code (Q15 phase-rotation logic) uses peak_re/peak_im in
+            // their original sign+magnitude convention. The PHASE is
+            // what matters for rotation; absolute scale cancels.
+            best_dl_re = (int32_t)re;
+            best_dl_im = (int32_t)im;
+        }
+    }
+    // UL path (float)
+    for (int k = 0; k < CORR_FFT_N; k++) {
+        float ar = fburst_re[k], ai = fburst_im[k];
+        float br = s_sync_ul_fft_re_f[k], bi = s_sync_ul_fft_im_f[k];
+        fifft_re[k] = ar * br - ai * bi;
+        fifft_im[k] = ar * bi + ai * br;
+    }
+    radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
+                    s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
+    for (int k = 0; k < search_complex; k++) {
+        int idx = k + L_minus_1;
+        if (idx >= CORR_FFT_N) break;
+        float re = fifft_re[idx], im = fifft_im[idx];
+        double m2 = (double)re * re + (double)im * im;
+        sum_ul += (int64_t)m2;
+        if ((int64_t)m2 > best_ul) {
+            best_ul = (int64_t)m2; best_ul_k = k;
+            best_ul_re = (int32_t)re;
+            best_ul_im = (int32_t)im;
+        }
+    }
+#else
+    // Q15 BFP matched filter (legacy path).
     static int32_t burst_re[CORR_FFT_N], burst_im[CORR_FFT_N];
     static int32_t ifft_re[CORR_FFT_N], ifft_im[CORR_FFT_N];
     memset(burst_re, 0, sizeof(burst_re));
@@ -936,25 +1125,6 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     (void)radix2_fft_q15(burst_re, burst_im, CORR_FFT_N, CORR_FFT_LOG,
                           s_corr_brev, s_corr_tw_re, s_corr_tw_im);
 
-    // The convolution peak for cross-correlation (sync * conj(reversed)
-    // ⊛ burst) lands at k = search_position + (L-1) where L = sync
-    // length. We compensate by shifting the peak index by -(L-1) when
-    // reporting, so peak_k becomes the burst-sample offset where the
-    // sync STARTS.
-    int64_t best_dl = 0, best_ul = 0;
-    int     best_dl_k = 0, best_ul_k = 0;
-    int32_t best_dl_re = 0, best_dl_im = 0;
-    int32_t best_ul_re = 0, best_ul_im = 0;
-    int64_t sum_dl = 0, sum_ul = 0;
-    int valid_count = 0;
-    const int L_minus_1 = SYNC_RRC_LEN - 1;
-
-    // DL path: burst_fft × sync_dl_fft (complex multiply), IFFT,
-    // magnitude-find. burst_FFT values bounded by BFP at ≤ 2^28;
-    // sync_FFT values renormalised in sync_init to SYNC_TARGET_MAX =
-    // 2^24. Product ≤ 2^52, so >>21 yields ≤ 2^31 (fits int32 with
-    // no headroom; the IFFT's BFP scan then shifts down further if
-    // needed).
     const int MUL_SHIFT = 21;
     for (int k = 0; k < CORR_FFT_N; k++) {
         int64_t ar = burst_re[k], ai = burst_im[k];
@@ -977,7 +1147,6 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
             best_dl_re = ifft_re[idx]; best_dl_im = ifft_im[idx];
         }
     }
-    // UL path: same with sync_ul_fft.
     for (int k = 0; k < CORR_FFT_N; k++) {
         int64_t ar = burst_re[k], ai = burst_im[k];
         int64_t br = s_sync_ul_fft_re[k], bi = s_sync_ul_fft_im[k];
@@ -997,6 +1166,7 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
             best_ul_re = ifft_re[idx]; best_ul_im = ifft_im[idx];
         }
     }
+#endif
     if (valid_count <= 1) return;
     (void)search_complex;       // valid_count is the real divisor
 
