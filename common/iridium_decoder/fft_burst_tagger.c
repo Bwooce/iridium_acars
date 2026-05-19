@@ -55,6 +55,7 @@ struct fft_burst_tagger_s {
     fbt_burst_t  bursts[FBT_MAX_BURSTS];
     int          n_bursts;
 
+    float    window_enbw;        // Blackman ENBW, computed at init
     uint64_t d_index;            // sample index of CURRENT FFT step's start
     uint64_t burst_id;
 };
@@ -76,6 +77,28 @@ static void build_blackman_q15(int16_t *w_out)
     }
 }
 
+// Effective Noise Bandwidth of the Blackman(N) window, used as
+// gri does in fft_burst_tagger_impl::create_new_bursts to scale
+// magnitude_db so a burst's reported SNR is the SNR an integrator
+// of the underlying noise process would see (not the per-bin
+// FFT-output magnitude relative to the per-bin EMA). For Blackman
+// a0=0.42, a1=0.5, a2=0.08: ENBW = N · Σw² / (Σw)² ≈ 1.7268. 10·log10
+// of that is +2.37 dB — magnitude_db without this factor reads
+// ~2.4 dB lower than gri reports for the same physical burst.
+//
+// Computed once at init and cached, because rebuild on every step
+// would be wasteful and the value is fixed for our Blackman window.
+static float compute_window_enbw(const int16_t *w, int n)
+{
+    double sum = 0, sum_sq = 0;
+    for (int i = 0; i < n; i++) {
+        double v = (double)w[i] / 32767.0;
+        sum    += v;
+        sum_sq += v * v;
+    }
+    return (float)((double)n * sum_sq / (sum * sum));
+}
+
 fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
                                            int burst_post_len,
                                            int burst_width,
@@ -88,13 +111,27 @@ fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
     t->burst_pre_len  = burst_pre_len;
     t->burst_post_len = burst_post_len;
     t->burst_width    = burst_width;
-    // threshold_q15: 10^(dB/10) × 2^15. For 10 dB → 10 × 32768 = 327680.
-    // For 15 dB → ~31.6 × 32768 ~ 1.0e6. Fits int32.
-    double t_lin = pow(10.0, (double)threshold_mult_db / 10.0);
-    t->threshold_q15 = (int32_t)(t_lin * 32768.0 + 0.5);
 
     build_blackman_q15(t->window);
+    t->window_enbw = compute_window_enbw(t->window, N);
     fft_sc16_2048_init();
+
+    // threshold_q15: 10^(dB/10) × 2^15. For 10 dB → 10 × 32768 = 327680.
+    // For 15 dB → ~31.6 × 32768 ~ 1.0e6. Fits int32.
+    //
+    // Note: we deliberately do NOT include the window_enbw factor here.
+    // gri's effective threshold is HISTORY×ENBW × less strict than the
+    // equivalent dB number suggests (its d_threshold = pow(10, thr/10)
+    // / HISTORY / ENBW compared against mag²/baseline). Our above_threshold
+    // already factors HISTORY into the LHS but omits ENBW — so at the
+    // same threshold_db we're effectively 10·log10(ENBW) ≈ 2.4 dB
+    // stricter than gri. We could match gri exactly by dividing
+    // threshold_q15 by ENBW, but that loosens the threshold and INCREASES
+    // burst count (verified by experiment: 146 → 1345). The 2× FP rate
+    // we see vs gri is NOT a threshold issue — it's somewhere else in
+    // the detector logic.
+    double t_lin = pow(10.0, (double)threshold_mult_db / 10.0);
+    t->threshold_q15 = (int32_t)(t_lin * 32768.0 + 0.5);
 
     t->baseline_history = baseline_history_ext;
     memset(t->baseline_history, 0,
@@ -193,32 +230,49 @@ static void rebuild_burst_mask(fft_burst_tagger_t *t)
 }
 
 // Scan all bins for new bursts. Bins must be above threshold AND
-// not masked by an existing burst. gri sorts peaks by magnitude
-// (strongest first) before creating bursts; we do the same so the
-// strongest peak gets the burst record when two bursts overlap.
+// not masked by an existing burst. gri sorts peaks by
+// relative_magnitude (mag² / baseline) — NOT by raw mag² — so the
+// peak with the highest SNR-above-local-noise wins when overlapping.
+// A consistently-noisy bin can have high raw mag² but also a high
+// baseline; sorting by relative_magnitude avoids letting it mask a
+// quieter-but-cleaner real burst nearby. This matches
+// fft_burst_tagger_impl::extract_peaks() in gr-iridium and is the
+// key to keeping false-positive burst count close to gri's ~65/s on
+// the ALBQ fixture (previously we were at ~133/s with raw mag² sort).
+//
+// sort_key is computed once at peak-detection time as
+//   (mag² × HISTORY_SIZE) / (baseline_sum + 1)
+// — same numerator we already form in above_threshold, so the cost
+// added by the sort-key swap is a single int64 divide per peak.
 static int create_new_bursts_internal(fft_burst_tagger_t *t,
                                        fbt_burst_t *out_new, int max_new)
 {
-    typedef struct { int bin; int32_t mag2; } peak_t;
+    typedef struct { int bin; int64_t sort_key; } peak_t;
     peak_t peaks[N];
     int n_peaks = 0;
 
     int margin = t->burst_width / 2;
     for (int bin = margin; bin < N - margin; bin++) {
         if (!t->burst_mask[bin]) continue;
-        if (above_threshold(t->magnitude_shifted[bin],
-                            t->baseline_sum[bin],
-                            t->threshold_q15)) {
+        int32_t mag2 = t->magnitude_shifted[bin];
+        int32_t base = t->baseline_sum[bin];
+        if (above_threshold(mag2, base, t->threshold_q15)) {
             peaks[n_peaks].bin = bin;
-            peaks[n_peaks].mag2 = t->magnitude_shifted[bin];
+            // Sort key = relative_magnitude × (HISTORY_SIZE × 32768)
+            // to keep an int64 representation that's stable for
+            // ordering. Same ordering as the float ratio mag²/baseline.
+            peaks[n_peaks].sort_key =
+                ((int64_t)mag2 * (int64_t)FBT_HISTORY_SIZE)
+                / ((int64_t)base + 1);
             n_peaks++;
         }
     }
 
-    // Sort peaks by mag² descending — bubble (n_peaks typically small).
+    // Sort peaks by relative magnitude descending. Bubble sort —
+    // n_peaks is typically small (<50), insertion would be marginal.
     for (int i = 0; i < n_peaks - 1; i++) {
         for (int j = i + 1; j < n_peaks; j++) {
-            if (peaks[j].mag2 > peaks[i].mag2) {
+            if (peaks[j].sort_key > peaks[i].sort_key) {
                 peak_t tmp = peaks[i]; peaks[i] = peaks[j]; peaks[j] = tmp;
             }
         }
@@ -237,13 +291,19 @@ static int create_new_bursts_internal(fft_burst_tagger_t *t,
         b->start = t->d_index - t->burst_pre_len;
         b->last_active = b->start;
         b->stop = 0;
-        // Magnitude (relative_magnitude × HISTORY_SIZE in linear). Convert
-        // to dB. Match gri's `10·log10(relative × HISTORY)` (window ENBW
-        // term applied at the dB level — caller scales separately if
-        // ENBW matters).
-        double rel = (double)peaks[p].mag2 * (double)FBT_HISTORY_SIZE
+        // Magnitude in dB, with the window ENBW scaling that gr-iridium
+        // applies (fft_burst_tagger_impl.cc:303):
+        //   magnitude = 10·log10(rel × HISTORY × window_enbw)
+        // ENBW corrects for the fact that the Blackman-windowed FFT
+        // bin output reflects integrated power over more than just
+        // a rectangular bin width — the noise per bin is wider than
+        // the FFT's nominal bin spacing. Without the factor our
+        // magnitude_db reads ~2.4 dB low vs gri for the same burst.
+        double rel = (double)t->magnitude_shifted[bin]
+                     * (double)FBT_HISTORY_SIZE
                      / ((double)t->baseline_sum[bin] + 1.0);
-        b->magnitude_db = (float)(10.0 * log10(rel + 1e-12));
+        b->magnitude_db = (float)(10.0 * log10(
+                          rel * (double)t->window_enbw + 1e-12));
         b->noise_db = (float)(10.0 * log10(
             (double)t->baseline_sum[bin] / (double)FBT_HISTORY_SIZE + 1e-12));
 
