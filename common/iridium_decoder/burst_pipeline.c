@@ -132,6 +132,16 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     if (search_complex > remaining - 24) search_complex = remaining - 24;
     if (search_complex <= 2) return false;
 
+    // NOTE: gr-iridium runs a per-iteration squared-FFT CFO inside
+    // process_next_frame. Tried it here for retry iterations
+    // (search_start > 0); it didn't recover the last path-C miss
+    // (gri 461) and regressed path A from 17/99 to 7/99 because the
+    // CFO finds spurious peaks on the channelizer's noisier signals
+    // and the resulting rotation breaks otherwise-decoding bursts.
+    // Skipped — the main pipeline's one-shot CFO is good enough for
+    // the cases this multi-frame loop catches. Per-iter CFO can be
+    // revisited once path A's channelizer SNR loss (D7+) is addressed.
+
     uw_corr_result_t tmp;
     memset(&tmp, 0, sizeof(tmp));
     uw_correlator_find(adj_burst + search_start * 2, remaining,
