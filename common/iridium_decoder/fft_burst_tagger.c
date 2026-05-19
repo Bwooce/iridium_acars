@@ -160,6 +160,21 @@ void fft_burst_tagger_destroy(fft_burst_tagger_t *t)
     free(t);
 }
 
+void fft_burst_tagger_flush(fft_burst_tagger_t *t,
+                             fbt_burst_t *out_gone, int *n_gone)
+{
+    int max = (n_gone && *n_gone > 0) ? *n_gone : 0;
+    int emitted = 0;
+    for (int b = 0; b < t->n_bursts && emitted < max; b++) {
+        t->bursts[b].stop = t->d_index;       // force-close at current sample
+        out_gone[emitted++] = t->bursts[b];
+    }
+    if (n_gone) *n_gone = emitted;
+    // Drop all active bursts; mask is full-rebuild on next step.
+    t->n_bursts = 0;
+    for (int k = 0; k < N; k++) t->burst_mask[k] = 1;
+}
+
 void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start)
 {
     t->d_index = start;

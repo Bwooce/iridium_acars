@@ -62,7 +62,17 @@
 #define INPUT_FS_HZ      2500000
 #define BURST_PRE_LEN    (2 * FBT_FFT_SIZE)            // = 4096
 #define BURST_POST_LEN   ((int)(INPUT_FS_HZ * 16e-3))  // = 40000
-#define BURST_WINDOW_LEN (BURST_PRE_LEN + BURST_POST_LEN)
+// Upper bound on the per-burst window. gri publishes variable-length
+// PDUs from `start` (= d_index - burst_pre_len) to `stop` (= last_active
+// + burst_post_len). Single-frame bursts span ~16 ms = 40000 samples
+// at 2.5 MSPS; multi-frame bursts (gri's handle_multiple_frames_per_burst)
+// keep last_active advancing as long as the signal stays above
+// threshold, often 50-100 ms total. We bound at 250 ms which exceeds
+// any Iridium burst type and matches gri's max_burst_len default
+// (sample_rate * 0.09 = 225 ms). Allocations use this max; the
+// per-burst slice is the actual gone.stop - gone.start.
+#define BURST_WINDOW_MAX_MS  250
+#define BURST_WINDOW_LEN ((int)(INPUT_FS_HZ * BURST_WINDOW_MAX_MS / 1000))  // = 625000
 #define BURST_WINDOW_250K (BURST_WINDOW_LEN / DIDECIM_DECIM)
 
 static int32_t s_baseline_history[FBT_HISTORY_SIZE * FBT_FFT_SIZE];
@@ -141,11 +151,17 @@ int main(void) {
     if (!t) { fprintf(stderr, "tagger init\n"); free(iq25); return 2; }
     fft_burst_tagger_set_start(t, 0);
 
-    // 3) Step through input + collect burst tags.
-    //    We collect them ALL first, then process each in step 4.
-    //    On P4 this would be streaming with a PSRAM ring buffer.
+    // 3) Step through input + collect GONE burst tags (matches gri's
+    //    publish-on-gone behaviour). Each gone event carries (start,
+    //    stop, center_bin) — the variable-length PDU gri's
+    //    tagged_burst_to_pdu would emit. Using `gone` (not `new`) is
+    //    important: multi-frame bursts stay active across many FFT
+    //    steps, and gri's handle_multiple_frames_per_burst expects
+    //    the whole PDU window. Using `new` with a fixed BURST_POST_LEN
+    //    truncates those to ~16 ms and loses the trailing frames.
     typedef struct {
         uint64_t start_sample;
+        uint64_t stop_sample;
         int      center_bin;
     } tag_t;
     enum { MAX_TAGS = 256 };
@@ -159,13 +175,30 @@ int main(void) {
         fft_burst_tagger_step(t, iq25 + off * 2, NULL,
                                new_bursts, &n_new,
                                gone_bursts, &n_gone);
-        for (int i = 0; i < n_new && n_tags < MAX_TAGS; i++) {
-            tags[n_tags].start_sample = new_bursts[i].start;
-            tags[n_tags].center_bin   = new_bursts[i].center_bin;
+        for (int i = 0; i < n_gone && n_tags < MAX_TAGS; i++) {
+            tags[n_tags].start_sample = gone_bursts[i].start;
+            tags[n_tags].stop_sample  = gone_bursts[i].stop;
+            tags[n_tags].center_bin   = gone_bursts[i].center_bin;
             n_tags++;
         }
     }
-    printf("Tagger emitted %d bursts\n", n_tags);
+    // Drain any still-active bursts at the end of the input: force-emit
+    // their `gone` records so we don't miss bursts that didn't naturally
+    // time out before the fixture ended.
+    {
+        int n_flush = FBT_MAX_BURSTS;
+        fbt_burst_t flushed[FBT_MAX_BURSTS];
+        fft_burst_tagger_flush(t, flushed, &n_flush);
+        for (int i = 0; i < n_flush && n_tags < MAX_TAGS; i++) {
+            tags[n_tags].start_sample = flushed[i].start;
+            tags[n_tags].stop_sample  = flushed[i].stop;
+            tags[n_tags].center_bin   = flushed[i].center_bin;
+            n_tags++;
+        }
+        printf("Tagger flushed %d still-active bursts at end-of-stream\n",
+               n_flush);
+    }
+    printf("Tagger emitted %d gone bursts total\n", n_tags);
 
     // 4) For each tag, build a window, rotate, decim, run pipeline.
     direct_if_decim_t dec;
@@ -207,15 +240,25 @@ int main(void) {
     }
     for (int i = 0; i < n_tags; i++) {
         uint64_t start = tags[i].start_sample;
+        uint64_t stop  = tags[i].stop_sample;
         int center_bin = tags[i].center_bin;
-        // Window centred on start. start_sample is already
-        // burst_pre_len before the actual envelope.
+        // Variable-length window from gri's gone-event (start, stop).
+        // start_sample is already burst_pre_len before the actual
+        // envelope. stop = last_active + burst_post_len so it overshoots
+        // the burst by burst_post_len — that's the gri-equivalent
+        // padding for the matched filter's tail.
         int64_t begin = (int64_t)start;
-        int64_t end   = begin + BURST_WINDOW_LEN;
-        if (begin < 0 || end > n25) continue;
+        int64_t end   = (int64_t)stop;
+        if (begin < 0 || end > n25 || end <= begin) continue;
+        int win_len = (int)(end - begin);
+        if (win_len > BURST_WINDOW_LEN) win_len = BURST_WINDOW_LEN;
+        // Round to multiple of DIDECIM_DECIM so direct_if_decim has
+        // a clean integer output count.
+        win_len -= win_len % DIDECIM_DECIM;
+        if (win_len < DIDECIM_DECIM) continue;
 
         memcpy(window_25, iq25 + begin * 2,
-               BURST_WINDOW_LEN * 2 * sizeof(int16_t));
+               win_len * 2 * sizeof(int16_t));
 
         // Rotate by -relative_frequency (shared helper). Using the
         // platform-best dispatcher — on host this resolves to the
@@ -226,7 +269,7 @@ int main(void) {
         // run used.
         double phase_step = rotate_to_dc_phase_step_from_bin(center_bin,
                                                               FBT_FFT_SIZE);
-        rotate_to_dc_q15_simd(window_25, BURST_WINDOW_LEN, phase_step);
+        rotate_to_dc_q15_simd(window_25, win_len, phase_step);
 
         // Decim 10× via the split (deinterleave + real-FIR ×2) path —
         // same I/O as direct_if_decim_process but uses streaming
@@ -235,7 +278,7 @@ int main(void) {
         // previous burst doesn't leak in.
         direct_if_decim_reset_state(&dec);
         int n_out = direct_if_decim_process_split(&dec, window_25,
-                                                    BURST_WINDOW_LEN,
+                                                    win_len,
                                                     window_250,
                                                     scr_in_i, scr_in_q,
                                                     scr_out_i, scr_out_q);

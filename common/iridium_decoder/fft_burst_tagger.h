@@ -125,3 +125,15 @@ bool fft_burst_tagger_step(fft_burst_tagger_t *t,
                             const int16_t *lookback,
                             fbt_burst_t *out_new_bursts,  int *n_new,
                             fbt_burst_t *out_gone_bursts, int *n_gone);
+
+// Force-emit any bursts still active. Used at end-of-stream in
+// offline tests / when an input source closes — without this, the
+// last few bursts in the stream never reach a `gone` event (because
+// their last_active + burst_post_len > final d_index) and would be
+// silently dropped. Sets stop = current d_index for each.
+//
+// `out_gone_bursts` is filled with up to *n_gone bursts; *n_gone
+// is updated to the actual count emitted. Internal state is cleared
+// so subsequent _step calls start fresh.
+void fft_burst_tagger_flush(fft_burst_tagger_t *t,
+                             fbt_burst_t *out_gone_bursts, int *n_gone);
