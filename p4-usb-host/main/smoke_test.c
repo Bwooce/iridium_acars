@@ -427,7 +427,17 @@ void smoke_test_run(void)
         unsigned int off = t * TRANSFER_BYTES;
         memcpy(synth, ALBQ_RAW_UINT8 + off, TRANSFER_BYTES);
         prev_slot = drive_transfer(synth, prev_slot);
-        vTaskDelay(1);
+        // DIAGNOSTIC: 50 ms inter-transfer delay (vs real-time ~3 ms)
+        // gives the worker time to drain its queue before signal_buffer
+        // wraps. signal_buffer holds 0.4 s at 2.5 MSPS = ~125 transfers.
+        // With the worker at ~420 ms/burst and queue depth 16 = 6.7 s
+        // backlog, the real-time feed rate guarantees stale-data reads
+        // for any burst not processed within 0.4 s. Slowing to 50 ms/
+        // transfer extends fixture-playback time from 1 s to ~16 s,
+        // giving the worker headroom to process bursts before their
+        // signal_buffer windows get overwritten. Confirms or rules out
+        // the wrap hypothesis. Reset to 1 once worker is real-time.
+        vTaskDelay(pdMS_TO_TICKS(50));
         esp_task_wdt_reset();
     }
     esp_task_wdt_delete(NULL);
