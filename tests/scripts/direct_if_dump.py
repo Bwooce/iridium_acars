@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import resample_poly, firwin
+from scipy.signal import resample_poly, firwin, kaiserord
 
 REPO = Path(__file__).resolve().parent.parent.parent
 FIXTURES = REPO / "tests/fixtures"
@@ -172,11 +172,22 @@ def direct_if_one_burst(raw_cf: np.ndarray, lo_hz: int, tag: dict) -> np.ndarray
     rot = np.exp(-2j * np.pi * freq_offset * n_idx / FS_RAW).astype(np.complex64)
     shifted = (slc * rot).astype(np.complex64)
 
-    # 10x decimation with a 100 kHz / 50 kHz transition LPF (matches
-    # gr-iridium's firdes.low_pass_2(1, 2.5e6, 100e3, 50e3, 60)).
-    # resample_poly applies a Kaiser-window LPF internally — close
-    # enough for this isolation test.
-    bb = resample_poly(shifted, up=1, down=DECIM).astype(np.complex64)
+    # 10x decimation with gr-iridium's EXACT input filter:
+    #   firdes.low_pass_2(1, channel_sample_rate=2.5e6, burst_width/2=20kHz,
+    #                     burst_width=40kHz, 40 dB)
+    # → Kaiser β≈5.5, ~279 taps. scipy.signal.resample_poly defaults to
+    # ~21-tap window — 40 dB at 20 kHz transition needs many more taps,
+    # so the default leaks adjacent-burst content (>40 kHz away) by
+    # only ~10-15 dB. On bursts where another Iridium burst lives near
+    # our window, that leakage dominates the squared-FFT CFO step and
+    # pushes omega to the ±2π clamp. Match gri exactly here.
+    cutoff_hz   = 20_000           # burst_width / 2
+    trans_hz    = 20_000           # burst_width - burst_width/2
+    atten_db    = 40
+    ntaps, beta = kaiserord(atten_db, 2 * trans_hz / FS_RAW)
+    if ntaps % 2 == 0: ntaps += 1
+    fir         = firwin(ntaps, cutoff_hz, window=('kaiser', beta), fs=FS_RAW)
+    bb = resample_poly(shifted, up=1, down=DECIM, window=fir).astype(np.complex64)
     return bb
 
 
