@@ -236,6 +236,32 @@ add_executable(test_pipeline_wideband_albq
     ${COMMON_DIR}/qpsk_demod.c
     ${COMMON_DIR}/sym_timing.c
 )
+
+# Same end-to-end pipeline as test_pipeline_wideband_albq, but
+# resamples ALBQ_RAW_UINT8 via resample_256_to_250 (the firmware's
+# ingest path) instead of reading the scipy-resampled cf32. Measures
+# the quality cost of the firmware's lower-tap-count polyphase vs
+# scipy's wider Kaiser, isolating that from anything else
+# firmware-specific.
+add_executable(test_pipeline_wideband_resampled
+    test_pipeline_wideband_resampled.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_pipeline_wideband_resampled PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_pipeline_wideband_resampled PRIVATE m)
 target_include_directories(test_pipeline_wideband_albq PRIVATE
     ${COMMON_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
