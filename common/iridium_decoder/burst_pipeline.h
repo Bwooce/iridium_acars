@@ -93,3 +93,12 @@ void burst_pipeline_force_start_once(int sample_idx);
 // state — only the next call to burst_pipeline_process_250khz dumps,
 // then auto-disables (to avoid dumping every burst).
 void burst_pipeline_set_dump_once(const char *dir);
+
+// Diagnostic — read accumulated per-stage wall-times since the last
+// call, plus loop iteration counts. Order:
+//   out[0]=D13, out[1]=CFO, out[2]=PREROT, out[3]=RRC,
+//   out[4]=first try_decode_frame call, out[5]=retry-loop total.
+// Returns first/retry call counts via out params so per-call cost
+// can be derived.
+void burst_pipeline_get_stage_us(uint32_t out[6], uint32_t *first_calls,
+                                  uint32_t *retry_calls);

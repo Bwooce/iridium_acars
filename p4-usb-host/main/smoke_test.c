@@ -18,6 +18,7 @@
 #include "ingest_core1.h"
 #include "signal_buffer.h"
 #include "dsp_processor.h"
+#include "burst_pipeline.h"
 #include "smoke_test.h"
 
 #if CONFIG_SMOKE_TEST_CORPUS
@@ -481,6 +482,17 @@ void smoke_test_run(void)
                  (double)ws.fir_decim_us,
                  (double)ws.demod_us,
                  (double)ws.bch_us);
+        // burst_pipeline substage breakdown — only useful when the
+        // "pipeline" stage above is the dominant cost.
+        uint32_t bp[6], bp_first, bp_retry;
+        burst_pipeline_get_stage_us(bp, &bp_first, &bp_retry);
+        ESP_LOGI(TAG, "  pipeline substages: D13=%lu CFO=%lu prerot=%lu "
+                      "RRC=%lu first=%lu retry=%lu (first_calls=%lu "
+                      "retry_calls=%lu)",
+                 (unsigned long)bp[0], (unsigned long)bp[1],
+                 (unsigned long)bp[2], (unsigned long)bp[3],
+                 (unsigned long)bp[4], (unsigned long)bp[5],
+                 (unsigned long)bp_first, (unsigned long)bp_retry);
         if (ws.bursts_dropped > 0) {
             ESP_LOGW(TAG, "  %u bursts dropped — queue overflow",
                      (unsigned)ws.bursts_dropped);

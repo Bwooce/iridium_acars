@@ -218,10 +218,44 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     return false;
 }
 
+#ifdef ESP_PLATFORM
+#include "esp_timer.h"
+#define PROFILE_T0()           int64_t _pt0 = esp_timer_get_time()
+#define PROFILE_NOW()          esp_timer_get_time()
+#define PROFILE_LOG(name)      do { \
+    int64_t _pt_now = esp_timer_get_time(); \
+    s_profile_us[BP_##name] += (uint32_t)(_pt_now - _pt0); \
+    _pt0 = _pt_now; \
+} while (0)
+#else
+#define PROFILE_T0()           do { } while (0)
+#define PROFILE_LOG(name)      do { } while (0)
+#endif
+
+enum {
+    BP_D13, BP_CFO, BP_PREROT, BP_RRC, BP_LOOP_FIRST, BP_LOOP_RETRY,
+    BP_N
+};
+static volatile uint32_t s_profile_us[BP_N] = { 0 };
+static volatile uint32_t s_profile_loops_first = 0;
+static volatile uint32_t s_profile_loops_retry = 0;
+
+void burst_pipeline_get_stage_us(uint32_t out[6], uint32_t *first_calls,
+                                  uint32_t *retry_calls)
+{
+    for (int i = 0; i < BP_N; i++) {
+        out[i] = s_profile_us[i];
+        s_profile_us[i] = 0;
+    }
+    if (first_calls) { *first_calls = s_profile_loops_first; s_profile_loops_first = 0; }
+    if (retry_calls) { *retry_calls = s_profile_loops_retry; s_profile_loops_retry = 0; }
+}
+
 bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
                                     burst_pipeline_result_t *result)
 {
     memset(result, 0, sizeof(*result));
+    PROFILE_T0();
 
     // 1. D13 envelope start_finder. Search depth matches gr-iridium's
     //    burst_downmix exactly: 0.007 × burst_sample_rate = 1750
@@ -253,12 +287,14 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
         // matched filter; bail out cleanly.
         return false;
     }
+    PROFILE_LOG(D13);
 
     dump_iq_cf32("04_post_d13_250k", adj_burst, adj_n);
 
     // 2. Pre-RRC squared-FFT CFO estimate on the trimmed burst.
     float omega_coarse = uw_correlator_estimate_cfo(adj_burst, adj_n);
     result->omega_coarse = omega_coarse;
+    PROFILE_LOG(CFO);
 
     // 3. Phase-correct adj_burst in place by exp(+j·omega/sps·n).
     //    Sign convention matches uw_correlator_estimate_cfo: the
@@ -272,11 +308,13 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
                                q15_from_float(cosf(dphi)),
                                q15_from_float(sinf(dphi)));
     }
+    PROFILE_LOG(PREROT);
 
     dump_iq_cf32("05_post_cfo_250k", adj_burst, adj_n);
 
     // 4. RRC matched filter.
     uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
+    PROFILE_LOG(RRC);
 
     dump_iq_cf32("06_post_rrc_250k", adj_burst, adj_n);
 
@@ -293,6 +331,8 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     //      gri's exact handled_samples count to advance by.
     bool decoded = try_decode_frame(adj_burst, adj_n, 0, result,
                                      /*dump=*/true);
+    s_profile_loops_first++;
+    PROFILE_LOG(LOOP_FIRST);
 
     if (!decoded) {
         // gr-iridium's MIN_FRAME_LENGTH_NORMAL = 131 symbols = 1310
@@ -301,12 +341,14 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
         for (int retry_start = RETRY_STEP_10SPS;
              retry_start + SYNC_SEARCH_LEN_GUARD <= adj_n;
              retry_start += RETRY_STEP_10SPS) {
+            s_profile_loops_retry++;
             if (try_decode_frame(adj_burst, adj_n, retry_start,
                                   result, /*dump=*/false)) {
                 break;
             }
         }
     }
+    PROFILE_LOG(LOOP_RETRY);
 
     // Clear the one-shot dump trigger so subsequent bursts don't dump.
     s_dump_pending = 0;
