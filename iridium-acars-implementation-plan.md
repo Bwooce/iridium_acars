@@ -14,11 +14,12 @@ This document tracks the concrete implementation steps for the [Iridium ACARS De
   decodes 65/65; the channelizer path (A) decodes 6/99 (channelizer
   losses dominate); the direct-IF host harness (path C — bypasses
   channelizer + resampler, feeds gr-iridium-equivalent baseband into
-  the same downstream `burst_pipeline`) decodes **63/65 (97%)**. Path
-  C is now at gr-iridium parity per Phase 3.6.H goal. The remaining 2
-  are sub-frames of multi-frame bursts whose primary frames DO decode;
-  closing them needs `handle_multiple_frames_per_burst` support in
-  burst_pipeline (deferred as a feature, not a parity fix).
+  the same downstream `burst_pipeline`) decodes **64/65 (98.5%)**. Path
+  C is at gr-iridium parity. With the multi-frame loop added to
+  burst_pipeline (mirroring gri's `handle_multiple_frames_per_burst`),
+  path A also climbed from 6/99 → 17/99 — the channelizer still has the
+  same 8 dB SNR loss but the multi-frame retries recover bursts where
+  the matched filter's first peak was a noisy data region.
   Channelizer path A remains broken (8 dB SNR loss from per-channel
   filter rolloff) — Phase 3.6.P will substitute components one at a
   time, measuring decode rate and execution time at each swap to
@@ -764,8 +765,9 @@ Goal: ≥ 58/64 decodes on the ALBQ fixture via the path-C harness
 | H3 | Fix D13 cut-position formula — half_fir_size double-counted (our smooth[n] is input-centred, gri's filtered[k] is filtered-output-indexed) | +N | ✅ 23/65 |
 | H4 | Float-precision matched filter alt path (CORR_USE_FLOAT_FFT) — rules out Q15 BFP as the primary divergence | research | ✅ |
 | H5 | gri-aligned decimation FIR in direct_if_dump.py — scipy's default short Kaiser leaked adjacent-channel bursts into the squared-FFT CFO step, clamping ω to ±2π on 38 bursts | +30+ | ✅ 59/65 |
-| H6 | Manifest-aware D13 bypass — sub-frames of multi-frame bursts have their RAW timestamp 8+ms after the burst envelope onset; D13 fires on the still-active prior frame at iq250[91] instead of locating the second frame's preamble. Force burst_start from the manifest's UW position for path C (deterministic at iq250[~250] given our Python pre-pad of 4096 raw samples) | +4 | ✅ **63/65 (97%)** |
-| H7 | Last 2 misses (gri 391, 461) are sub-frames of multi-frame physical bursts. Path C rotates the whole window by the sub-frame's published freq, but gri's iter2 CFO correction was per-frame inside the same PDU. Eliminating these would require porting gr-iridium's `handle_multiple_frames_per_burst` loop into burst_pipeline_process_250khz — a feature, not a parity fix | (multi-frame feature) | deferred |
+| H6 | Manifest-aware D13 bypass — sub-frames of multi-frame bursts have their RAW timestamp 8+ms after the burst envelope onset; D13 fires on the still-active prior frame at iq250[91] instead of locating the second frame's preamble. Force burst_start from the manifest's UW position for path C (deterministic at iq250[~250] given our Python pre-pad of 4096 raw samples) | +4 | ✅ 63/65 |
+| H7 | Multi-frame loop in burst_pipeline — refactor steps 5-8 (UW correlator + pre-rotate + decim + demod) into `try_decode_frame(adj_burst, search_start)`. After the first attempt fails, sweep additional search starts at half-MIN_FRAME_LENGTH (655 samples) increments through the remaining buffer. Mirrors gri's `handle_multiple_frames_per_burst`. Catches sub-frame entries gri publishes as second/third RAW lines for one physical PDU | +1 | ✅ **64/65 (98.5%)** |
+| H8 | Last miss (gri 461) — sub-frame whose rotation puts both frames at different baselines. Per-iter CFO inside the multi-frame loop (gri's process_next_frame model) recovers nothing on this corpus and regresses path A by 10/99 (channelizer's noisier signal makes per-iter CFO find spurious peaks). Deferred until path A's channelizer SNR loss is addressed | (defer w/ D7+) | open |
 
 ### Step 3.6.P — P4-realistic substitution with measured impact
 
