@@ -19,7 +19,9 @@ This document tracks the concrete implementation steps for the [Iridium ACARS De
   burst_pipeline (mirroring gri's `handle_multiple_frames_per_burst`),
   path A also climbed from 6/99 → 17/99 — the channelizer still has the
   same 8 dB SNR loss but the multi-frame retries recover bursts where
-  the matched filter's first peak was a noisy data region.
+  the matched filter's first peak was a noisy data region. Phase 3.6.M
+  (front-end channelizer parity) must close the remaining path-A gap
+  before Phase 3.6.P (P4 substitutions) becomes a meaningful exercise.
   Channelizer path A remains broken (8 dB SNR loss from per-channel
   filter rolloff) — Phase 3.6.P will substitute components one at a
   time, measuring decode rate and execution time at each swap to
@@ -769,20 +771,54 @@ Goal: ≥ 58/64 decodes on the ALBQ fixture via the path-C harness
 | H7 | Multi-frame loop in burst_pipeline — refactor steps 5-8 (UW correlator + pre-rotate + decim + demod) into `try_decode_frame(adj_burst, search_start)`. After the first attempt fails, sweep additional search starts at half-MIN_FRAME_LENGTH (655 samples) increments through the remaining buffer. Mirrors gri's `handle_multiple_frames_per_burst`. Catches sub-frame entries gri publishes as second/third RAW lines for one physical PDU | +1 | ✅ **64/65 (98.5%)** |
 | H8 | Last miss (gri 461) — sub-frame whose rotation puts both frames at different baselines. Per-iter CFO inside the multi-frame loop (gri's process_next_frame model) recovers nothing on this corpus and regresses path A by 10/99 (channelizer's noisier signal makes per-iter CFO find spurious peaks). Deferred until path A's channelizer SNR loss is addressed | (defer w/ D7+) | open |
 
+### Step 3.6.M — Front-end (channelizer) parity with gr-iridium
+
+**Gates Phase 3.6.P.** Substitution-with-measurement only works against
+a baseline that's actually close to gr-iridium. Path A (the current
+polyphase-channelizer front end) is at 17/99 vs gri's 65/65 — measuring
+P-step substitutions on top of that 80% gap would drown each step's
+real impact in front-end noise.
+
+The polyphase channelizer's known issues:
+- 8 dB SNR loss at post-D13 (measured May 2026, see "Per-stage SNR-gap
+  measurement")
+- 40 kHz quantisation: residual carrier at burst_pipeline input is up
+  to ±20 kHz, well past the qpsk_demod PLL's ±2.5 kHz capture range
+- Per-channel filter rolloff splits bursts that straddle a channel edge
+- Adjacent-burst leakage (when scipy decim was under-attenuated, path C
+  had this too — fixed by gri-aligned 279-tap Kaiser; path A's
+  channelizer has analogous issues that aren't fixable just by raising
+  filter quality, because the architecture itself quantises by 40 kHz)
+
+Three options for closing the gap (chosen between based on feasibility
+investigation, then implemented):
+
+| # | Approach | Effort | Risk | Outcome |
+|---|---|---|---|---|
+| M.A | Improve polyphase channelizer: sharper per-channel filters, Iridium-grid alignment refinement, residual-freq estimator before burst_pipeline | High | Medium — incremental, but architecture has a fundamental ±20 kHz residual ceiling | Path A potentially → 50/99; still front-end-quantised |
+| M.B | Replace channelizer with gr-iridium's wideband `fft_burst_tagger` (gri's actual front end) + per-burst direct-IF mixer | High | Lower — gri proves this architecture works at 64/65 | Path A could match path C's 64/65 |
+| M.C | Hybrid: keep polyphase for detection only, redirect entire wideband cut + downmix per burst to a direct-IF path for the actual decoding | Medium | Medium — new architecture, novel | Best of both, but needs design + validation |
+
+**Decision pending:** P4-memory-footprint investigation of the
+wideband tagger (option M.B). If 2048-pt FFT fits, M.B is the
+preferred path because it gives us gri-aligned baseband to all
+downstream stages. If not, fall back to M.A (incremental improvement)
+or M.C (hybrid).
+
 ### Step 3.6.P — P4-realistic substitution with measured impact
 
-Each step replaces ONE host component with a P4-appropriate version
-and runs the same path-C harness for decode rate plus a new
-per-burst wall-time measurement. Order is from least-risky to most-risky:
+**Blocked on Phase 3.6.M completion.** Each step replaces ONE host
+component with a P4-appropriate version and runs the same path-C
+harness for decode rate plus a new per-burst wall-time measurement.
+Order is from least-risky to most-risky:
 
 | # | Substitution | What we expect to lose / measure | P4 constraint |
 |---|---|---|---|
 | P1 | scipy `resample_poly` 10× decim → C int16 polyphase FIR decim (host) | float→Q15 rounding; ~0–2 decodes acceptable | First step needed for any embedded path |
 | P2 | Floating-point downstream DSP hot paths (CFO FFT, RRC, UW correlator) → Q15 / fixed-point | ~0–2 decodes; full precision impact across pipeline | P4 has scalar FPU but PIE vector is integer-only — Q15 needed for SIMD |
-| P3 | gr-iridium-equivalent **C** wideband `fft_burst_tagger` → produces same `(start_sample, freq_offset)` tags we currently parse from `iridium-extractor` stdout | 0 decodes (just replaces the Python detection step) | Still wideband; not yet P4-fit, but standalone |
-| P4 | Wideband C tagger → **polyphase channelizer** (current path-A front end) | Largest expected drop (currently 17 decodes between path-C and path-A); the trade-off the whole effort is built to measure | Resolves the 8 dB SNR-loss measured at post-D13 in May; informs whether to widen channel BW, redesign filters, or keep direct-IF |
-| P5 | Direct-IF rotate+FIR-decim on raw 2.5 MSPS → integer rotate+`firmr_s16` (esp-dsp) | ~0 decodes; just the existing P4 resampler in the new role | If P4 chosen over A, this is the P4 front end |
-| P6 | Per-burst wall-time profiling on actual P4 hardware: confirm host substitution numbers reproduce; identify whichever step exceeds the per-burst CPU budget | actual perf numbers | Real platform — PSRAM/SRAM placement, cache behaviour, queue contention |
+| P3 | Python detection (parsing iridium-extractor RAW lines) → the chosen front end from 3.6.M (wideband C tagger, improved polyphase, or hybrid) | 0 decodes if M.B was chosen; some loss if M.A | The actual P4 front end |
+| P4 | Direct-IF rotate+FIR-decim on raw 2.5 MSPS → integer rotate+`firmr_s16` (esp-dsp) | ~0 decodes; just the existing P4 resampler in the new role | Only needed if M.B or M.C was the M-step choice |
+| P5 | Per-burst wall-time profiling on actual P4 hardware: confirm host substitution numbers reproduce; identify whichever step exceeds the per-burst CPU budget | actual perf numbers | Real platform — PSRAM/SRAM placement, cache behaviour, queue contention |
 
 Each P-step writes one row to a results table in this plan:
 `(step, decode rate vs prior, decode rate vs gr-iridium, host µs/burst,
@@ -793,13 +829,17 @@ the plan can see exactly how each substitution moved both numbers.
 
 By end of 3.6 we have:
 - A host pipeline at gr-iridium parity (≥58/64) that serves as a
-  golden reference for any future change.
+  golden reference for any future change. **(✅ achieved: path C
+  64/65 = 98.5%.)**
+- Path A at near-parity with path C, validating the chosen front-end
+  architecture against gri's full decode rate. **(Phase 3.6.M; in
+  progress.)**
 - A measured cost-vs-loss curve for every P4-specific substitution,
-  so the front-end choice (channelizer vs direct-IF + tagger) is made
-  on data not speculation.
+  starting from the front end chosen in 3.6.M.
 - A regression test suite where the path-C run prints a single line:
   `D/N decoded` — degradation from substitution is one number, not
-  a long log to read.
+  a long log to read. **(✅ achieved via dsp_compare.py + path-C
+  harness.)**
 
 ### Step 3.6.T — Comparison tooling (DONE)
 
