@@ -131,20 +131,12 @@ int main(void) {
     fft_burst_tagger_t *t = fft_burst_tagger_init(
         BURST_PRE_LEN, BURST_POST_LEN,
         /*burst_width=*/ 32,
-        // 14 dB was found by sweep to be the sweet spot for
-        // false-positive reduction on this fixture:
-        //   thr  | tagged | decoded | precision
-        //   10dB |   133  |   59    |   44%
-        //   12dB |    74  |   56    |   76%
-        //   14dB |    70  |   56    |   80%   ← chosen
-        //   16dB |    63  |   52    |   83%
-        //   18dB |    48  |   40    |   83%
-        // gri's iridium-extractor CLI default is 18 dB; at our
-        // numerics 18 dB drops decode count by 32%. 14 dB keeps
-        // decode count within 3 of the 10 dB peak (5% loss) while
-        // halving tagged-burst count, materially reducing worker
-        // queue pressure in the firmware.
-        /*threshold_db=*/ 14.0f,
+        // 10 dB matches the firmware setting in dsp_processor.c —
+        // gives 59/65 = 91% gri-equivalent decode rate. The 14 dB
+        // tradeoff for fewer tags is no longer needed since the
+        // PIE FIR fix (commit 7eab12a) made per-burst cost low
+        // enough for the worker to handle 133 tags/sec.
+        /*threshold_db=*/ 10.0f,
         s_baseline_history);
     if (!t) { fprintf(stderr, "tagger init\n"); free(iq25); return 2; }
     fft_burst_tagger_set_start(t, 0);

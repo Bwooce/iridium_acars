@@ -20,15 +20,16 @@
 
 static const char *TAG = "DSP_PROC";
 
-// Tagger threshold over the EMA baseline. 14 dB found by sweep on
-// the ALBQ wideband test as the best trade between decode count
-// (56 at 14 dB vs 59 at 10 dB, a 5% loss) and FP-induced worker
-// queue pressure (70 tagged at 14 dB vs 133 at 10 dB, a 47%
-// reduction). gri's iridium-extractor CLI default is 18 dB, which
-// is more aggressive than our pipeline tolerates (drops to 40
-// decodes at 18 dB). See test_pipeline_wideband_albq comment for
-// the full sweep.
-#define FBT_THRESHOLD_DB    14.0f
+// Tagger threshold over the EMA baseline. 10 dB recovers the best
+// decode count we've measured: 59/65 = 91% of gri's reference 65
+// on the ALBQ fixture, vs 56/65 = 86% at the 14 dB setting we used
+// during the queue-overload era. The 14 dB choice cost 3 real
+// decodes (5% absolute) to halve burst count and stop queue
+// overflow; the 280-tap PIE FIR fix (commit 7eab12a) made the
+// per-burst cost low enough that the worker keeps up at 133
+// bursts/sec on slow-feed smoke. Setting back to 10 to recover
+// the 5% absolute decode rate.
+#define FBT_THRESHOLD_DB    10.0f
 
 // Burst window padding in INPUT samples (at FS_DETECT_HZ). gri's
 // defaults: pre = 2*fft_size = 4096, post = sample_rate * 16e-3 =
