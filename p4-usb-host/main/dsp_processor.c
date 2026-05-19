@@ -1,26 +1,12 @@
-// dsp_processor — wideband burst detector. As of the Phase 3.6.M
-// cutover this is a thin shim around fft_burst_tagger
-// (common/iridium_decoder/), which runs the gr-iridium wideband
-// spectrogram detector against the full 2.5 MSPS input subband.
-//
-// History:
-//   1. Single 2048-pt FFT with per-bin EMA threshold (legacy). One
-//      strongest bin across the whole subband; collapsed two
-//      concurrent bursts that overlapped in time.
-//   2. Polyphase channelizer + per-channel detector (D7). Bounded
-//      centre-frequency error at ½ × 40 kHz = 20 kHz per channel.
-//      Hit real-time on P4 but had ~8 dB SNR loss vs gri and 40 kHz
-//      frequency quantisation that swamped the PLL's capture range.
-//   3. (this) Wideband fft_burst_tagger + per-burst direct_if_decim.
-//      gr-iridium-equivalent per stage on host (Phase 3.6.M, commit
-//      de72f24). Each burst carries an exact relative-frequency tag
-//      (FFT bin → Hz), so the worker's rotation is sub-bin precise
-//      and the burst_pipeline PLL only needs to track residual scatter.
-//
-// The channelizer files (channelizer_detector, polyphase_channelizer,
-// polyphase_mac_arp4) and the legacy windowing/magnitude PIE kernels
-// (dsp_window_arp4.S, dsp_mag_arp4.S) remain in-tree as references
-// for any future PIE work; orphan sections drop in the linker output.
+// dsp_processor — wideband burst detector. Thin shim around
+// fft_burst_tagger (common/iridium_decoder/), which runs the gr-iridium
+// wideband spectrogram detector against the full 2.5 MSPS input
+// subband. The Phase 3.6.M cutover (commit bf0bb9f) replaced an
+// earlier single-FFT detector and a polyphase channelizer with this
+// gri-aligned path; both predecessors were removed from the tree.
+// Each tagged burst carries an exact relative-frequency tag (FFT
+// bin → Hz), so the worker's rotation is sub-bin precise and the
+// downstream burst_pipeline PLL only tracks residual scatter.
 
 #include <stdio.h>
 #include <string.h>

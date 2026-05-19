@@ -1,21 +1,15 @@
-// Shared Q14 fixed-point conventions for the int16 DSP path.
+// Q14 fixed-point macros, used by uw_correlator.c's RRC matched
+// filter. Q14 (not Q15) so the multiply-accumulate has one bit of
+// headroom for RRC taps that occasionally exceed |1.0| around the
+// pulse-shaping ringing tails.
 //
-// Q14 (1.14 signed) is used for filter taps in the channelizer and
-// uw_correlator: float taps in [-1,1] are scaled by Q14_ONE and stored
-// as int16. A Q14 tap × int16 sample produces an int32 product; sum a
-// burst's worth, then >> Q14_SHIFT to undo the scale and return to
-// signal-scale int16.
-//
-// We pick Q14 (not Q15) because DC-gain-normalised taps for a
-// 1024-tap polyphase filter sum to 1.0 with peak ~0.05; Q15 would
-// give peak tap ~1638 with no margin for accumulation, but Q14 has
-// a comfortable 2× headroom and matches the ESP32-P4 PIE vector
-// MAC's natural fractional width (the SRS instruction shifts by 14
-// after accumulation).
-
+// Previously this header was part of the polyphase channelizer
+// module (which used Q14 throughout); the channelizer was removed
+// when the wideband fft_burst_tagger took over as the active front
+// end, but uw_correlator's RRC filter still uses these macros.
+// Kept as a standalone header rather than inlined into uw_correlator.c
+// in case other modules adopt Q14 RRC-shaped filtering later.
 #pragma once
 
-#include <stdint.h>
-
-#define Q14_ONE         16384   // 1.0 in Q14
-#define Q14_SHIFT       14      // bits to shift right after Q14 MAC
+#define Q14_SHIFT  14
+#define Q14_ONE    (1 << Q14_SHIFT)   // 16384 — represents 1.0 in Q14

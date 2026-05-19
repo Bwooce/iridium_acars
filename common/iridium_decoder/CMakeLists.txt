@@ -1,13 +1,22 @@
 # Iridium ACARS shared decoder component.
 #
-# Cross-board code: BCH(31,21) decoder and DQPSK demod with PLL phase
-# tracking. Used by the host board (USB ingest + FFT detection)
-# in-process today; will be used by future child-processor P4 boards
-# (worker side) when the multi-board pipeline lands.
+# Cross-board code: BCH(31,21) decoder, DQPSK demod with PLL phase
+# tracking, wideband fft_burst_tagger front end, direct-IF decimator,
+# and per-burst pipeline orchestration.
 #
 # Pure C, no FreeRTOS / USB / ESP-IDF runtime dependencies beyond
 # esp_log (used only for status messages, easily stubbed for host
 # unit tests under tests/host/).
+#
+# Historical: the polyphase channelizer was the active front end
+# through Phase 3.5 / D7. Phase 3.6.M replaced it with the
+# wideband fft_burst_tagger (matches gr-iridium's architecture).
+# The channelizer code, its detector/MAC kernels, and the per-frame
+# windowing/magnitude PIE asm that fed it were all removed in commit
+# (TBD when this commit lands). Last revision with the channelizer
+# present and active: bf0bb9f^ (the commit just before the wideband
+# cutover); last revision with channelizer dead-but-linked:
+# 7eab12a (this commit's parent).
 idf_component_register(
     SRCS
         "bch_decoder.c"
@@ -21,35 +30,24 @@ idf_component_register(
         "ida_decode.c"
         # Phase D part 5: SBD multi-frame reassembler.
         "sbd_reassembler.c"
-        # Phase D7: polyphase FFT channelizer (front-end multi-burst separation).
-        "polyphase_channelizer.c"
-        "channelizer_detector.c"
-        # D20 step 3: PIE/SIMD polyphase MAC kernel.
-        "polyphase_mac_arp4.S"
-        # D8: fine carrier frequency estimator for the worker
-        # (companion to D7's coarse channelizer).
+        # Fine carrier frequency estimator for the worker (legacy companion
+        # to the channelizer; retained for diagnostic use).
         "freq_estimator.c"
-        # D10: Gardner symbol-timing recovery for qpsk_demod.
+        # Gardner symbol-timing recovery for qpsk_demod.
         "sym_timing.c"
-        # D10 (gr-iridium-style): UW cross-correlator for one-shot
-        # timing + direction estimation.
+        # gr-iridium-style UW cross-correlator for one-shot timing +
+        # direction estimation. Drives D13 / CFO / pre-rotate / demod
+        # inside burst_pipeline.
         "uw_correlator.c"
         # Per-burst pipeline orchestration shared between worker_core1
         # and the host pipeline test. Single source of truth for the
         # gr-iridium-aligned D13 → CFO → RRC → UW → demod chain.
         "burst_pipeline.c"
-        # Portable Q15 64-pt FFT used by the host channelizer (target
-        # uses esp-dsp's hardware-accelerated dsps_fft2r_sc16_arp4
-        # instead — this file's fft_sc16_64() symbol is dead code on
-        # target but still compiled to keep the build target list
-        # uniform).
-        "fft_sc16_64.c"
         # Phase 3.6.M wideband-tagger path. All portable C — same
         # source compiles for host unit tests and P4 firmware.
-        # The fft_sc16_2048 hot loop runs in ~18% of one P4 core at
-        # 2.5 MSPS per the Phase 3.6.M feasibility analysis; could
-        # be swapped for esp-dsp's PIE-accelerated dsps_fft2r_sc16
-        # later if we need more headroom.
+        # fft_sc16_2048 internals are scalar Q15; esp-dsp's
+        # PIE-accelerated dsps_fft2r_sc16_arp4 could replace them
+        # later if more headroom is needed.
         "fft_sc16_2048.c"
         "fft_burst_tagger.c"
         "direct_if_decim.c"
@@ -72,8 +70,6 @@ idf_component_register(
     # decoder for free.
     REQUIRES libacars_idf
     # frame_queue uses heap_caps_calloc with MALLOC_CAP_SPIRAM.
-    # polyphase_channelizer.c (D20 step 2) calls dsps_fft2r_fc32_arp4
-    # on target; gated by #ifdef ESP_PLATFORM so it does not affect
-    # host unit-test builds.
+    # direct_if_decim on target uses dsps_fird_s16_arp4.
     PRIV_REQUIRES esp_mm espressif__esp-dsp
 )

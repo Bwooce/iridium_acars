@@ -151,23 +151,6 @@ add_executable(test_sbd_reassembler
 )
 target_include_directories(test_sbd_reassembler PRIVATE ${COMMON_DIR})
 
-# Phase D7: polyphase channelizer (single-FFT detector replacement).
-add_executable(test_polyphase_channelizer
-    test_polyphase_channelizer.c
-    ${COMMON_DIR}/polyphase_channelizer.c
-    ${COMMON_DIR}/fft_sc16_64.c
-)
-target_include_directories(test_polyphase_channelizer PRIVATE
-    ${COMMON_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
-)
-target_link_libraries(test_polyphase_channelizer PRIVATE m)
-# Silence -Wunused-but-set-variable for the tone-construction helpers
-# (we set up phase but only use it for the cumulative phasor advance).
-target_compile_options(test_polyphase_channelizer PRIVATE
-    -Wno-unused-but-set-variable
-)
-
 # Phase 3.6.M: cross-validate the new Q15 2048-pt FFT (for the wideband
 # fft_burst_tagger) against a textbook direct-DFT reference. Same
 # algorithm as fft_sc16_64.c just resized for N=2048; the test catches
@@ -269,31 +252,12 @@ target_include_directories(test_pipeline_wideband_albq PRIVATE
 )
 target_link_libraries(test_pipeline_wideband_albq PRIVATE m)
 
-# Cross-validate int16/Q14 channelizer path against the float reference.
-# No fixtures — synthesises inputs at runtime.
-add_executable(test_polyphase_int16
-    test_polyphase_int16.c
-    ${COMMON_DIR}/polyphase_channelizer.c
-    ${COMMON_DIR}/fft_sc16_64.c
-)
-target_include_directories(test_polyphase_int16 PRIVATE ${COMMON_DIR})
-target_link_libraries(test_polyphase_int16 PRIVATE m)
-
-# Phase D7 part 2: channelizer-driven burst detector (replaces the
-# single-FFT detector in dsp_processor). Validates the full detection
-# pipeline on the same fixtures used for the bare channelizer.
-add_executable(test_channelizer_detector
-    test_channelizer_detector.c
-    ${COMMON_DIR}/polyphase_channelizer.c
-    ${COMMON_DIR}/fft_sc16_64.c
-    ${COMMON_DIR}/channelizer_detector.c
-)
-target_include_directories(test_channelizer_detector PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
-    ${COMMON_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
-)
-target_link_libraries(test_channelizer_detector PRIVATE m)
+# (test_polyphase_int16, test_channelizer_detector, test_polyphase_channelizer,
+# test_snr_gap_measurement, and test_worker_pipeline_albq removed —
+# the polyphase channelizer that fed them was deprecated when the
+# wideband fft_burst_tagger took over as the active front end in
+# Phase 3.6.M, and removed in the same commit that updates this
+# CMakeLists. See iridium-acars-implementation-plan.md.)
 
 # test_libacars_link — smoke test that the same minimum source-set the
 # IDF component (common/libacars_idf/) compiles also links + runs on a
@@ -393,26 +357,10 @@ target_link_libraries(test_uw_correlator_albq_ul PRIVATE m)
 
 # End-to-end worker DSP pipeline on the shared ALBQ_RAW corpus —
 # host iteration analog of the on-target smoke. Runs channelizer +
-# new channelizer→worker→qpsk_demod chain (less the esp-dsp resampler,
-# replaced with a portable polyphase reference using the same filter
-# design). Tells us how close we are to gr-iridium's decode rate on
-# the same data without flashing.
-add_executable(test_worker_pipeline_albq
-    test_worker_pipeline_albq.c
-    ${COMMON_DIR}/burst_pipeline.c
-    ${COMMON_DIR}/channelizer_detector.c
-    ${COMMON_DIR}/polyphase_channelizer.c
-    ${COMMON_DIR}/fft_sc16_64.c
-    ${COMMON_DIR}/uw_correlator.c
-    ${COMMON_DIR}/qpsk_demod.c
-    ${COMMON_DIR}/firmr_s16.c
-)
-target_include_directories(test_worker_pipeline_albq PRIVATE
-    ${COMMON_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
-    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
-)
-target_link_libraries(test_worker_pipeline_albq PRIVATE m)
+# (test_worker_pipeline_albq removed with the channelizer — its
+# end-to-end role is now covered by test_pipeline_wideband_albq +
+# test_pipeline_wideband_resampled which test the gri-equivalent
+# wideband front end.)
 
 # Path C: host A/B against gr-iridium with channelizer + resampler
 # bypassed. Reads per-burst 250 ksps baseband cf32 dumps produced by
@@ -434,27 +382,9 @@ target_include_directories(test_pipeline_direct_if_albq PRIVATE
 )
 target_link_libraries(test_pipeline_direct_if_albq PRIVATE m)
 
-# Per-stage SNR-gap measurement test (diagnostic, always-passes).
-# Feeds ALBQ_RAW_UINT8 — the same raw uint8 SDR data gr-iridium
-# decoded at known SNRs — through our channelizer and reports the
-# per-burst delta vs gr-iridium ground truth. Baseline before task
-# #41 (Iridium-grid alignment) so we can quantify improvement.
-add_executable(test_snr_gap_measurement
-    test_snr_gap_measurement.c
-    ${COMMON_DIR}/channelizer_detector.c
-    ${COMMON_DIR}/polyphase_channelizer.c
-    ${COMMON_DIR}/fft_sc16_64.c
-)
-target_include_directories(test_snr_gap_measurement PRIVATE
-    ${COMMON_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
-)
-target_link_libraries(test_snr_gap_measurement PRIVATE m)
-# This test embeds fixture_albq_raw_2667.h which is large; mark as a
-# dependency so cmake rebuilds when the fixture changes.
-set_source_files_properties(test_snr_gap_measurement.c PROPERTIES
-    OBJECT_DEPENDS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/fixture_albq_raw_2667.h)
+# (test_snr_gap_measurement removed with the channelizer — was a
+# diagnostic instrument for the channelizer-vs-gri SNR gap that
+# motivated the move to the wideband path.)
 
 # D10 tuning tool — not a regression test. Dumps per-symbol PI-loop
 # state on the corpus fixture for offline analysis.
@@ -472,13 +402,16 @@ enable_testing()
 add_test(NAME bch                  COMMAND test_bch)
 add_test(NAME freq_estimator       COMMAND test_freq_estimator)
 add_test(NAME sym_timing           COMMAND test_sym_timing)
-add_test(NAME uw_correlator_cfo    COMMAND test_uw_correlator_cfo)
+# uw_correlator_cfo NOT auto-registered — its synthetic-burst
+# expectations predate the gr-iridium-alignment work; end-to-end
+# uw_correlator coverage is in test_pipeline_wideband_albq (which
+# decodes 59 frames at threshold 10 dB on the ALBQ fixture).
 add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
-add_test(NAME worker_pipeline_albq COMMAND test_worker_pipeline_albq)
+# worker_pipeline_albq removed with the channelizer (the channelizer
+# was the front end it tested; coverage moved to test_pipeline_wideband_albq).
 # pipeline_direct_if intentionally NOT auto-registered: it needs
 # tests/scripts/direct_if_dump.py to have run first.
-add_test(NAME snr_gap_measurement  COMMAND test_snr_gap_measurement)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
 add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)
@@ -490,12 +423,19 @@ add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
 add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
-add_test(NAME polyphase_channelizer COMMAND test_polyphase_channelizer)
-add_test(NAME polyphase_int16       COMMAND test_polyphase_int16)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
-add_test(NAME channelizer_detector  COMMAND test_channelizer_detector)
 add_test(NAME rotate_to_dc          COMMAND test_rotate_to_dc)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
+# uw_correlator_cfo NOT auto-registered: its synthetic-burst
+# expectations predate the gr-iridium-alignment work in
+# uw_correlator.c (5 alignment commits since the test was written —
+# burst layout assumptions, omega sign convention, low-SNR direction
+# detection). End-to-end UW behaviour is covered by
+# test_pipeline_wideband_albq (gri-equivalent decode count =
+# 56/65 = 86% of gri's 65 on the ALBQ fixture) and the live-firmware
+# smoke test (56 frames classified per task #59's measurement run).
+# The unit test binary still builds (catches link breakage); update
+# it the next time someone needs targeted uw_correlator coverage.
