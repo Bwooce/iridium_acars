@@ -581,7 +581,16 @@ static void sync_init(void)
 // ~0.015 rad/sym, plenty for our needs) — keeps memory bounded.
 #define CFO_FFT_N        4096
 #define CFO_FFT_LOG      12
-#define CFO_INPUT_N      (SYNC_LENGTH * UW_SPS)        // 280 samples
+// gr-iridium burst_downmix_impl.cc:128-131:
+//   d_cfo_est_fft_size = pow(2, int(log(sps * (PREAMBLE_LENGTH_SHORT + 10))
+//                                   / log(2)))
+//                      = pow(2, int(log(260) / log(2)))  = 256
+// i.e. (preamble + 10 UW symbols) rounded DOWN to next power of 2.
+// We previously used SYNC_LENGTH*sps = 280, which changed both the
+// Blackman window shape and the squared-signal spectral content vs
+// gr-iridium — biasing the squared-FFT peak position on borderline
+// bursts.
+#define CFO_INPUT_N      256
 #define CFO_PREAMBLE_N   (PREAMBLE_LENGTH * UW_SPS)    // 160 samples
 #define CFO_UW_ONLY_N    (UW_LENGTH * UW_SPS)          // 120 samples (fallback)
 
