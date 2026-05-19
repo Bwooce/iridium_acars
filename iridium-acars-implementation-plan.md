@@ -3,12 +3,20 @@
 This document tracks the concrete implementation steps for the [Iridium ACARS Decoding Stack Design](./iridium-acars-decoding-stack-design.md).
 
 ## Current Status
-- **Target:** Phase 4 (Live RF validation).
+- **Target:** Phase 3.6 (host parity with gr-iridium) → then Phase 4
+  (Live RF validation).
 - **Status:** Phases 0, 2, 3.1–3.5 COMPLETE. End-to-end DSP pipeline
   runs against a real RTL-SDR v4 at the device's full streaming rate
   with zero packet loss. Bursts flow through detect → extract →
   freq-centre → decimate → resample → demod → BCH cleanly. USB host
   recovers from stuck-device states without physical unplug.
+- **Decode-rate gap:** on the shared 1.25 s ALBQ fixture gr-iridium
+  decodes 64/64; the channelizer path (A) decodes 3/64; the new
+  direct-IF host harness (path C — bypasses channelizer + resampler,
+  feeds gr-iridium-equivalent baseband into the same downstream
+  `burst_pipeline`) decodes 20/64. The front end accounts for ~17 of
+  the gap; the downstream chain still loses 44 bursts gr-iridium
+  decodes. Phase 3.6 below restructures the work to close both.
 - **Throughput:** 4.88 MB/s = 100.5% of the 4.85 MB/s real-time
   target; rb_full_drops = 0; Core 0 cycle headroom ~35%.
 - **Functional regression tests:** all green (target smoke + 4 host
@@ -711,6 +719,77 @@ each of these stages because real Iridium RF requires them. Multi-
 burst-in-subband, off-bin carriers, sample-rate drift, channel
 overlap, etc. are properties of the protocol/spec, not artefacts of
 the test data. No antenna improvement closes the gap.
+
+---
+
+## Phase 3.6: Host-first parity, then measured P4 substitution (IN PROGRESS)
+
+The D7–D14 work above tried to evolve a *single* pipeline toward gr-iridium
+parity. After many rounds we are still at 3/64 decodes on the shared ALBQ
+fixture while gr-iridium decodes 64/64. Mixing front-end choices
+(polyphase channelizer for P4 fit) with downstream-correctness work makes
+it hard to tell which deviation is costing decodes.
+
+Phase 3.6 fixes that with a two-step strategy:
+
+1. **Build a host pipeline that fully matches gr-iridium's algorithm**
+   (decode rate ≥ 90% of gr-iridium on the corpus) before touching any
+   P4-realistic component. The host is unconstrained — we use scipy,
+   float64, wideband FFTs, anything that maps 1:1 onto gr-iridium.
+2. **Substitute one component at a time with a P4-appropriate version**,
+   measuring BOTH decode rate AND execution time on the host. A swap is
+   acceptable only if decode rate degradation is within budget. Once a
+   swap is accepted on the host, port to the P4 and confirm both numbers
+   reproduce there.
+
+This decouples correctness from performance: any decode regression after
+a substitution is by definition caused by that substitution.
+
+### Step 3.6.H — Host parity with gr-iridium
+
+Goal: ≥ 58/64 decodes on the ALBQ fixture via the path-C harness
+(`tests/host/test_pipeline_direct_if_albq.c`). Each item below is a single
+host change measured against the path-C baseline.
+
+| # | Change | Target | Status |
+|---|---|---|---|
+| H1 | Path-C scaffold: rotate raw 2.5 MSPS → DC at gr-iridium-tagged offset, decimate 10× with scipy, feed `burst_pipeline_process_250khz` (task #55) | baseline | ✅ 20/64 |
+| H2 | Fix squared-FFT CFO out-of-range omegas (failure mode: `ω ≈ ±2π`, picked at FFT edge bins). Most likely a bin→ω mapping or unwrap bug; ~44 bursts fail with this signature today | +20 decodes | next |
+| H3 | Fix start-finder fine-position / matched-filter rotation handling once CFO is correct | +5 | after H2 |
+| H4 | PLL acquisition robustness for borderline-SNR bursts (gr-iridium decodes some at 6–7 dB UW SNR; we lose them) | +5 | after H3 |
+| H5 | Triage remaining ≤ 6 misses; either decoder defect or true low-SNR drop | accept | after H4 |
+
+### Step 3.6.P — P4-realistic substitution with measured impact
+
+Each step replaces ONE host component with a P4-appropriate version
+and runs the same path-C harness for decode rate plus a new
+per-burst wall-time measurement. Order is from least-risky to most-risky:
+
+| # | Substitution | What we expect to lose / measure | P4 constraint |
+|---|---|---|---|
+| P1 | scipy `resample_poly` 10× decim → C int16 polyphase FIR decim (host) | float→Q15 rounding; ~0–2 decodes acceptable | First step needed for any embedded path |
+| P2 | Floating-point downstream DSP hot paths (CFO FFT, RRC, UW correlator) → Q15 / fixed-point | ~0–2 decodes; full precision impact across pipeline | P4 has scalar FPU but PIE vector is integer-only — Q15 needed for SIMD |
+| P3 | gr-iridium-equivalent **C** wideband `fft_burst_tagger` → produces same `(start_sample, freq_offset)` tags we currently parse from `iridium-extractor` stdout | 0 decodes (just replaces the Python detection step) | Still wideband; not yet P4-fit, but standalone |
+| P4 | Wideband C tagger → **polyphase channelizer** (current path-A front end) | Largest expected drop (currently 17 decodes between path-C and path-A); the trade-off the whole effort is built to measure | Resolves the 8 dB SNR-loss measured at post-D13 in May; informs whether to widen channel BW, redesign filters, or keep direct-IF |
+| P5 | Direct-IF rotate+FIR-decim on raw 2.5 MSPS → integer rotate+`firmr_s16` (esp-dsp) | ~0 decodes; just the existing P4 resampler in the new role | If P4 chosen over A, this is the P4 front end |
+| P6 | Per-burst wall-time profiling on actual P4 hardware: confirm host substitution numbers reproduce; identify whichever step exceeds the per-burst CPU budget | actual perf numbers | Real platform — PSRAM/SRAM placement, cache behaviour, queue contention |
+
+Each P-step writes one row to a results table in this plan:
+`(step, decode rate vs prior, decode rate vs gr-iridium, host µs/burst,
+P4 µs/burst, notes)`. The table is the artefact — anyone reading
+the plan can see exactly how each substitution moved both numbers.
+
+### Outcome shape
+
+By end of 3.6 we have:
+- A host pipeline at gr-iridium parity (≥58/64) that serves as a
+  golden reference for any future change.
+- A measured cost-vs-loss curve for every P4-specific substitution,
+  so the front-end choice (channelizer vs direct-IF + tagger) is made
+  on data not speculation.
+- A regression test suite where the path-C run prints a single line:
+  `D/N decoded` — degradation from substitution is one number, not
+  a long log to read.
 
 ---
 
