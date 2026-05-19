@@ -212,14 +212,23 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
 // Per burst we FFT the burst (zero-padded to CORR_FFT_N), multiply
 // elementwise by the stored sync FFT, IFFT, and peak-find.
 //
-// CORR_FFT_N matches gr-iridium's d_corr_fft_size at 10 sps:
-//   next_pow2(d_sync_search_len + sync_word_len - 1)
-//   = next_pow2((16 + 12 + 8)*10 + 280 - 1) = next_pow2(639) = 1024
-// Search range = CORR_FFT_N - SYNC_RRC_LEN + 1 = 745 burst samples
-// after D13's start-finder trim. At 10 sps that's ~3 ms — comfortably
-// past the worst-case envelope misalignment.
-#define CORR_FFT_N   1024
-#define CORR_FFT_LOG 10
+// CORR_FFT_N matches gr-iridium's d_corr_fft_size at 10 sps. gri:
+//   d_sync_search_len = (PREAMBLE_LENGTH_LONG + UW_LENGTH + 8) * 10
+//                     = (64 + 12 + 8) * 10 = 840
+//   sync_word_len     = 28 * 10 = 280
+//   d_corr_fft_size   = next_pow2(840 + 280 - 1) = next_pow2(1119) = 2048
+//
+// BUG fixed May 2026: this was 1024, computed using PREAMBLE_LENGTH_SHORT
+// instead of _LONG. With CORR_FFT_N < required, the FFT-based linear
+// convolution aliases — the burst's data portion (samples ~280..1024)
+// wraps into the front and creates spurious correlation peaks in
+// the data region. On the ALBQ fixture this put the matched-filter
+// peak ~500 samples (50 symbols) past the real sync position, with
+// SNR just above the 6 dB threshold so the result still gets used.
+// Downstream pre-rotation then aligned to the wrong location and
+// qpsk_demod saw noise.
+#define CORR_FFT_N   2048
+#define CORR_FFT_LOG 11
 static uint16_t s_corr_brev[CORR_FFT_N];
 static int16_t  s_corr_tw_re[CORR_FFT_N / 2];   // Q15 cos
 static int16_t  s_corr_tw_im[CORR_FFT_N / 2];   // Q15 sin
@@ -670,7 +679,12 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
 
     cfo_fft_f32(re, im);
 
-    // Find peak (gr-iridium: std::max_element on magnitude²).
+    // Find peak (gr-iridium: std::max_element on magnitude²,
+    // burst_downmix_impl.cc:527-528). gr-iridium uses unbounded search
+    // over all FFT bins — DO NOT add a search range here. If the
+    // squared signal has noise peaks beating the preamble's DC tone,
+    // the cause is upstream divergence in the windowed signal, not the
+    // peak finder.
     float peak_mag = -1.0f;
     int   peak_k   = 0;
     for (int k = 0; k < CFO_FFT_N; k++) {
@@ -1068,27 +1082,39 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         burst_2sps, n_complex, peak_k + PREAMBLE_LENGTH * SYM_STRIDE);
 }
 
-// D13 burst-start finder constants (mirror gr-iridium defaults).
-// Their low-pass filter is firdes.low_pass_2(1, fs, 2.5e3, 5e3, 60dB)
-// which at 50 ksps yields ~33 taps. We use a simpler triangular
-// Kaiser-windowed sinc LP filter for the start finder. gr-iridium
-// uses `firdes.low_pass_2(1, fs, 2.5e3, 5e3, 60)` on the magnitude²
-// envelope — Kaiser β corresponding to 60 dB stopband attenuation
-// (β ≈ 5.65), ~182 taps at their 250 ksps. The filter time constant
-// is what matters for envelope smoothing — at their rate this is
-// ~0.73 ms (~18 symbol periods).
+// D13 burst-start finder — matches gr-iridium burst_downmix exactly:
+//   firdes.low_pass_2(1, burst_sample_rate, 2.5e3, 5e3, 60dB)
+//   passband_edge = 2500 Hz, stopband_edge = 5000 Hz, 60 dB
+//   Kaiser β=5.65, ~182 taps at 250 ksps.
 //
-// At our 50 ksps rate to keep the same TIME constant we need
-// 0.73 ms × 50 = 37 taps. Round up to 41 for symmetry. β=5.65 gives
-// us the same stopband attenuation. Much sharper envelope detection
-// than the previous Bartlett MA (17 taps, no stopband control).
-#define START_LP_NTAPS         41
+// HISTORICAL BUG: the previous comment assumed D13 runs at 50 ksps,
+// so fc_norm was set to 0.05 (= 2500/50000). But burst_pipeline calls
+// D13 on the post-resample 250 ksps stream → the cutoff was actually
+// 5× too wide (12.5 kHz). With a 5× wider LP, the envelope still has
+// significant variation from one symbol to the next, the argmax-then-
+// 28%-threshold logic picks a position influenced by the modulation
+// pattern rather than the true envelope onset, and downstream sees
+// the burst starting up to 100 µs (= 2.5 symbol periods) away from
+// the correct position. That broke CFO + matched filter + qpsk_demod
+// in turn.
+//
+// gr-iridium-exact config:
+//   firdes.low_pass_2(1, 250000, 2.5e3, 5e3, 60dB) → 183 taps
+//   We use 183 to match exactly. (Was 101; the under-attenuated
+//   filter let noise into the envelope and caused D13 to fire on
+//   false rises, especially on path C's pre-pad noise band.)
+#define START_LP_NTAPS        183
 #define START_LP_KAISER_BETA   5.65f
 #define START_THRESHOLD_FRAC   0.28f
-// gr-iridium's d_pre_start_samples is a small bias to back off from
-// the detected edge so we don't clip the preamble's first symbol.
-// They use 1-2 samples; we follow with 2.
-#define START_PRE_SAMPLES      2
+// gr-iridium's d_pre_start_samples = 0.1ms × output_sample_rate
+// = 0.1e-3 × 250000 = 25 samples (burst_downmix_impl.cc:122). Used
+// as a NEGATIVE bias in `start = first_crossing + half_fir - pre_start`,
+// so it backs the cut OFF the leading edge to keep the preamble's
+// first symbols inside the trimmed window. With our prior value of 2
+// the cut landed 23 samples past where gr-iridium would have cut,
+// chopping into the preamble and putting the matched-filter sync
+// pattern partially before adj_burst[0].
+#define START_PRE_SAMPLES      25
 
 // D13 scratch sized for the worst-case burst length we see (50 ksps
 // × ~50 ms max burst = 2500 samples). Independent of CORR_FFT_N
@@ -1122,16 +1148,16 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
         mag2[n] = m2;
     }
 
-    // Kaiser LP taps in Q15. Cutoff fc/fs = 2.5/50 = 0.05 (same
-    // proportion as gr-iridium's 2.5 kHz cutoff at 250 ksps). The
-    // filter shapes a sharp envelope estimate with 60 dB stopband;
-    // much better burst-edge precision than the prior Bartlett MA.
+    // Kaiser LP taps in Q15. Cutoff fc/fs = 2.5/250 = 0.01, matching
+    // gr-iridium's firdes.low_pass_2(1, 250k, 2.5k, 5k, 60dB). D13
+    // runs on the post-resample 250 ksps stream from burst_pipeline,
+    // so the cutoff is 2500 / 250000 = 0.01.
     static int16_t w_q15[START_LP_NTAPS];
     static bool s_start_lp_inited = false;
     int half = START_LP_NTAPS / 2;
     if (!s_start_lp_inited) {
         const float PI = 3.14159265358979323846f;
-        const float fc_norm = 0.05f;       // cutoff = 0.05 × fs
+        const float fc_norm = 0.01f;       // 2.5 kHz / 250 kHz
         const float inv_i0_beta = 1.0f / bessel_i0(START_LP_KAISER_BETA);
         float w_f[START_LP_NTAPS];
         float wsum = 0.0f;
