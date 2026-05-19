@@ -62,28 +62,35 @@ void direct_if_decim_init(direct_if_decim_t *d)
     // ✓
 
     const double PI = 3.14159265358979323846;
-    const int    N  = DIDECIM_NTAPS;
-    const int    center = N / 2;
+    // Design with N_DESIGN = 279 (gri's original Kaiser length), then
+    // pad with one zero tap at the end so the final array length is
+    // DIDECIM_NTAPS = 280 — required by dsps_fird_s16_arp4 (P4 PIE
+    // FIR), which falls back to the scalar ANSI implementation if
+    // coeffs_len is not a multiple of 8. Padding with zero preserves
+    // the filter's frequency response exactly.
+    const int    N_DESIGN = 279;
+    const int    N        = DIDECIM_NTAPS;
+    const int    center = N_DESIGN / 2;
     const double fc_norm = F_CUTOFF / FS;       // 0.008
     const double inv_i0_beta = 1.0 / bessel_i0(beta);
 
-    // Build float taps: sinc × Kaiser window, then sum-normalise.
-    double w[DIDECIM_NTAPS];
+    // Build float taps over the design length, sum-normalise.
+    double w[DIDECIM_NTAPS] = { 0 };   // remaining entries stay zero (padding)
     double sum = 0.0;
-    for (int k = 0; k < N; k++) {
+    for (int k = 0; k < N_DESIGN; k++) {
         double t = (double)(k - center);
         double sinc = (t == 0.0)
                       ? 2.0 * fc_norm
                       : sin(2.0 * PI * fc_norm * t) / (PI * t);
         // Kaiser window: I0(β·sqrt(1-(2k/(N-1)-1)²)) / I0(β)
-        double u = 2.0 * (double)k / (double)(N - 1) - 1.0;
+        double u = 2.0 * (double)k / (double)(N_DESIGN - 1) - 1.0;
         double arg = beta * sqrt(1.0 - u * u);
         double kw  = bessel_i0(arg) * inv_i0_beta;
         w[k] = sinc * kw;
         sum += w[k];
     }
     if (sum != 0.0) {
-        for (int k = 0; k < N; k++) w[k] /= sum;
+        for (int k = 0; k < N_DESIGN; k++) w[k] /= sum;
     }
 
     // Quantise to Q15. Sum-normalised float taps have peak ~0.05

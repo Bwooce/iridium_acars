@@ -464,6 +464,15 @@ void smoke_test_run(void)
                  (unsigned)ws.bursts_skipped,
                  (unsigned)ws.queue_high_water,
                  (double)ws.avg_burst_us);
+        // Per-stage cost so we can see WHERE the worker spends its time —
+        // critical for choosing the right PIE/SIMD optimisation target.
+        ESP_LOGI(TAG, "  per-stage avg us: extract=%.0f rotate=%.0f "
+                       "decim=%.0f pipeline=%.0f bch=%.0f",
+                 (double)ws.extract_us,
+                 (double)ws.freq_center_us,
+                 (double)ws.fir_decim_us,
+                 (double)ws.demod_us,
+                 (double)ws.bch_us);
         if (ws.bursts_dropped > 0) {
             ESP_LOGW(TAG, "  %u bursts dropped — queue overflow",
                      (unsigned)ws.bursts_dropped);

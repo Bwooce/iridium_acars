@@ -28,7 +28,12 @@
 #endif
 
 #define DIDECIM_DECIM        10        // 10× decim (2.5M → 250k)
-#define DIDECIM_NTAPS        279       // matches gri's 40 dB Kaiser
+// 280 taps = 279 from the gri-aligned Kaiser design + 1 zero tap padding.
+// dsps_fird_s16_arp4 (P4 PIE) requires coeffs_len divisible by 8 — without
+// the pad, the asm falls through to dsps_fird_s16_ansi (scalar C) at the
+// very first instruction, defeating the whole point of the PIE path. The
+// extra zero contributes nothing to filter response.
+#define DIDECIM_NTAPS        280       // matches gri's 40 dB Kaiser + 1 zero
 
 // Per-channel FIR state for the split (deinterleaved) path on host.
 // Mirrors the inner-loop semantics of esp-dsp's fir_s16_t / dsps_fird
