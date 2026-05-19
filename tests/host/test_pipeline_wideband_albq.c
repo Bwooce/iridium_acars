@@ -33,6 +33,7 @@
 #include "fft_burst_tagger.h"
 #include "fft_sc16_2048.h"
 #include "direct_if_decim.h"
+#include "resample_256_to_250.h"
 #include "burst_pipeline.h"
 #include "qpsk_demod.h"
 #include "uw_correlator.h"
@@ -52,45 +53,22 @@
 
 static int32_t s_baseline_history[FBT_HISTORY_SIZE * FBT_FFT_SIZE];
 
-// Resample 2.56 MSPS uint8 IQ → 2.5 MSPS int16 IQ via a simple
-// 125/128 rational resampler. For the wideband detector we don't
-// need bit-exact alignment, so a short polyphase filter is fine.
-// We use a 9-tap Hamming-windowed sinc per phase × 125 phases.
+// Resample 2.56 MSPS uint8 IQ → 2.5 MSPS int16 IQ via the gri-aligned
+// 125/128 polyphase Kaiser resampler (resample_256_to_250 / firmr_s16).
 //
-// Output length = floor(input_len * 125 / 128).
+// We first convert u8 → int16 with the scale gri uses (cu8 - 128) × 256,
+// then run the resampler. Output length ≈ n_in × 125 / 128.
 static int resample_2_56_to_2_5(const uint8_t *in_u8, int n_in_complex,
                                   int16_t *out_iq) {
-    // Cheap: just decimate every 128th sample of an up-by-125
-    // interpolated stream. Implementation: skip 3 in 128 input
-    // samples ≈ 2.34% rate change.
-    //
-    // For PIE this would be a proper polyphase rational resampler.
-    // For this host test we use a simpler linear-interp resampler
-    // — adequate for the burst detector (we just need rate-matched
-    // input).
-    const double IN_FS  = 2560000.0;
-    const double OUT_FS = 2500000.0;
-    int n_out = (int)((double)n_in_complex * OUT_FS / IN_FS);
-    for (int k = 0; k < n_out; k++) {
-        double t = (double)k * IN_FS / OUT_FS;     // fractional input position
-        int    i = (int)t;
-        double frac = t - (double)i;
-        if (i + 1 >= n_in_complex) break;
-        double in0_r = ((double)in_u8[2 * i]       - 128.0);
-        double in0_i = ((double)in_u8[2 * i + 1]   - 128.0);
-        double in1_r = ((double)in_u8[2 * (i+1)]   - 128.0);
-        double in1_i = ((double)in_u8[2 * (i+1)+1] - 128.0);
-        double r = in0_r * (1.0 - frac) + in1_r * frac;
-        double iv = in0_i * (1.0 - frac) + in1_i * frac;
-        // Scale to int16 (input was ±128 → roughly ±32k after ×256)
-        r *= 256.0; iv *= 256.0;
-        if (r >  32767) r =  32767;
-        if (r < -32768) r = -32768;
-        if (iv >  32767) iv =  32767;
-        if (iv < -32768) iv = -32768;
-        out_iq[2 * k + 0] = (int16_t)lrint(r);
-        out_iq[2 * k + 1] = (int16_t)lrint(iv);
+    int16_t *in_s16 = (int16_t *)malloc(2 * n_in_complex * sizeof(int16_t));
+    if (!in_s16) return 0;
+    for (int k = 0; k < 2 * n_in_complex; k++) {
+        in_s16[k] = ((int16_t)in_u8[k] - 128) << 8;     // ±127 → ±32512
     }
+    static resample_256_to_250_t r;
+    resample_256_to_250_init(&r);
+    int n_out = resample_256_to_250_process(&r, in_s16, n_in_complex, out_iq);
+    free(in_s16);
     return n_out;
 }
 
@@ -127,6 +105,18 @@ static void q15_rotate(int16_t *iq, int n,
         pr = (int16_t)(npr > 32767 ? 32767 : npr < -32768 ? -32768 : npr);
         pi = (int16_t)(npi > 32767 ? 32767 : npi < -32768 ? -32768 : npi);
     }
+}
+
+// When DUMP_TARGET_BIN env var is set, the burst whose center_bin is
+// closest to that value gets its burst_pipeline stages dumped to
+// /tmp/host_signals/ (via burst_pipeline_set_dump_once). Used to feed
+// the dsp_compare.py stagewise tool against gri's debug dumps for the
+// same physical burst. Default: gri id=30 lands near bin 1209
+// (freq +225 kHz / bin_width 1220 Hz + N/2).
+static int parse_dump_target_bin(void) {
+    const char *s = getenv("DUMP_TARGET_BIN");
+    if (!s) return -1;
+    return atoi(s);
 }
 
 int main(void) {
@@ -186,6 +176,24 @@ int main(void) {
     int decoded = 0;
     int pipeline_ok = 0;
     int uw_found = 0;
+    // Stage-dump targeting (env-driven).
+    int target_bin = parse_dump_target_bin();
+    int best_dump_match_idx = -1;
+    int best_dump_match_dist = 1 << 30;
+    if (target_bin >= 0) {
+        for (int i = 0; i < n_tags; i++) {
+            int dist = abs(tags[i].center_bin - target_bin);
+            if (dist < best_dump_match_dist) {
+                best_dump_match_dist = dist;
+                best_dump_match_idx = i;
+            }
+        }
+        if (best_dump_match_idx >= 0) {
+            printf("Will dump stages for burst %d (bin %d, target was %d)\n",
+                   best_dump_match_idx,
+                   tags[best_dump_match_idx].center_bin, target_bin);
+        }
+    }
     for (int i = 0; i < n_tags; i++) {
         uint64_t start = tags[i].start_sample;
         int center_bin = tags[i].center_bin;
@@ -211,6 +219,26 @@ int main(void) {
         // Pipeline
         burst_pipeline_result_t res;
         memset(&res, 0, sizeof(res));
+        if (i == best_dump_match_idx) {
+            int sysrc = system("mkdir -p /tmp/host_signals");
+            (void)sysrc;
+            burst_pipeline_set_dump_once("/tmp/host_signals");
+            // Also dump the pre-burst-pipeline 250 ksps input so the
+            // stagewise compare can see our equivalent of gri's
+            // signal-filtered-deci.
+            FILE *f = fopen("/tmp/host_signals/03_resamp_250k.cf32", "wb");
+            if (f) {
+                for (int k = 0; k < n_out; k++) {
+                    float fr = (float)window_250[2*k+0] / 32768.0f;
+                    float fi = (float)window_250[2*k+1] / 32768.0f;
+                    fwrite(&fr, 4, 1, f);
+                    fwrite(&fi, 4, 1, f);
+                }
+                fclose(f);
+                printf("dumped pre-pipeline 03_resamp_250k.cf32 (%d cplx)\n",
+                       n_out);
+            }
+        }
         bool ok = burst_pipeline_process_250khz(window_250, n_out, &res);
         if (ok) pipeline_ok++;
         if (res.uw_res.direction != UW_DIR_UNKNOWN) uw_found++;
