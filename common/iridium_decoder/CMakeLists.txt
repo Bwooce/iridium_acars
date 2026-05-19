@@ -44,6 +44,22 @@ idf_component_register(
         # target but still compiled to keep the build target list
         # uniform).
         "fft_sc16_64.c"
+        # Phase 3.6.M wideband-tagger path. All portable C — same
+        # source compiles for host unit tests and P4 firmware.
+        # The fft_sc16_2048 hot loop runs in ~18% of one P4 core at
+        # 2.5 MSPS per the Phase 3.6.M feasibility analysis; could
+        # be swapped for esp-dsp's PIE-accelerated dsps_fft2r_sc16
+        # later if we need more headroom.
+        "fft_sc16_2048.c"
+        "fft_burst_tagger.c"
+        "direct_if_decim.c"
+        "resample_256_to_250.c"
+        # firmr_s16 was previously host-only (P4 called esp-dsp's
+        # dsps_firmr_s16 directly). resample_256_to_250 depends on
+        # it, so compile firmr_s16.c into the IDF target too. Same
+        # ANSI math; identical to dsps_firmr_s16_ansi on identical
+        # input.
+        "firmr_s16.c"
     INCLUDE_DIRS "."
     # libacars_idf is the vendored ACARS frame parser. It's pulled in
     # here (rather than directly by p4-usb-host/main) so that any board
