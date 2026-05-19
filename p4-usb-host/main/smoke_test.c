@@ -347,6 +347,22 @@ void smoke_test_run(void)
 
     int prev_slot = -1;
 
+#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
+    // No synthetic-noise priming for wideband mode. The wideband
+    // fft_burst_tagger keeps a 512-chunk EMA window; if Phase 1
+    // primes on synthetic NOISE and Phase 2 hands it the real
+    // ALBQ recording, the step transient at the Phase-1→Phase-2
+    // boundary triggers a priming-completion burst flood that
+    // masks the bins covering the actual Iridium bursts. The host
+    // wideband test (test_pipeline_wideband_albq) feeds real data
+    // from sample 0 and lets the tagger prime on it naturally,
+    // which works (59 decodes). Mirror that here — the ALBQ
+    // fixture's first 512 chunks prime the EMA on real signal
+    // and subsequent bursts get detected against a meaningful
+    // baseline.
+    ESP_LOGI(TAG, "Phase 1: skipped for wideband mode "
+                  "(fft_burst_tagger primes on real fixture)");
+#else
     ESP_LOGI(TAG, "Phase 1: %d priming noise transfers (let baseline settle)",
              PRIMING_TRANSFERS);
     for (int i = 0; i < PRIMING_TRANSFERS; i++) {
@@ -354,6 +370,7 @@ void smoke_test_run(void)
         prev_slot = drive_transfer(synth, prev_slot);
         vTaskDelay(1);  // let ingest task make progress
     }
+#endif
 
 #if CONFIG_SMOKE_TEST_CORPUS
     // Real-signal regression mode: replace the synthetic tone with a

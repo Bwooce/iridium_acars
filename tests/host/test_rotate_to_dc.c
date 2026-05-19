@@ -76,6 +76,43 @@ static double rms_mag(const int16_t *iq, int n_complex)
     return sqrt(s / (double)n_complex);
 }
 
+// Cross-check rotate_to_dc_q15_simd_ref against rotate_to_dc_q15_inc.
+// The SIMD reference processes samples in 8-lane chunks; the inc
+// variant goes one sample at a time. They should produce nearly
+// identical output (NMSE ≤ -60 dB), differing only in the cadence
+// of the chunk-aligned renormalisation. Catches bugs in the chunk
+// boundary handling, the tail path, and the lane-table build that
+// might otherwise show up only after the PIE asm lands.
+static int check_simd_ref_matches_inc(int n_complex,
+                                       double f_in_hz, double f_shift_hz,
+                                       double fs_hz)
+{
+    int16_t *src = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
+    int16_t *inc = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
+    int16_t *simd = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
+    if (!src || !inc || !simd) { free(src); free(inc); free(simd); return 1; }
+
+    synth_tone(src, n_complex, f_in_hz, fs_hz);
+    double phase_step = -2.0 * M_PI * f_shift_hz / fs_hz;
+
+    memcpy(inc, src, 2 * n_complex * sizeof(int16_t));
+    rotate_to_dc_q15_inc(inc, n_complex, phase_step);
+    memcpy(simd, src, 2 * n_complex * sizeof(int16_t));
+    rotate_to_dc_q15_simd_ref(simd, n_complex, phase_step);
+
+    int max_diff = 0;
+    double nmse = nmse_db(inc, simd, n_complex, &max_diff);
+    printf("    SIMD-ref vs q15_inc: NMSE %.2f dB, max diff %d LSB\n",
+           nmse, max_diff);
+    int fail = 0;
+    if (nmse > -55.0) {
+        printf("    FAIL: SIMD-ref drift from q15_inc exceeds -55 dB NMSE\n");
+        fail = 1;
+    }
+    free(src); free(inc); free(simd);
+    return fail;
+}
+
 // One test case: rotate a synthesised tone, compare reference vs Q15-inc.
 // `description` is logged in the per-case header.
 static int run_case(const char *description,
@@ -173,6 +210,14 @@ int main(void)
     // pressure is highest).
     fails += run_case("large shift (1.2 MHz, near-Nyquist)",
                        40000, 1000.0, 1200000.0, 2500000.0, -40.0);
+
+    // SIMD-reference cross-check: chunked scalar reference for the
+    // future PIE asm must produce output very close to q15_inc.
+    // Tests both chunk-aligned and tail-bearing input sizes.
+    printf("\n--- SIMD-reference cross-check against q15_inc ---\n");
+    fails += check_simd_ref_matches_inc(40000, 1000.0, 800000.0, 2500000.0);
+    fails += check_simd_ref_matches_inc(40005, 1000.0, 800000.0, 2500000.0);
+    fails += check_simd_ref_matches_inc(100000, 1000.0, 800000.0, 2500000.0);
 
     printf("\n%d failing case(s)\n", fails);
     return fails ? 1 : 0;

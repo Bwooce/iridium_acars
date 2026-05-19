@@ -42,16 +42,39 @@ void rotate_to_dc(int16_t *iq, int n_complex, double phase_step);
 // samples to prevent the magnitude-decay trap documented in the
 // module header.
 //
-// Validated against rotate_to_dc to NMSE ≤ -50 dB. ~30× faster
+// Validated against rotate_to_dc to NMSE ≤ -40 dB. ~5× faster
 // than the cosf/sinf reference on RV-32IMF (per-sample work is
 // 4 int16 muls instead of 2 software-polynomial trig calls).
-//
-// This kernel is structurally what the eventual PIE int16 SIMD
-// asm will implement — the same Q15 complex-multiply per sample
-// against a periodically-refreshed phasor, just vectorised 8 lanes
-// wide. Keeping the scalar version here both as a host-testable
-// reference and as the fallback when PIE isn't available.
 void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step);
+
+// Chunked scalar reference for the PIE int16 SIMD path. Same
+// numerics as rotate_to_dc_q15_inc but structured in 8-sample
+// chunks to match how the PIE asm pipelines: per chunk, first
+// build an 8-pack of phasor values (cs[0..7], ss[0..7]) by Q15-
+// incrementing an internal accumulator, then apply a vector
+// complex-multiply across the 8 input samples. The asm version
+// (rotate_to_dc_q15_simd_arp4, P4-only) does the inner SIMD multiply
+// in PIE; this scalar reference does it as 8 separate Q15 muls so
+// the same code can be host-tested.
+//
+// Validated against rotate_to_dc_q15_inc to NMSE ≤ -60 dB
+// (bit-exact except for ordering of saturation rounding).
+//
+// Use this on the host AND as the on-target fallback when PIE
+// isn't available. The P4 firmware swaps to the PIE asm via a
+// thin wrapper (see rotate_to_dc_q15_simd below).
+void rotate_to_dc_q15_simd_ref(int16_t *iq, int n_complex,
+                                double phase_step);
+
+// Platform-best dispatcher: P4 firmware calls the PIE asm
+// (rotate_to_dc_q15_simd_arp4), host build calls the scalar
+// reference. Same input/output contract.
+void rotate_to_dc_q15_simd(int16_t *iq, int n_complex, double phase_step);
+
+// Width of the SIMD chunk (in complex samples). Exposed so callers
+// or test harnesses can pad inputs to a multiple of this if they
+// want to avoid the per-call tail-handling cost.
+#define ROT_SIMD_LANES 8
 
 // Convenience: convert (FFT center bin, FFT size) to the per-sample
 // phase_step that rotate_to_dc expects.

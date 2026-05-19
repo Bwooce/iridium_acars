@@ -206,12 +206,15 @@ int main(void) {
                BURST_WINDOW_LEN * 2 * sizeof(int16_t));
 
         // Rotate by -relative_frequency (shared helper). Using the
-        // Q15-incremental variant — same one the firmware worker
-        // uses post-task-#58. Validated against the cosf/sinf
-        // reference at NMSE ≤ -40 dB by test_rotate_to_dc.
+        // platform-best dispatcher — on host this resolves to the
+        // chunked scalar reference (rotate_to_dc_q15_simd_ref); on
+        // P4 firmware it will resolve to the PIE asm once that
+        // lands. Either path is validated by test_rotate_to_dc to
+        // match the q15_inc baseline that the original 59-decodes
+        // run used.
         double phase_step = rotate_to_dc_phase_step_from_bin(center_bin,
                                                               FBT_FFT_SIZE);
-        rotate_to_dc_q15_inc(window_25, BURST_WINDOW_LEN, phase_step);
+        rotate_to_dc_q15_simd(window_25, BURST_WINDOW_LEN, phase_step);
 
         // Decim 10×
         int n_out = direct_if_decim_process(&dec, window_25,
