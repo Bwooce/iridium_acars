@@ -128,17 +128,24 @@ static void ingest_task(void *arg)
 
 esp_err_t ingest_core1_init(void)
 {
-    // Allocate ping-pong buffers in DMA-capable internal SRAM with
-    // 64-byte cache-line alignment. s_resamp is sized the same as
-    // s_conv even though 125/128 < 1 produces a slightly smaller
-    // output; the headroom avoids edge-case checks in the hot path.
+    // Allocate ping-pong buffers. s_raw + s_conv stay in DMA-capable
+    // internal SRAM (USB DWC OTG DMA writes raw; convert writes int16
+    // there). s_resamp is CPU-touched once per cycle (resample output)
+    // then read by AXI-GDMA into PSRAM signal_buffer — AXI handles
+    // PSRAM sources cleanly, so s_resamp lives in PSRAM to keep the
+    // internal-DMA pool small enough to fit the
+    // SPIRAM_MALLOC_RESERVE_INTERNAL budget. The resample's CPU touch
+    // is one linear write pass per slot (~8000 complex), fine for
+    // PSRAM. Sized identical to s_conv even though 125/128 < 1
+    // produces a slightly smaller output — the headroom avoids
+    // edge-case checks in the hot path.
     for (int i = 0; i < INGEST_NUM_SLOTS; i++) {
         s_raw[i] = heap_caps_aligned_alloc(64, 16 * 1024,
                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         s_conv[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         s_resamp[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
-                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         if (!s_raw[i] || !s_conv[i] || !s_resamp[i]) {
             ESP_LOGE(TAG, "Slot %d alloc failed (raw=%p conv=%p resamp=%p)",
                      i, s_raw[i], s_conv[i], s_resamp[i]);

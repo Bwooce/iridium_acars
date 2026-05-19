@@ -52,9 +52,11 @@ static const char *TAG = "DSP_PROC";
 
 static fft_burst_tagger_t *s_tagger = NULL;
 static int32_t            *s_baseline_history = NULL;   // PSRAM, 4 MB
-static int16_t            *s_lookback = NULL;           // internal SRAM,
-                                                         //  2*FBT_BURST_PRE_LEN
-                                                         //  int16
+// (lookback argument to fft_burst_tagger_step is currently unused in
+// the detection math — the header documents it as reserved for a
+// future PDU-cut step, and the host test passes NULL. We pass NULL
+// here too rather than burn 16 KB of internal SRAM heap on a
+// placeholder buffer.)
 static burst_detected_cb_t s_user_cb = NULL;
 
 // Accumulator for chunks smaller than FBT_FFT_SIZE complex samples.
@@ -118,7 +120,7 @@ static void dispatch_new_burst(const fbt_burst_t *b)
 }
 
 // Process one FFT-aligned chunk: hand it to the tagger, advance the
-// sample index, copy chunk into lookback buffer for the next step.
+// sample index.
 static void process_chunk(const int16_t *chunk_iq)
 {
     fbt_burst_t new_bursts [FBT_NEW_BUF_SIZE];
@@ -127,7 +129,7 @@ static void process_chunk(const int16_t *chunk_iq)
     int n_gone = FBT_GONE_BUF_SIZE;
 
     int64_t t0 = esp_timer_get_time();
-    bool ok = fft_burst_tagger_step(s_tagger, chunk_iq, s_lookback,
+    bool ok = fft_burst_tagger_step(s_tagger, chunk_iq, NULL,
                                      new_bursts,  &n_new,
                                      gone_bursts, &n_gone);
     int64_t t1 = esp_timer_get_time();
@@ -138,14 +140,6 @@ static void process_chunk(const int16_t *chunk_iq)
         s_acc_new_bursts  += (uint32_t)n_new;
         s_acc_gone_bursts += (uint32_t)n_gone;
     }
-
-    // Slide lookback forward by FBT_FFT_SIZE: old[FFT_SIZE..2*FFT_SIZE-1]
-    // becomes new[0..FFT_SIZE-1]; chunk becomes new[FFT_SIZE..2*FFT_SIZE-1].
-    memmove(s_lookback,
-            s_lookback + 2 * FBT_FFT_SIZE,
-            2 * FBT_FFT_SIZE * sizeof(int16_t));
-    memcpy(s_lookback + 2 * FBT_FFT_SIZE, chunk_iq,
-           2 * FBT_FFT_SIZE * sizeof(int16_t));
 
     s_next_sample_idx += FBT_FFT_SIZE;
 }
@@ -174,23 +168,6 @@ esp_err_t dsp_processor_init(burst_detected_cb_t cb)
                      bytes);
             return ESP_ERR_NO_MEM;
         }
-    }
-
-    // 2 × burst_pre_len int16 in internal SRAM for the FFT history.
-    // burst_pre_len is 4096, so this is 16 KB. The tagger header
-    // contract: lookback points to 2*burst_pre_len int16
-    // = 2 × 4096 = 8192 int16 = 16 KB. Allocate once.
-    if (!s_lookback) {
-        size_t bytes = 2 * FBT_BURST_PRE_LEN * sizeof(int16_t);
-        s_lookback = (int16_t *)heap_caps_aligned_alloc(16, bytes,
-                                                         MALLOC_CAP_INTERNAL
-                                                         | MALLOC_CAP_8BIT);
-        if (!s_lookback) {
-            ESP_LOGE(TAG, "lookback alloc %zu bytes (internal) failed",
-                     bytes);
-            return ESP_ERR_NO_MEM;
-        }
-        memset(s_lookback, 0, bytes);
     }
 
     s_tagger = fft_burst_tagger_init(FBT_BURST_PRE_LEN, FBT_BURST_POST_LEN,
