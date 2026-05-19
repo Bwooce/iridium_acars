@@ -1416,11 +1416,29 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
     }
     if (start < 0) return 0;
 
-    // Step 5: back off by half_fir - pre_start_samples so we don't
-    // chop into the preamble. gr-iridium: `start = max(start +
-    // half_fir_size - d_pre_start_samples, 0)`. With our LP being
-    // a centred moving average, half_fir_size = (NTAPS-1)/2 = 8.
-    int adjust = (START_LP_NTAPS - 1) / 2 - START_PRE_SAMPLES;
+    // Step 5: back off by pre_start_samples so we don't chop into the
+    // preamble's first symbol. Index convention NOTE:
+    //
+    // gr-iridium's start_finder_impl writes filterN output where
+    // filtered[k] corresponds to INPUT position (k + half_fir_size).
+    // Their formula `start = filtered_start + half_fir - pre_start`
+    // converts the filtered-output index to input position
+    // (filtered_start + half_fir) and then backs off by pre_start.
+    //
+    // OUR smooth[n] is centred at input position n already (the LP
+    // convolution uses indices [n - half, n + half], so smooth[n]
+    // represents the smoothed envelope value AT input position n).
+    // The conversion-to-input-position step is therefore a no-op for
+    // us; we only need the back-off.
+    //
+    // BUG fixed May 2026: this previously read `(NTAPS-1)/2 -
+    // PRE_SAMPLES` = +66, double-counting half_fir. The cut landed 91
+    // samples (= 9.1 symbols) past the envelope rise, putting the
+    // first ~45 samples of the preamble OUTSIDE adj_burst. The
+    // matched filter then picked a spurious data-region peak instead
+    // of the real sync, breaking every burst except those where the
+    // spurious peak happened to land near a valid decode position.
+    int adjust = -START_PRE_SAMPLES;
     start = start + adjust;
     if (start < 0) start = 0;
     if (start >= n_complex) start = n_complex - 1;
