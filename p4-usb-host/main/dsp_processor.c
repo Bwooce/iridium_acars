@@ -20,16 +20,29 @@
 
 static const char *TAG = "DSP_PROC";
 
-// Tagger threshold over the EMA baseline. 10 dB recovers the best
-// decode count we've measured: 59/65 = 91% of gri's reference 65
-// on the ALBQ fixture, vs 56/65 = 86% at the 14 dB setting we used
-// during the queue-overload era. The 14 dB choice cost 3 real
-// decodes (5% absolute) to halve burst count and stop queue
-// overflow; the 280-tap PIE FIR fix (commit 7eab12a) made the
-// per-burst cost low enough that the worker keeps up at 133
-// bursts/sec on slow-feed smoke. Setting back to 10 to recover
-// the 5% absolute decode rate.
-#define FBT_THRESHOLD_DB    10.0f
+// Tagger threshold over the EMA baseline.
+//
+// Host wideband test results across the threshold/window sweep:
+//   thr  | window | tagged | decoded | % of gri-65
+//   ----|--------|--------|---------|-------------
+//   10  | fixed  |  133   |   58    |   89%
+//   10  | gone   |  133   |   60    |   92%   ← host peak
+//   12  | gone   |   74   |   57    |   88%
+//   14  | gone   |   70   |   57    |   88%   ← firmware setting
+//   14  | fixed  |   70   |   56    |   86%
+//
+// Firmware uses 14 dB because per-burst processing went up with
+// variable windows (~178 ms vs 132 ms fixed-window) and the worker
+// can't keep up with 133 bursts/sec in the 16-deep queue. 70
+// bursts/sec at 178 ms = 12.5 sec worker time per 1 sec of fixture;
+// with slow-feed smoke (15.6 sec playback) this fits. Host runs
+// thr=10 for the full 60-burst decode peak — the host has no
+// queue, just flat memory.
+//
+// Once burst_pipeline PIE acceleration lands and per-burst cost
+// drops, revisit thr=10 on firmware to recover the 3 missed
+// decodes vs the host peak.
+#define FBT_THRESHOLD_DB    14.0f
 
 // Burst window padding in INPUT samples (at FS_DETECT_HZ). gri's
 // defaults: pre = 2*fft_size = 4096, post = sample_rate * 16e-3 =

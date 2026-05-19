@@ -242,7 +242,12 @@ void worker_task(void *arg)
 
 esp_err_t worker_core1_init(void)
 {
-    burst_queue = xQueueCreate(16, sizeof(detected_burst_t));
+    // Queue depth 32: enough to absorb the per-burst-length variability
+    // under gone-trigger (single-frame ~130 ms, multi-frame up to
+    // 250 ms processing time). With 16-deep, we saw 5-7 drops per
+    // smoke run at peak load. 32 absorbs the variability without
+    // hitting the queue cap.
+    burst_queue = xQueueCreate(32, sizeof(detected_burst_t));
     if (!burst_queue) return ESP_ERR_NO_MEM;
 
     // Wideband buffers in PSRAM. The decim buffer can be smaller
