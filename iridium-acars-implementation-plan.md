@@ -799,11 +799,34 @@ investigation, then implemented):
 | M.B | Replace channelizer with gr-iridium's wideband `fft_burst_tagger` (gri's actual front end) + per-burst direct-IF mixer | High | Lower — gri proves this architecture works at 64/65 | Path A could match path C's 64/65 |
 | M.C | Hybrid: keep polyphase for detection only, redirect entire wideband cut + downmix per burst to a direct-IF path for the actual decoding | Medium | Medium — new architecture, novel | Best of both, but needs design + validation |
 
-**Decision pending:** P4-memory-footprint investigation of the
-wideband tagger (option M.B). If 2048-pt FFT fits, M.B is the
-preferred path because it gives us gri-aligned baseband to all
-downstream stages. If not, fall back to M.A (incremental improvement)
-or M.C (hybrid).
+**Decision: M.B chosen.** P4-feasibility investigation done — memory
+fits comfortably (~120 KB internal SRAM hot working set + 4 MB PSRAM
+for `baseline_history`, well within the ~568 KB SRAM / 6 MB PSRAM
+headroom). CPU is feasible **only if Q15/sc16** — at fc32 the per-FFT
+load is ~110% of a core; the existing PIE sc16 FFT path
+(`dsps_fft2r_sc16_arp4`, `fft_sc16_64.c` family) brings it to ~18%
+load at N=2048, comfortably under the 40% idle budget.
+
+Implementation order:
+1. **Prototype Q15 sc16 2048-pt FFT** in `common/iridium_decoder/`,
+   extending `fft_sc16_64.c` to N=2048 via `dsps_fft2r_sc16_arp4` +
+   sc16 twiddle init. Benchmark on the P4 in isolation against the
+   0.93 ms budget. Target ≤0.2 ms / FFT step.
+2. **Implement wideband fft_burst_tagger** in C, porting gri's
+   structure: window-mul → FFT → magnitude² → noise-floor EMA
+   (4 MB PSRAM history buffer) → per-bin threshold → burst tracking
+   with hysteresis. Use the Q15 FFT from step 1 for the hot path.
+3. **Per-burst direct-IF mixer** in C: int16 rotate + `firmr_s16`
+   decim from 2.5 MSPS to 250 ksps. Replaces both the channelizer
+   AND the resampler in path A.
+4. **Wire it up as the path-A front end**, validate against
+   gri-tagged corpus, target ≥58/65 host-test decodes (matching
+   path C's 64/65 within front-end quantisation noise).
+
+Why N=2048: Iridium burst tagger SNR is sensitive to FFT bin width
+(1.22 kHz at N=2048 vs 2.44 kHz at N=1024 — halving N raises
+per-bin noise by 3 dB, directly costing detection margin). Memory
+isn't the constraint, so we pick the better resolution.
 
 ### Step 3.6.P — P4-realistic substitution with measured impact
 
