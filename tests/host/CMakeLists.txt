@@ -194,6 +194,18 @@ target_include_directories(test_fft_burst_tagger PRIVATE
 )
 target_link_libraries(test_fft_burst_tagger PRIVATE m)
 
+# Phase 3.6.M: C direct-IF decimator vs Python scipy reference. For
+# one burst, runs the same rotate+decim in C and compares NMSE
+# against /tmp/host_direct_if/burst_NNN.cf32 (the Python output).
+# NOT in ctest by default: needs the Python fixture-dump to have
+# run first.
+add_executable(test_direct_if_decim
+    test_direct_if_decim.c
+    ${COMMON_DIR}/direct_if_decim.c
+)
+target_include_directories(test_direct_if_decim PRIVATE ${COMMON_DIR})
+target_link_libraries(test_direct_if_decim PRIVATE m)
+
 # Cross-validate int16/Q14 channelizer path against the float reference.
 # No fixtures — synthesises inputs at runtime.
 add_executable(test_polyphase_int16
@@ -419,5 +431,7 @@ add_test(NAME polyphase_channelizer COMMAND test_polyphase_channelizer)
 add_test(NAME polyphase_int16       COMMAND test_polyphase_int16)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
+# direct_if_decim intentionally NOT auto-registered: needs
+# tests/scripts/direct_if_dump.py to have run first.
 add_test(NAME channelizer_detector  COMMAND test_channelizer_detector)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
