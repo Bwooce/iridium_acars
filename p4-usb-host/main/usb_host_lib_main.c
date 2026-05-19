@@ -132,16 +132,16 @@ void app_main(void)
     // Smoke test mode: bypass the USB stack entirely and run the
     // synthetic-IQ regression test on a single Core 0 task. The smoke
     // test never returns (parks the CPU after logging the result).
-    // 24 KB stack: the smoke task drives the entire ingest+DSP path,
-    // so its stack covers smoke_test_run's locals + fill_tone's
-    // per-sample libm calls + dsp_processor_feed → fft_burst_tagger_step
-    // (window-mul → FFT_2048 → mag-shift → burst tracking) per chunk.
-    // 16 KB overflowed by ~2.3 KB in Phase 2 (Tagger FFT or burst-track
-    // path); 8 KB overflowed during init. 24 KB gives margin without
-    // being silly — the production class_driver task uses 8 KB because
-    // it doesn't drive DSP directly.
+    // 32 KB stack: the smoke task drives the entire ingest+DSP path
+    // and accumulates frames from libm calls deep inside
+    // fft_burst_tagger_step / dsp_processor_feed. 24 KB worked at
+    // threshold=10 dB but overflowed again at 14 dB (different
+    // callback-fire pattern → different stack depth). 32 KB is the
+    // generous setting that has plenty of headroom for any iteration.
+    // The production class_driver task uses 8 KB because it doesn't
+    // drive DSP itself.
     xTaskCreatePinnedToCore((TaskFunction_t)smoke_test_run,
-                            "smoke", 24576, NULL, 5, NULL, 0);
+                            "smoke", 32768, NULL, 5, NULL, 0);
     return;
 #endif
 

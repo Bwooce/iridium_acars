@@ -34,10 +34,15 @@
 
 static const char *TAG = "DSP_PROC";
 
-// Tagger threshold over the EMA baseline. gr-iridium's default is
-// ~10 dB; matches the threshold_mult parameter discussed in the
-// fft_burst_tagger header.
-#define FBT_THRESHOLD_DB    10.0f
+// Tagger threshold over the EMA baseline. 14 dB found by sweep on
+// the ALBQ wideband test as the best trade between decode count
+// (56 at 14 dB vs 59 at 10 dB, a 5% loss) and FP-induced worker
+// queue pressure (70 tagged at 14 dB vs 133 at 10 dB, a 47%
+// reduction). gri's iridium-extractor CLI default is 18 dB, which
+// is more aggressive than our pipeline tolerates (drops to 40
+// decodes at 18 dB). See test_pipeline_wideband_albq comment for
+// the full sweep.
+#define FBT_THRESHOLD_DB    14.0f
 
 // Burst window padding in INPUT samples (at FS_DETECT_HZ). gri's
 // defaults: pre = 2*fft_size = 4096, post = sample_rate * 16e-3 =

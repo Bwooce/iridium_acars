@@ -55,6 +55,15 @@ struct fft_burst_tagger_s {
     fbt_burst_t  bursts[FBT_MAX_BURSTS];
     int          n_bursts;
 
+    // Per-step peak workspace (used inside create_new_bursts_internal).
+    // Lives in the struct (heap-backed) rather than on the stack
+    // because at sort_key = int64 it's 32 KB — too big for the smoke
+    // task's stack and just wasteful churn on every step regardless.
+    struct {
+        int     bin;
+        int64_t sort_key;   // relative_magnitude × HISTORY (gri sort order)
+    } peaks[N];
+
     float    window_enbw;        // Blackman ENBW, computed at init
     uint64_t d_index;            // sample index of CURRENT FFT step's start
     uint64_t burst_id;
@@ -247,8 +256,6 @@ static void rebuild_burst_mask(fft_burst_tagger_t *t)
 static int create_new_bursts_internal(fft_burst_tagger_t *t,
                                        fbt_burst_t *out_new, int max_new)
 {
-    typedef struct { int bin; int64_t sort_key; } peak_t;
-    peak_t peaks[N];
     int n_peaks = 0;
 
     int margin = t->burst_width / 2;
@@ -257,11 +264,11 @@ static int create_new_bursts_internal(fft_burst_tagger_t *t,
         int32_t mag2 = t->magnitude_shifted[bin];
         int32_t base = t->baseline_sum[bin];
         if (above_threshold(mag2, base, t->threshold_q15)) {
-            peaks[n_peaks].bin = bin;
+            t->peaks[n_peaks].bin = bin;
             // Sort key = relative_magnitude × (HISTORY_SIZE × 32768)
             // to keep an int64 representation that's stable for
             // ordering. Same ordering as the float ratio mag²/baseline.
-            peaks[n_peaks].sort_key =
+            t->peaks[n_peaks].sort_key =
                 ((int64_t)mag2 * (int64_t)FBT_HISTORY_SIZE)
                 / ((int64_t)base + 1);
             n_peaks++;
@@ -272,15 +279,19 @@ static int create_new_bursts_internal(fft_burst_tagger_t *t,
     // n_peaks is typically small (<50), insertion would be marginal.
     for (int i = 0; i < n_peaks - 1; i++) {
         for (int j = i + 1; j < n_peaks; j++) {
-            if (peaks[j].sort_key > peaks[i].sort_key) {
-                peak_t tmp = peaks[i]; peaks[i] = peaks[j]; peaks[j] = tmp;
+            if (t->peaks[j].sort_key > t->peaks[i].sort_key) {
+                int     bin_tmp = t->peaks[i].bin;
+                int64_t key_tmp = t->peaks[i].sort_key;
+                t->peaks[i] = t->peaks[j];
+                t->peaks[j].bin = bin_tmp;
+                t->peaks[j].sort_key = key_tmp;
             }
         }
     }
 
     int n_emitted = 0;
     for (int p = 0; p < n_peaks; p++) {
-        int bin = peaks[p].bin;
+        int bin = t->peaks[p].bin;
         if (!t->burst_mask[bin]) continue;     // got masked by an earlier peak in this loop
         if (t->n_bursts >= FBT_MAX_BURSTS) break;
 
