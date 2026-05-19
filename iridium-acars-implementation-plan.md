@@ -791,6 +791,22 @@ By end of 3.6 we have:
   `D/N decoded` — degradation from substitution is one number, not
   a long log to read.
 
+### Step 3.6.T — Comparison tooling (DONE)
+
+Single unified DSP comparison tool: `tests/scripts/dsp_compare.py`.
+Replaces four scattered scripts with one CLI exposing three modes
+(`--mode stagewise`, `--mode squared-fft`, `--mode raw`) plus
+`--save-golden` / `--check-golden` for regression vectors stored under
+`tests/fixtures/*.npz`. All FFTs are numpy/scipy (no hand-rolled DFTs)
+and burst alignment uses `/tmp/host_direct_if/manifest.csv`.
+
+Per-stage thresholds (NMSE-dB, phase coherence, peak-frequency Hz) are
+hard-coded in the script's `THRESHOLDS_*` dicts from the conventional
+gr-iridium-port engineering targets — channelizer ≤ −50 dB NMSE, RRC
+≤ −40 dB, etc. Not empirically tuned to pass the current run.
+
+Reference: [docs/host-vs-griridium-testing.md](docs/host-vs-griridium-testing.md).
+
 ---
 
 ## Phase 4: Live RF Validation (NEXT — blocked on hardware)
