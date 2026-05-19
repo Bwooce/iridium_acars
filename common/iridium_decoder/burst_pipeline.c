@@ -177,9 +177,52 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
         return true;            // pipeline ran, no decode
     }
 
-    // 6. Sub-sample timing correction + peak-phase pre-rotation +
-    //    residual-omega linear phase ramp, all combined in one pass
-    //    with linear interpolation between adjacent samples.
+    // 6a. Constant-phase pre-rotation on the FULL adj_burst, matching
+    //     gr-iridium burst_downmix_impl.cc:692-694 exactly:
+    //       d_r.set_phase_incr(exp(gr_complex(0, 0)));    // no freq ramp
+    //       d_r.set_phase(std::conj(corr/abs(corr)));     // peak conj
+    //       d_r.rotateN(d_tmp_b, d_tmp_a, frame_size);    // rotate ALL
+    //     gri then trims the rotated buffer by uw_start later. We
+    //     mirror that order: rotate everything in adj_burst first,
+    //     then apply our sub-sample interp + trim as a separate
+    //     downstream-only step (step 6b). This keeps our
+    //     07_post_prerot dump comparable to gri's
+    //     signal-filtered-deci-cut-start-shift-rrc-rotate-<id>.cfile
+    //     (same window boundaries, same sample rate).
+    float pmag = sqrtf(result->uw_res.peak_re * result->uw_res.peak_re
+                     + result->uw_res.peak_im * result->uw_res.peak_im);
+    // Match the legacy worker: when pmag is too small to derive a
+    // clean rotation, still run the decim + qpsk_demod on the
+    // un-rotated data — a peak with near-zero phase already sits on
+    // the constellation, and the demod's own PLL can pull small
+    // residuals.
+    if (pmag > 1e-3f) {
+        float rot_re = result->uw_res.peak_re / pmag;
+        float rot_im = result->uw_res.peak_im / pmag;
+        int16_t pr_q = q15_from_float(rot_re);
+        int16_t pi_q = q15_from_float(rot_im);
+        for (int i = 0; i < adj_n; i++) {
+            int32_t re = adj_burst[i * 2 + 0];
+            int32_t im = adj_burst[i * 2 + 1];
+            int32_t nr = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
+            int32_t ni = ((int32_t)re * pi_q + (int32_t)im * pr_q) >> 15;
+            adj_burst[i * 2 + 0] = q15_saturate(nr);
+            adj_burst[i * 2 + 1] = q15_saturate(ni);
+        }
+    }
+
+    // Dump POST-rotation 10 sps stream — same window as adj_burst
+    // (post-D13), matches gr-iridium's "rotate" dump in time-window
+    // boundaries. Note gri's dump is its frame_size which may be
+    // smaller than adj_n; lengths can still differ, but the START
+    // points align now.
+    dump_iq_cf32("07_post_prerot_250k", adj_burst, adj_n);
+
+    // 6b. Sub-sample timing correction + UW-start trim — our addition
+    //     (not in gri's burst_downmix; gri leaves the sub-sample offset
+    //     in PDU metadata for the downstream Python qpsk_demod).
+    //     Apply linear-interp fractional delay across the WHOLE
+    //     adj_burst, then point src at the int_base sample position.
     float true_pos = (float)result->uw_res.uw_offset
                    + result->uw_res.correction;
     int   int_base = (int)floorf(true_pos);
@@ -187,45 +230,24 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     if (int_base < 0) { int_base = 0; interp_frac = 0.0f; }
     int16_t *src = adj_burst + int_base * 2;
     int n_rot = adj_n - int_base;
-
-    float pmag = sqrtf(result->uw_res.peak_re * result->uw_res.peak_re
-                     + result->uw_res.peak_im * result->uw_res.peak_im);
-    // Match the legacy worker exactly: even when pmag is too small
-    // to derive a clean rotation, still run the decim + qpsk_demod
-    // on the un-rotated data — a peak with near-zero phase already
-    // sits on the constellation, and the demod's own PLL can pull
-    // small residuals. Losing those rare cases moved decode count
-    // ~1 between runs.
-    if (pmag > 1e-3f) {
-        float rot_re = result->uw_res.peak_re / pmag;
-        float rot_im = result->uw_res.peak_im / pmag;
-        // Skip the post-RRC residual omega — the pre-RRC coarse step
-        // (step 3 above) already cancelled the bulk of the carrier.
-        // gr-iridium applies CFO ONCE (pre-RRC). Our previous code
-        // applied BOTH the pre-RRC omega_coarse AND the post-RRC
-        // uw_res.omega_per_sym, which double-corrected: the post-RRC
-        // squared-FFT on band-limited data picks up noise peaks
-        // (host channel 58 results showed omegas ±0.06 to ±1.18 on
-        // bursts whose carrier was already cancelled by the coarse
-        // step). Only the single burst with post-RRC omega ≈ 0 (i.e.
-        // residual happened to be near zero) decoded. Setting dphi=0
-        // means we trust the coarse step and let qpsk_demod's PLL
-        // soak up any final residual.
-        float dphi   = 0.0f;
-
-        int16_t pr_q = q15_from_float(rot_re);
-        int16_t pi_q = q15_from_float(rot_im);
-        int16_t cs_q = q15_from_float(cosf(dphi));
-        int16_t ss_q = q15_from_float(sinf(dphi));
-        int16_t a_q  = q15_from_float(1.0f - interp_frac);
-        int16_t b_q  = q15_from_float(interp_frac);
-
-        // n_rot includes src[0..n_rot-1]; the linear interp uses
-        // src[i+1] so the in-place rotation bound is n_rot - 1.
-        // (The decim count below still uses n_rot — matches legacy
-        // worker behaviour where the un-rotated final sample is
-        // included in the decimation count even though it was not
-        // written by the interp loop.)
+    // Cap the post-UW-cut window to gr-iridium's
+    //   frame_size = min(adj_n - int_base, uw_start + max_frame_length)
+    //   max_frame_length = MAX_FRAME_LENGTH_NORMAL × sps = 191 × 10 = 1910
+    // for normal (non-simplex) bursts. Bursts in our ALBQ corpus are
+    // all <1626 MHz (= normal). This trims spurious post-burst noise
+    // that would otherwise feed qpsk_demod and confuse PLL lock.
+    //
+    // TODO: for simplex bursts (≥1626 MHz, paging) the cap is
+    // MAX_FRAME_LENGTH_SIMPLEX × 10 = 4440. burst_pipeline doesn't
+    // currently know the burst frequency; either plumb it through or
+    // detect SIMPLEX from burst length itself.
+    const int MAX_FRAME_LEN_NORMAL_10SPS = 191 * UW_SPS;     // 1910
+    if (n_rot > MAX_FRAME_LEN_NORMAL_10SPS) {
+        n_rot = MAX_FRAME_LEN_NORMAL_10SPS;
+    }
+    if (interp_frac != 0.0f) {
+        int16_t a_q = q15_from_float(1.0f - interp_frac);
+        int16_t b_q = q15_from_float(interp_frac);
         int n_rot_cplx_interp = n_rot - 1;
         if (n_rot_cplx_interp < 0) n_rot_cplx_interp = 0;
         for (int i = 0; i < n_rot_cplx_interp; i++) {
@@ -233,20 +255,16 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
                         + (int32_t)b_q * src[(i + 1) * 2 + 0]) >> 15;
             int32_t im = ((int32_t)a_q * src[i * 2 + 1]
                         + (int32_t)b_q * src[(i + 1) * 2 + 1]) >> 15;
-            int32_t nr = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
-            int32_t ni = ((int32_t)re * pi_q + (int32_t)im * pr_q) >> 15;
-            src[i * 2 + 0] = q15_saturate(nr);
-            src[i * 2 + 1] = q15_saturate(ni);
-            int32_t npr = ((int32_t)pr_q * cs_q - (int32_t)pi_q * ss_q) >> 15;
-            int32_t npi = ((int32_t)pr_q * ss_q + (int32_t)pi_q * cs_q) >> 15;
-            pr_q = q15_saturate(npr);
-            pi_q = q15_saturate(npi);
+            src[i * 2 + 0] = q15_saturate(re);
+            src[i * 2 + 1] = q15_saturate(im);
         }
     }
 
-    // Dump POST-rotation 10 sps stream (before decim) so the
-    // stagewise compare can see what qpsk_demod sees pre-decimation.
-    dump_iq_cf32("07_post_prerot_250k", src,
+    // Dump the post-trim 250 kHz stream — this is the gri-equivalent
+    // of signal-filtered-deci-cut-start-shift-rrc-rotate-cut, matching
+    // gri's pre-qpsk-demod 10-sps buffer. Useful for stagewise compare
+    // to verify our trim + sub-sample interp landed in the right spot.
+    dump_iq_cf32("07b_post_rotate_cut_250k", src,
                  n_rot - 1 > 0 ? n_rot - 1 : 0);
 
     // 7. 5:1 decimation 10 sps → 2 sps. In-place: read every 5th

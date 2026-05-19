@@ -131,10 +131,10 @@ STAGE_DEFS = [
      "07_post_prerot_250k.cf32",
      250_000),
     ("rotate_cut",
-     "final 2-sps (rotate-cut)",
+     "post UW-cut 250k (rotate-cut)",
      "signal-filtered-deci-cut-start-shift-rrc-rotate-cut",
-     "08_decim_2sps.cf32",
-     50_000),
+     "07b_post_rotate_cut_250k.cf32",
+     250_000),
 ]
 
 GRI_DIR = Path("/tmp/signals")
