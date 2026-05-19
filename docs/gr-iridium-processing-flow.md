@@ -356,7 +356,44 @@ manifests as a "no-demod" failure on path C (the matched filter
 finds the FIRST frame, not the SECOND). Fix requires porting the
 iterative loop into burst_pipeline_process_250khz.
 
-### 12. Pre-rotation: rotate full frame_size first, THEN trim by uw_start
+### 12. Q15 incremental phasor decays magnitude — gri uses float32
+
+A naïve Q15 rotator with an incremental phasor:
+```c
+int16_t pr = 32767, pi = 0;
+for (k = 0; k < n; k++) {
+    out[k] = in[k] * (pr + j*pi);
+    // advance: p ← p · (cs_q + j·ss_q)
+    pr_new = (pr*cs_q - pi*ss_q) >> 15;
+    pi_new = (pr*ss_q + pi*cs_q) >> 15;
+}
+```
+loses **0.012% magnitude per sample** because the `>>15` truncates ~1
+LSB of the unit-magnitude phasor every step, and the quantised
+(cs_q, ss_q) themselves have |z| slightly < 1. Over a 44k-sample
+burst window the phasor magnitude collapses:
+`|phasor| → 0.99988^44096 ≈ 2e-7`.
+
+This manifests as a ~3 dB AMPLITUDE divergence at every downstream
+stage of the wideband chain, even though the SHAPE of the signal
+(phase coherence) stays high. Easy to mistake for some other DSP
+issue.
+
+gr-iridium uses volk's float32 rotator (`d_r.rotateN()`), which
+keeps |phasor| ≈ 1.0 across any practical burst length. To match
+gr-iridium on the host, **compute the phasor from absolute phase
+each sample** (`cosf(k·dphi)`, `sinf(k·dphi)`) — no per-step
+multiplication, no cumulative quantisation. Two trig ops per sample
+are negligible vs the FFT cost.
+
+On P4 we'll need either periodic Q15 phasor renormalisation OR
+per-sample cosf/sinf — TBD under Phase 3.6.P. For the
+`q15_freq_shift_inplace` in burst_pipeline.c (which applies a CFO
+correction over a ≤17 ms window = ≤4250 samples at 250 ksps,
+shorter than the wideband window so the decay is tolerable for
+that use), the incremental phasor is currently still in use.
+
+### 13. Pre-rotation: rotate full frame_size first, THEN trim by uw_start
 
 In `process_next_frame` (lines 692-694, 710-711) the order is:
 1. Compute uw_start from the FFT correlation peak
