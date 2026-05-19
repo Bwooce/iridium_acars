@@ -113,18 +113,28 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    // The Python dumper pre-pads each burst by 1.6 ms (PRE_SAMPLES_RAW=4000
-    // at 2.5 MSPS), so at 250 ksps the burst preamble starts at sample
-    // PRE_SAMPLES_BB = 400. With CFO_BYPASS_D13=1 the path-C harness
-    // skips D13's envelope search and points burst_pipeline directly at
-    // that known-good position — isolates downstream defects (CFO,
-    // matched filter, PLL) from D13 mispositioning.
-    // direct_if_dump.py adds 3.2 ms (8000 raw / 800 @ 250k samples)
-    // of pre-pad so the window always starts at-or-before gri's
-    // b.start. Used only when CFO_BYPASS_D13 forces a known start.
-    const int PRE_SAMPLES_BB = 0;
+    // direct_if_dump.py uses PRE_SAMPLES_RAW=4096 raw samples of pre-pad,
+    // so after 10x decimation each burst's UW position lands at
+    // iq250[~410] and the preamble starts at iq250[~250]. For path-C
+    // bursts that are SUB-FRAMES of a longer multi-frame burst (gri
+    // handle_multiple_frames_per_burst), the first frame's plateau is
+    // still active at iq250[0..200], so D13 fires at its earliest valid
+    // sample (66) instead of locating the second frame's preamble.
+    //
+    // Use the manifest timestamp directly: force burst_start such that
+    // adj_burst[0] sits ~50 samples before the expected preamble start.
+    // This is path-C-specific (we trust gri's published UW position) and
+    // is enabled by default for the path-C test.
+    //
+    // CFO_BYPASS_D13=1 keeps the legacy "manifest-aware force start"
+    // behaviour. CFO_BYPASS_D13=0 reverts to running D13 normally on
+    // every burst (for measuring how D13 performs in isolation).
+    //
+    // PRE_SAMPLES_RAW / DECIM = 4096 / 10 = 409.6 → preamble at iq250[250]
+    // → forced burst_start = 200 places preamble at adj_burst[50].
+    const int PRE_SAMPLES_BB = 200;
     const char *bypass_env = getenv("CFO_BYPASS_D13");
-    int bypass_d13 = (bypass_env && bypass_env[0] == '1');
+    int bypass_d13 = !(bypass_env && bypass_env[0] == '0');   // default ON
 
     // For stagewise gr-iridium comparison: when set, dump per-stage
     // cf32 signals to /tmp/host_signals/ for this one path-C burst.
