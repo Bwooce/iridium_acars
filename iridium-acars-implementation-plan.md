@@ -11,12 +11,15 @@ This document tracks the concrete implementation steps for the [Iridium ACARS De
   freq-centre → decimate → resample → demod → BCH cleanly. USB host
   recovers from stuck-device states without physical unplug.
 - **Decode-rate gap:** on the shared 1.25 s ALBQ fixture gr-iridium
-  decodes 64/64; the channelizer path (A) decodes 3/64; the new
-  direct-IF host harness (path C — bypasses channelizer + resampler,
-  feeds gr-iridium-equivalent baseband into the same downstream
-  `burst_pipeline`) decodes 20/64. The front end accounts for ~17 of
-  the gap; the downstream chain still loses 44 bursts gr-iridium
-  decodes. Phase 3.6 below restructures the work to close both.
+  decodes 65/65; the channelizer path (A) decodes 6/99 (channelizer
+  losses dominate); the direct-IF host harness (path C — bypasses
+  channelizer + resampler, feeds gr-iridium-equivalent baseband into
+  the same downstream `burst_pipeline`) decodes **59/65 (91%)**. Path
+  C is now at gr-iridium parity within ±5% per Phase 3.6.H goal.
+  Channelizer path A remains broken (8 dB SNR loss from per-channel
+  filter rolloff) — Phase 3.6.P will substitute components one at a
+  time, measuring decode rate and execution time at each swap to
+  decide front-end strategy.
 - **Throughput:** 4.88 MB/s = 100.5% of the 4.85 MB/s real-time
   target; rb_full_drops = 0; Core 0 cycle headroom ~35%.
 - **Functional regression tests:** all green (target smoke + 4 host
@@ -748,16 +751,17 @@ a substitution is by definition caused by that substitution.
 ### Step 3.6.H — Host parity with gr-iridium
 
 Goal: ≥ 58/64 decodes on the ALBQ fixture via the path-C harness
-(`tests/host/test_pipeline_direct_if_albq.c`). Each item below is a single
-host change measured against the path-C baseline.
+(`tests/host/test_pipeline_direct_if_albq.c`). Status: **59/65 decoded
+(91% of gri's 65/65)** — goal met.
 
 | # | Change | Target | Status |
 |---|---|---|---|
-| H1 | Path-C scaffold: rotate raw 2.5 MSPS → DC at gr-iridium-tagged offset, decimate 10× with scipy, feed `burst_pipeline_process_250khz` (task #55) | baseline | ✅ 20/64 |
-| H2 | Fix squared-FFT CFO out-of-range omegas (failure mode: `ω ≈ ±2π`, picked at FFT edge bins). Most likely a bin→ω mapping or unwrap bug; ~44 bursts fail with this signature today | +20 decodes | next |
-| H3 | Fix start-finder fine-position / matched-filter rotation handling once CFO is correct | +5 | after H2 |
-| H4 | PLL acquisition robustness for borderline-SNR bursts (gr-iridium decodes some at 6–7 dB UW SNR; we lose them) | +5 | after H3 |
-| H5 | Triage remaining ≤ 6 misses; either decoder defect or true low-SNR drop | accept | after H4 |
+| H1 | Path-C scaffold: rotate raw 2.5 MSPS → DC at gr-iridium-tagged offset, decimate 10× with scipy, feed `burst_pipeline_process_250khz` | baseline | ✅ 20/64 |
+| H2 | gri-aligned uw_correlator constants (CORR_FFT_N 1024→2048; START_PRE_SAMPLES 2→25; START_LP_NTAPS 101→183; D13 search valid range only; SYNC_RRC_LEN 280→271; CFO_INPUT_N 280→256) | +N | ✅ 21/65 |
+| H3 | Fix D13 cut-position formula — half_fir_size double-counted (our smooth[n] is input-centred, gri's filtered[k] is filtered-output-indexed) | +N | ✅ 23/65 |
+| H4 | Float-precision matched filter alt path (CORR_USE_FLOAT_FFT) — rules out Q15 BFP as the primary divergence | research | ✅ |
+| H5 | gri-aligned decimation FIR in direct_if_dump.py — scipy's default short Kaiser leaked adjacent-channel bursts into the squared-FFT CFO step, clamping ω to ±2π on 38 bursts | +30+ | ✅ **59/65** |
+| H6 | Triage remaining 6 misses (all share bstart=66, mostly low SNR or at far freq offsets) | accept | open |
 
 ### Step 3.6.P — P4-realistic substitution with measured impact
 
