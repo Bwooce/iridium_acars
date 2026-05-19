@@ -72,6 +72,14 @@ typedef struct {
 bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
                                     burst_pipeline_result_t *result);
 
+// Diagnostic: override D13's burst_start for the NEXT call only,
+// then auto-clear. Used by the path-C host harness to bypass our
+// envelope start-finder when we already have a known-good start
+// position (e.g. from gr-iridium's fft_burst_tagger), so we can
+// isolate downstream defects from D13 mispositioning errors.
+// Pass -1 to leave D13 running normally.
+void burst_pipeline_force_start_once(int sample_idx);
+
 // Diagnostic: when non-NULL, the pipeline writes intermediate
 // signals (as interleaved float32 IQ in [-1, +1]) to the given
 // directory before/after each major stage. Filenames match the

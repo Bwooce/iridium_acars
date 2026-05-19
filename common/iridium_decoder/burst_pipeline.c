@@ -13,6 +13,14 @@
 static char s_dump_dir[256] = {0};
 static int  s_dump_pending = 0;
 
+// One-shot D13 override. -1 = use D13 normally.
+static int  s_force_burst_start = -1;
+
+void burst_pipeline_force_start_once(int sample_idx)
+{
+    s_force_burst_start = sample_idx;
+}
+
 void burst_pipeline_set_dump_once(const char *dir)
 {
     if (dir) {
@@ -105,11 +113,18 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     //    → matched filter operates on the wrong burst → 0 decodes.
     //    Cap at 7 ms so start_finder always finds the FIRST envelope
     //    rise (the actual burst we got tagged for).
-    const int SEARCH_DEPTH_SAMPLES = 1750;
-    int search_depth = SEARCH_DEPTH_SAMPLES;
-    if (search_depth > n_complex) search_depth = n_complex;
-    int burst_start = uw_correlator_find_burst_start(
+    int burst_start;
+    if (s_force_burst_start >= 0) {
+        burst_start = s_force_burst_start;
+        if (burst_start >= n_complex) burst_start = 0;
+        s_force_burst_start = -1;
+    } else {
+        const int SEARCH_DEPTH_SAMPLES = 1750;
+        int search_depth = SEARCH_DEPTH_SAMPLES;
+        if (search_depth > n_complex) search_depth = n_complex;
+        burst_start = uw_correlator_find_burst_start(
                           iq250, n_complex, /*search_max=*/search_depth);
+    }
     result->burst_start = burst_start;
     int16_t *adj_burst = iq250 + burst_start * 2;
     int adj_n = n_complex - burst_start;

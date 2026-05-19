@@ -313,6 +313,26 @@ target_include_directories(test_worker_pipeline_albq PRIVATE
 )
 target_link_libraries(test_worker_pipeline_albq PRIVATE m)
 
+# Path C: host A/B against gr-iridium with channelizer + resampler
+# bypassed. Reads per-burst 250 ksps baseband cf32 dumps produced by
+# tests/scripts/direct_if_dump.py (mirrors gr-iridium burst_downmix:
+# rotate raw to DC at tagged offset, LPF + decimate 10x). Runs the
+# same burst_pipeline_process_250khz that runs on P4. Isolates whether
+# the host-vs-gr-iridium decode gap is the front end or the downstream
+# pipeline. Always passes; the body is a measurement we read by eye.
+add_executable(test_pipeline_direct_if_albq
+    test_pipeline_direct_if_albq.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_pipeline_direct_if_albq PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+)
+target_link_libraries(test_pipeline_direct_if_albq PRIVATE m)
+
 # Per-stage SNR-gap measurement test (diagnostic, always-passes).
 # Feeds ALBQ_RAW_UINT8 — the same raw uint8 SDR data gr-iridium
 # decoded at known SNRs — through our channelizer and reports the
@@ -355,6 +375,8 @@ add_test(NAME uw_correlator_cfo    COMMAND test_uw_correlator_cfo)
 add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
 add_test(NAME worker_pipeline_albq COMMAND test_worker_pipeline_albq)
+# pipeline_direct_if intentionally NOT auto-registered: it needs
+# tests/scripts/direct_if_dump.py to have run first.
 add_test(NAME snr_gap_measurement  COMMAND test_snr_gap_measurement)
 add_test(NAME qpsk                 COMMAND test_qpsk)
 add_test(NAME demod_corpus         COMMAND test_demod_corpus)
