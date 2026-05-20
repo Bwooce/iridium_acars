@@ -39,6 +39,11 @@ idf_component_register(
         # direction estimation. Drives D13 / CFO / pre-rotate / demod
         # inside burst_pipeline.
         "uw_correlator.c"
+        # Codegenned const FFT precompute tables (bit-reversal,
+        # twiddles, Blackman windows). Lives in .rodata (flash),
+        # frees ~37 KiB from .ext_ram.bss. Regenerate via
+        # tests/scripts/gen_uw_correlator_tables.py.
+        "uw_correlator_tables.c"
         # Per-burst pipeline orchestration shared between worker_core1
         # and the host pipeline test. Single source of truth for the
         # gr-iridium-aligned D13 → CFO → RRC → UW → demod chain.

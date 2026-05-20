@@ -293,10 +293,16 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
 #define CORR_USE_FLOAT_FFT 1
 #endif
 
-// Read-only-after-init FFT precompute tables. Cold relative to the
-// per-sample DSP loops; PSRAM placement frees DMA-internal SRAM.
-// See docs/p4-bss-audit.md win #3.
-static EXT_RAM_BSS_ATTR uint16_t s_corr_brev[CORR_FFT_N];        // shared between Q15 and float FFT paths
+// Read-only-after-init FFT precompute tables. Closed-form
+// (bit-reversal + cosf/sinf twiddles + Blackman windows) so they're
+// codegenned by tests/scripts/gen_uw_correlator_tables.py into
+// uw_correlator_tables.c as `const`, landing in .rodata (flash).
+// L2 cache covers the sequential FFT-inner-loop access pattern.
+// Frees ~37 KiB from .ext_ram.bss (PSRAM) and 0 KiB from internal
+// SRAM -- net: PSRAM heap grows by 37 KiB, flash binary grows by
+// 37 KiB. Regenerate if CORR_FFT_N / CFO_FFT_N / CFO_INPUT_N /
+// CFO_UW_ONLY_N change.
+extern const uint16_t s_corr_brev[CORR_FFT_N];        // shared between Q15 and float FFT paths
 #if !CORR_USE_FLOAT_FFT
 static int16_t  s_corr_tw_re[CORR_FFT_N / 2];   // Q15 cos
 static int16_t  s_corr_tw_im[CORR_FFT_N / 2];   // Q15 sin
@@ -316,8 +322,13 @@ static int32_t  s_sync_ul_fft_im[CORR_FFT_N];
 // Parallel float-precision matched filter state. Twiddles built at
 // init time; sync FFTs computed from the same s_sync_*_re/im sources
 // but kept in float32. Memory: 4 × CORR_FFT_N × 4B = 32 KB.
-static EXT_RAM_BSS_ATTR float    s_corr_tw_re_f[CORR_FFT_N / 2];
-static EXT_RAM_BSS_ATTR float    s_corr_tw_im_f[CORR_FFT_N / 2];
+extern const float               s_corr_tw_re_f[CORR_FFT_N / 2]; // generated
+extern const float               s_corr_tw_im_f[CORR_FFT_N / 2]; // generated
+// Sync FFTs depend on the runtime-built RC-shaped sync, so they
+// can't be codegened without a much heavier Python step that
+// duplicates the RRC + FFT chain. Left in PSRAM via
+// EXT_RAM_BSS_ATTR. Sequential read pattern in the matched-filter
+// inner loop is cache-friendly.
 static EXT_RAM_BSS_ATTR float    s_sync_dl_fft_re_f[CORR_FFT_N];
 static EXT_RAM_BSS_ATTR float    s_sync_dl_fft_im_f[CORR_FFT_N];
 static EXT_RAM_BSS_ATTR float    s_sync_ul_fft_re_f[CORR_FFT_N];
@@ -472,25 +483,16 @@ static void sync_init(void)
         s_rrc_taps_q14[n] = (int16_t)lrintf(v);
     }
 
-    // Init the correlation FFT tables.
-    for (int i = 0; i < CORR_FFT_N; i++) {
-        uint16_t r = 0, v = (uint16_t)i;
-        for (int b = 0; b < CORR_FFT_LOG; b++) {
-            r = (uint16_t)((r << 1) | (v & 1));
-            v = (uint16_t)(v >> 1);
-        }
-        s_corr_brev[i] = r;
-    }
+    // Correlation FFT bit-reversal + float twiddles are codegenned
+    // const in uw_correlator_tables.c. The Q15 twiddle path remains
+    // runtime-initialised (off by default; CORR_USE_FLOAT_FFT=1).
+#if !CORR_USE_FLOAT_FFT
     for (int k = 0; k < CORR_FFT_N / 2; k++) {
         double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CORR_FFT_N;
-#if !CORR_USE_FLOAT_FFT
         s_corr_tw_re[k] = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
         s_corr_tw_im[k] = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
-#else
-        s_corr_tw_re_f[k] = (float)cos(ang);
-        s_corr_tw_im_f[k] = (float)sin(ang);
-#endif
     }
+#endif
 
     const int L = SYNC_RRC_LEN;
 #if !CORR_USE_FLOAT_FFT
@@ -658,7 +660,7 @@ static void sync_init(void)
 
 static inline float parabolic_interp(float yl, float yc, float yr);
 
-static EXT_RAM_BSS_ATTR uint16_t s_cfo_brev[CFO_FFT_N];
+extern const uint16_t s_cfo_brev[CFO_FFT_N]; // generated
 #if CFO_USE_Q15_FFT
 static int16_t  s_cfo_tw_re[CFO_FFT_N / 2];     // Q15 cos
 static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin
@@ -671,10 +673,10 @@ static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin
 // real carrier residual. Cost is ~32 KB scratch + ~16 KB twiddles
 // in BSS, plus a few hundred microseconds per burst (acceptable —
 // the CFO step runs once per detected burst).
-static EXT_RAM_BSS_ATTR float    s_cfo_tw_re_f[CFO_FFT_N / 2];
-static EXT_RAM_BSS_ATTR float    s_cfo_tw_im_f[CFO_FFT_N / 2];
-static EXT_RAM_BSS_ATTR float    s_cfo_window_full_f[CFO_INPUT_N];
-static EXT_RAM_BSS_ATTR float    s_cfo_window_uw_f[CFO_UW_ONLY_N];
+extern const float               s_cfo_tw_re_f[CFO_FFT_N / 2];     // generated
+extern const float               s_cfo_tw_im_f[CFO_FFT_N / 2];     // generated
+extern const float               s_cfo_window_full_f[CFO_INPUT_N]; // generated
+extern const float               s_cfo_window_uw_f[CFO_UW_ONLY_N]; // generated
 // Blackman windows in Q15 (matches gr::fft::window::WIN_BLACKMAN):
 //   w[n] = 0.42 - 0.5·cos(2πn/(N-1)) + 0.08·cos(4πn/(N-1))
 // Window values are in [0, 1] → Q15 representation [0, INT16_MAX].
@@ -687,42 +689,30 @@ static bool     s_cfo_inited = false;
 static void cfo_init(void)
 {
     if (s_cfo_inited) return;
-    for (int i = 0; i < CFO_FFT_N; i++) {
-        uint16_t r = 0, v = (uint16_t)i;
-        for (int b = 0; b < CFO_FFT_LOG; b++) {
-            r = (uint16_t)((r << 1) | (v & 1));
-            v = (uint16_t)(v >> 1);
-        }
-        s_cfo_brev[i] = r;
-    }
+    // CFO bit-reversal, float twiddles, and float Blackman windows
+    // are codegenned const in uw_correlator_tables.c. The Q15
+    // versions (off by default; CFO_USE_Q15_FFT=0) still need
+    // runtime init.
+#if CFO_USE_Q15_FFT
     for (int k = 0; k < CFO_FFT_N / 2; k++) {
         double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CFO_FFT_N;
-#if CFO_USE_Q15_FFT
-        s_cfo_tw_re[k]   = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
-        s_cfo_tw_im[k]   = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
-#endif
-        s_cfo_tw_re_f[k] = (float)cos(ang);
-        s_cfo_tw_im_f[k] = (float)sin(ang);
+        s_cfo_tw_re[k] = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
+        s_cfo_tw_im[k] = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
     }
     const float PI = 3.14159265358979323846f;
     for (int i = 0; i < CFO_INPUT_N; i++) {
         float t = (float)i / (float)(CFO_INPUT_N - 1);
         float w = 0.42f - 0.5f * cosf(2.0f * PI * t)
                         + 0.08f * cosf(4.0f * PI * t);
-#if CFO_USE_Q15_FFT
-        s_cfo_window_full[i]   = (int16_t)lrintf(w * (float)INT16_MAX);
-#endif
-        s_cfo_window_full_f[i] = w;
+        s_cfo_window_full[i] = (int16_t)lrintf(w * (float)INT16_MAX);
     }
     for (int i = 0; i < CFO_UW_ONLY_N; i++) {
         float t = (float)i / (float)(CFO_UW_ONLY_N - 1);
         float w = 0.42f - 0.5f * cosf(2.0f * PI * t)
                         + 0.08f * cosf(4.0f * PI * t);
-#if CFO_USE_Q15_FFT
-        s_cfo_window_uw[i]   = (int16_t)lrintf(w * (float)INT16_MAX);
-#endif
-        s_cfo_window_uw_f[i] = w;
+        s_cfo_window_uw[i] = (int16_t)lrintf(w * (float)INT16_MAX);
     }
+#endif
     s_cfo_inited = true;
 }
 

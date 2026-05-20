@@ -216,6 +216,7 @@ add_executable(test_pipeline_wideband_albq
     ${COMMON_DIR}/rotate_to_dc.c
     ${COMMON_DIR}/burst_pipeline.c
     ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
     ${COMMON_DIR}/qpsk_demod.c
     ${COMMON_DIR}/sym_timing.c
 )
@@ -236,6 +237,7 @@ add_executable(test_pipeline_wideband_resampled
     ${COMMON_DIR}/rotate_to_dc.c
     ${COMMON_DIR}/burst_pipeline.c
     ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
     ${COMMON_DIR}/qpsk_demod.c
     ${COMMON_DIR}/sym_timing.c
 )
@@ -341,6 +343,7 @@ target_link_libraries(test_sym_timing PRIVATE m)
 add_executable(test_uw_correlator_cfo
     test_uw_correlator_cfo.c
     ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
 )
 target_include_directories(test_uw_correlator_cfo PRIVATE ${COMMON_DIR})
 target_link_libraries(test_uw_correlator_cfo PRIVATE m)
@@ -351,6 +354,7 @@ target_link_libraries(test_uw_correlator_cfo PRIVATE m)
 add_executable(test_uw_correlator_albq
     test_uw_correlator_albq.c
     ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
 )
 target_include_directories(test_uw_correlator_albq PRIVATE
     ${COMMON_DIR}
@@ -363,6 +367,7 @@ target_link_libraries(test_uw_correlator_albq PRIVATE m)
 add_executable(test_uw_correlator_albq_ul
     test_uw_correlator_albq_ul.c
     ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
 )
 target_include_directories(test_uw_correlator_albq_ul PRIVATE
     ${COMMON_DIR}
@@ -388,6 +393,7 @@ add_executable(test_pipeline_direct_if_albq
     test_pipeline_direct_if_albq.c
     ${COMMON_DIR}/burst_pipeline.c
     ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
     ${COMMON_DIR}/qpsk_demod.c
     ${COMMON_DIR}/sym_timing.c
 )
