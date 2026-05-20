@@ -46,7 +46,7 @@ static const char *TAG = "DAEMON";
 // signal-buffer DMA, audit the PSRAM access ordering — APM-560
 // recovery is system-reset-only on v1.3.
 
-static void host_lib_daemon_task(void *arg)
+void host_lib_daemon_task(void *arg)
 {
     SemaphoreHandle_t signaling_sem = (SemaphoreHandle_t)arg;
 

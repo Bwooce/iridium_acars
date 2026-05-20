@@ -68,7 +68,12 @@ static void make_resample_coeffs(int16_t *coeffs)
     const double   inv_i0    = 1.0 / bessel_i0(beta);
     const int      center    = NPROTO / 2;
 
-    double w[RS25_DELAY_SIZE * RS25_INTERP];
+    // 1125 doubles = 9000 bytes — too large to live on this task's stack
+    // (class_driver_task is 4 KB and would overflow before bessel_i0
+    // returns). Allocate on the heap for the design pass only; freed
+    // before this function returns.
+    double *w = (double *)malloc(sizeof(double) * RS25_DELAY_SIZE * RS25_INTERP);
+    if (!w) return;
     double sum_phase[RS25_INTERP];
     for (int p = 0; p < INTERP; p++) sum_phase[p] = 0.0;
 
@@ -106,6 +111,8 @@ static void make_resample_coeffs(int16_t *coeffs)
         if (v < -(double)INT16_MAX) v = -(double)INT16_MAX;
         coeffs[k] = (int16_t)lrint(v);
     }
+
+    free(w);
 }
 
 void resample_256_to_250_init(resample_256_to_250_t *r)

@@ -299,45 +299,53 @@ static void smoke_test_run_frame_decoder(void)
 #endif
 
 #if CONFIG_SMOKE_TEST_LIVE_SDR
-// Live-SDR smoke. Runs the production pipeline (class_driver does the
-// USB enumeration + transfer loop on its own task; we just spin and
-// monitor status_logger output). After SMOKE_LIVE_DURATION_S seconds:
-//   - asserts USB throughput >= SMOKE_LIVE_MIN_RATE_MB_S
-//   - asserts rb_full_drops == 0 over the window
-//   - reports DSP/worker counters for eyeball validation
-//   - does NOT assert on Iridium frame decode (we may be antenna-less
-//     and getting noise; the point is to verify the USB->ingest->DSP
-//     chain works with real samples, not that it decodes anything).
+// Live-SDR smoke. Stands up the production USB-host + ingest + DSP
+// chain (same task topology as app_main's non-smoke branch) so a real
+// USB RTL-SDR can stream IQ end-to-end, then observes the worker
+// counters for SMOKE_LIVE_DURATION_S. Reports per-stage counts and
+// pass/fails on:
+//   - worker queue overflow (bursts_dropped > 0)
+//   - no bursts at all over the window (zero queued)
+// Does NOT assert on Iridium frame decode -- the antenna may be
+// missing or the sky may be quiet, and the point of this variant is
+// to validate the USB/SDR/ingest/DSP path, not the demodulator.
 #define SMOKE_LIVE_DURATION_S      10
-#define SMOKE_LIVE_MIN_RATE_MB_S   1.0
 
 #include "worker_core1.h"
 #include "signal_buffer.h"
 #include "ingest_core1.h"
 #include "dsp_processor.h"
 
+extern void host_lib_daemon_task(void *arg);
+extern void class_driver_task(void *arg);
+
 static void smoke_test_run_live_sdr(void)
 {
     ESP_LOGI(TAG, "=== Smoke test start (live SDR mode, %d s window) ===",
              SMOKE_LIVE_DURATION_S);
-    ESP_LOGI(TAG, "  Will assert: USB rate >= %.1f MB/s, rb_full_drops == 0",
-             SMOKE_LIVE_MIN_RATE_MB_S);
+    ESP_LOGI(TAG, "  Will assert: no worker queue overflow, >= 1 burst tagged");
     ESP_LOGI(TAG, "  Will NOT assert: Iridium frame decode (antenna optional)");
 
-    // The production class_driver task brings up the USB host stack
-    // and starts streaming when an SDR enumerates. We don't drive any
-    // of that here — class_driver runs from app_main's task creation.
-    // This smoke simply observes the status_logger output for the
-    // configured window then asserts on what we saw.
-    //
-    // We sample worker_stats_t directly at start and end of the window
-    // (status_logger samples them itself but we want a clean
-    // before/after delta). USB stats come from class_driver's
-    // status_snapshot_t indirectly via the worker counters we have
-    // local access to.
-    worker_stats_t s0, s1;
-    worker_core1_get_stats(&s0);   // first read clears the counters
-    (void)s0;                       // discard the 'before' (counters start at 0)
+    // Spawn the same daemon + class_driver tasks the production
+    // app_main creates. class_driver_task does signal_buffer_init,
+    // worker_core1_init, ingest_core1_init, dsp_processor_init on
+    // first entry, so we don't need to call them explicitly here.
+    SemaphoreHandle_t signaling_sem = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(host_lib_daemon_task,
+                            "daemon", 4096,
+                            (void *)signaling_sem,
+                            5, NULL, 1);
+    xTaskCreatePinnedToCore(class_driver_task,
+                            "class", 4096,
+                            (void *)signaling_sem,
+                            4, NULL, 0);
+
+    // Give the USB stack a moment to enumerate and start streaming
+    // before sampling the counters.
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    worker_stats_t s0;
+    worker_core1_get_stats(&s0);   // baseline (counters monotonically up)
 
     int64_t t_start = esp_timer_get_time();
     int64_t deadline = t_start + (int64_t)SMOKE_LIVE_DURATION_S * 1000000;
@@ -347,43 +355,39 @@ static void smoke_test_run_live_sdr(void)
     int64_t t_end = esp_timer_get_time();
     double window_s = (double)(t_end - t_start) / 1e6;
 
+    worker_stats_t s1;
     worker_core1_get_stats(&s1);
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 
-    ESP_LOGI(TAG, "Live-SDR window done after %.1f s", window_s);
-    ESP_LOGI(TAG, "  Worker: queued=%u processed=%u bch_decoded=%u "
-                   "bch_failed=%u dropped=%u skipped=%u",
-             s1.bursts_queued, s1.bursts_processed,
-             s1.bursts_bch_decoded, s1.bursts_bch_failed,
-             s1.bursts_dropped, s1.bursts_skipped);
-    ESP_LOGI(TAG, "  Heap: PSRAM free=%u KB  internal free=%u KB",
-             (unsigned)(psram_free / 1024), (unsigned)(internal_free / 1024));
+    uint32_t d_queued   = s1.bursts_queued    - s0.bursts_queued;
+    uint32_t d_proc     = s1.bursts_processed - s0.bursts_processed;
+    uint32_t d_bch_ok   = s1.bursts_bch_decoded - s0.bursts_bch_decoded;
+    uint32_t d_bch_fail = s1.bursts_bch_failed  - s0.bursts_bch_failed;
+    uint32_t d_drop     = s1.bursts_dropped   - s0.bursts_dropped;
+    uint32_t d_skip     = s1.bursts_skipped   - s0.bursts_skipped;
 
-    // Pass/fail. Worker dropped > 0 means queue overflow (worker
-    // can't keep up with burst rate). That's worth flagging.
+    ESP_LOGI(TAG, "Live-SDR window done after %.1f s", window_s);
+    ESP_LOGI(TAG, "  Worker delta: queued=%u processed=%u "
+                   "bch_decoded=%u bch_failed=%u dropped=%u skipped=%u",
+             (unsigned)d_queued, (unsigned)d_proc,
+             (unsigned)d_bch_ok, (unsigned)d_bch_fail,
+             (unsigned)d_drop, (unsigned)d_skip);
+    ESP_LOGI(TAG, "  Heap: PSRAM free=%u KB  internal free=%u KB",
+             (unsigned)(psram_free / 1024),
+             (unsigned)(internal_free / 1024));
+
     bool pass = true;
-    if (s1.bursts_dropped > 0) {
+    if (d_drop > 0) {
         ESP_LOGE(TAG, "  FAIL: worker dropped %u bursts (queue overflow)",
-                 s1.bursts_dropped);
+                 (unsigned)d_drop);
         pass = false;
     }
-    // We don't have direct visibility of rb_full_drops or USB rate
-    // from inside this task — those live in class_driver / esp_libusb
-    // and surface via the 1-second STATUS lines from status_logger.
-    // For a SMOKE-grade check, the absence of any STATUS-ERR warnings
-    // in the log over the window is the user-visible signal.
-    //
-    // bursts_queued > 0 is the proof that the USB->ingest->dsp_processor
-    // chain produced at least one burst tag during the window. Zero
-    // is suspicious (no SDR connected, no signal, or USB enumeration
-    // failed silently).
-    if (s1.bursts_queued == 0) {
-        ESP_LOGW(TAG, "  WARN: zero bursts tagged over %.1f s — no SDR? "
-                       "no signal? check class_driver / USB enumeration "
-                       "log lines above this point.", window_s);
-        // Not a hard fail — a perfectly-quiet antenna environment
-        // could legitimately yield zero bursts. Flagged for the user.
+    if (d_queued == 0) {
+        ESP_LOGE(TAG, "  FAIL: zero bursts tagged over %.1f s -- USB SDR not "
+                       "enumerated, or signal floor below detector threshold",
+                 window_s);
+        pass = false;
     }
 
     if (pass) ESP_LOGI(TAG, "===== SMOKE_LIVE_SDR_PASS =====");
