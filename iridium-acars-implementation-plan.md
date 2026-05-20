@@ -318,21 +318,47 @@ and breaks the PLL phase tracker during bursts.
 
 ### Internal SRAM accounting (P4 has 768 KB L2MEM, not 283 KB)
 
-The heap manager reports ~283 KiB across five regions. The rest of
-the 768 KiB L2MEM is consumed by:
+**Physical:**
 
-- **L2 cache: 128 KiB** (`CONFIG_CACHE_L2_CACHE_256KB=y`; the 256 KB
-  cache uses 128 KB SRAM for tags+entries).
-- **`.data` + `.rodata` loaded into L2MEM at boot: ~80 KiB** (segment
-  loader log shows 51 KB + 16 KB + 13 KB at addresses 0x4FF00000+).
-- **`.bss` zero-init globals: ~200 KiB** (the bulk — fft_burst_tagger
-  state, esp-dsp twiddles, libacars, mbedtls, lwip, FreeRTOS).
-- **ROM scratch / IDF runtime overhead**: ~30 KiB.
+| Region | Address | Size | Linker-visible |
+|---|---|---|---|
+| L2MEM (HP) | 0x4FF00000 | 768 KiB | 435 KiB (`sram_low` 179 + `sram_high` 256) |
+| TCM | (HP CPU-local) | 8 KiB | — (no DMA) |
+| LP SRAM | 0x50108000 | 32 KiB | 32 KiB |
+| HP SPM | 0x30100000 | 8 KiB | 8 KiB |
 
-Of the 283 KiB heap, only the 162 KiB "RAM large" chunk is
-contiguous enough to back a useful `SPIRAM_MALLOC_RESERVE_INTERNAL`
-reserve — bumping the reserve past ~160 KB boot-loops because IDF
-can't allocate a contiguous reservation that big.
+**L2MEM (768 KiB) breakdown** (per `esp-idf/components/esp_system/ld/esp32p4/memory.ld.in:30-43`):
+
+| Region | Address range | Size | Knob |
+|---|---|---|---|
+| `sram_low` (firmware IRAM + DRAM low) | `0x4FF00000` .. `0x4FF2CBD0` | **179 KiB** | — |
+| 2nd-stage bootloader `iram_loader_seg` | `0x4FF2CBD0` .. `0x4FF40000` | **77 KiB** | Hard-coded constant in `memory.ld.in`; no Kconfig knob. Stuck. |
+| `sram_high` (firmware DRAM high + heap) | `0x4FF40000` .. `0x4FF80000` | **256 KiB** | Computed as `0x80000 - CACHE_L2_CACHE_SIZE` — shrinks if cache grows |
+| L2 cache backing | `0x4FF80000` .. `0x4FFC0000` | **256 KiB** | `CONFIG_CACHE_L2_CACHE_256KB=y` (choice of 128 / 256 / 512 KiB) |
+| **Total** | | **768 KiB** | |
+
+Firmware static layout (from `p4-usb-host.map`, lives inside `sram_low` + `sram_high`):
+
+| Section | Size | Notes |
+|---|---|---|
+| `.iram0.text` | 65.6 KiB | Code in SRAM for hot paths |
+| `.dram0.data` | 13.0 KiB | Initialised globals |
+| `.dram0.bss` + `.dram1.bss` | **184.7 KiB** | See `docs/p4-bss-audit.md` for per-symbol breakdown — ~150 KiB firmware-owned + ~35 KiB library |
+| Flash-mapped `.flash.text` | 228 KiB | No SRAM cost; cached on demand via L2 |
+
+Heap (what IDF heap manager exposes): **283 KiB total** = RETENT_RAM 65 + RAM small 18 + RAM large 162 + RTCRAM 31 + SPM 7. Of those, only the 162 KiB "RAM large" chunk is contiguous enough to back a useful `SPIRAM_MALLOC_RESERVE_INTERNAL`.
+
+**Knobs to reclaim SRAM:**
+
+- **`.bss` migrations** (audit's recommended wins): ~140 KiB. See `docs/p4-bss-audit.md`. **The actionable lever.**
+- L2 cache 256 → 128 KiB: +128 KiB SRAM but DSP working-set thrash risk, especially after `.bss`-to-PSRAM moves increase cache pressure. Probably stay at 256.
+- 2nd-stage bootloader `iram_loader_seg` (77 KiB): hard-coded, would need custom bootloader. Not worth it.
+- FreeRTOS trace facility / runtime stats: ~500 B saving, real diagnostic loss.
+- Memory protection / ULP reserve / RTC reserve: 0 or marginal.
+
+Flash-mapped (no SRAM cost): `.flash.text` 228 KiB. Mapped via L2 cache, evicts on pressure.
+
+**Of the 184.7 KiB `.bss`, ~150 KiB is firmware-owned and movable to PSRAM** via `EXT_RAM_BSS_ATTR`. The audit identifies the top 35 firmware symbols ≥100 B and classifies each as `CAN_MOVE`, `MUST_STAY_INTERNAL` (PIE-asm bound), or library-out-of-scope. Recommended first three wins reclaim ~140 KiB; see `docs/p4-bss-audit.md`.
 
 **Live demand on DMA-capable internal SRAM (LIVE_SDR build):**
 
@@ -341,26 +367,31 @@ can't allocate a contiguous reservation that big.
 | `ingest_core1` `s_raw[2]` | 32 KB | yes (USB DWC OTG-HS DMA target) |
 | `worker_core1` `s_chunk_iq` | 16 KB | yes (PIE FIR `esp.vld.128.ip` can't read PSRAM) |
 | `worker_core1` `s_decim_scr_*` (4 buffers) | ~32 KB | yes (PIE FIR) |
-| `uw_correlator` RRC scratch (4 buffers) | 32 KB | yes (PIE FIR) |
+| `uw_correlator` RRC + start-finder PIE state | ~32 KB | yes (PIE FIR coeffs) |
 | `fft_sc16_2048` twiddle | 8 KB | yes (FFT inner loop) |
-| `fft_burst_tagger` static `.bss` | ~30 KB | yes (fed by `fft_sc16_2048`) |
-| `dsp_processor` `s_accum` | 8 KB | yes (FFT mag accumulator) |
+| `fft_burst_tagger` working .bss | ~30 KB | yes (fed by `fft_sc16_2048`) |
 | `esp_libusb` async transfer pool | 8 × 8 KB = 64 KB | yes (USB DMA) |
 
-**Demand: ~222 KB DMA-capable. Reserve: 144 KB. Free pre-stream: 70 KB.**
-The gap closed once `s_conv` (64 KB) moved to PSRAM — see
-`p4-usb-host/main/ingest_core1.c` and commit 88112bc.
+**Demand: ~214 KB DMA-capable. Reserve: 144 KB. Free pre-stream: 70 KB.**
+The gap closed once `s_conv` (64 KB) moved to PSRAM (commit 88112bc).
+After applying the audit's first three wins, the heap manager will see
+roughly +140 KiB more DMA-capable headroom, comfortably accommodating
+the original 8 × 16 KB transfer pool plus margin.
 
-Levers for future tightening:
+Levers for future tightening (descending impact):
 
-1. `EXT_RAM_BSS_ATTR` on cold `.bss` sections (gri reference data,
-   any read-mostly globals that don't need fast access).
-2. Drop L2 cache from 256 KB back to 128 KB — saves 64 KB but risks
-   re-introducing the cache thrashing the bigger cache was added to
-   fix. Measure first.
-3. Audit fft_burst_tagger / uw_correlator scratch — anything that
-   doesn't actually need DMA capability can move to PSRAM (the
-   constraint is PIE asm endpoints, mostly).
+1. **Apply the `.bss` audit's three wins** — reclaim ~140 KiB by
+   annotating `syn_ra` (bch_decoder), six FFT scratch buffers
+   (uw_correlator), and the float twiddle/window precomputes
+   (uw_correlator) with `EXT_RAM_BSS_ATTR`.
+2. **Convert read-only-after-init tables to `static const`** — the
+   bit-reversal, twiddle, and window tables in `uw_correlator.c`
+   are all computable at compile time. Moving them to
+   `.flash.rodata` frees SRAM entirely (no PSRAM space used). One
+   evening's refactor.
+3. **Drop L2 cache from 256 KB back to 128 KB** — saves 64 KB but
+   risks re-introducing the cache thrashing the bigger cache was
+   added to fix. Measure first.
 
 ### esp-dsp 1.8.1 upstream bugs
 
