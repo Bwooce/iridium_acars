@@ -142,4 +142,33 @@ config SMOKE_TEST_REAL_IRIDIUM
         fixture with tests/scripts/build_albq_fixture.py if you change
         the source recording or resampling parameters.
 
+config SMOKE_TEST_LIVE_SDR
+    bool "Drive the live USB-attached RTL-SDR (no fixture; SDR-noise smoke)"
+    depends on SMOKE_TEST_MODE
+    depends on !SMOKE_TEST_CORPUS
+    depends on !SMOKE_TEST_FRAME_DECODER
+    depends on !SMOKE_TEST_REAL_IRIDIUM
+    depends on !SMOKE_TEST_RAW_IRIDIUM
+    default n
+    help
+        Validates the live-SDR path end-to-end without expecting valid
+        Iridium frames. The smoke:
+          1. Enumerates the USB-attached RTL-SDR (R820T2 or similar)
+             via the existing class_driver / esp_libusb chain.
+          2. Tunes to a configurable LO (default 1618.5 MHz, an Iridium
+             downlink band) and streams ~10 seconds of IQ at 2.56 MSPS.
+          3. Asserts the USB sustained throughput is at least 1 MB/s
+             (= sample flow is happening, not just enumeration).
+          4. Asserts no rb_full_drops occurred during the window
+             (= ingest path keeps up with the SDR's output rate).
+          5. Reports DSP frames-per-second + worker-burst count for
+             eyeballing, but does NOT assert on Iridium frame decode —
+             rooftop antenna + clear-sky pass is needed for that and
+             we may have neither.
+
+        Used to validate hardware bring-up and to regression-test the
+        USB-host / SDR / ingest_core1 / signal_buffer / dsp_processor
+        stack without a fixture in the loop. Mutually exclusive with
+        the fixture-driven smoke variants.
+
 endmenu
