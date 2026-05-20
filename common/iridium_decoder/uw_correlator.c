@@ -132,10 +132,10 @@ static int16_t s_rrc_taps_q14[RRC_NTAPS];
 #ifdef ESP_PLATFORM
 static int16_t s_rrc_taps_padded[RRC_NTAPS_PADDED] __attribute__((aligned(16)));
 static fir_s16_t s_rrc_fir_i, s_rrc_fir_q;
-static int16_t *s_rrc_scr_in_i  = NULL;   // PSRAM, lazy
-static int16_t *s_rrc_scr_in_q  = NULL;
-static int16_t *s_rrc_scr_out_i = NULL;
-static int16_t *s_rrc_scr_out_q = NULL;
+static int16_t *s_rrc_scr_in_i  = NULL;   // INTERNAL preferred, lazy;
+static int16_t *s_rrc_scr_in_q  = NULL;   // falls back to PSRAM if internal heap
+static int16_t *s_rrc_scr_out_i = NULL;   // is exhausted (multi-frame bursts).
+static int16_t *s_rrc_scr_out_q = NULL;   // PIE asm only engages on internal.
 static int      s_rrc_scr_cap   = 0;       // current capacity (complex samples)
 static int      s_rrc_fir_inited = 0;
 #endif
@@ -1685,16 +1685,37 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
         free(s_rrc_scr_in_i);  free(s_rrc_scr_in_q);
         free(s_rrc_scr_out_i); free(s_rrc_scr_out_q);
         size_t bytes = (size_t)fir_len * sizeof(int16_t);
-        s_rrc_scr_in_i  = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
-        s_rrc_scr_in_q  = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
-        s_rrc_scr_out_i = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
-        s_rrc_scr_out_q = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        // dsps_fird_s16_arp4 uses `esp.vld.128.ip` for its vector
+        // loads — same constraint as the front-end FFT and decim
+        // path: scratch MUST be in INTERNAL SRAM for PIE to engage.
+        // PSRAM-backed scratch silently degrades to non-PIE behaviour
+        // (see worker_core1.c's chunked-decim comment for the
+        // measured cost). Try INTERNAL first; fall back to PSRAM
+        // only for the rare multi-frame burst that exceeds the
+        // ~100 KB of free internal heap — that path is slower but
+        // still numerically correct.
+        s_rrc_scr_in_i  = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL);
+        s_rrc_scr_in_q  = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL);
+        s_rrc_scr_out_i = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL);
+        s_rrc_scr_out_q = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL);
         if (!s_rrc_scr_in_i || !s_rrc_scr_in_q
             || !s_rrc_scr_out_i || !s_rrc_scr_out_q) {
-            // Out of PSRAM — fall through to scalar path so we still
-            // produce output (slower but correct).
-            s_rrc_scr_cap = 0;
-            goto rrc_scalar_fallback;
+            // Internal heap exhausted (long multi-frame burst). Free
+            // any partials and retry in PSRAM so the call still
+            // returns a valid filtered burst — at the cost of falling
+            // off the PIE fast path.
+            free(s_rrc_scr_in_i);  free(s_rrc_scr_in_q);
+            free(s_rrc_scr_out_i); free(s_rrc_scr_out_q);
+            s_rrc_scr_in_i  = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+            s_rrc_scr_in_q  = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+            s_rrc_scr_out_i = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+            s_rrc_scr_out_q = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+            if (!s_rrc_scr_in_i || !s_rrc_scr_in_q
+                || !s_rrc_scr_out_i || !s_rrc_scr_out_q) {
+                // PSRAM also exhausted — true OOM. Scalar fallback.
+                s_rrc_scr_cap = 0;
+                goto rrc_scalar_fallback;
+            }
         }
         s_rrc_scr_cap = fir_len;
     }
