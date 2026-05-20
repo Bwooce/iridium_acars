@@ -102,6 +102,15 @@ static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
 #ifdef ESP_PLATFORM
 #include "dsps_fir.h"
 #include "esp_heap_caps.h"
+// D13 start-finder LP filter PIE state. Padded to 184 taps for the
+// `coeffs_len % 8 == 0` PIE gate; the +1 zero is at array index [0]
+// (= late end of the impulse response after dsps_fird's reversal),
+// giving a clean 91-sample group delay we compensate by feeding 91
+// trailing zeros and using outputs[91..91+search_max-1].
+static int16_t s_start_lp_taps_padded[/*START_LP_NTAPS_PADDED*/ 184]
+    __attribute__((aligned(16)));
+static fir_s16_t s_start_lp_fir;
+static int s_start_lp_fir_inited = 0;
 // Pad RRC taps from 51 to 56 (multiple of 8) for dsps_fird_s16_arp4.
 // The PIE asm has an early `andi t2, t2, 7; beqz; j ansi` gate that
 // falls back to the scalar ANSI variant unless coeffs_len % 8 == 0.
@@ -1317,6 +1326,14 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 //   filter let noise into the envelope and caused D13 to fire on
 //   false rises, especially on path C's pre-pad noise band.)
 #define START_LP_NTAPS        183
+// Pad to multiple of 8 (=184) on ESP_PLATFORM so dsps_fird_s16_arp4
+// engages its PIE inner loop. The padding zero goes at array index
+// [0] (= late end of the impulse response after dsps_fird's reversal),
+// giving exactly (N-1)/2 = 91 sample group delay, compensated with
+// 91 trailing zeros on input + output[91..] indexing. Compute path
+// has been chosen to make the int32 mag² fit in int16 by
+// uniform-shift downcast (see find_burst_start for shift logic).
+#define START_LP_NTAPS_PADDED 184
 #define START_LP_KAISER_BETA   5.65f
 #define START_THRESHOLD_FRAC   0.28f
 // gr-iridium's d_pre_start_samples = 0.1ms × output_sample_rate
@@ -1413,6 +1430,98 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
     // noise into the squared-FFT CFO window and produced ω ≈ ±2π
     // saturation on most bursts. Matching gri exactly: only search
     // the LP-valid range.
+#ifdef ESP_PLATFORM
+    // PIE path: 8-lane Q15 SIMD FIR via dsps_fird_s16_arp4.
+    // 1) Find max(mag²) and compute a uniform right-shift that brings
+    //    the peak under INT16_MAX, then downcast mag² → int16. Argmax
+    //    + threshold logic downstream are scale-invariant; we restore
+    //    int32 magnitude after the FIR by left-shifting back.
+    int32_t max_mag2 = 0;
+    for (int n = 0; n < search_max; n++) {
+        if (mag2[n] > max_mag2) max_mag2 = mag2[n];
+    }
+    if (max_mag2 == 0) {
+        for (int n = 0; n < search_max; n++) smooth[n] = 0;
+        goto d13_argmax;
+    }
+    int shift = 0;
+    while ((max_mag2 >> shift) > INT16_MAX) shift++;
+    // Buffers live in PSRAM (lazy-allocated on first call) — internal
+    // SRAM is reserved for the SPIRAM_MALLOC pool, and ~11 KB of D13
+    // statics had been enough to push that pool below its 102 KB
+    // minimum, panicking the boot.
+    enum { D13_FIR_BUF_LEN = START_SEARCH_MAX + START_LP_NTAPS_PADDED };
+    static int16_t *mag2_i16 = NULL;
+    static int16_t *smooth_i16 = NULL;
+    if (mag2_i16 == NULL) {
+        mag2_i16   = (int16_t *)heap_caps_malloc(
+                       D13_FIR_BUF_LEN * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        smooth_i16 = (int16_t *)heap_caps_malloc(
+                       D13_FIR_BUF_LEN * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        if (!mag2_i16 || !smooth_i16) {
+            // PSRAM exhausted — fall through to a scalar inline LP
+            // below so D13 still produces a valid start.
+            for (int n = 0; n < search_max; n++) {
+                if (n >= half && n + half < search_max) {
+                    int64_t acc = 0;
+                    for (int k = 0; k < START_LP_NTAPS; k++) {
+                        acc += (int64_t)w_q15[k] * (int64_t)mag2[n - half + k];
+                    }
+                    acc >>= 15;
+                    if (acc > INT32_MAX) acc = INT32_MAX;
+                    if (acc < 0)         acc = 0;
+                    smooth[n] = (int32_t)acc;
+                } else {
+                    smooth[n] = 0;
+                }
+            }
+            goto d13_argmax;
+        }
+    }
+    for (int n = 0; n < search_max; n++) {
+        int32_t v = mag2[n] >> shift;
+        if (v > INT16_MAX) v = INT16_MAX;
+        mag2_i16[n] = (int16_t)v;
+    }
+    const int GROUP_DELAY = (START_LP_NTAPS_PADDED - 1) / 2;  // 91
+    int fir_len = search_max + GROUP_DELAY;
+    for (int n = search_max; n < fir_len; n++) mag2_i16[n] = 0;
+
+    if (!s_start_lp_fir_inited) {
+        // Tap layout: zero at index [0], orig 183 at [1..183]. After
+        // dsps_fird's time-reversal the zero lands at the late end of
+        // the impulse response → exactly 91-sample group delay.
+        s_start_lp_taps_padded[0] = 0;
+        for (int k = 0; k < START_LP_NTAPS; k++) {
+            s_start_lp_taps_padded[k + 1] = w_q15[k];
+        }
+        // shift = 0 → dsps_fird applies `acc >> 15`, matching the Q15
+        // tap quantisation (sum of Q15 taps = 32768 → unity DC gain).
+        dsps_fird_init_s16(&s_start_lp_fir, s_start_lp_taps_padded, NULL,
+                            START_LP_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
+                            /*shift=*/0);
+        s_start_lp_fir_inited = 1;
+    }
+    // Reset streaming state between unrelated bursts.
+    for (int n = 0; n < START_LP_NTAPS_PADDED; n++) s_start_lp_fir.delay[n] = 0;
+    s_start_lp_fir.pos = 0;
+    s_start_lp_fir.d_pos = 0;
+
+    (void)dsps_fird_s16_arp4(&s_start_lp_fir, mag2_i16, smooth_i16, fir_len);
+
+    // Restore int32 dynamic range (shift back) and apply the original
+    // valid-range gating so edge samples can't beat the threshold.
+    for (int n = 0; n < search_max; n++) {
+        if (n >= half && n + half < search_max) {
+            int32_t v = (int32_t)smooth_i16[n + GROUP_DELAY];
+            if (v < 0) v = 0;       // negative ringing on edges → 0
+            smooth[n] = v << shift;
+        } else {
+            smooth[n] = 0;
+        }
+    }
+d13_argmax: ;
+#else
     for (int n = 0; n < search_max; n++) {
         if (n >= half && n + half < search_max) {
             int64_t acc = 0;
@@ -1427,6 +1536,7 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
             smooth[n] = 0;
         }
     }
+#endif
 
     // Step 3: max of smoothed envelope — search ONLY the LP-valid range,
     // matching gr-iridium's filterN output (start_finder_impl, post-FIR
