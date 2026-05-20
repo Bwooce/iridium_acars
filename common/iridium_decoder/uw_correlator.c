@@ -99,12 +99,37 @@ static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
 // taps approach unity and Q15(1.0) = 32768 doesn't fit in int16.
 #include "q14_fixed.h"
 
+#ifdef ESP_PLATFORM
+#include "dsps_fir.h"
+#include "esp_heap_caps.h"
+// Pad RRC taps from 51 to 56 (multiple of 8) for dsps_fird_s16_arp4.
+// The PIE asm has an early `andi t2, t2, 7; beqz; j ansi` gate that
+// falls back to the scalar ANSI variant unless coeffs_len % 8 == 0.
+// The five zero taps are placed at the LATE end of the impulse
+// response (dsps_fird's time-reversal makes them array indices [0..4],
+// see uw_correlator_apply_rrc). Group delay is exactly 25 samples
+// (= (RRC_NTAPS-1)/2), compensated at the call site by feeding 25
+// trailing zeros and using outputs[25..25+n-1].
+#define RRC_NTAPS_PADDED  56
+#endif
+
 #ifdef UW_CORRELATOR_CFO_DEBUG
 #include <stdio.h>
 #endif
 
 // Q14 burst-side FIR taps (RRC). Used by uw_correlator_apply_rrc.
 static int16_t s_rrc_taps_q14[RRC_NTAPS];
+
+#ifdef ESP_PLATFORM
+static int16_t s_rrc_taps_padded[RRC_NTAPS_PADDED] __attribute__((aligned(16)));
+static fir_s16_t s_rrc_fir_i, s_rrc_fir_q;
+static int16_t *s_rrc_scr_in_i  = NULL;   // PSRAM, lazy
+static int16_t *s_rrc_scr_in_q  = NULL;
+static int16_t *s_rrc_scr_out_i = NULL;
+static int16_t *s_rrc_scr_out_q = NULL;
+static int      s_rrc_scr_cap   = 0;       // current capacity (complex samples)
+static int      s_rrc_fir_inited = 0;
+#endif
 
 // RC-shaped sync word references in FLOAT (used by FFT correlation
 // and CFO FFT paths, which are still float — Q15 FFT conversion
@@ -1458,6 +1483,96 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
                               int n_complex)
 {
     sync_init();   // ensures RRC taps are populated
+
+#ifdef ESP_PLATFORM
+    // PIE path: split-deinterleave + dsps_fird_s16_arp4 (decim=1) + reinterleave.
+    // Same pattern as direct_if_decim_process_split — 8-lane Q15 SIMD inner loop.
+    // Lazy first-call init: build padded taps, ensure scratch capacity, init firs.
+    if (!s_rrc_fir_inited) {
+        // Tap-array layout: zeros at indices [0..4], original 51 taps
+        // at [5..55]. In dsps_fird's convention y[m] = sum taps[N-1-i] *
+        // x[m-i], reversed indexing means the zeros end up at the LATE
+        // end of the impulse response. The convolution then runs over
+        // i=0..50 (active) and i=51..55 (zero) and y_stream[m] =
+        // sum_{j=0..50} orig[j] * x[m-50+j], i.e. centred at x[m-25].
+        // That's exactly a 25-sample group delay vs the scalar centred-
+        // zero-pad (y_scalar[k] = ... * x[k-25+t]). We feed an extra
+        // 25 trailing zeros so stream output[25 + k] is the equivalent
+        // of scalar output[k] for k = 0 .. n_complex-1.
+        for (int i = 0; i < RRC_NTAPS_PADDED; i++) s_rrc_taps_padded[i] = 0;
+        for (int i = 0; i < RRC_NTAPS; i++) {
+            s_rrc_taps_padded[RRC_NTAPS_PADDED - RRC_NTAPS + i] = s_rrc_taps_q14[i];
+        }
+        // shift = 1 → dsps_fird applies `acc >> (15 - shift) = acc >> 14`,
+        // matching the Q14 tap quantisation. delay buffer = NULL:
+        // dsps_fird_init_s16 on arp4 ignores it and allocates an aligned
+        // one internally (see dsps_fird_init_s16.c).
+        dsps_fird_init_s16(&s_rrc_fir_i, s_rrc_taps_padded, NULL,
+                            RRC_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
+                            /*shift=*/1);
+        dsps_fird_init_s16(&s_rrc_fir_q, s_rrc_taps_padded, NULL,
+                            RRC_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
+                            /*shift=*/1);
+        s_rrc_fir_inited = 1;
+    }
+    // We feed n_complex + RRC_GROUP_DELAY trailing zeros and use
+    // output[RRC_GROUP_DELAY .. RRC_GROUP_DELAY + n_complex - 1], so
+    // scratch must accommodate the extra 25 trailing zero samples.
+    enum { RRC_GROUP_DELAY = (RRC_NTAPS - 1) / 2 };  // 25
+    int fir_len = n_complex + RRC_GROUP_DELAY;
+    if (fir_len > s_rrc_scr_cap) {
+        free(s_rrc_scr_in_i);  free(s_rrc_scr_in_q);
+        free(s_rrc_scr_out_i); free(s_rrc_scr_out_q);
+        size_t bytes = (size_t)fir_len * sizeof(int16_t);
+        s_rrc_scr_in_i  = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        s_rrc_scr_in_q  = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        s_rrc_scr_out_i = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        s_rrc_scr_out_q = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        if (!s_rrc_scr_in_i || !s_rrc_scr_in_q
+            || !s_rrc_scr_out_i || !s_rrc_scr_out_q) {
+            // Out of PSRAM — fall through to scalar path so we still
+            // produce output (slower but correct).
+            s_rrc_scr_cap = 0;
+            goto rrc_scalar_fallback;
+        }
+        s_rrc_scr_cap = fir_len;
+    }
+    // Reset streaming FIR state between unrelated bursts.
+    for (int n = 0; n < RRC_NTAPS_PADDED; n++) {
+        s_rrc_fir_i.delay[n] = 0;
+        s_rrc_fir_q.delay[n] = 0;
+    }
+    s_rrc_fir_i.pos = 0;  s_rrc_fir_i.d_pos = 0;
+    s_rrc_fir_q.pos = 0;  s_rrc_fir_q.d_pos = 0;
+
+    // Deinterleave IQ → I, Q streams + trailing zero pad to extract the
+    // last RRC_GROUP_DELAY centred outputs (matches scalar's behaviour
+    // where input[k >= n_complex] = 0).
+    for (int k = 0; k < n_complex; k++) {
+        s_rrc_scr_in_i[k] = burst_in[k * 2 + 0];
+        s_rrc_scr_in_q[k] = burst_in[k * 2 + 1];
+    }
+    for (int k = n_complex; k < fir_len; k++) {
+        s_rrc_scr_in_i[k] = 0;
+        s_rrc_scr_in_q[k] = 0;
+    }
+    // PIE real FIR on each channel. decim=1 so input_len == output_len.
+    // arp4's return value is unreliable on this esp-dsp version (see
+    // hardware notes in the plan); we use fir_len directly.
+    (void)dsps_fird_s16_arp4(&s_rrc_fir_i, s_rrc_scr_in_i,
+                              s_rrc_scr_out_i, fir_len);
+    (void)dsps_fird_s16_arp4(&s_rrc_fir_q, s_rrc_scr_in_q,
+                              s_rrc_scr_out_q, fir_len);
+    // Re-interleave, skipping the first RRC_GROUP_DELAY transient
+    // samples so output[k] corresponds to scalar's centred output[k].
+    for (int k = 0; k < n_complex; k++) {
+        burst_out[k * 2 + 0] = s_rrc_scr_out_i[k + RRC_GROUP_DELAY];
+        burst_out[k * 2 + 1] = s_rrc_scr_out_q[k + RRC_GROUP_DELAY];
+    }
+    return;
+rrc_scalar_fallback: ;   // empty stmt — falls through to scalar below
+#endif
+
     const int center = (RRC_NTAPS - 1) / 2;
 
     // Linear delay line (no circular modulo in the inner loop).
