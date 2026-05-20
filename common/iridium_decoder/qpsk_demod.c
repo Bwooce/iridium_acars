@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "esp_log.h"
@@ -6,6 +7,13 @@
 #include "sym_timing.h"
 
 static const char *TAG = "QPSK";
+
+// Diagnostic: dump per-symbol PLL state for the first burst that
+// passes UW detection. Gated by env var QPSK_DUMP=<path> on host
+// (no-op on target builds because getenv returns NULL there for
+// embedded paths anyway). Used to localise where our hard-decision
+// stream diverges from gri's expected symbols past the UW. One-shot.
+static int s_qpsk_dump_done = 0;
 
 static const int IR_UW_DL[] = { 0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2 };
 static const int IR_UW_UL[] = { 2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2 };
@@ -261,8 +269,43 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         out->bits[2 * i + 1] = decoded & 1;
     }
 
-    ESP_LOGI(TAG, "Successfully demodulated %s frame, %d bits", 
+    ESP_LOGI(TAG, "Successfully demodulated %s frame, %d bits",
              (out->direction == DIR_DOWNLINK) ? "DL" : "UL", out->n_bits);
+
+#ifndef ESP_PLATFORM
+    // One-shot per-symbol dump for the first UW-locked burst. Writes
+    // i, re_in, im_in, re_pll, im_pll, hd, bit_hi, bit_lo per row so an
+    // external script can compare against gri's expected hd / bits and
+    // pinpoint the symbol index where PLL phase or sample timing
+    // diverges. Set QPSK_DUMP=/tmp/qpsk_dump.csv to enable.
+    if (!s_qpsk_dump_done) {
+        const char *path = getenv("QPSK_DUMP");
+        if (path && path[0]) {
+            FILE *fp = fopen(path, "w");
+            if (fp) {
+                fprintf(fp, "i,re_in,im_in,re_pll,im_pll,hd,bit_hi,bit_lo\n");
+                int prev = 0;
+                for (int i = 0; i < n_symbols; i++) {
+                    int diff = (hard_decisions[i] - prev + 4) % 4;
+                    prev = hard_decisions[i];
+                    int decoded = DQPSK_MAP[diff];
+                    fprintf(fp, "%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d\n",
+                            i,
+                            (double)crealf(symbols[i]),
+                            (double)cimagf(symbols[i]),
+                            (double)crealf(pll_out[i]),
+                            (double)cimagf(pll_out[i]),
+                            hard_decisions[i],
+                            (decoded >> 1) & 1, decoded & 1);
+                }
+                fclose(fp);
+                ESP_LOGI(TAG, "QPSK_DUMP: wrote %d symbols to %s",
+                         n_symbols, path);
+            }
+            s_qpsk_dump_done = 1;
+        }
+    }
+#endif
 
     free(symbols); free(pll_out); free(hard_decisions);
     return 1;
