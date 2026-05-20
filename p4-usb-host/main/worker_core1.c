@@ -93,6 +93,10 @@ static volatile uint64_t s_t_bch_us     = 0;
 
 static int16_t          *s_extract_buf  = NULL;   // 2.5 MSPS wideband window
 static int16_t          *s_decim_buf    = NULL;   // 250 ksps post-decim
+static int16_t          *s_chunk_iq     = NULL;   // INTERNAL — per-chunk IQ scratch
+                                                  // (rotate runs here, then
+                                                  // process_split deinterleaves
+                                                  // from here)
 // Deinterleave scratch for direct_if_decim_process_split (PSRAM —
 // no DMA so plain heap_caps_malloc with MALLOC_CAP_SPIRAM is fine).
 static int16_t          *s_decim_scr_in_i  = NULL;
@@ -153,41 +157,55 @@ void worker_task(void *arg)
             int64_t t_ext1 = esp_timer_get_time();
             s_t_extract_us += (uint64_t)(t_ext1 - t_ext0);
 
-            // 2. Rotation to DC via Q15 incremental phasor (task #58
-            // step 1). ~30× faster than the cosf/sinf reference on
-            // RV-32IMF, with cosf/sinf renormalisation every 128
-            // samples to bound the Q15-magnitude-decay drift.
-            // Host-validated to NMSE ≤ -40 dB vs the reference and
-            // decode-count-equivalent on test_pipeline_wideband_albq
-            // (59/133 either way).
+            // 2 + 3. Fused rotate-to-DC + 10× decim, both running on
+            // internal-SRAM chunks. The previous design rotated the
+            // whole burst in PSRAM (~25 ms PSRAM round-trip) and then
+            // decimated from PSRAM scratch (PIE FIR partially blocked
+            // by the same vld.128 constraint as the FFT). This loop
+            // reads each DECIM_CHUNK_IN-sample slice from extract_buf
+            // (PSRAM, single linear read) into the internal-SRAM
+            // chunk buffer, rotates it there, then hands it to
+            // process_split (whose scratch is also internal). PSRAM
+            // is touched once per burst (read-only) instead of three
+            // times (extract-write + rotate-read+write + decim-read).
+            //
+            // Phase continuity across chunks via
+            // rotate_to_dc_q15_inc_at(..., sample_offset = off): each
+            // chunk's first absolute-phase renorm uses the burst-global
+            // sample index so the rotated output is identical to a
+            // single all-burst rotate call (within Q15 saturation).
+            //
+            // Streaming FIR delay-line state in `s_decim` carries
+            // history across chunks within a burst; reset once per
+            // burst so leftover history from previous bursts doesn't
+            // bleed in.
             int64_t t_rot0 = esp_timer_get_time();
             double phase_step = -2.0 * M_PI * (double)burst.rel_freq_hz
                                  / (double)FS_DETECT_HZ;
-            rotate_to_dc_q15_inc(s_extract_buf, (int)ext_len, phase_step);
             int64_t t_rot1 = esp_timer_get_time();
+            // Rotate-stage timer (kept for the per-stage breakdown) is
+            // effectively the cosf/sinf phase_step setup now — the
+            // per-chunk rotate work counts under the decim timer.
             s_t_rotate_us += (uint64_t)(t_rot1 - t_rot0);
 
-            // 3. 10× decim 2.5 MSPS → 250 ksps via the split
-            // (deinterleave + real-FIR ×2) path. On target this uses
-            // esp-dsp's PIE-accelerated dsps_fird_s16_arp4 internally;
-            // on host the same code path uses portable C. Reset
-            // streaming FIR state between unrelated bursts so leftover
-            // history from a previous burst doesn't bleed into this one.
-            //
-            // Processed in DECIM_CHUNK_IN-sample chunks so the PIE FIR
-            // scratch (s_decim_scr_in_i/q) fits in internal SRAM — the
-            // PIE path is silently broken on PSRAM inputs (same vld.128
-            // constraint as the front-end FFT). Streaming FIR delay
-            // line in `s_decim` carries history across chunks within
-            // a burst, so outputs concatenate seamlessly.
             int64_t t_dec0 = esp_timer_get_time();
             direct_if_decim_reset_state(&s_decim);
             int n_250k = 0;
             for (int off = 0; off < (int)ext_len; off += DECIM_CHUNK_IN) {
                 int chunk = (int)ext_len - off;
                 if (chunk > DECIM_CHUNK_IN) chunk = DECIM_CHUNK_IN;
+                // Pull chunk from PSRAM extract_buf into the internal-
+                // SRAM chunk buffer (single linear memcpy, cache-warm).
+                memcpy(s_chunk_iq,
+                       s_extract_buf + (size_t)off * 2,
+                       (size_t)chunk * 2 * sizeof(int16_t));
+                // Rotate the chunk in internal SRAM. sample_offset = off
+                // keeps the absolute-phase renorm aligned across the
+                // burst as if it were a single rotate call.
+                rotate_to_dc_q15_inc_at(s_chunk_iq, chunk,
+                                         phase_step, off);
                 int n_chunk_out = direct_if_decim_process_split(&s_decim,
-                                       s_extract_buf + (size_t)off * 2, chunk,
+                                       s_chunk_iq, chunk,
                                        s_decim_buf + (size_t)n_250k * 2,
                                        s_decim_scr_in_i, s_decim_scr_in_q,
                                        s_decim_scr_out_i, s_decim_scr_out_q);
@@ -287,13 +305,15 @@ esp_err_t worker_core1_init(void)
     size_t scr_in_bytes   = (size_t)DECIM_CHUNK_IN      * sizeof(int16_t);
     size_t scr_out_bytes  = (size_t)(DECIM_CHUNK_IN / DIDECIM_DECIM)
                                                         * sizeof(int16_t);
+    size_t chunk_iq_bytes = (size_t)DECIM_CHUNK_IN * 2 * sizeof(int16_t);
     s_extract_buf      = heap_caps_malloc(ext_bytes,     MALLOC_CAP_SPIRAM);
     s_decim_buf        = heap_caps_malloc(dec_bytes,     MALLOC_CAP_SPIRAM);
+    s_chunk_iq         = heap_caps_aligned_alloc(16, chunk_iq_bytes, MALLOC_CAP_INTERNAL);
     s_decim_scr_in_i   = heap_caps_aligned_alloc(16, scr_in_bytes,  MALLOC_CAP_INTERNAL);
     s_decim_scr_in_q   = heap_caps_aligned_alloc(16, scr_in_bytes,  MALLOC_CAP_INTERNAL);
     s_decim_scr_out_i  = heap_caps_aligned_alloc(16, scr_out_bytes, MALLOC_CAP_INTERNAL);
     s_decim_scr_out_q  = heap_caps_aligned_alloc(16, scr_out_bytes, MALLOC_CAP_INTERNAL);
-    if (!s_extract_buf || !s_decim_buf
+    if (!s_extract_buf || !s_decim_buf || !s_chunk_iq
         || !s_decim_scr_in_i || !s_decim_scr_in_q
         || !s_decim_scr_out_i || !s_decim_scr_out_q) {
         ESP_LOGE(TAG, "Worker buffer alloc failed");

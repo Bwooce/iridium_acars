@@ -241,3 +241,44 @@ void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step)
         n_to_renorm++;
     }
 }
+
+void rotate_to_dc_q15_inc_at(int16_t *iq, int n_complex,
+                              double phase_step, int sample_offset)
+{
+    // Same algorithm as rotate_to_dc_q15_inc but the absolute-phase
+    // renorm uses (sample_offset + k) instead of k, so a burst rotated
+    // chunk-by-chunk by the worker_core1 chunk loop matches what a
+    // single all-in-one call would have produced (modulo Q15 saturation
+    // rounding ordering). Each chunk's first sample force-renorms via
+    // n_to_renorm = ROT_RENORM_PERIOD on entry — no inter-chunk state
+    // is carried in the running phasor, the cos/sin reference fully
+    // re-establishes it.
+    double cs_d = cos(phase_step);
+    double ss_d = sin(phase_step);
+    int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
+    int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
+
+    int16_t pr_q = 32767;
+    int16_t pi_q = 0;
+    int n_to_renorm = ROT_RENORM_PERIOD;
+
+    for (int k = 0; k < n_complex; k++) {
+        if (n_to_renorm >= ROT_RENORM_PERIOD) {
+            n_to_renorm = 0;
+            double phase = phase_step * (double)(sample_offset + k);
+            pr_q = (int16_t)lrint(cos(phase) * 32767.0);
+            pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+        }
+        int32_t r = iq[k * 2 + 0];
+        int32_t v = iq[k * 2 + 1];
+        int32_t nr = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
+        int32_t ni = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
+        iq[k * 2 + 0] = q15_sat(nr);
+        iq[k * 2 + 1] = q15_sat(ni);
+        int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
+        int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
+        pr_q = q15_sat(npr);
+        pi_q = q15_sat(npi);
+        n_to_renorm++;
+    }
+}

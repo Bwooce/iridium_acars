@@ -47,6 +47,19 @@ void rotate_to_dc(int16_t *iq, int n_complex, double phase_step);
 // 4 int16 muls instead of 2 software-polynomial trig calls).
 void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step);
 
+// Same as rotate_to_dc_q15_inc but treats `iq[0]` as if it were
+// sample `sample_offset` in a larger logical stream — i.e. uses
+// phase `(sample_offset + k) * phase_step` for output sample k.
+// Used by the worker_core1 chunk loop to maintain phase continuity
+// across chunks: a burst is rotated in N internal-SRAM chunks of
+// CHUNK samples each, with this function called per chunk and
+// sample_offset = chunk_index * CHUNK so the absolute-phase
+// renorm at each ROT_RENORM_PERIOD boundary lines up exactly
+// with what a single all-in-one rotate_to_dc_q15_inc would have
+// produced (within Q15 saturation rounding).
+void rotate_to_dc_q15_inc_at(int16_t *iq, int n_complex,
+                              double phase_step, int sample_offset);
+
 // Chunked scalar reference for the PIE int16 SIMD path. Same
 // numerics as rotate_to_dc_q15_inc but structured in 8-sample
 // chunks to match how the PIE asm pipelines: per chunk, first
