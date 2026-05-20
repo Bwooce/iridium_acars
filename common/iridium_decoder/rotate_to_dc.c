@@ -182,14 +182,107 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
     }
 }
 
-// PIE asm prototype — implemented in rotate_to_dc_q15_simd_arp4.S
-// (P4 only). The .S file defines ROT_SIMD_ARP4_AVAILABLE through the
-// build system when present; until that lands the dispatcher below
-// stays on the scalar reference.
-#if defined(ESP_PLATFORM) && defined(ROT_SIMD_ARP4_AVAILABLE)
+// ESP_PLATFORM PIE SIMD path. The 8-lane inner kernel
+// rotate_q15_chunk_arp4 lives in rotate_to_dc_arp4.S; this C wrapper
+// owns the outer per-chunk loop (renorm + phasor advance + de/inter-
+// leave) so we can iterate on the inner kernel without re-doing the
+// boilerplate. Same numerical contract as rotate_to_dc_q15_simd_ref_at
+// within Q15 saturation rounding; validated on target via the
+// scalar-vs-PIE diff diagnostic in smoke_test (see ROT_SIMD_DIAG).
+#ifdef ESP_PLATFORM
+#define ROT_SIMD_ARP4_AVAILABLE 1
+
+extern void rotate_q15_chunk_arp4(const int16_t *I, const int16_t *Q,
+                                   const int16_t *cs, const int16_t *ss,
+                                   int16_t *nI, int16_t *nQ);
+
 void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
-                                    double phase_step, int sample_offset);
-#endif
+                                    double phase_step, int sample_offset)
+{
+    double cs_d = cos(phase_step);
+    double ss_d = sin(phase_step);
+    int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
+    int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
+
+    int16_t pr_q = 32767;
+    int16_t pi_q = 0;
+    int n_chunks_to_renorm = 0;
+
+    int n_chunks = n_complex / ROT_SIMD_LANES;
+    int tail_start = n_chunks * ROT_SIMD_LANES;
+
+    // Stack-resident, 16-byte aligned scratch — PIE vld.128 needs
+    // alignment, and we set the unaligned cfg bit anyway as a safety
+    // net (see rotate_to_dc_arp4.S). The deinterleave + interleave
+    // cost is ~16 cycles/chunk vs the ~8-lane SIMD inner kernel's
+    // ~12 cycles/chunk; net per-chunk ~30 cycles vs scalar ~210.
+    int16_t I_lane[ROT_SIMD_LANES]   __attribute__((aligned(16)));
+    int16_t Q_lane[ROT_SIMD_LANES]   __attribute__((aligned(16)));
+    int16_t cs_lane[ROT_SIMD_LANES]  __attribute__((aligned(16)));
+    int16_t ss_lane[ROT_SIMD_LANES]  __attribute__((aligned(16)));
+    int16_t nI[ROT_SIMD_LANES]       __attribute__((aligned(16)));
+    int16_t nQ[ROT_SIMD_LANES]       __attribute__((aligned(16)));
+
+    for (int c = 0; c < n_chunks; c++) {
+        if (n_chunks_to_renorm == 0) {
+            double phase = phase_step * (double)(sample_offset
+                                                  + c * ROT_SIMD_LANES);
+            pr_q = (int16_t)lrint(cos(phase) * 32767.0);
+            pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+            n_chunks_to_renorm = ROT_RENORM_PERIOD / ROT_SIMD_LANES;
+        }
+        n_chunks_to_renorm--;
+
+        // Build the 8 per-lane phasor values via incremental Q15
+        // advance — same exact arithmetic as the scalar reference so
+        // a phasor-mismatch can't be the source of any output diff.
+        for (int k = 0; k < ROT_SIMD_LANES; k++) {
+            cs_lane[k] = pr_q;
+            ss_lane[k] = pi_q;
+            int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
+            int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
+            pr_q = q15_sat(npr);
+            pi_q = q15_sat(npi);
+        }
+
+        // Deinterleave the 8 IQ pairs into split I/Q lanes for the
+        // SIMD kernel (which operates on real-only int16 vectors).
+        int16_t *p = iq + (size_t)(c * ROT_SIMD_LANES) * 2;
+        for (int k = 0; k < ROT_SIMD_LANES; k++) {
+            I_lane[k] = p[k * 2 + 0];
+            Q_lane[k] = p[k * 2 + 1];
+        }
+
+        rotate_q15_chunk_arp4(I_lane, Q_lane, cs_lane, ss_lane, nI, nQ);
+
+        // Re-interleave.
+        for (int k = 0; k < ROT_SIMD_LANES; k++) {
+            p[k * 2 + 0] = nI[k];
+            p[k * 2 + 1] = nQ[k];
+        }
+    }
+
+    // Tail (fewer than ROT_SIMD_LANES remaining samples) — scalar
+    // per-sample, identical to _simd_ref_at's tail.
+    if (tail_start < n_complex) {
+        double phase = phase_step * (double)(sample_offset + tail_start);
+        pr_q = (int16_t)lrint(cos(phase) * 32767.0);
+        pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+        for (int k = tail_start; k < n_complex; k++) {
+            int32_t r = iq[k * 2 + 0];
+            int32_t v = iq[k * 2 + 1];
+            int32_t nr = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
+            int32_t ni = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
+            iq[k * 2 + 0] = q15_sat(nr);
+            iq[k * 2 + 1] = q15_sat(ni);
+            int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
+            int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
+            pr_q = q15_sat(npr);
+            pi_q = q15_sat(npi);
+        }
+    }
+}
+#endif /* ESP_PLATFORM */
 
 // Platform-best dispatcher. P4 firmware calls the PIE asm if it has
 // been linked in (ROT_SIMD_ARP4_AVAILABLE); otherwise both paths

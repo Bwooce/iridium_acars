@@ -55,8 +55,14 @@ idf_component_register(
         # Absolute-phase IQ rotation shared with the host wideband
         # test. Lives here (not in worker_core1 / the test) because
         # both call sites need the SAME Q15-magnitude-decay-avoiding
-        # implementation; the header explains the trap.
+        # implementation; the header explains the trap. Companion
+        # P4 PIE asm (rotate_to_dc_arp4.S) is the 8-lane SIMD kernel
+        # called by rotate_to_dc_q15_simd_arp4_at — the .S file
+        # self-gates on `__riscv && SOC_CPU_HAS_PIE` so it compiles
+        # to a no-op on host (and on Xtensa) and lets the same
+        # CMakeLists serve both target builds.
         "rotate_to_dc.c"
+        "rotate_to_dc_arp4.S"
         # firmr_s16 was previously host-only (P4 called esp-dsp's
         # dsps_firmr_s16 directly). resample_256_to_250 depends on
         # it, so compile firmr_s16.c into the IDF target too. Same
