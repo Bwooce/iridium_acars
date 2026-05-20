@@ -640,6 +640,11 @@ void smoke_test_run(void)
                  snr_db);
         pass = false;
     }
+    // Golden-bits comparison: per-burst Hamming distance vs gri's
+    // canonical decoded bits, with claim-tracking so each gri entry
+    // is matched at most once and unclaimed entries are surfaced as
+    // GOLDEN-MISSED rows.
+    worker_core1_golden_print_summary();
 #elif CONFIG_SMOKE_TEST_CORPUS
     const int CORPUS_BIN_LO = 1014;
     const int CORPUS_BIN_HI = 1034;

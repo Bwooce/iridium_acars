@@ -28,4 +28,9 @@ typedef struct {
 
 void worker_core1_get_stats(worker_stats_t *out);
 
+// Smoke-only: dumps per-burst golden-bits comparison summary at the
+// end of the smoke run. Compiled to a no-op outside the
+// CONFIG_SMOKE_TEST_RAW_IRIDIUM build.
+void worker_core1_golden_print_summary(void);
+
 #endif

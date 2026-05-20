@@ -34,6 +34,11 @@
 #include "rotate_to_dc.h"
 #include "bch_decoder.h"
 #include "frame_decoder.h"
+#include "sdkconfig.h"
+
+#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
+#include "fixture_albq_golden_bits.h"
+#endif
 
 static const char *TAG = "WORKER1";
 
@@ -53,6 +58,191 @@ static volatile uint64_t s_t_rotate_us  = 0;
 static volatile uint64_t s_t_decim_us   = 0;
 static volatile uint64_t s_t_pipeline_us = 0;
 static volatile uint64_t s_t_bch_us     = 0;
+
+#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
+// Golden-bits comparison counters (smoke build only). Each decoded
+// burst is matched to a gri golden entry by (start_sample_2500k,
+// freq_offset_hz) tolerance window. We then compute Hamming
+// distance over the overlapping prefix and bucket the result.
+//
+// Tolerances:
+//   ±125000 samples (50 ms at 2.5 MSPS) — gri's reported timestamp_ms
+//     is the DECODED-FRAME time (post-UW-correlation offset), not the
+//     burst-tagger start. Same window we use for tagger-vs-manifest
+//     in test_tagger_vs_manifest.c (the 86% recall test).
+//   ±20000 Hz freq offset — about half a channel width (40 kHz)
+//     since adjacent-channel bursts shouldn't false-match.
+#define GOLDEN_TIME_TOL_2500K   125000
+#define GOLDEN_FREQ_TOL_HZ      20000
+
+static volatile uint32_t s_gold_decoded         = 0;  // device decoded a frame
+static volatile uint32_t s_gold_matched         = 0;  // and matched a golden entry
+static volatile uint32_t s_gold_unmatched       = 0;  // decoded but no golden in window
+static volatile uint32_t s_gold_exact           = 0;  // BER = 0 over min length
+static volatile uint32_t s_gold_close           = 0;  // BER < 5 %
+static volatile uint32_t s_gold_partial         = 0;  // BER < 25 %
+static volatile uint32_t s_gold_divergent       = 0;  // BER >= 25 %
+static volatile uint32_t s_gold_total_bits      = 0;  // sum of min(device, gri) lengths
+static volatile uint32_t s_gold_total_errors    = 0;  // sum of Hamming distances
+static volatile uint32_t s_gold_len_eq          = 0;  // device n_bits == gri n_bits
+static volatile uint32_t s_gold_len_short       = 0;  // device n_bits < gri n_bits
+
+// Per-golden-entry "claimed" flag. When a device burst matches a
+// golden entry, we mark it so a second device burst at the same
+// time-freq cell can't double-count it. After all bursts have been
+// processed, unclaimed golden entries are "MISSED by device" —
+// the recall complement of the matched count.
+static uint8_t s_gold_claimed[128];  // sized > FIXTURE_ALBQ_RAW_GOLDEN_COUNT
+
+// Per-burst row for end-of-run reporting (smoke only — 65-ish bursts,
+// fits comfortably in RAM).
+typedef struct {
+    int      gri_id;
+    int      device_n_bits;
+    int      gri_n_bits;
+    int      compared_bits;
+    int      errors;
+    int      bucket;   // 0=exact 1=close 2=partial 3=divergent 4=unmatched
+} golden_row_t;
+static golden_row_t s_gold_rows[128];
+static int          s_gold_n_rows = 0;
+
+static void golden_compare_burst(const detected_burst_t *burst,
+                                  const decoded_frame_t *frame)
+{
+    s_gold_decoded++;
+    // Find golden entry within tolerance window. Pick the one with
+    // smallest combined (Δsample, Δfreq) distance.
+    int best = -1;
+    int64_t best_score = INT64_MAX;
+    for (int g = 0; g < FIXTURE_ALBQ_RAW_GOLDEN_COUNT; g++) {
+        if (s_gold_claimed[g]) continue;  // already paired with an earlier burst
+        const golden_burst_t *e = &FIXTURE_ALBQ_RAW_GOLDEN_BURSTS[g];
+        int64_t ds = (int64_t)burst->start_sample_idx
+                     - (int64_t)e->start_sample_2500k;
+        if (ds < 0) ds = -ds;
+        if (ds > GOLDEN_TIME_TOL_2500K) continue;
+        int64_t df = (int64_t)burst->rel_freq_hz - (int64_t)e->freq_offset_hz;
+        if (df < 0) df = -df;
+        if (df > GOLDEN_FREQ_TOL_HZ) continue;
+        // Combined score normalised to tolerances.
+        int64_t score = (ds * 100 / GOLDEN_TIME_TOL_2500K)
+                       + (df * 100 / GOLDEN_FREQ_TOL_HZ);
+        if (score < best_score) {
+            best_score = score;
+            best = g;
+        }
+    }
+    if (best < 0) {
+        s_gold_unmatched++;
+        if (s_gold_n_rows < (int)(sizeof(s_gold_rows) / sizeof(s_gold_rows[0]))) {
+            s_gold_rows[s_gold_n_rows++] = (golden_row_t){
+                .gri_id = -1, .device_n_bits = frame->n_bits,
+                .gri_n_bits = 0, .compared_bits = 0, .errors = 0,
+                .bucket = 4,
+            };
+        }
+        return;
+    }
+    s_gold_claimed[best] = 1;  // pair this golden entry to the current device burst
+    const golden_burst_t *e = &FIXTURE_ALBQ_RAW_GOLDEN_BURSTS[best];
+    int cmp_n = frame->n_bits < e->gri_n_bits ? frame->n_bits : e->gri_n_bits;
+    int errors = 0;
+    for (int k = 0; k < cmp_n; k++) {
+        if (frame->bits[k] != e->gri_bits[k]) errors++;
+    }
+    s_gold_matched++;
+    s_gold_total_bits += (uint32_t)cmp_n;
+    s_gold_total_errors += (uint32_t)errors;
+    if (frame->n_bits == e->gri_n_bits) s_gold_len_eq++;
+    else if (frame->n_bits < e->gri_n_bits) s_gold_len_short++;
+
+    int bucket;
+    if (cmp_n == 0) {
+        bucket = 4;  // can't classify with zero bits compared
+    } else {
+        int ber_pct = errors * 100 / cmp_n;
+        if (errors == 0)       { s_gold_exact++;     bucket = 0; }
+        else if (ber_pct < 5)  { s_gold_close++;     bucket = 1; }
+        else if (ber_pct < 25) { s_gold_partial++;   bucket = 2; }
+        else                   { s_gold_divergent++; bucket = 3; }
+    }
+    if (s_gold_n_rows < (int)(sizeof(s_gold_rows) / sizeof(s_gold_rows[0]))) {
+        s_gold_rows[s_gold_n_rows++] = (golden_row_t){
+            .gri_id = e->gri_id,
+            .device_n_bits = frame->n_bits,
+            .gri_n_bits = e->gri_n_bits,
+            .compared_bits = cmp_n,
+            .errors = errors,
+            .bucket = bucket,
+        };
+    }
+}
+
+void worker_core1_golden_print_summary(void)
+{
+    int n_gri = FIXTURE_ALBQ_RAW_GOLDEN_COUNT;
+    int n_missed = 0;
+    for (int g = 0; g < n_gri; g++) {
+        if (!s_gold_claimed[g]) n_missed++;
+    }
+    double recall_pct    = n_gri > 0 ? 100.0 * (double)s_gold_matched / (double)n_gri : 0.0;
+    double precision_pct = s_gold_decoded > 0
+        ? 100.0 * (double)s_gold_matched / (double)s_gold_decoded : 0.0;
+    ESP_LOGI(TAG, "GOLDEN: gri_total=%d device_decoded=%u matched=%u "
+                  "missed_by_device=%d unmatched_device=%u "
+                  "(recall=%.1f%% precision=%.1f%%)",
+             n_gri, s_gold_decoded, s_gold_matched, n_missed,
+             s_gold_unmatched, recall_pct, precision_pct);
+    ESP_LOGI(TAG, "GOLDEN: histogram exact=%u close(BER<5%%)=%u "
+                  "partial(<25%%)=%u divergent(>=25%%)=%u",
+             s_gold_exact, s_gold_close, s_gold_partial, s_gold_divergent);
+    if (s_gold_total_bits > 0) {
+        ESP_LOGI(TAG, "GOLDEN: overall BER %u/%u = %.2f%% "
+                      "(length_eq=%u length_short=%u)",
+                 s_gold_total_errors, s_gold_total_bits,
+                 100.0 * (double)s_gold_total_errors / (double)s_gold_total_bits,
+                 s_gold_len_eq, s_gold_len_short);
+    }
+    // Detail dump (one line per row) for offline diff against gri.
+    for (int i = 0; i < s_gold_n_rows; i++) {
+        const golden_row_t *r = &s_gold_rows[i];
+        if (r->bucket == 4 && r->gri_id < 0) {
+            ESP_LOGI(TAG, "GOLDEN[%d]: UNMATCHED device_n=%d", i, r->device_n_bits);
+        } else {
+            const char *tag = r->bucket == 0 ? "EXACT"
+                            : r->bucket == 1 ? "CLOSE"
+                            : r->bucket == 2 ? "PARTIAL"
+                            : r->bucket == 3 ? "DIVERG"
+                            :                 "UNMATCH";
+            ESP_LOGI(TAG, "GOLDEN[%d]: gri_id=%d %s err=%d/%d "
+                          "(device_n=%d gri_n=%d)",
+                     i, r->gri_id, tag, r->errors, r->compared_bits,
+                     r->device_n_bits, r->gri_n_bits);
+        }
+    }
+    // Missed-by-device rows: gri decoded these but no device burst
+    // claimed them in the alignment window. The gri burst could be:
+    //   (a) below our SNR threshold (we never tagged it),
+    //   (b) tagged but with bad start / freq putting it outside our window,
+    //   (c) tagged but failed to demod end-to-end (no decoded_frame_t).
+    // Identifying which requires cross-referencing with the tagger
+    // log — for now just emit the gri_id so an offline script can
+    // do the deeper match.
+    for (int g = 0; g < n_gri; g++) {
+        if (s_gold_claimed[g]) continue;
+        const golden_burst_t *e = &FIXTURE_ALBQ_RAW_GOLDEN_BURSTS[g];
+        ESP_LOGI(TAG, "GOLDEN-MISSED: gri_id=%d start=%llu freq_off=%ld "
+                      "conf=%d gri_n_bits=%d",
+                 e->gri_id, (unsigned long long)e->start_sample_2500k,
+                 (long)e->freq_offset_hz, e->conf_pct, e->gri_n_bits);
+    }
+}
+#else
+// Outside the smoke build, the public summary entry is a no-op so
+// smoke_test.c can call it unconditionally.
+void worker_core1_golden_print_summary(void) {}
+#endif  // CONFIG_SMOKE_TEST_RAW_IRIDIUM
 
 // Buffer sizes for the wideband per-burst window. The tagger
 // publishes variable-length bursts via gri's gone-event semantics
@@ -247,6 +437,9 @@ void worker_task(void *arg)
                 ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)",
                          frame.direction == DIR_DOWNLINK ? "DL" : "UL",
                          frame.n_bits);
+#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
+                golden_compare_burst(&burst, &frame);
+#endif
 
                 if (frame.n_bits >= 24 + 64) {
                     const uint8_t *payload = frame.bits + 24;
