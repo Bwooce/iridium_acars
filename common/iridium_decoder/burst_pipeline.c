@@ -1,6 +1,7 @@
 // See burst_pipeline.h for design rationale and pipeline ordering.
 
 #include "burst_pipeline.h"
+#include "rotate_to_dc.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -300,13 +301,26 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     //    Sign convention matches uw_correlator_estimate_cfo: the
     //    returned omega is the NEGATIVE of the actual offset, so
     //    multiplying by exp(+j·omega/sps·n) cancels it.
+    //
+    // Use absolute-phase rotation (rotate_to_dc_q15_simd_at) rather
+    // than Q15 incremental phasor multiplication. The incremental
+    // p ← p · exp(j·dphi) with >>15 truncation loses ~0.012%
+    // magnitude per sample; over 7900-sample bursts that decays to
+    // ~5% of initial, collapsing the modulation into a constant-phase
+    // tone for large-residual-carrier bursts (gri_id=70 freq_off
+    // -342 kHz was a clean example: post-CFO phases clustered at
+    // ±170° instead of swinging through quadrants -- hd diverged at
+    // first post-UW symbol with 180° flip). See memory note
+    // `feedback_q15_incremental_phasor_decays.md`.
+    //
+    // rotate_to_dc_q15_simd_at periodically renormalises pr_q/pi_q
+    // to the exact absolute-phase quantisation so the magnitude
+    // stays at Q15 unit length, matching gr-iridium's volk-based
+    // per-sample rotation exactly.
     if (omega_coarse != 0.0f) {
         float dphi = omega_coarse / (float)UW_SPS;
-        q15_freq_shift_inplace(adj_burst, adj_n,
-                               q15_from_float(1.0f),     // initial pr
-                               q15_from_float(0.0f),     // initial pi
-                               q15_from_float(cosf(dphi)),
-                               q15_from_float(sinf(dphi)));
+        rotate_to_dc_q15_simd_at(adj_burst, adj_n,
+                                  (double)dphi, 0);
     }
     PROFILE_LOG(PREROT);
 
