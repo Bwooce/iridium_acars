@@ -1,9 +1,17 @@
-// See fft_sc16_2048.h. Same algorithm as fft_sc16_64.c (direct port
-// of esp-dsp's dsps_fft2r_sc16_ansi.c) sized for N=2048. The two
-// files share NO state — separate twiddle tables, separate init —
-// because the two FFT sizes are used in independent code paths and
-// always-on init/state shared between modules invites
-// initialisation-order bugs.
+// See fft_sc16_2048.h. On ESP32-P4 this wraps esp-dsp's PIE-accelerated
+// dsps_fft2r_sc16_arp4 (8-lane Q15 SIMD, ~3× the ANSI scalar version
+// on smoke). On host the ANSI port below runs — the algorithm is the
+// C reference for arp4 so output is bit-identical between the paths.
+//
+// CRITICAL on ESP_PLATFORM: the PIE FFT uses `esp.vld.128.ip` for its
+// vector loads, which cannot service PSRAM access timing — output is
+// silently garbage (peak at DC instead of the real tone) if `data`
+// is in PSRAM. We absorb this with a static 8 KB internal-SRAM
+// scratch (`s_fft_scratch`): copy caller's data in, run PIE FFT in
+// internal SRAM, copy result back. The copy is ~30 µs at internal-
+// SRAM bandwidth and dominates well below the ~1.5 ms FFT speedup
+// it unlocks. The twiddle table also lives in internal SRAM for the
+// same reason.
 
 #include "fft_sc16_2048.h"
 
@@ -11,9 +19,71 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef ESP_PLATFORM
+// Pull esp-dsp's headers BEFORE defining `N` locally — esp-dsp's
+// function prototypes use `int N` as parameter names and would
+// otherwise be macro-substituted to `int 2048`.
+#include <string.h>
+#include "dsps_fft2r.h"
+#include "esp_err.h"
+#include "esp_heap_caps.h"
+#endif
+
 #define N      FFT_SC16_2048_N    // 2048
 #define N_HALF (N / 2)            // 1024
 #define LOG2_N 11                 // log2(2048)
+
+#ifdef ESP_PLATFORM
+
+// Lazy-allocated from internal-SRAM HEAP (not .bss): static .bss
+// arrays would claim 12 KB of internal SRAM pre-main(), reducing the
+// post-boot free pool below the CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL
+// threshold (psram_init then panics on "Could not reserve internal/
+// DMA pool"). Allocating after boot from the internal heap is fine
+// because mag2/smooth in uw_correlator.c were moved to PSRAM,
+// freeing the 20 KB of .bss internal SRAM that previously made this
+// the binding constraint.
+//
+// s_w_table     — 4 KB, esp-dsp's twiddle table for N=2048
+// s_fft_scratch — 8 KB, target for in-place FFT (caller's `data`
+//                 may be in PSRAM which PIE asm can't service)
+static int16_t *s_w_table     = NULL;
+static int16_t *s_fft_scratch = NULL;
+static bool s_inited = false;
+
+void fft_sc16_2048_init(void)
+{
+    if (s_inited) return;
+    s_w_table     = (int16_t *)heap_caps_aligned_alloc(16, N * sizeof(int16_t),
+                                                        MALLOC_CAP_INTERNAL);
+    s_fft_scratch = (int16_t *)heap_caps_aligned_alloc(16, 2 * N * sizeof(int16_t),
+                                                        MALLOC_CAP_INTERNAL);
+    if (!s_w_table || !s_fft_scratch) return;  // alloc failed; FFT will no-op
+    // dsps_fft2r_init_sc16 ignores the size arg when buffer is NULL and
+    // uses CONFIG_DSP_MAX_FFT_SIZE (= 4096), producing cos(2π·i/4096)
+    // twiddles — wrong for our 2048-pt FFT (the inner loop reads w[j]
+    // without stride-correcting). Pass our own N=2048-sized buffer.
+    (void)dsps_fft2r_init_sc16(s_w_table, N);
+    s_inited = true;
+}
+
+void fft_sc16_2048(int16_t *data)
+{
+    if (!s_inited) fft_sc16_2048_init();
+    if (!s_inited) return;   // alloc still failing — caller sees no-op
+    memcpy(s_fft_scratch, data, 2 * N * sizeof(int16_t));
+    // PIE radix-2 DIF — output is in bit-reversed order, un-reverse
+    // to natural (DC at bin 0). dsps_bit_rev_sc16_ansi called directly
+    // because esp-dsp's macro alias is only defined in the
+    // !CONFIG_DSP_OPTIMIZED branch of dsps_fft2r.h (header bug — no
+    // PIE bit-rev exists for sc16, the ANSI scalar is fine).
+    dsps_fft2r_sc16(s_fft_scratch, N);
+    dsps_bit_rev_sc16_ansi(s_fft_scratch, N);
+    memcpy(data, s_fft_scratch, 2 * N * sizeof(int16_t));
+    (void)LOG2_N;   // legacy define; unused on this path
+}
+
+#else  /* host: ANSI scalar port, identical algorithm */
 
 static int16_t s_w_table[N];      // N int16 = N/2 complex (4 KB)
 static bool    s_inited = false;
@@ -153,3 +223,5 @@ void fft_sc16_2048(int16_t *data)
     bit_rev_data(data, N);
     (void)LOG2_N;     // kept as documentation; unused
 }
+
+#endif  /* ESP_PLATFORM */

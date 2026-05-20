@@ -1366,8 +1366,27 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
     // Q15 (sum-normalised → DC gain = 1 in Q15 too). MAC sum into
     // int64, then >>15 and saturate back to int32 for the smoothed
     // envelope. Threshold and max comparisons are all int32.
+    //
+    // Memory: 10 KB × 2 = 20 KB of scratch. On ESP_PLATFORM these
+    // live in PSRAM (lazy-allocated on first call) — keeping them in
+    // .bss would lock 20 KB of internal SRAM that the PIE FFT needs
+    // for its (data + twiddle) scratch (see fft_sc16_2048.c). Access
+    // pattern is write-once / read-sequentially-for-argmax → PSRAM
+    // cache lines are well-utilised, no measurable perf cost.
+#ifdef ESP_PLATFORM
+    static int32_t *mag2 = NULL;
+    static int32_t *smooth = NULL;
+    if (!mag2) {
+        mag2   = (int32_t *)heap_caps_malloc(START_SEARCH_MAX * sizeof(int32_t),
+                                              MALLOC_CAP_SPIRAM);
+        smooth = (int32_t *)heap_caps_malloc(START_SEARCH_MAX * sizeof(int32_t),
+                                              MALLOC_CAP_SPIRAM);
+        if (!mag2 || !smooth) return 0;     // OOM — caller treats as "no start"
+    }
+#else
     static int32_t mag2[START_SEARCH_MAX];
     static int32_t smooth[START_SEARCH_MAX];
+#endif
     if (search_max > START_SEARCH_MAX) search_max = START_SEARCH_MAX;
 
     for (int n = 0; n < search_max; n++) {
