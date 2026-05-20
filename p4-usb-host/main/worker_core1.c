@@ -103,12 +103,24 @@ typedef struct {
     int      compared_bits;
     int      errors;
     int      bucket;   // 0=exact 1=close 2=partial 3=divergent 4=unmatched
+    int      bch_e1;   // post-BCH block-1 correctable-error count, -1 if no BCH
+    int      bch_e2;   // post-BCH block-2 correctable-error count, -1 if no BCH
+    int      gri_conf; // gri's reported confidence pct (-1 for UNMATCHED rows)
 } golden_row_t;
 static golden_row_t s_gold_rows[128];
 static int          s_gold_n_rows = 0;
 
+// Aggregated post-BCH stats across matched-AND-BCH-attempted bursts.
+// e1/e2 < 0 means BCH failed (more than 3 errors → uncorrectable).
+// e1 == 0 && e2 == 0 → clean decode, no errors needed correcting.
+static volatile uint32_t s_gold_bch_clean    = 0;  // e1==0 && e2==0
+static volatile uint32_t s_gold_bch_corrected = 0; // (e1>0 || e2>0) && both ≥ 0
+static volatile uint32_t s_gold_bch_failed   = 0;  // either block uncorrectable
+static volatile uint32_t s_gold_bch_skipped  = 0;  // frame too short for BCH
+
 static void golden_compare_burst(const detected_burst_t *burst,
-                                  const decoded_frame_t *frame)
+                                  const decoded_frame_t *frame,
+                                  int e1_bch, int e2_bch)
 {
     s_gold_decoded++;
     // Find golden entry within tolerance window. Pick the one with
@@ -133,6 +145,19 @@ static void golden_compare_burst(const detected_burst_t *burst,
             best = g;
         }
     }
+    // Track BCH outcome regardless of whether we found a golden match —
+    // it's the most direct quality signal we have for the device's
+    // own decode (independent of any external reference).
+    if (e1_bch < 0 && e2_bch < 0) {
+        s_gold_bch_skipped++;
+    } else if (e1_bch < 0 || e2_bch < 0) {
+        s_gold_bch_failed++;
+    } else if (e1_bch == 0 && e2_bch == 0) {
+        s_gold_bch_clean++;
+    } else {
+        s_gold_bch_corrected++;
+    }
+
     if (best < 0) {
         s_gold_unmatched++;
         if (s_gold_n_rows < (int)(sizeof(s_gold_rows) / sizeof(s_gold_rows[0]))) {
@@ -140,6 +165,7 @@ static void golden_compare_burst(const detected_burst_t *burst,
                 .gri_id = -1, .device_n_bits = frame->n_bits,
                 .gri_n_bits = 0, .compared_bits = 0, .errors = 0,
                 .bucket = 4,
+                .bch_e1 = e1_bch, .bch_e2 = e2_bch, .gri_conf = -1,
             };
         }
         return;
@@ -194,6 +220,7 @@ static void golden_compare_burst(const detected_burst_t *burst,
             .compared_bits = cmp_n,
             .errors = errors,
             .bucket = bucket,
+            .bch_e1 = e1_bch, .bch_e2 = e2_bch, .gri_conf = e->conf_pct,
         };
     }
 }
@@ -216,6 +243,19 @@ void worker_core1_golden_print_summary(void)
     ESP_LOGI(TAG, "GOLDEN: histogram exact=%u close(BER<5%%)=%u "
                   "partial(<25%%)=%u divergent(>=25%%)=%u",
              s_gold_exact, s_gold_close, s_gold_partial, s_gold_divergent);
+    // Post-BCH quality — the most semantic signal we can produce
+    // without a known-good gri-side post-BCH oracle (task #61 follow-
+    // up). bch_clean means both BCH(31,21) blocks decoded with zero
+    // bit errors corrected (= ideal); bch_corrected means BCH had to
+    // fix 1-3 errors per block (still a valid frame, but at the edge
+    // of the code's capacity); bch_failed means at least one block
+    // had >3 errors (BCH gave up; the frame's first 2 BCH words are
+    // garbage); bch_skipped means the frame was shorter than 88 bits
+    // (UW + 2 blocks) so we didn't try BCH at all.
+    ESP_LOGI(TAG, "GOLDEN: BCH outcomes clean(e==0)=%u corrected(1<=e<=3)=%u "
+                  "failed(uncorrectable)=%u skipped(short_frame)=%u",
+             s_gold_bch_clean, s_gold_bch_corrected,
+             s_gold_bch_failed, s_gold_bch_skipped);
     if (s_gold_total_bits > 0) {
         ESP_LOGI(TAG, "GOLDEN: overall BER %u/%u = %.2f%% "
                       "(length_eq=%u length_short=%u)",
@@ -224,20 +264,29 @@ void worker_core1_golden_print_summary(void)
                  s_gold_len_eq, s_gold_len_short);
     }
     // Detail dump (one line per row) for offline diff against gri.
+    // bch=ee/EE prints the two block correctable-error counts so a
+    // pattern of high BCH errors localised to a few bursts can be
+    // distinguished from a global precision issue.
     for (int i = 0; i < s_gold_n_rows; i++) {
         const golden_row_t *r = &s_gold_rows[i];
+        char bch_str[32];
+        if (r->bch_e1 < 0 && r->bch_e2 < 0)      snprintf(bch_str, sizeof(bch_str), "skip");
+        else if (r->bch_e1 < 0 || r->bch_e2 < 0) snprintf(bch_str, sizeof(bch_str), "FAIL");
+        else                                      snprintf(bch_str, sizeof(bch_str), "%d/%d",
+                                                          r->bch_e1, r->bch_e2);
         if (r->bucket == 4 && r->gri_id < 0) {
-            ESP_LOGI(TAG, "GOLDEN[%d]: UNMATCHED device_n=%d", i, r->device_n_bits);
+            ESP_LOGI(TAG, "GOLDEN[%d]: UNMATCHED device_n=%d bch=%s",
+                     i, r->device_n_bits, bch_str);
         } else {
             const char *tag = r->bucket == 0 ? "EXACT"
                             : r->bucket == 1 ? "CLOSE"
                             : r->bucket == 2 ? "PARTIAL"
                             : r->bucket == 3 ? "DIVERG"
                             :                 "UNMATCH";
-            ESP_LOGI(TAG, "GOLDEN[%d]: gri_id=%d %s err=%d/%d "
-                          "(device_n=%d gri_n=%d)",
-                     i, r->gri_id, tag, r->errors, r->compared_bits,
-                     r->device_n_bits, r->gri_n_bits);
+            ESP_LOGI(TAG, "GOLDEN[%d]: gri_id=%d conf=%d%% %s "
+                          "raw_err=%d/%d bch=%s (device_n=%d gri_n=%d)",
+                     i, r->gri_id, r->gri_conf, tag, r->errors, r->compared_bits,
+                     bch_str, r->device_n_bits, r->gri_n_bits);
         }
     }
     // Missed-by-device rows: gri decoded these but no device burst
@@ -456,24 +505,31 @@ void worker_task(void *arg)
                 ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)",
                          frame.direction == DIR_DOWNLINK ? "DL" : "UL",
                          frame.n_bits);
-#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
-                golden_compare_burst(&burst, &frame);
-#endif
 
+                int e1_bch = -1, e2_bch = -1;
                 if (frame.n_bits >= 24 + 64) {
                     const uint8_t *payload = frame.bits + 24;
                     uint8_t block1[32], block2[32];
                     uint8_t data1[21], data2[21];
 
                     iridium_deinterleave(payload, block1, block2);
-                    int e1 = bch_decode_block(block1, data1);
-                    int e2 = bch_decode_block(block2, data2);
+                    e1_bch = bch_decode_block(block1, data1);
+                    e2_bch = bch_decode_block(block2, data2);
 
-                    if (e1 >= 0 && e2 >= 0) {
+                    if (e1_bch >= 0 && e2_bch >= 0) {
                         ESP_LOGI(TAG, "BCH DECODE SUCCESS! Errors: %d, %d",
-                                 e1, e2);
+                                 e1_bch, e2_bch);
                     }
                 }
+#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
+                // Golden compare runs AFTER BCH so the comparison row
+                // can record post-BCH quality (block-1 and block-2
+                // correctable-error counts). e1/e2 = -1 means BCH was
+                // not attempted (frame too short). BCH(31,21) corrects
+                // up to 3 errors per block; >3 returns a negative value
+                // meaning the block could not be decoded.
+                golden_compare_burst(&burst, &frame, e1_bch, e2_bch);
+#endif
 
                 frame_decoder_push(frame.bits, frame.n_bits,
                                    frame.direction, 0u,
