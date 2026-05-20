@@ -96,8 +96,8 @@ static inline int16_t q15_sat(int32_t x)
 // Tail samples (n_complex not a multiple of ROT_SIMD_LANES) are
 // processed scalar at the end via the existing q15_inc per-sample
 // path so the boundary doesn't need extra masking in the asm.
-void rotate_to_dc_q15_simd_ref(int16_t *iq, int n_complex,
-                                double phase_step)
+void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
+                                   double phase_step, int sample_offset)
 {
     double cs_d = cos(phase_step);
     double ss_d = sin(phase_step);
@@ -117,11 +117,14 @@ void rotate_to_dc_q15_simd_ref(int16_t *iq, int n_complex,
     for (int c = 0; c < n_chunks; c++) {
         // Chunk-aligned renorm: replace pr_q, pi_q with the exact
         // absolute-phase quantisation at the start of this chunk.
-        // Doing this every ROT_RENORM_PERIOD/ROT_SIMD_LANES chunks
-        // keeps the renorm cadence equivalent to q15_inc's
+        // sample_offset shifts the absolute-phase reference so the
+        // chunked-with-offset path is bit-equivalent to a single
+        // all-buffer rotate. Renorm cadence (every
+        // ROT_RENORM_PERIOD/ROT_SIMD_LANES chunks) matches q15_inc's
         // ROT_RENORM_PERIOD samples.
         if (n_chunks_to_renorm == 0) {
-            double phase = phase_step * (double)(c * ROT_SIMD_LANES);
+            double phase = phase_step * (double)(sample_offset
+                                                  + c * ROT_SIMD_LANES);
             pr_q = (int16_t)lrint(cos(phase) * 32767.0);
             pi_q = (int16_t)lrint(sin(phase) * 32767.0);
             n_chunks_to_renorm = ROT_RENORM_PERIOD / ROT_SIMD_LANES;
@@ -158,9 +161,10 @@ void rotate_to_dc_q15_simd_ref(int16_t *iq, int n_complex,
     // Tail (fewer than ROT_SIMD_LANES remaining samples). Reuse the
     // q15_inc per-sample path on the tail. Recompute the phasor at
     // the correct absolute phase first so the tail aligns with the
-    // chunk-processed prefix.
+    // chunk-processed prefix. sample_offset shifts the absolute phase
+    // so chunk-loop callers stay consistent across chunks.
     if (tail_start < n_complex) {
-        double phase = phase_step * (double)tail_start;
+        double phase = phase_step * (double)(sample_offset + tail_start);
         pr_q = (int16_t)lrint(cos(phase) * 32767.0);
         pi_q = (int16_t)lrint(sin(phase) * 32767.0);
         for (int k = tail_start; k < n_complex; k++) {
@@ -178,17 +182,27 @@ void rotate_to_dc_q15_simd_ref(int16_t *iq, int n_complex,
     }
 }
 
-// Platform-best dispatcher. On the P4 firmware this would forward to
-// the PIE asm (rotate_to_dc_q15_simd_arp4 — to be added under
-// ESP_PLATFORM). For now both paths use the scalar reference so the
-// dispatcher is functional on host AND target without the asm in
-// place yet.
-void rotate_to_dc_q15_simd(int16_t *iq, int n_complex, double phase_step)
+// PIE asm prototype — implemented in rotate_to_dc_q15_simd_arp4.S
+// (P4 only). The .S file defines ROT_SIMD_ARP4_AVAILABLE through the
+// build system when present; until that lands the dispatcher below
+// stays on the scalar reference.
+#if defined(ESP_PLATFORM) && defined(ROT_SIMD_ARP4_AVAILABLE)
+void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
+                                    double phase_step, int sample_offset);
+#endif
+
+// Platform-best dispatcher. P4 firmware calls the PIE asm if it has
+// been linked in (ROT_SIMD_ARP4_AVAILABLE); otherwise both paths
+// land on the scalar chunked reference so behaviour is identical
+// on host and target. Same input/output contract, including
+// sample_offset semantics — see rotate_to_dc.h.
+void rotate_to_dc_q15_simd_at(int16_t *iq, int n_complex,
+                               double phase_step, int sample_offset)
 {
 #if defined(ESP_PLATFORM) && defined(ROT_SIMD_ARP4_AVAILABLE)
-    rotate_to_dc_q15_simd_arp4(iq, n_complex, phase_step);
+    rotate_to_dc_q15_simd_arp4_at(iq, n_complex, phase_step, sample_offset);
 #else
-    rotate_to_dc_q15_simd_ref(iq, n_complex, phase_step);
+    rotate_to_dc_q15_simd_ref_at(iq, n_complex, phase_step, sample_offset);
 #endif
 }
 

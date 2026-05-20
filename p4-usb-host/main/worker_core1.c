@@ -202,8 +202,12 @@ void worker_task(void *arg)
                 // Rotate the chunk in internal SRAM. sample_offset = off
                 // keeps the absolute-phase renorm aligned across the
                 // burst as if it were a single rotate call.
-                rotate_to_dc_q15_inc_at(s_chunk_iq, chunk,
-                                         phase_step, off);
+                // _simd_at dispatches to the PIE asm on target (when
+                // ROT_SIMD_ARP4_AVAILABLE is set in the build) and to
+                // the chunked-scalar reference on host — same
+                // numerical contract either way.
+                rotate_to_dc_q15_simd_at(s_chunk_iq, chunk,
+                                          phase_step, off);
                 int n_chunk_out = direct_if_decim_process_split(&s_decim,
                                        s_chunk_iq, chunk,
                                        s_decim_buf + (size_t)n_250k * 2,
