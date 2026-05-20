@@ -287,7 +287,8 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
 #define CORR_USE_FLOAT_FFT 1
 #endif
 
-static uint16_t s_corr_brev[CORR_FFT_N];
+static uint16_t s_corr_brev[CORR_FFT_N];        // shared between Q15 and float FFT paths
+#if !CORR_USE_FLOAT_FFT
 static int16_t  s_corr_tw_re[CORR_FFT_N / 2];   // Q15 cos
 static int16_t  s_corr_tw_im[CORR_FFT_N / 2];   // Q15 sin
 // Pre-computed FFTs of the reversed-conjugated RC-shaped sync
@@ -300,6 +301,7 @@ static int32_t  s_sync_dl_fft_re[CORR_FFT_N];
 static int32_t  s_sync_dl_fft_im[CORR_FFT_N];
 static int32_t  s_sync_ul_fft_re[CORR_FFT_N];
 static int32_t  s_sync_ul_fft_im[CORR_FFT_N];
+#endif
 
 #if CORR_USE_FLOAT_FFT
 // Parallel float-precision matched filter state. Twiddles built at
@@ -472,14 +474,17 @@ static void sync_init(void)
     }
     for (int k = 0; k < CORR_FFT_N / 2; k++) {
         double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CORR_FFT_N;
+#if !CORR_USE_FLOAT_FFT
         s_corr_tw_re[k] = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
         s_corr_tw_im[k] = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
-#if CORR_USE_FLOAT_FFT
+#else
         s_corr_tw_re_f[k] = (float)cos(ang);
         s_corr_tw_im_f[k] = (float)sin(ang);
 #endif
     }
 
+    const int L = SYNC_RRC_LEN;
+#if !CORR_USE_FLOAT_FFT
     // Pre-compute reversed-conjugated sync FFTs. gr-iridium does:
     //   std::reverse(sync_padded.begin(), sync_padded.end());
     //   volk_32fc_conjugate_32fc(sync_padded, sync_padded, ...);
@@ -497,7 +502,6 @@ static void sync_init(void)
     // breaking the peak_DL vs peak_UL discrimination in the matched
     // filter.
     static int32_t tmp_re[CORR_FFT_N], tmp_im[CORR_FFT_N];
-    const int L = SYNC_RRC_LEN;
     // Target magnitude after sync FFT renormalisation: 2^24 leaves
     // 7 bits of headroom for the burst×sync multiply (burst FFT max
     // ~ 2^21, product ~ 2^45, >>15 = 2^30 — fits int32 with margin).
@@ -556,6 +560,7 @@ static void sync_init(void)
     }
     memcpy(s_sync_ul_fft_re, tmp_re, sizeof(tmp_re));
     memcpy(s_sync_ul_fft_im, tmp_im, sizeof(tmp_im));
+#endif  // !CORR_USE_FLOAT_FFT (Q15 sync FFT precompute)
 
 #if CORR_USE_FLOAT_FFT
     // Float-precision sync FFTs — mirror gr-iridium exactly:
@@ -628,11 +633,25 @@ static void sync_init(void)
 #define CFO_PREAMBLE_N   (PREAMBLE_LENGTH * UW_SPS)    // 160 samples
 #define CFO_UW_ONLY_N    (UW_LENGTH * UW_SPS)          // 120 samples (fallback)
 
+// Select CFO FFT precision at compile-time. Default is float (matches
+// gr-iridium's volk_32fc_*_32fc + fft_complex path exactly). Setting
+// CFO_USE_Q15_FFT=1 switches to the legacy Q15 BFP path — lower
+// precision but smaller scratch — useful for a future size-constrained
+// build profile. The Q15 code below is preserved intact; the gate
+// here ensures its storage (~38 KB of internal-SRAM .bss: tw_re/im,
+// window_full/uw, plus the function-static re/im[CFO_FFT_N] inside
+// cfo_fine_estimate_q15) is excluded from the binary when off.
+#ifndef CFO_USE_Q15_FFT
+#define CFO_USE_Q15_FFT 0
+#endif
+
 static inline float parabolic_interp(float yl, float yc, float yr);
 
 static uint16_t s_cfo_brev[CFO_FFT_N];
-static int16_t  s_cfo_tw_re[CFO_FFT_N / 2];     // Q15 cos (legacy, unused)
-static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin (legacy, unused)
+#if CFO_USE_Q15_FFT
+static int16_t  s_cfo_tw_re[CFO_FFT_N / 2];     // Q15 cos
+static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin
+#endif
 // Float twiddle factors for the CFO squared-FFT. The Q15 version
 // above is kept compiled (cfo_init sets it) but the CFO function now
 // uses float precision — gr-iridium uses float throughout the
@@ -648,8 +667,10 @@ static float    s_cfo_window_uw_f[CFO_UW_ONLY_N];
 // Blackman windows in Q15 (matches gr::fft::window::WIN_BLACKMAN):
 //   w[n] = 0.42 - 0.5·cos(2πn/(N-1)) + 0.08·cos(4πn/(N-1))
 // Window values are in [0, 1] → Q15 representation [0, INT16_MAX].
+#if CFO_USE_Q15_FFT
 static int16_t  s_cfo_window_full[CFO_INPUT_N];
 static int16_t  s_cfo_window_uw[CFO_UW_ONLY_N];
+#endif
 static bool     s_cfo_inited = false;
 
 static void cfo_init(void)
@@ -665,8 +686,10 @@ static void cfo_init(void)
     }
     for (int k = 0; k < CFO_FFT_N / 2; k++) {
         double ang = -2.0 * 3.14159265358979323846 * (double)k / (double)CFO_FFT_N;
+#if CFO_USE_Q15_FFT
         s_cfo_tw_re[k]   = (int16_t)lrintf((float)cos(ang) * (float)INT16_MAX);
         s_cfo_tw_im[k]   = (int16_t)lrintf((float)sin(ang) * (float)INT16_MAX);
+#endif
         s_cfo_tw_re_f[k] = (float)cos(ang);
         s_cfo_tw_im_f[k] = (float)sin(ang);
     }
@@ -675,23 +698,29 @@ static void cfo_init(void)
         float t = (float)i / (float)(CFO_INPUT_N - 1);
         float w = 0.42f - 0.5f * cosf(2.0f * PI * t)
                         + 0.08f * cosf(4.0f * PI * t);
+#if CFO_USE_Q15_FFT
         s_cfo_window_full[i]   = (int16_t)lrintf(w * (float)INT16_MAX);
+#endif
         s_cfo_window_full_f[i] = w;
     }
     for (int i = 0; i < CFO_UW_ONLY_N; i++) {
         float t = (float)i / (float)(CFO_UW_ONLY_N - 1);
         float w = 0.42f - 0.5f * cosf(2.0f * PI * t)
                         + 0.08f * cosf(4.0f * PI * t);
+#if CFO_USE_Q15_FFT
         s_cfo_window_uw[i]   = (int16_t)lrintf(w * (float)INT16_MAX);
+#endif
         s_cfo_window_uw_f[i] = w;
     }
     s_cfo_inited = true;
 }
 
+#if CFO_USE_Q15_FFT
 // Forward declaration so cfo_fine_estimate can dispatch to the Q15
 // path when CFO_USE_Q15_FFT=1.
 static float cfo_fine_estimate_q15(const int16_t *burst_2sps,
                                     int n_complex, int uw_offset_complex);
+#endif
 
 // Float 4096-pt radix-2 DIT FFT — same butterfly structure as
 // cfo_fft_q15 below but with full float precision throughout. Used
@@ -730,6 +759,7 @@ static void cfo_fft_f32(float *re, float *im)
     }
 }
 
+#if CFO_USE_Q15_FFT
 // Q15 4096-pt block-floating-point FFT (same scheme as radix2_fft_q15
 // — int32 buffers, scan max before each stage, shift only as needed).
 // Returns the cumulative shift exponent.
@@ -777,6 +807,7 @@ static int cfo_fft_q15(int32_t *re, int32_t *im)
     }
     return exp_shift;
 }
+#endif  // CFO_USE_Q15_FFT (cfo_fft_q15)
 
 // Square-then-FFT CFO estimator. Uses preamble + UW (~56 samples)
 // when uw_offset is large enough to include the preamble; otherwise
@@ -950,9 +981,9 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
 // CFO_USE_Q15_FFT=1. Same algorithm as cfo_fine_estimate() above
 // but with int16 squared signal and int32 BFP FFT. Loses ~10 bits
 // of dynamic range vs the float path on borderline-SNR bursts;
-// kept compiled so the build can switch back to it if needed
+// kept compiled-gated so the build can switch back to it if needed
 // (e.g. the eventual size-constrained profile).
-__attribute__((unused))
+#if CFO_USE_Q15_FFT
 static float cfo_fine_estimate_q15(const int16_t *burst_2sps,
                                     int n_complex, int uw_offset_complex)
 {
@@ -1024,6 +1055,7 @@ static float cfo_fine_estimate_q15(const int16_t *burst_2sps,
     if (omega < -CFO_CLAMP) omega = -CFO_CLAMP;
     return omega;
 }
+#endif  // CFO_USE_Q15_FFT (cfo_fine_estimate_q15)
 
 // (UW-only sign arrays removed — the active correlator uses
 // SYNC_*_SIGN[28]. The second half of each SYNC_*_SIGN array is the

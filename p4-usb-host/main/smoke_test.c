@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "esp_task_wdt.h"
+#include "esp_attr.h"
 #include "sdkconfig.h"
 #include "ingest_core1.h"
 #include "signal_buffer.h"
@@ -344,7 +345,10 @@ void smoke_test_run(void)
     }
 
     // Stack-borrowed scratch is too small for 16 KB; use a static buffer.
-    static uint8_t synth[TRANSFER_BYTES] __attribute__((aligned(64)));
+    // Lives in PSRAM (EXT_RAM_BSS_ATTR) — the buffer is filled then
+    // memcpy'd into ingest_core1's slot (which is internal+DMA), never
+    // DMA'd directly. Frees 16 KB of internal .bss for hotter consumers.
+    static EXT_RAM_BSS_ATTR uint8_t synth[TRANSFER_BYTES] __attribute__((aligned(64)));
 
     int prev_slot = -1;
 
