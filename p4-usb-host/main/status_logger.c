@@ -73,16 +73,38 @@ static void emit(const status_snapshot_t *s)
              ingest_convert_us_avg, ingest_push_us_avg,
              s->ingest.dispatches, s->ingest.consumer_waits, ingest_wait_us_avg);
 
-    ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame "
+    // Capacity %: how much wall-clock each subsystem consumed in this
+    // 1-second window. >100 % = falling behind, queue/buffer would
+    // eventually overflow; values in the 80-100 % range are the early
+    // warning that we're at the edge.
+    //
+    // DSP (Core 0 front end): continuous IQ stream, so the budget is
+    // (dsp_total_time_us / window_us). If feed calls collectively take
+    // more than the window's wall time, we can't keep up with the USB.
+    //
+    // Worker (Core 1 burst processing): bursty work, so the budget is
+    // (sum of burst processing times / window_us). avg_burst_us is the
+    // running mean of all processed bursts (not just this window), so
+    // multiplying it by THIS WINDOW's processed count is an
+    // approximation of "would this rate be sustainable" — exact if
+    // per-burst times are stable, slightly off during a transient.
+    double dsp_pct    = 100.0 * (double)s->dsp_total_time_us
+                              / (double)s->window_us;
+    double worker_pct = 100.0 * (double)s->ws.bursts_processed
+                              * (double)s->ws.avg_burst_us
+                              / (double)s->window_us;
+
+    ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame, cap=%.1f%% "
                   "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
-             s->dsp_frame_count, avg_dsp_us,
+             s->dsp_frame_count, avg_dsp_us, dsp_pct,
              s->dsp.wind_us, s->dsp.fft_us, s->dsp.mag_us,
              s->dsp.detect_us, s->dsp.baseline_us);
 
     ESP_LOGI(TAG, "Worker: queued=%u dropped=%u processed=%u skipped=%u "
-                  "qmax=%u avg_burst=%.0f us",
+                  "qmax=%u avg_burst=%.0f us cap=%.1f%%",
              s->ws.bursts_queued, s->ws.bursts_dropped, s->ws.bursts_processed,
-             s->ws.bursts_skipped, s->ws.queue_high_water, s->ws.avg_burst_us);
+             s->ws.bursts_skipped, s->ws.queue_high_water, s->ws.avg_burst_us,
+             worker_pct);
 
     ESP_LOGI(TAG, "Worker-stages (us): extract=%.0f freq=%.0f fir=%.0f "
                   "resamp=%.0f demod=%.0f bch=%.0f",
@@ -93,14 +115,34 @@ static void emit(const status_snapshot_t *s)
     // only when an anomaly counter is nonzero. Real burst/decode events
     // (BURST DETECTED, DEMOD SUCCESS, BCH DECODE SUCCESS, Block1 Data:)
     // are unaffected — they log at their source regardless of this flag.
-    ESP_LOGI(TAG, "STATUS: rate=%.2f MB/s frames=%u processed=%u drops=%u",
-             rate_inst, s->dsp_frame_count,
-             s->ws.bursts_processed, s->us.rb_full_drops);
+    //
+    // Capacity %: see the verbose branch above for derivation. We
+    // surface dsp_cap and worker_cap here too because they're a leading
+    // indicator — drops only start once we cross 100 %, so seeing
+    // "worker_cap=92%" lets the operator anticipate saturation a few
+    // seconds before the first dropped burst.
+    double dsp_pct    = 100.0 * (double)s->dsp_total_time_us
+                              / (double)s->window_us;
+    double worker_pct = 100.0 * (double)s->ws.bursts_processed
+                              * (double)s->ws.avg_burst_us
+                              / (double)s->window_us;
 
-    if (s->us.rb_full_drops    || s->us.status_errors ||
+    ESP_LOGI(TAG, "STATUS: rate=%.2f MB/s frames=%u processed=%u drops=%u "
+                  "dsp_cap=%.0f%% worker_cap=%.0f%%",
+             rate_inst, s->dsp_frame_count,
+             s->ws.bursts_processed, s->us.rb_full_drops,
+             dsp_pct, worker_pct);
+
+    // Warn proactively when EITHER subsystem crosses 80 % capacity OR
+    // any drop counter ticks — operator gets the heads-up before the
+    // queue overflows.
+    bool over_capacity = (dsp_pct > 80.0) || (worker_pct > 80.0);
+    if (over_capacity || s->us.rb_full_drops || s->us.status_errors ||
         s->us.resubmit_errors  || s->ws.bursts_dropped) {
-        ESP_LOGW(TAG, "STATUS-ERR: rb_full_drops=%u status_err=%u resubmit_err=%u "
+        ESP_LOGW(TAG, "STATUS-ERR: dsp_cap=%.0f%% worker_cap=%.0f%% "
+                      "rb_full_drops=%u status_err=%u resubmit_err=%u "
                       "worker_dropped=%u last_err=0x%02x",
+                 dsp_pct, worker_pct,
                  s->us.rb_full_drops, s->us.status_errors,
                  s->us.resubmit_errors, s->ws.bursts_dropped,
                  s->us.last_error_status);
