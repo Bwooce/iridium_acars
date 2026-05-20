@@ -87,7 +87,8 @@ int main(void)
         if ((int)CORPUS_2SPS_LEN - int16_off < 24 * STEP_INT16) break;
         memset(&frame, 0, sizeof(frame));
         rc = qpsk_demod_process(CORPUS_2SPS + int16_off,
-                                CORPUS_2SPS_LEN - int16_off, &frame);
+                                CORPUS_2SPS_LEN - int16_off,
+                                DIR_UNKNOWN, &frame);
         if (rc) {
             alignment_offset = sym_off;
             break;

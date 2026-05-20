@@ -211,7 +211,15 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     result->n_post_2sps = n_post_cplx;
     if (dump) dump_iq_cf32("08_decim_2sps", src, n_post_cplx);
 
-    if (qpsk_demod_process(src, n_post_cplx * 2, &result->frame)) {
+    // Pass the upstream UW correlator's direction so qpsk_demod can
+    // run data-aided PLL over the UW symbols (faster convergence,
+    // fewer error bits in the early data symbols). uw_res.direction
+    // is UW_DIR_UNKNOWN / DOWNLINK / UPLINK — map to qpsk_demod's
+    // ir_direction_t.
+    ir_direction_t hint = DIR_UNKNOWN;
+    if (result->uw_res.direction == UW_DIR_DOWNLINK) hint = DIR_DOWNLINK;
+    else if (result->uw_res.direction == UW_DIR_UPLINK) hint = DIR_UPLINK;
+    if (qpsk_demod_process(src, n_post_cplx * 2, hint, &result->frame)) {
         result->demod_ok = true;
         return true;
     }

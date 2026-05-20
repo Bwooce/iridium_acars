@@ -65,7 +65,9 @@ static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 // not wider-band PLL.
 #define M_SQRT1_2f      0.70710678f
 
-int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame_t *out)
+int qpsk_demod_process(const int16_t *samples_2sps, int n_samples,
+                        ir_direction_t expected_direction,
+                        decoded_frame_t *out)
 {
     // n_samples is the number of int16_t values (I, Q interleaved) at 2 sps.
     // Each complex sample is 2 int16_t.
@@ -107,6 +109,19 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     //   ω_hat += β · err                              // frequency integrator
     float complex phi_hat = 1.0f + 0.0f * _Complex_I;
     float omega_hat = 0.0f;
+    // Data-aided PLL over the UW symbols: when the upstream UW
+    // correlator has already identified direction (DL/UL), the
+    // known UW pattern gives us the expected x_hat for the first
+    // 12 symbols. That converges the PLL on a KNOWN reference
+    // rather than on potentially-wrong hard decisions during the
+    // first 3-5 symbols of convergence — which was leaving the
+    // earliest data symbols (= the LAST bits in each BCH block
+    // post-deinterleave) corrupted. See task #69 background.
+    static const int8_t QUAD_RE[4] = {  1, -1, -1,  1 };
+    static const int8_t QUAD_IM[4] = {  1,  1, -1, -1 };
+    const int *uw_pattern =
+        (expected_direction == DIR_DOWNLINK) ? IR_UW_DL :
+        (expected_direction == DIR_UPLINK)   ? IR_UW_UL : NULL;
     for (int i = 0; i < n_symbols; i++) {
         pll_out[i] = symbols[i] * phi_hat;
 
@@ -119,6 +134,20 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         else if (re < 0 && im >= 0) { x_hat = -M_SQRT1_2f + M_SQRT1_2f * _Complex_I; hard_decisions[i] = 1; }
         else if (re < 0 && im < 0)  { x_hat = -M_SQRT1_2f - M_SQRT1_2f * _Complex_I; hard_decisions[i] = 2; }
         else                        { x_hat = M_SQRT1_2f - M_SQRT1_2f * _Complex_I; hard_decisions[i] = 3; }
+
+        // If we have a UW direction hint and we're still in the UW
+        // window, REPLACE the hard-decision x_hat with the KNOWN UW
+        // symbol's constellation point. The PLL error feedback then
+        // measures rotation of the received signal vs the truth
+        // pattern, locking faster and with less variance than
+        // decision-directed mode. hard_decisions[i] is still set
+        // from the actual data so the downstream UW-match check
+        // (line ~154) keeps working as a sanity gate.
+        if (uw_pattern && i < IR_UW_LENGTH) {
+            int q = uw_pattern[i];
+            x_hat = (M_SQRT1_2f * (float)QUAD_RE[q])
+                  + (M_SQRT1_2f * (float)QUAD_IM[q]) * _Complex_I;
+        }
 
         float complex er = conjf(x_hat) * pll_out[i];
         float er_mag = cabsf(er);
