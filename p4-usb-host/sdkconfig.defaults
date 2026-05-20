@@ -41,6 +41,13 @@ CONFIG_SPIRAM_MEMTEST=y
 # linear write per cycle.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=147456
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# Enables EXT_RAM_BSS_ATTR placement of static .bss variables into
+# PSRAM. The .bss audit (docs/p4-bss-audit.md) identified ~140 KiB
+# of firmware-owned static buffers (uw_correlator FFT scratch +
+# precomputed tables, bch_decoder syndrome LUT) that are touched
+# only on per-burst cadence and don't need DMA-internal SRAM. The
+# annotations have no effect without this gate.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
 # Disabled to harden against ESP32-P4 v1.3 silicon errata MSPI-750 +
 # APM-560 (memory/project_p4_errata_status.md). When ON, the option

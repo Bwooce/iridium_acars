@@ -18,6 +18,12 @@
 // apart. So we step burst by 2 between each UW symbol comparison.
 
 #include "uw_correlator.h"
+#if __has_include("esp_attr.h")
+#include "esp_attr.h"
+#else
+// Host build: EXT_RAM_BSS_ATTR is a no-op (only one address space).
+#define EXT_RAM_BSS_ATTR
+#endif
 
 #include <math.h>
 #include <stdbool.h>
@@ -287,7 +293,10 @@ static void build_shaped_sync(const int8_t *signs, const float *shape,
 #define CORR_USE_FLOAT_FFT 1
 #endif
 
-static uint16_t s_corr_brev[CORR_FFT_N];        // shared between Q15 and float FFT paths
+// Read-only-after-init FFT precompute tables. Cold relative to the
+// per-sample DSP loops; PSRAM placement frees DMA-internal SRAM.
+// See docs/p4-bss-audit.md win #3.
+static EXT_RAM_BSS_ATTR uint16_t s_corr_brev[CORR_FFT_N];        // shared between Q15 and float FFT paths
 #if !CORR_USE_FLOAT_FFT
 static int16_t  s_corr_tw_re[CORR_FFT_N / 2];   // Q15 cos
 static int16_t  s_corr_tw_im[CORR_FFT_N / 2];   // Q15 sin
@@ -307,12 +316,12 @@ static int32_t  s_sync_ul_fft_im[CORR_FFT_N];
 // Parallel float-precision matched filter state. Twiddles built at
 // init time; sync FFTs computed from the same s_sync_*_re/im sources
 // but kept in float32. Memory: 4 × CORR_FFT_N × 4B = 32 KB.
-static float    s_corr_tw_re_f[CORR_FFT_N / 2];
-static float    s_corr_tw_im_f[CORR_FFT_N / 2];
-static float    s_sync_dl_fft_re_f[CORR_FFT_N];
-static float    s_sync_dl_fft_im_f[CORR_FFT_N];
-static float    s_sync_ul_fft_re_f[CORR_FFT_N];
-static float    s_sync_ul_fft_im_f[CORR_FFT_N];
+static EXT_RAM_BSS_ATTR float    s_corr_tw_re_f[CORR_FFT_N / 2];
+static EXT_RAM_BSS_ATTR float    s_corr_tw_im_f[CORR_FFT_N / 2];
+static EXT_RAM_BSS_ATTR float    s_sync_dl_fft_re_f[CORR_FFT_N];
+static EXT_RAM_BSS_ATTR float    s_sync_dl_fft_im_f[CORR_FFT_N];
+static EXT_RAM_BSS_ATTR float    s_sync_ul_fft_re_f[CORR_FFT_N];
+static EXT_RAM_BSS_ATTR float    s_sync_ul_fft_im_f[CORR_FFT_N];
 #endif
 
 // Block-floating-point Q15 radix-2 DIT FFT. Buffers are int32 to
@@ -570,7 +579,9 @@ static void sync_init(void)
     //   path's renorm has no gri equivalent and is potentially
     //   biasing peak position; the float path skips it).
     {
-        static float ftmp_re[CORR_FFT_N], ftmp_im[CORR_FFT_N];
+        // Init-time scratch -- runs once per program. PSRAM placement
+        // costs nothing here. See docs/p4-bss-audit.md win #2.
+        static EXT_RAM_BSS_ATTR float ftmp_re[CORR_FFT_N], ftmp_im[CORR_FFT_N];
         // DL
         memset(ftmp_re, 0, sizeof(ftmp_re));
         memset(ftmp_im, 0, sizeof(ftmp_im));
@@ -647,7 +658,7 @@ static void sync_init(void)
 
 static inline float parabolic_interp(float yl, float yc, float yr);
 
-static uint16_t s_cfo_brev[CFO_FFT_N];
+static EXT_RAM_BSS_ATTR uint16_t s_cfo_brev[CFO_FFT_N];
 #if CFO_USE_Q15_FFT
 static int16_t  s_cfo_tw_re[CFO_FFT_N / 2];     // Q15 cos
 static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin
@@ -660,10 +671,10 @@ static int16_t  s_cfo_tw_im[CFO_FFT_N / 2];     // Q15 sin
 // real carrier residual. Cost is ~32 KB scratch + ~16 KB twiddles
 // in BSS, plus a few hundred microseconds per burst (acceptable —
 // the CFO step runs once per detected burst).
-static float    s_cfo_tw_re_f[CFO_FFT_N / 2];
-static float    s_cfo_tw_im_f[CFO_FFT_N / 2];
-static float    s_cfo_window_full_f[CFO_INPUT_N];
-static float    s_cfo_window_uw_f[CFO_UW_ONLY_N];
+static EXT_RAM_BSS_ATTR float    s_cfo_tw_re_f[CFO_FFT_N / 2];
+static EXT_RAM_BSS_ATTR float    s_cfo_tw_im_f[CFO_FFT_N / 2];
+static EXT_RAM_BSS_ATTR float    s_cfo_window_full_f[CFO_INPUT_N];
+static EXT_RAM_BSS_ATTR float    s_cfo_window_uw_f[CFO_UW_ONLY_N];
 // Blackman windows in Q15 (matches gr::fft::window::WIN_BLACKMAN):
 //   w[n] = 0.42 - 0.5·cos(2πn/(N-1)) + 0.08·cos(4πn/(N-1))
 // Window values are in [0, 1] → Q15 representation [0, INT16_MAX].
@@ -839,9 +850,12 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     // FFT scratch — float for the gr-iridium-aligned full-precision
     // path. Q15 BFP was losing peak-vs-noise resolution at borderline
     // SNR; float matches gr-iridium's volk_32fc_*_32fc + fft_complex
-    // exactly. ~32 KB scratch (acceptable — single-threaded function,
-    // and on P4 it lives in PSRAM-eligible BSS or the worker's stack).
-    static float re[CFO_FFT_N], im[CFO_FFT_N];
+    // exactly. 32 KB scratch — moved to PSRAM (EXT_RAM_BSS_ATTR) to
+    // free internal DMA SRAM for the USB transfer pool. CFO runs once
+    // per detected burst; PSRAM latency on a single-threaded float
+    // FFT pass is invisible at burst rates. See docs/p4-bss-audit.md
+    // win #2.
+    static EXT_RAM_BSS_ATTR float re[CFO_FFT_N], im[CFO_FFT_N];
     memset(re, 0, sizeof(re));
     memset(im, 0, sizeof(im));
 
@@ -1126,8 +1140,14 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 #if CORR_USE_FLOAT_FFT
     // Float-precision matched filter — mirrors gr-iridium's volk-based
     // chain exactly (no BFP, no SYNC_TARGET_MAX renormalisation).
-    static float fburst_re[CORR_FFT_N], fburst_im[CORR_FFT_N];
-    static float fifft_re[CORR_FFT_N], fifft_im[CORR_FFT_N];
+    // Per-burst FFT/IFFT scratch -- 4 * 8 KiB = 32 KiB. Moved to
+    // PSRAM via EXT_RAM_BSS_ATTR so DMA-internal SRAM stays free for
+    // the USB transfer pool. The matched-filter runs once per
+    // detected burst (~10-100 bursts/s worst case); PSRAM latency
+    // adds a few hundred us per burst at most. See docs/p4-bss-audit.md
+    // win #2.
+    static EXT_RAM_BSS_ATTR float fburst_re[CORR_FFT_N], fburst_im[CORR_FFT_N];
+    static EXT_RAM_BSS_ATTR float fifft_re[CORR_FFT_N], fifft_im[CORR_FFT_N];
     memset(fburst_re, 0, sizeof(fburst_re));
     memset(fburst_im, 0, sizeof(fburst_im));
     int load_n = n_complex < CORR_FFT_N ? n_complex : CORR_FFT_N;

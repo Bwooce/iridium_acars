@@ -1,9 +1,21 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#if __has_include("esp_attr.h")
+#include "esp_attr.h"
+#else
+// Host build: EXT_RAM_BSS_ATTR is a no-op (only one address space).
+#define EXT_RAM_BSS_ATTR
+#endif
 #include "bch_decoder.h"
 
-static struct { int errs; uint32_t locator; } syn_ra[1024];
+// 8 KiB syndrome -> (errs, locator) LUT. Random access pattern but
+// only a few hundred lookups per BCH(31,21) block (and 2 blocks per
+// Iridium frame), so the per-lookup PSRAM latency (~30 ns vs ~5 ns
+// for internal SRAM) is invisible at frame rates. Lives in PSRAM
+// to free DMA-capable internal SRAM for the USB transfer pool.
+// See docs/p4-bss-audit.md win #1.
+static EXT_RAM_BSS_ATTR struct { int errs; uint32_t locator; } syn_ra[1024];
 
 static uint32_t gf2_remainder(uint32_t poly, uint32_t val)
 {
