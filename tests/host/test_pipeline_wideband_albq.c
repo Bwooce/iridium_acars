@@ -451,7 +451,31 @@ int main(void) {
         // Pipeline
         burst_pipeline_result_t res;
         memset(&res, 0, sizeof(res));
-        if (i == best_dump_match_idx) {
+        // Two ways to select the dump target:
+        //  - DUMP_TARGET_BIN env var: dump the burst whose center_bin is
+        //    closest to the requested bin (default mode).
+        //  - DUMP_FIRST_UW env var: dump the FIRST burst whose
+        //    burst_pipeline succeeds and UW direction != UNKNOWN. This
+        //    matches QPSK_DUMP's trigger (it also fires on first
+        //    UW-lock), so the stage dumps + QPSK CSV cover the same
+        //    physical burst -- needed to compare apples-to-apples
+        //    against gri's debug-id dumps for the burst that
+        //    golden-matches gri_id N.
+        static bool dump_first_uw = false;
+        static bool dump_first_uw_inited = false;
+        static bool dump_first_uw_fired = false;
+        if (!dump_first_uw_inited) {
+            const char *e = getenv("DUMP_FIRST_UW");
+            dump_first_uw = (e != NULL && e[0] != 0);
+            dump_first_uw_inited = true;
+        }
+        bool do_dump = false;
+        if (!dump_first_uw && i == best_dump_match_idx) {
+            do_dump = true;
+            printf("dump-mode: bin-target (burst %d at bin %d)\n",
+                   i, tags[i].center_bin);
+        }
+        if (do_dump) {
             int sysrc = system("mkdir -p /tmp/host_signals");
             (void)sysrc;
             burst_pipeline_set_dump_once("/tmp/host_signals");
@@ -476,6 +500,12 @@ int main(void) {
         if (res.uw_res.direction != UW_DIR_UNKNOWN) uw_found++;
         if (res.demod_ok) {
             decoded++;
+            if (dump_first_uw && !dump_first_uw_fired) {
+                printf("FIRST-UW-LOCK burst tag #%d bin=%d -- set DUMP_TARGET_BIN=%d "
+                       "and re-run to dump this burst's stages.\n",
+                       i, tags[i].center_bin, tags[i].center_bin);
+                dump_first_uw_fired = true;
+            }
             // Device-equivalent compare: same tolerance window, same
             // bucketing as worker_core1.c's golden_compare_burst().
             // rel_freq_hz derived from center_bin via the same formula
