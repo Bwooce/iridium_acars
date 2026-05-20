@@ -9,6 +9,14 @@ static const char *TAG = "QPSK";
 
 static const int IR_UW_DL[] = { 0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2 };
 static const int IR_UW_UL[] = { 2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2 };
+// DQPSK Gray-code mapping for our pipeline's conventions.
+//   diff 0 → 00, diff 1 → 10, diff 2 → 11, diff 3 → 01.
+// EMPIRICAL: alternative {0, 1, 3, 2} (the more common Iridium-toolkit
+// Gray direction) broke frame classification entirely (all 58 bursts
+// went UNKNOWN, BCH-fail rose 27 → 36). This value is correct for our
+// downstream deinterleave + BCH + frame_decoder chain — do not change
+// without re-validating end-to-end against the RAW_IRIDIUM smoke
+// frame-class counts.
 static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 
 // Second-order PLL gains. ALPHA is the phase (proportional) term;

@@ -15,6 +15,7 @@
 #include "esp_random.h"
 #include "esp_task_wdt.h"
 #include "esp_attr.h"
+#include "esp_chip_info.h"
 #include "sdkconfig.h"
 #include "ingest_core1.h"
 #include "signal_buffer.h"
@@ -308,6 +309,26 @@ void smoke_test_run(void)
 #endif
 
     ESP_LOGI(TAG, "=== Smoke test start ===");
+
+    // One-shot silicon revision check. ESP32-P4 v1.x is 360 MHz; v3.x
+    // is 400 MHz with the full PIE feature set. Our sdkconfig pins
+    // CPU to 360 MHz so we're safe on either, but the log line makes
+    // the actual chip step explicit when triaging perf anomalies.
+    {
+        esp_chip_info_t chip_info;
+        esp_chip_info(&chip_info);
+        uint32_t major = chip_info.revision / 100;
+        uint32_t minor = chip_info.revision % 100;
+        ESP_LOGI(TAG, "CHIP: ESP32-P4 silicon v%d.%d (cores=%d features=0x%x)",
+                 (int)major, (int)minor, chip_info.cores, chip_info.features);
+        if (major < 3) {
+            ESP_LOGW(TAG, "CHIP: running on early v1.x silicon (360 MHz limit, "
+                          "no v3-only PIE features)");
+        } else {
+            ESP_LOGI(TAG, "CHIP: production v3.x silicon (400 MHz + full PIE)");
+        }
+    }
+
     ESP_LOGI(TAG, "Injecting tone at FFT bin %d (post-shift bin %d), "
              "expecting detection in [%d..%d]",
              TONE_FFT_BIN, (TONE_FFT_BIN + FFT_SIZE / 2) % FFT_SIZE,
