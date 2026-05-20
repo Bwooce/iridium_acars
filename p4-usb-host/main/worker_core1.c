@@ -405,10 +405,25 @@ void worker_task(void *arg)
             if (safe_len > (uint32_t)WB_MAX_BURST_SAMPLES) {
                 safe_len = (uint32_t)WB_MAX_BURST_SAMPLES;
             }
-            // Round to multiple of DIDECIM_DECIM for a clean integer
-            // output count from the decim. Also keeps cache alignment
-            // when combined with the 16-aligned WB_PRE_PAD_SAMPLES.
-            safe_len -= safe_len % DIDECIM_DECIM;
+            // Two alignments to honour simultaneously:
+            //   - DIDECIM_DECIM (= 10): so the decim produces an integer
+            //     output count with no leftover input
+            //   - 16 complex samples (= 64 bytes): so esp_cache_msync on
+            //     the extracted PSRAM range doesn't reject the call
+            //     with ESP_ERR_INVALID_ARG (cache line = 64 bytes on P4)
+            // LCM(10, 16) = 80. Rounding safe_len down to a multiple of
+            // 80 satisfies both. WB_PRE_PAD_SAMPLES is already 16-cplx
+            // aligned (= 288 = 18 * 16, also a multiple of 80? no — 288
+            // mod 80 = 48 — but combined-with rule still works: we need
+            // ext_len % 16 == 0, and 288 is 16-aligned, so safe_len need
+            // only be 16-aligned; the 80 rounding is the strictest needed
+            // for the joint constraint).
+            //
+            // Before this rounding only 1-in-8 valid safe_len values
+            // were cache-aligned; the rest silently failed msync and
+            // the worker processed stale cached PSRAM → ~46% bit error
+            // rate vs gri's ground truth across most bursts.
+            safe_len -= safe_len % 80;
             uint32_t ext_len = safe_len + WB_PRE_PAD_SAMPLES;
             if (ext_len > WB_EXTRACT_MAX) {
                 ext_len = WB_EXTRACT_MAX;
