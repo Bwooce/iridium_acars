@@ -30,22 +30,22 @@ typedef struct
 
 // USB bulk-IN transfer pool. usb_host_transfer_alloc returns DMA-
 // capable internal SRAM (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM
-// is disabled for errata hardening — see sdkconfig.defaults). Total
-// budget here = COUNT × SIZE. Internal DMA heap is shared with the
-// 96 KB of ingest_core1 raw+conv ping-pong buffers and the static
-// fft_burst_tagger working set, so this pool needs to fit in the
-// remainder.
+// is disabled for errata hardening -- see sdkconfig.defaults).
 //
-// At COUNT=8, SIZE=16 KB (128 KB total) usb_host_transfer_alloc
-// returns ESP_ERR_NO_MEM at the first transfer because the DMA-
-// capable internal pool is exhausted after the wideband front end's
-// static allocations. COUNT=4, SIZE=8 KB (32 KB total) fits and
-// provides ~12.5 ms of in-flight buffering at 2.56 MSPS — enough
-// since the post-transfer ringbuffer is 512 KB in PSRAM.
+// Total budget here = COUNT * SIZE. The post-s_conv-move DMA-internal
+// pool has ~70 KB free pre-stream; 8 * 8 KB = 64 KB fits with margin.
+// More transfers = less back-pressure on the SDR (smaller pool causes
+// rb_full_drops once the consumer falls behind for even a few ms).
 //
-// If a future build re-enables USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM
-// (or trims the static allocations), COUNT/SIZE can grow back.
-#define ASYNC_TRANSFER_COUNT 4
+// History:
+//  - 8 x 16 KB (128 KB) original. Fails ESP_ERR_NO_MEM after the
+//    wideband C front end's static allocations (~96 KB DMA-internal
+//    for ingest_core1 raw+conv) consume the budget.
+//  - 4 x 8 KB (32 KB) fits in the constrained pool but throttles
+//    the SDR to ~0.85 MB/s vs 2.5 MB/s needed -> rb_full_drops.
+//  - 8 x 8 KB (64 KB) is the post-s_conv-move setting. Verified the
+//    DMA-internal heap accommodates this comfortably.
+#define ASYNC_TRANSFER_COUNT 8
 #define ASYNC_TRANSFER_SIZE (8 * 1024)
 
 typedef struct
