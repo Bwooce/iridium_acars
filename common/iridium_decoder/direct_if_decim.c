@@ -35,15 +35,29 @@ static double bessel_i0(double x)
 void direct_if_decim_init(direct_if_decim_t *d)
 {
     const double FS         = 2500000.0;
-    const double F_CUTOFF   = 20000.0;       // burst_width / 2
+    const double F_CUTOFF   = 20000.0;       // gri's `cutoff_freq` arg
+    const double F_TRANS    = 40000.0;       // gri's `transition_width` arg
     const double ATTEN_DB   = 40.0;
-    // Transition width is 20 kHz (= burst_width/2). Documented for
-    // reference; the tap count (DIDECIM_NTAPS = 279) is locked to
-    // this design via the Kaiser formula:
-    //   ntaps ≈ (atten - 7.95) / (2.285 * 2π * trans / fs)
-    //         = 32.05 / 0.1148 ≈ 279
+    // gri's call (iridium_extractor_flowgraph.py:517):
+    //   firdes.low_pass_2(gain=1, sampling_freq=2.5e6,
+    //                     cutoff_freq=20e3, transition_width=40e3,
+    //                     attenuation_dB=40)
+    // GNU Radio's compute_ntaps_windowed_filter for Kaiser:
+    //   delta_w = 2π * trans / fs
+    //   ntaps   = round((atten - 7.95) / (2.285 * delta_w)) + 1
+    //           = round(32.05 / 0.2297) + 1
+    //           = round(139.55) + 1 = 141
+    // The earlier design here mistook `transition_width` for half the
+    // burst width and used trans = 20 kHz → ntaps = 279. The narrower
+    // transition gave a sharper roll-off, which produced a different
+    // broadband shape vs gri's filtered_deci dump (NMSE ≈ -16 dB at
+    // the post-resample stage on burst 390, propagated through every
+    // downstream stage and into BCH-fail). Matching gri's actual
+    // transition width is what brings the stages into agreement.
+    (void)F_TRANS;   // referenced via the constants used below
 
-    // Kaiser β from atten (Oppenheim & Schafer formula).
+    // Kaiser β from atten (Oppenheim & Schafer formula). Matches gri's
+    // `compute_kaiser_beta` exactly. For atten = 40 dB → β ≈ 3.395.
     double beta;
     if (ATTEN_DB > 50.0) {
         beta = 0.1102 * (ATTEN_DB - 8.7);
@@ -54,21 +68,12 @@ void direct_if_decim_init(direct_if_decim_t *d)
         beta = 0.0;
     }
 
-    // Required ntaps from atten + transition width. We hardcode
-    // DIDECIM_NTAPS = 279, so just verify the design is consistent:
-    //   ntaps_needed ≈ (atten - 7.95) / (2.285 * 2π * trans / fs)
-    //                = (40 - 7.95) / (2.285 * 2π * 20e3 / 2.5e6)
-    //                = 32.05 / 0.1148 ≈ 279
-    // ✓
-
     const double PI = 3.14159265358979323846;
-    // Design with N_DESIGN = 279 (gri's original Kaiser length), then
-    // pad with one zero tap at the end so the final array length is
-    // DIDECIM_NTAPS = 280 — required by dsps_fird_s16_arp4 (P4 PIE
-    // FIR), which falls back to the scalar ANSI implementation if
-    // coeffs_len is not a multiple of 8. Padding with zero preserves
-    // the filter's frequency response exactly.
-    const int    N_DESIGN = 279;
+    // Design at gri's exact length N_DESIGN = 141, then zero-pad to
+    // DIDECIM_NTAPS = 144 so dsps_fird_s16_arp4 stays on the PIE path
+    // (coeffs_len must be a multiple of 8). Zero taps preserve the
+    // frequency response exactly.
+    const int    N_DESIGN = 141;
     const int    N        = DIDECIM_NTAPS;
     const int    center = N_DESIGN / 2;
     const double fc_norm = F_CUTOFF / FS;       // 0.008

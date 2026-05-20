@@ -8,16 +8,17 @@
 // trivial unit-testing.
 //
 // FIR design: matches gr-iridium burst_downmix exactly —
-//   firdes.low_pass_2(1, 2.5e6, burst_width/2=20kHz,
-//                     burst_width=40kHz, 40dB)
-// → Kaiser β≈5.5, 279 taps. The decim factor (10) is fixed by the
-// host fixture rate and our internal 250 ksps target.
+//   firdes.low_pass_2(gain=1, fs=2.5e6, cutoff=20kHz,
+//                     transition_width=40kHz, attenuation_dB=40)
+// → Kaiser β ≈ 3.4, 141 taps (zero-padded to 144 here so the P4 PIE
+// FIR's coeffs_len-%-8 requirement is met). The decim factor (10) is
+// fixed by the host fixture rate and our internal 250 ksps target.
 //
 // Implementation: direct FIR + downsample. Integer decim has no
 // multiply-savings opportunity from polyphase decomposition; the
 // only benefit would be memory-access patterns and we don't need
-// that for batch per-burst processing. ~279 MACs per output sample
-// × 4000 outputs per burst (16 ms × 250 ksps) ≈ 1.1M MACs/burst.
+// that for batch per-burst processing. ~141 MACs per output sample
+// × 4000 outputs per burst (16 ms × 250 ksps) ≈ 560k MACs/burst.
 // Runs in microseconds on host; budget on P4 measured in step 4.
 
 #pragma once
@@ -28,12 +29,21 @@
 #endif
 
 #define DIDECIM_DECIM        10        // 10× decim (2.5M → 250k)
-// 280 taps = 279 from the gri-aligned Kaiser design + 1 zero tap padding.
-// dsps_fird_s16_arp4 (P4 PIE) requires coeffs_len divisible by 8 — without
-// the pad, the asm falls through to dsps_fird_s16_ansi (scalar C) at the
-// very first instruction, defeating the whole point of the PIE path. The
-// extra zero contributes nothing to filter response.
-#define DIDECIM_NTAPS        280       // matches gri's 40 dB Kaiser + 1 zero
+// 144 taps = 141 from gri's firdes.low_pass_2 design + 3 zero taps for
+// alignment.  Gri calls
+//   firdes.low_pass_2(gain=1, fs=2.5e6, cutoff=20e3,
+//                     trans_width=40e3, atten=40 dB)
+// which is the Kaiser-window design from compute_ntaps_windowed_filter():
+//   ntaps = round((40-7.95) / (2.285 * 2π * 40e3/2.5e6)) + 1 = 141
+// The earlier 279-tap design here used trans_width=20e3 (half the gri
+// value), which gave a sharper roll-off and a measurably different
+// broadband shape vs gri's filtered_deci dump (NMSE ≈ -16 dB on burst
+// 390 even after time-alignment). Matching gri's actual transition
+// width is what brings the post-resample stage into bit-level agreement.
+// dsps_fird_s16_arp4 (P4 PIE) requires coeffs_len divisible by 8; we
+// pad 141 → 144 with three zero taps. Zero padding preserves the
+// frequency response exactly.
+#define DIDECIM_NTAPS        144       // gri firdes.low_pass_2 (141) + 3 zero
 
 // Per-channel FIR state for the split (deinterleaved) path on host.
 // Mirrors the inner-loop semantics of esp-dsp's fir_s16_t / dsps_fird

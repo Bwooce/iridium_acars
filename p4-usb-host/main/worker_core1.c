@@ -333,7 +333,10 @@ void worker_core1_golden_print_summary(void) {}
 // per complex) is naturally 64-byte aligned. We subtract
 // WB_PRE_PAD_SAMPLES; making that subtraction a multiple of 16
 // complex samples (= 64 bytes) keeps the extract address aligned
-// for esp_cache_msync. DIDECIM_NTAPS - 1 = 279; round up to 288.
+// for esp_cache_msync. DIDECIM_NTAPS is 144 (gri-aligned 141 + 3
+// zero-pad for PIE 8-alignment); 144 already lines up on 16-cplx,
+// but we keep 288 as a margin to absorb any future Kaiser-design
+// revisions without re-checking alignment.
 #define WB_PRE_PAD_SAMPLES    288     // 18 × 16, ≥ DIDECIM_NTAPS - 1
 #define WB_MAX_BURST_SAMPLES  ((int)(FS_DETECT_HZ / 4))   // 250 ms = 625000
 #define WB_EXTRACT_SAFETY     1024

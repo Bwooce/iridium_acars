@@ -3,8 +3,9 @@
 //
 // Path-C generates per-burst 250 ksps cf32 files at
 // /tmp/host_direct_if/burst_NNN.cf32 via scipy.signal.resample_poly
-// with a 279-tap Kaiser FIR. The C decimator in direct_if_decim.c
-// implements the same filter. For ONE specific burst, we:
+// with the same gri-aligned Kaiser FIR (141 taps, trans=40kHz). The
+// C decimator in direct_if_decim.c implements the same filter. For
+// ONE specific burst, we:
 //   1. Read the path-C-generated cf32 (Python's "ground truth")
 //   2. Re-derive what the C decimator would produce on the same
 //      pre-rotated raw input (load that from raw_cf32 dump)

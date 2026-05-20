@@ -172,17 +172,18 @@ def direct_if_one_burst(raw_cf: np.ndarray, lo_hz: int, tag: dict) -> np.ndarray
     rot = np.exp(-2j * np.pi * freq_offset * n_idx / FS_RAW).astype(np.complex64)
     shifted = (slc * rot).astype(np.complex64)
 
-    # 10x decimation with gr-iridium's EXACT input filter:
-    #   firdes.low_pass_2(1, channel_sample_rate=2.5e6, burst_width/2=20kHz,
-    #                     burst_width=40kHz, 40 dB)
-    # → Kaiser β≈5.5, ~279 taps. scipy.signal.resample_poly defaults to
-    # ~21-tap window — 40 dB at 20 kHz transition needs many more taps,
-    # so the default leaks adjacent-burst content (>40 kHz away) by
+    # 10x decimation with gr-iridium's EXACT input filter
+    # (iridium_extractor_flowgraph.py:517):
+    #   firdes.low_pass_2(gain=1, fs=2.5e6, cutoff=20kHz,
+    #                     transition_width=40kHz, attenuation_dB=40)
+    # → Kaiser β ≈ 3.4, 141 taps. scipy.signal.resample_poly defaults to
+    # ~21-tap window — 40 dB at this cutoff/transition needs ~141 taps,
+    # so the default leaks adjacent-burst content (>60 kHz away) by
     # only ~10-15 dB. On bursts where another Iridium burst lives near
     # our window, that leakage dominates the squared-FFT CFO step and
     # pushes omega to the ±2π clamp. Match gri exactly here.
-    cutoff_hz   = 20_000           # burst_width / 2
-    trans_hz    = 20_000           # burst_width - burst_width/2
+    cutoff_hz   = 20_000           # gri's `cutoff_freq` arg
+    trans_hz    = 40_000           # gri's `transition_width` arg
     atten_db    = 40
     ntaps, beta = kaiserord(atten_db, 2 * trans_hz / FS_RAW)
     if ntaps % 2 == 0: ntaps += 1
