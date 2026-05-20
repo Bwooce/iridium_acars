@@ -78,6 +78,19 @@ static volatile uint64_t s_t_bch_us     = 0;
 // 250 ksps output is at most WB_EXTRACT_MAX / 10 + 1.
 #define WB_DECIM_MAX          ((WB_EXTRACT_MAX / DIDECIM_DECIM) + 8)
 
+// Per-chunk size for the streaming decim. The PIE FIR scratch needs
+// to be in INTERNAL SRAM (dsps_fird_s16_arp4's `esp.vld.128.ip` can't
+// service PSRAM); chunking keeps that scratch tiny. 4000 input samples
+// per chunk = 8 KB per I/Q channel = ~17 KB total internal SRAM
+// (vs ~200 KB if we tried full-burst scratch). 4000 is a multiple of
+// DIDECIM_DECIM=10 and of 8 (PIE alignment), so each chunk consumes
+// exactly N inputs and produces exactly N/10 outputs; no boundary
+// math needed inside the loop. The streaming FIR delay-line state
+// in `s_decim` is reset once at the start of each burst (so leftover
+// history from previous bursts doesn't bleed in), then preserves
+// naturally across chunks within a burst.
+#define DECIM_CHUNK_IN        4000
+
 static int16_t          *s_extract_buf  = NULL;   // 2.5 MSPS wideband window
 static int16_t          *s_decim_buf    = NULL;   // 250 ksps post-decim
 // Deinterleave scratch for direct_if_decim_process_split (PSRAM —
@@ -160,15 +173,26 @@ void worker_task(void *arg)
             // on host the same code path uses portable C. Reset
             // streaming FIR state between unrelated bursts so leftover
             // history from a previous burst doesn't bleed into this one.
+            //
+            // Processed in DECIM_CHUNK_IN-sample chunks so the PIE FIR
+            // scratch (s_decim_scr_in_i/q) fits in internal SRAM — the
+            // PIE path is silently broken on PSRAM inputs (same vld.128
+            // constraint as the front-end FFT). Streaming FIR delay
+            // line in `s_decim` carries history across chunks within
+            // a burst, so outputs concatenate seamlessly.
             int64_t t_dec0 = esp_timer_get_time();
             direct_if_decim_reset_state(&s_decim);
-            int n_250k = direct_if_decim_process_split(&s_decim,
-                                                        s_extract_buf, (int)ext_len,
-                                                        s_decim_buf,
-                                                        s_decim_scr_in_i,
-                                                        s_decim_scr_in_q,
-                                                        s_decim_scr_out_i,
-                                                        s_decim_scr_out_q);
+            int n_250k = 0;
+            for (int off = 0; off < (int)ext_len; off += DECIM_CHUNK_IN) {
+                int chunk = (int)ext_len - off;
+                if (chunk > DECIM_CHUNK_IN) chunk = DECIM_CHUNK_IN;
+                int n_chunk_out = direct_if_decim_process_split(&s_decim,
+                                       s_extract_buf + (size_t)off * 2, chunk,
+                                       s_decim_buf + (size_t)n_250k * 2,
+                                       s_decim_scr_in_i, s_decim_scr_in_q,
+                                       s_decim_scr_out_i, s_decim_scr_out_q);
+                n_250k += n_chunk_out;
+            }
             int64_t t_dec1 = esp_timer_get_time();
             s_t_decim_us += (uint64_t)(t_dec1 - t_dec0);
 
@@ -250,19 +274,25 @@ esp_err_t worker_core1_init(void)
     burst_queue = xQueueCreate(32, sizeof(detected_burst_t));
     if (!burst_queue) return ESP_ERR_NO_MEM;
 
-    // Wideband buffers in PSRAM. The decim buffer can be smaller
-    // (10× decimation) but is sized generously since PSRAM is
-    // plentiful.
+    // Wideband buffers. Big working surfaces stay in PSRAM (extract +
+    // decim output). The PIE FIR scratch must live in INTERNAL SRAM,
+    // otherwise `esp.vld.128.ip` inside dsps_fird_s16_arp4 can't
+    // service PSRAM access timing and the PIE path silently degrades
+    // (we previously measured 22.9 ms/burst on this stage; PIE should
+    // do ~1.5 ms). Decim runs in DECIM_CHUNK_IN-sample chunks so the
+    // scratch stays tiny (8 KB per I/Q channel) rather than the 100 KB
+    // each that a full-burst buffer would need.
     size_t ext_bytes      = (size_t)WB_EXTRACT_MAX * 2 * sizeof(int16_t);
     size_t dec_bytes      = (size_t)WB_DECIM_MAX   * 2 * sizeof(int16_t);
-    size_t scr_in_bytes   = (size_t)WB_EXTRACT_MAX     * sizeof(int16_t);
-    size_t scr_out_bytes  = (size_t)WB_DECIM_MAX       * sizeof(int16_t);
+    size_t scr_in_bytes   = (size_t)DECIM_CHUNK_IN      * sizeof(int16_t);
+    size_t scr_out_bytes  = (size_t)(DECIM_CHUNK_IN / DIDECIM_DECIM)
+                                                        * sizeof(int16_t);
     s_extract_buf      = heap_caps_malloc(ext_bytes,     MALLOC_CAP_SPIRAM);
     s_decim_buf        = heap_caps_malloc(dec_bytes,     MALLOC_CAP_SPIRAM);
-    s_decim_scr_in_i   = heap_caps_malloc(scr_in_bytes,  MALLOC_CAP_SPIRAM);
-    s_decim_scr_in_q   = heap_caps_malloc(scr_in_bytes,  MALLOC_CAP_SPIRAM);
-    s_decim_scr_out_i  = heap_caps_malloc(scr_out_bytes, MALLOC_CAP_SPIRAM);
-    s_decim_scr_out_q  = heap_caps_malloc(scr_out_bytes, MALLOC_CAP_SPIRAM);
+    s_decim_scr_in_i   = heap_caps_aligned_alloc(16, scr_in_bytes,  MALLOC_CAP_INTERNAL);
+    s_decim_scr_in_q   = heap_caps_aligned_alloc(16, scr_in_bytes,  MALLOC_CAP_INTERNAL);
+    s_decim_scr_out_i  = heap_caps_aligned_alloc(16, scr_out_bytes, MALLOC_CAP_INTERNAL);
+    s_decim_scr_out_q  = heap_caps_aligned_alloc(16, scr_out_bytes, MALLOC_CAP_INTERNAL);
     if (!s_extract_buf || !s_decim_buf
         || !s_decim_scr_in_i || !s_decim_scr_in_q
         || !s_decim_scr_out_i || !s_decim_scr_out_q) {
