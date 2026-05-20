@@ -13,7 +13,7 @@ files: one source of truth, all assistants read it.
 ESP32-P4 firmware that captures Iridium L-band signals via an RTL-SDR v4,
 detects bursts in real time, and decodes ACARS frames carried by Iridium
 Short Burst Data. Active code lives under
-[`esp32p4-usb-host-benchmark/p4-usb-host/`](./esp32p4-usb-host-benchmark/p4-usb-host/).
+[`p4-usb-host/`](./p4-usb-host/).
 
 The implementation plan is the source of truth for what's done and what's
 next. Read it before changing anything substantial.
@@ -26,15 +26,15 @@ common workflow:
 ```sh
 # Build (uses direct `ninja -C build` for fast incremental builds;
 #  falls back to `idf.py build` on first build / when reconfigure is needed).
-./esp32p4-usb-host-benchmark/scripts/build.sh
+./scripts/build.sh
 
 # Flash + reset. Auto-detects the first /dev/ttyACM* if no port given.
-./esp32p4-usb-host-benchmark/scripts/flash.sh                # auto port
-./esp32p4-usb-host-benchmark/scripts/flash.sh /dev/ttyACM0   # explicit
+./scripts/flash.sh                # auto port
+./scripts/flash.sh /dev/ttyACM0   # explicit
 
 # Non-interactive serial monitor — reads N seconds of output to stdout
 # (grep/awk-pipeable). Use this from automation; idf.py monitor is for humans.
-./esp32p4-usb-host-benchmark/scripts/monitor.sh <seconds> [/dev/ttyACM0]
+./scripts/monitor.sh <seconds> [/dev/ttyACM0]
 ```
 
 Build and flash are intentionally split into separate scripts so each can
@@ -42,7 +42,7 @@ be authorised independently — don't chain them with `&&` in a single Bash
 call.
 
 If you need raw `idf.py` (e.g. `menuconfig`, `clean`, interactive monitor):
-`source esp-idf/export.sh` then `cd esp32p4-usb-host-benchmark/p4-usb-host`.
+`source esp-idf/export.sh` then `cd p4-usb-host`.
 
 ## Reading the runtime diagnostics
 
