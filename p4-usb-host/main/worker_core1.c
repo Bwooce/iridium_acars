@@ -151,6 +151,25 @@ static void golden_compare_burst(const detected_burst_t *burst,
     for (int k = 0; k < cmp_n; k++) {
         if (frame->bits[k] != e->gri_bits[k]) errors++;
     }
+    // Dump the first N matched-bursts' raw bit strings so an offline
+    // analyzer (tests/scripts/golden_bits_align.py) can search for
+    // the transform that aligns device bits to gri bits (shift, NOT,
+    // Gray inversion, etc.). Cleared once we know the mapping.
+    if (s_gold_matched < 3) {
+        char dev_str[400];
+        char gri_str[400];
+        int n_to_dump = cmp_n < 384 ? cmp_n : 384;
+        for (int k = 0; k < n_to_dump; k++) {
+            dev_str[k] = frame->bits[k]   ? '1' : '0';
+            gri_str[k] = e->gri_bits[k]   ? '1' : '0';
+        }
+        dev_str[n_to_dump] = 0;
+        gri_str[n_to_dump] = 0;
+        ESP_LOGI(TAG, "GOLDEN-BITDUMP gri_id=%d device_n=%d gri_n=%d",
+                 e->gri_id, frame->n_bits, e->gri_n_bits);
+        ESP_LOGI(TAG, "GOLDEN-BITDUMP   dev=%s", dev_str);
+        ESP_LOGI(TAG, "GOLDEN-BITDUMP   gri=%s", gri_str);
+    }
     s_gold_matched++;
     s_gold_total_bits += (uint32_t)cmp_n;
     s_gold_total_errors += (uint32_t)errors;
