@@ -79,7 +79,7 @@ static int test_direction(const int *uw, const char *name, ir_direction_t expect
     int n_int16 = build_iq_2sps(symbols, 32, iq, 1000);
 
     decoded_frame_t frame = { 0 };
-    int rc = qpsk_demod_process(iq, n_int16, DIR_UNKNOWN, &frame);
+    int rc = qpsk_demod_process(iq, n_int16, &frame);
 
     if (!rc) { printf("  %s: FAIL — demod returned 0\n", name); return 0; }
     if (frame.direction != expected) {
@@ -111,7 +111,7 @@ static int test_unknown_direction(void)
     int16_t iq[32 * 4];
     int n_int16 = build_iq_2sps(symbols, 32, iq, 1000);
     decoded_frame_t frame = { 0 };
-    int rc = qpsk_demod_process(iq, n_int16, DIR_UNKNOWN, &frame);
+    int rc = qpsk_demod_process(iq, n_int16, &frame);
 
     if (rc != 0) {
         printf("  unknown-UW: FAIL — demod returned %d (expected 0)\n", rc);
@@ -128,7 +128,7 @@ static int test_too_short(void)
     int16_t iq[8 * 4];
     int n_int16 = build_iq_2sps(symbols, 8, iq, 1000);
     decoded_frame_t frame = { 0 };
-    int rc = qpsk_demod_process(iq, n_int16, DIR_UNKNOWN, &frame);
+    int rc = qpsk_demod_process(iq, n_int16, &frame);
     if (rc != 0) {
         printf("  too-short: FAIL — demod returned %d (expected 0)\n", rc);
         free(frame.bits);

@@ -111,8 +111,7 @@ int main(void)
             if ((int)ALBQ_2SPS_LEN - int16_off < 24 * STEP_INT16) break;
             decoded_frame_t f = { 0 };
             int rc = qpsk_demod_process(rotated + int16_off,
-                                        ALBQ_2SPS_LEN - int16_off,
-                                        DIR_UNKNOWN, &f);
+                                        ALBQ_2SPS_LEN - int16_off, &f);
             if (!rc) continue;
             const char *dir =
                 (f.direction == DIR_DOWNLINK) ? "DL" :
