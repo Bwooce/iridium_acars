@@ -6,9 +6,26 @@
 #include "esp_attr.h"
 #include "esp_async_memcpy.h"
 #include "esp_cache.h"
+#include "sdkconfig.h"
 #include "signal_buffer.h"
 
 static const char *TAG = "SIG_BUF";
+
+// ESP32-P4 v1.3 silicon errata MSPI-750 guardrail. The PSRAM DMA path
+// requires byte-aligned bursts; our PSRAM writes here use 4-byte
+// alignment (n_samples * 4 bytes per transfer, head_bytes = head * 4
+// for the destination offset) which is enough as long as IDF GDMA
+// keeps weighted-arbitration OFF. If a future build turns on
+// CONFIG_GDMA_ENABLE_WEIGHTED_ARBITRATION, GDMA will raise the
+// required alignment to dma_burst_size (= 64 below) and our 4-byte-
+// multiple lengths could fail validation, silently dropping into a
+// slow fallback or returning an error. Catch that at compile time.
+#ifdef CONFIG_GDMA_ENABLE_WEIGHTED_ARBITRATION
+_Static_assert(0,
+    "GDMA weighted arbitration changes alignment requirements; review "
+    "signal_buffer_push's 4-byte multiples vs dma_burst_size=64 before "
+    "enabling. See memory/project_p4_errata_status.md (MSPI-750).");
+#endif
 
 // 4 MB circular buffer in PSRAM. int16 IQ pairs:
 //   circular_buf[head*2 + 0] = I

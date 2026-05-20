@@ -34,7 +34,17 @@ CONFIG_SPIRAM_MEMTEST=y
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=118784
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
-CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
+# Disabled to harden against ESP32-P4 v1.3 silicon errata MSPI-750 +
+# APM-560 (memory/project_p4_errata_status.md). When ON, the option
+# allows usb_host_transfer_alloc(..., USB_TRANSFER_FLAG_ALLOC_DMA, ...)
+# callers to opt buffers INTO PSRAM. We never call with that flag
+# today (all our calls use flag = 0 → internal SRAM), so disabling
+# the capability is a no-op for current code. Disabling removes the
+# trip-wire: a future hub-support / large-control-transfer change that
+# sets ALLOC_DMA would otherwise silently land USB-DMA buffers in
+# PSRAM, opening MSPI-750 (USB-DMA isn't 4-byte-aware) and APM-560
+# (concurrent AHB master into PSRAM alongside our AXI-GDMA ring).
+CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n
 
 # Bigger L2 cache. Default was 128 KB; baseline[] (8 KB) + magnitudes[] (8 KB)
 # + window_cplx (8 KB) + USB ringbuffer working-set don't co-exist cleanly in
