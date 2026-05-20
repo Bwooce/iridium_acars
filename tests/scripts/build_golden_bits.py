@@ -51,14 +51,24 @@ def parse_macro(header_path: Path, macro: str) -> int:
     return int(m.group(1))
 
 
-def run_extractor(cu8_path: Path, lo_hz: int) -> str:
+def run_extractor(input_path: Path, lo_hz: int) -> str:
+    # Read the CF32 (already 2.5 MSPS post-125/128 resample) the host
+    # pipeline reads. Previously this ran on the raw cu8 file with
+    # `-f cu8 -r 2500000` -- gri would then treat 2,555,904 cu8
+    # samples as 2.5 MSPS even though they're really 2.56 MSPS,
+    # giving gri timing offsets a ~2.4% rate error vs the host
+    # pipeline's reference frame. That made the golden table's
+    # start_sample_2500k positions inconsistent with host tag
+    # positions -- ±125k-sample tolerance in golden_compare papered
+    # over the mismatch but matched DIFFERENT physical bursts.
+    fmt = "cf32_le" if str(input_path).endswith((".cf32", ".cf")) else "cu8"
     cmd = [
         "iridium-extractor",
         "-c", str(lo_hz),
         "-r", "2500000",
-        "-f", "cu8",
+        "-f", fmt,
         "--offline",
-        str(cu8_path),
+        str(input_path),
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
     return res.stdout
@@ -242,17 +252,21 @@ def main():
                     help="merge host wideband bits from /tmp/host_wideband_bits.txt")
     args = ap.parse_args()
 
-    cu8 = SLICES_DIR / "fixture_albq_raw.cu8"
-    if not cu8.exists():
-        print(f"error: {cu8} missing. Run:\n"
-              f"  python3 tests/scripts/grIridium_on_slices.py "
-              f"--only fixture_albq_raw.h", file=sys.stderr)
+    # Run gri on the SAME cf32 the host pipeline reads. Previous path
+    # used the raw cu8 fixture which is at 2.56 MSPS but gri was told
+    # `-r 2500000` -- giving a 2.4% rate error in gri's timing vs the
+    # host's reference frame. Both must read identical IQ at identical
+    # rates for the golden compare to mean anything.
+    cf32 = Path("/tmp/host_direct_if/fixture_albq_raw_2500k.cf32")
+    if not cf32.exists():
+        print(f"error: {cf32} missing. Run:\n"
+              f"  python3 tests/scripts/direct_if_dump.py", file=sys.stderr)
         return 2
 
     header = FIXTURES / ALBQ_RAW_HEADER
     lo_hz = parse_macro(header, ALBQ_RAW_LO_MACRO)
-    print(f"running iridium-extractor on {cu8.name} @ LO {lo_hz} Hz...", file=sys.stderr)
-    out = run_extractor(cu8, lo_hz)
+    print(f"running iridium-extractor on {cf32.name} @ LO {lo_hz} Hz...", file=sys.stderr)
+    out = run_extractor(cf32, lo_hz)
     gri_tags = parse_raw_lines(out)
     print(f"  parsed {len(gri_tags)} RAW lines from gri", file=sys.stderr)
     if not gri_tags:
