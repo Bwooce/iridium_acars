@@ -51,6 +51,13 @@ static volatile uint32_t s_bursts_processed = 0;
 static volatile uint32_t s_bursts_skipped = 0;
 static volatile uint32_t s_queue_high_water = 0;
 static volatile uint64_t s_burst_total_us = 0;
+// BCH outcome counters. processed counts qpsk_demod successes (the
+// "DEMOD SUCCESS" log). bch_decoded counts the ones that actually
+// passed BCH — the real decode rate. bch_failed counts qpsk-demod
+// successes that produced an uncorrectable frame (false-positive
+// decodes from the application's perspective).
+static volatile uint32_t s_bursts_bch_decoded = 0;
+static volatile uint32_t s_bursts_bch_failed = 0;
 
 // Per-stage timing accumulators, summed over processed bursts only.
 static volatile uint64_t s_t_extract_us = 0;
@@ -517,8 +524,22 @@ void worker_task(void *arg)
                     e2_bch = bch_decode_block(block2, data2);
 
                     if (e1_bch >= 0 && e2_bch >= 0) {
-                        ESP_LOGI(TAG, "BCH DECODE SUCCESS! Errors: %d, %d",
+                        ESP_LOGI(TAG, "BCH PASS: errors=%d/%d (real decode)",
                                  e1_bch, e2_bch);
+                        s_bursts_bch_decoded++;
+                    } else {
+                        // DEMOD SUCCESS but BCH FAIL — the qpsk_demod
+                        // produced bits but the frame's BCH-protected
+                        // payload is uncorrupted-but-corrupted past
+                        // the (31,21) code's 3-error budget. The
+                        // app-layer frame_decoder will still attempt
+                        // classification on these bits and most will
+                        // come back as UNKNOWN (no LCW type field
+                        // matched).
+                        ESP_LOGI(TAG, "BCH FAIL: e1=%d e2=%d (false-positive "
+                                       "qpsk_demod success — bits unusable)",
+                                 e1_bch, e2_bch);
+                        s_bursts_bch_failed++;
                     }
                 }
 #if CONFIG_SMOKE_TEST_RAW_IRIDIUM
@@ -615,11 +636,13 @@ void worker_core1_push_burst(const detected_burst_t *burst)
 void worker_core1_get_stats(worker_stats_t *out)
 {
     uint32_t n = s_bursts_processed;
-    out->bursts_queued    = s_bursts_queued;
-    out->bursts_dropped   = s_bursts_dropped;
-    out->bursts_processed = n;
-    out->bursts_skipped   = s_bursts_skipped;
-    out->queue_high_water = s_queue_high_water;
+    out->bursts_queued      = s_bursts_queued;
+    out->bursts_dropped     = s_bursts_dropped;
+    out->bursts_processed   = n;
+    out->bursts_skipped     = s_bursts_skipped;
+    out->bursts_bch_decoded = s_bursts_bch_decoded;
+    out->bursts_bch_failed  = s_bursts_bch_failed;
+    out->queue_high_water   = s_queue_high_water;
     if (n > 0) {
         float fn = (float)n;
         out->avg_burst_us    = (float)s_burst_total_us / fn;
@@ -638,6 +661,8 @@ void worker_core1_get_stats(worker_stats_t *out)
     s_bursts_dropped = 0;
     s_bursts_processed = 0;
     s_bursts_skipped = 0;
+    s_bursts_bch_decoded = 0;
+    s_bursts_bch_failed = 0;
     s_queue_high_water = 0;
     s_burst_total_us = 0;
     s_t_extract_us = s_t_rotate_us = s_t_decim_us = s_t_pipeline_us

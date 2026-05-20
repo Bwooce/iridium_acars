@@ -14,6 +14,8 @@ typedef struct {
     uint32_t bursts_dropped;      // dropped because queue was full
     uint32_t bursts_processed;    // ran end-to-end through the worker
     uint32_t bursts_skipped;      // dropped by edge/length/zero-output guards
+    uint32_t bursts_bch_decoded;  // subset of processed whose frame passed BCH (real decodes)
+    uint32_t bursts_bch_failed;   // subset that demod'd but BCH was uncorrectable (false positives)
     uint32_t queue_high_water;    // peak observed queue depth
     float    avg_burst_us;        // mean wall-clock per processed burst
 

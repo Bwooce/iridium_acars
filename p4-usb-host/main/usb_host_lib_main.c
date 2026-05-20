@@ -31,6 +31,20 @@ static const char *TAG = "DAEMON";
 // Earlier code drove GPIO 45 / 54 thinking they were VBUS_EN; per the schematic
 // netlist, GPIO 45 controls SD-card power (Q1 SI2301CDS), and GPIO 54 is just a
 // breakout pin (header GP00). Neither has anything to do with USB VBUS.
+//
+// v3.x compatibility note: GPIO 54 is reassigned from NC to VDD_HP_1 (HP digital
+// power rail) on ESP32-P4 rev v3.x silicon. If/when this firmware targets v3.x
+// chips, GPIO 54 must NOT be driven as a generic IO — it's a power rail.
+//
+// APM-560 runbook (ESP32-P4 v1.3, see memory/project_p4_errata_status.md):
+// We currently run with the default (permissive) APM policy and a single
+// AHB master targeting PSRAM (AXI-GDMA via esp_async_memcpy in
+// signal_buffer.c). USB DWC-OTG-HS DMA writes into INTERNAL SRAM only
+// (s_raw[], s_conv[] in ingest_core1.c). This avoids the APM-560
+// concurrency window. Before adding ANY of (SDMMC, GMAC, USB-OTGFS,
+// APM enforcement policy) that touches PSRAM concurrently with the
+// signal-buffer DMA, audit the PSRAM access ordering — APM-560
+// recovery is system-reset-only on v1.3.
 
 static void host_lib_daemon_task(void *arg)
 {
