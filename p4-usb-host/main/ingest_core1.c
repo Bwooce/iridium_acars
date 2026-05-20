@@ -128,22 +128,30 @@ static void ingest_task(void *arg)
 
 esp_err_t ingest_core1_init(void)
 {
-    // Allocate ping-pong buffers. s_raw + s_conv stay in DMA-capable
-    // internal SRAM (USB DWC OTG DMA writes raw; convert writes int16
-    // there). s_resamp is CPU-touched once per cycle (resample output)
-    // then read by AXI-GDMA into PSRAM signal_buffer — AXI handles
-    // PSRAM sources cleanly, so s_resamp lives in PSRAM to keep the
-    // internal-DMA pool small enough to fit the
-    // SPIRAM_MALLOC_RESERVE_INTERNAL budget. The resample's CPU touch
-    // is one linear write pass per slot (~8000 complex), fine for
-    // PSRAM. Sized identical to s_conv even though 125/128 < 1
-    // produces a slightly smaller output — the headroom avoids
-    // edge-case checks in the hot path.
+    // Allocate ping-pong buffers.
+    //
+    // s_raw[]: USB DWC OTG DMA target. MUST be in DMA-capable internal
+    //   SRAM because CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n.
+    //
+    // s_conv[]: CPU-only path -- written by the uint8->int16 convert
+    //   loop (above this fn), read by resample_256_to_250_process.
+    //   No DMA engine touches it. Previously flagged
+    //   MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA "for safety" but that
+    //   over-restriction starved the USB transfer pool of internal
+    //   DMA SRAM (esp_libusb's bulk-IN allocations failed at
+    //   start_stream with ESP_ERR_NO_MEM). Moved to PSRAM; freed
+    //   64 KB DMA-internal (2 slots * 32 KB). Cost: CPU writes go
+    //   to PSRAM @ ~100 MB/s vs ~700 MB/s internal SRAM -> ~160 us
+    //   extra per 16 ms slot, ~1% real-time overhead.
+    //
+    // s_resamp[]: AXI-GDMA reads from here into signal_buffer (also
+    //   PSRAM). AXI handles PSRAM sources fine. CPU touch is one
+    //   linear write pass per cycle. Already in PSRAM.
     for (int i = 0; i < INGEST_NUM_SLOTS; i++) {
         s_raw[i] = heap_caps_aligned_alloc(64, 16 * 1024,
                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         s_conv[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
-                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         s_resamp[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         if (!s_raw[i] || !s_conv[i] || !s_resamp[i]) {

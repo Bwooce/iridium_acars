@@ -19,19 +19,27 @@ CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MEMTEST=y
-# Bumped from 32 KB (IDF default) so driver-side internal allocations
-# don't spill into PSRAM (which would add load on the AXI bus that DSP
-# and worker share). 128 KB stopped fitting after the wideband C front
-# end was linked in (Phase 3.6.M) — uw_correlator's CFO + sync-FFT
-# scratch is ~50 KB of internal .bss and combined with fft_sc16_2048's
-# 4 KB twiddle + dsp_processor's 8 KB s_accum the largest contiguous
-# free internal-SRAM block shrank to ~107 KB. 98304 (96 KB) is what
-# fits and covers ingest_core1's raw + conv slot demand (2 × 16 KB raw
-# + 2 × 32 KB conv = 96 KB) without bumping any of the static scratch
-# buffers to PSRAM. ingest_core1's resample output (s_resamp) is in
-# PSRAM — AXI-GDMA reads PSRAM sources fine and the resample's CPU
-# touch is one linear write per cycle.
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=118784
+# DMA-capable internal SRAM reserve. Bumped from 32 KB (IDF default)
+# so driver-side internal allocations don't spill into PSRAM (which
+# would add load on the AXI bus that DSP and worker share).
+#
+# History:
+#  - 98304 (96 KB) covered ingest_core1's raw + conv slot demand
+#    (2 × 16 KB raw + 2 × 32 KB conv = 96 KB).
+#  - 118784 (116 KB) added headroom for fft_sc16_2048's twiddle +
+#    dsp_processor's s_accum + uw_correlator scratch.
+#  - 180224 (176 KB) needed once esp_libusb's 4 × 8 KB = 32 KB async
+#    bulk-IN transfer pool is also DMA-capable internal allocated
+#    (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n per the errata
+#    hardening means usb_host_transfer_alloc cannot land buffers in
+#    PSRAM). Without this bump, transfer_alloc returns
+#    ESP_ERR_NO_MEM at start-stream because internal DMA heap is
+#    exhausted by the wideband front-end's static allocations.
+#
+# ingest_core1's resample output (s_resamp) stays in PSRAM — AXI-
+# GDMA reads PSRAM sources fine and the resample's CPU touch is one
+# linear write per cycle.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=147456
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
 # Disabled to harden against ESP32-P4 v1.3 silicon errata MSPI-750 +

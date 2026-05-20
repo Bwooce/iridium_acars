@@ -247,10 +247,34 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
     }
 
     dev->streaming = true;
+    // Diagnostic for the DMA-pool exhaustion symptom that previously
+    // showed up as "Failed to alloc async transfer 0" with no further
+    // detail. usb_host_transfer_alloc requires DMA-capable internal
+    // SRAM because CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM is off
+    // (silicon errata hardening, see sdkconfig.defaults). Print heap
+    // state so a future failure points immediately at the right
+    // budget knob.
+    size_t internal_free_at_start = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    size_t internal_largest_at_start = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    ESP_LOGI("LIBUSB", "Pre-stream DMA-internal heap: free=%u KB, largest=%u KB; "
+                       "need %d × %d KB = %d KB",
+             (unsigned)(internal_free_at_start / 1024),
+             (unsigned)(internal_largest_at_start / 1024),
+             ASYNC_TRANSFER_COUNT, ASYNC_TRANSFER_SIZE / 1024,
+             ASYNC_TRANSFER_COUNT * ASYNC_TRANSFER_SIZE / 1024);
     for (int i = 0; i < ASYNC_TRANSFER_COUNT; i++) {
         esp_err_t r = usb_host_transfer_alloc(ASYNC_TRANSFER_SIZE, 0, &dev->transfers[i]);
         if (r != ESP_OK || dev->transfers[i] == NULL) {
-            ESP_LOGE("LIBUSB", "Failed to alloc async transfer %d", i);
+            size_t free_now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            size_t largest_now = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            ESP_LOGE("LIBUSB", "transfer_alloc #%d failed: r=0x%x (%s), "
+                              "DMA-internal heap free=%u KB largest=%u KB "
+                              "(needed %d KB). Bump CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL "
+                              "or shrink ASYNC_TRANSFER_COUNT/_SIZE.",
+                     i, r, esp_err_to_name(r),
+                     (unsigned)(free_now / 1024),
+                     (unsigned)(largest_now / 1024),
+                     ASYNC_TRANSFER_SIZE / 1024);
             return -1;
         }
         dev->transfers[i]->device_handle = dev_hdl;
@@ -258,7 +282,7 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
         dev->transfers[i]->callback = stream_transfer_cb;
         dev->transfers[i]->context = (void *)driver_obj;
         dev->transfers[i]->num_bytes = ASYNC_TRANSFER_SIZE;
-        
+
         r = usb_host_transfer_submit(dev->transfers[i]);
         if (r != ESP_OK) {
             ESP_LOGE("LIBUSB", "Failed to submit async transfer %d: %d", i, r);
