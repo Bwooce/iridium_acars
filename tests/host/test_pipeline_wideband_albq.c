@@ -37,6 +37,7 @@
 #include "burst_pipeline.h"
 #include "qpsk_demod.h"
 #include "uw_correlator.h"
+#include "fixture_albq_golden_bits.h"
 
 // We do NOT pull in fixture_albq_raw.h (the 2.56 MSPS u8 fixture) any
 // more — instead we read /tmp/host_direct_if/fixture_albq_raw_2500k.cf32
@@ -124,6 +125,169 @@ static int parse_dump_target_bin(void) {
     const char *s = getenv("DUMP_TARGET_BIN");
     if (!s) return -1;
     return atoi(s);
+}
+
+// =========================================================================
+// Host-side golden-bit comparison (mirrors the device path in
+// worker_core1.c). Same tolerances, same buckets, same printout format
+// so device vs host runs read identically. The split:
+//   - device path computes BCH error counts (e1, e2) per block; this
+//     host test does not (the host wideband pipeline doesn't run BCH),
+//     so the "bch=" column always prints "skip" here.
+//   - device dumps the first 3 GOLDEN-BITDUMP rows so an offline aligner
+//     can search for the bit-permutation that fits; host does the same.
+// =========================================================================
+#define HG_TIME_TOL_2500K   125000
+#define HG_FREQ_TOL_HZ      20000
+
+static uint32_t hg_decoded         = 0;
+static uint32_t hg_matched         = 0;
+static uint32_t hg_unmatched       = 0;
+static uint32_t hg_exact           = 0;
+static uint32_t hg_close           = 0;
+static uint32_t hg_partial         = 0;
+static uint32_t hg_divergent       = 0;
+static uint32_t hg_total_bits      = 0;
+static uint32_t hg_total_errors    = 0;
+static uint32_t hg_len_eq          = 0;
+static uint32_t hg_len_short       = 0;
+static uint8_t  hg_claimed[128];
+
+typedef struct {
+    int gri_id;
+    int host_n_bits;
+    int gri_n_bits;
+    int compared_bits;
+    int errors;
+    int bucket;       // 0=exact 1=close 2=partial 3=divergent 4=unmatched
+    int gri_conf;
+} hg_row_t;
+static hg_row_t hg_rows[128];
+static int      hg_n_rows = 0;
+
+static int hg_dump_count = 0;
+
+static void host_golden_compare(uint32_t start_sample, float rel_freq_hz,
+                                 const uint8_t *bits, int n_bits)
+{
+    hg_decoded++;
+    int best = -1;
+    int64_t best_score = INT64_MAX;
+    for (int g = 0; g < FIXTURE_ALBQ_RAW_GOLDEN_COUNT; g++) {
+        if (hg_claimed[g]) continue;
+        const golden_burst_t *e = &FIXTURE_ALBQ_RAW_GOLDEN_BURSTS[g];
+        int64_t ds = (int64_t)start_sample - (int64_t)e->start_sample_2500k;
+        if (ds < 0) ds = -ds;
+        if (ds > HG_TIME_TOL_2500K) continue;
+        int64_t df = (int64_t)rel_freq_hz - (int64_t)e->freq_offset_hz;
+        if (df < 0) df = -df;
+        if (df > HG_FREQ_TOL_HZ) continue;
+        int64_t score = (ds * 100 / HG_TIME_TOL_2500K)
+                       + (df * 100 / HG_FREQ_TOL_HZ);
+        if (score < best_score) { best_score = score; best = g; }
+    }
+    if (best < 0) {
+        hg_unmatched++;
+        if (hg_n_rows < (int)(sizeof(hg_rows)/sizeof(hg_rows[0]))) {
+            hg_rows[hg_n_rows++] = (hg_row_t){
+                .gri_id = -1, .host_n_bits = n_bits,
+                .gri_n_bits = 0, .compared_bits = 0, .errors = 0,
+                .bucket = 4, .gri_conf = -1,
+            };
+        }
+        return;
+    }
+    hg_claimed[best] = 1;
+    const golden_burst_t *e = &FIXTURE_ALBQ_RAW_GOLDEN_BURSTS[best];
+    int cmp_n = n_bits < e->gri_n_bits ? n_bits : e->gri_n_bits;
+    int errors = 0;
+    for (int k = 0; k < cmp_n; k++) {
+        if (bits[k] != e->gri_bits[k]) errors++;
+    }
+    if (hg_dump_count < 3) {
+        char dev_str[400], gri_str[400];
+        int nd = cmp_n < 384 ? cmp_n : 384;
+        for (int k = 0; k < nd; k++) {
+            dev_str[k] = bits[k] ? '1' : '0';
+            gri_str[k] = e->gri_bits[k] ? '1' : '0';
+        }
+        dev_str[nd] = 0; gri_str[nd] = 0;
+        printf("GOLDEN-BITDUMP gri_id=%d host_n=%d gri_n=%d\n",
+               e->gri_id, n_bits, e->gri_n_bits);
+        printf("GOLDEN-BITDUMP   dev=%s\n", dev_str);
+        printf("GOLDEN-BITDUMP   gri=%s\n", gri_str);
+        hg_dump_count++;
+    }
+    hg_matched++;
+    hg_total_bits   += (uint32_t)cmp_n;
+    hg_total_errors += (uint32_t)errors;
+    if (n_bits == e->gri_n_bits) hg_len_eq++;
+    else if (n_bits < e->gri_n_bits) hg_len_short++;
+
+    int bucket;
+    if (cmp_n == 0) bucket = 4;
+    else {
+        int ber_pct = errors * 100 / cmp_n;
+        if (errors == 0)      { hg_exact++;     bucket = 0; }
+        else if (ber_pct < 5) { hg_close++;     bucket = 1; }
+        else if (ber_pct < 25){ hg_partial++;   bucket = 2; }
+        else                  { hg_divergent++; bucket = 3; }
+    }
+    if (hg_n_rows < (int)(sizeof(hg_rows)/sizeof(hg_rows[0]))) {
+        hg_rows[hg_n_rows++] = (hg_row_t){
+            .gri_id = e->gri_id, .host_n_bits = n_bits,
+            .gri_n_bits = e->gri_n_bits, .compared_bits = cmp_n,
+            .errors = errors, .bucket = bucket, .gri_conf = e->conf_pct,
+        };
+    }
+}
+
+static void host_golden_print_summary(void)
+{
+    int n_gri = FIXTURE_ALBQ_RAW_GOLDEN_COUNT;
+    int n_missed = 0;
+    for (int g = 0; g < n_gri; g++) if (!hg_claimed[g]) n_missed++;
+    double recall    = n_gri > 0 ? 100.0 * (double)hg_matched / (double)n_gri : 0.0;
+    double precision = hg_decoded > 0 ? 100.0 * (double)hg_matched / (double)hg_decoded : 0.0;
+    printf("\n");
+    printf("GOLDEN: gri_total=%d host_decoded=%u matched=%u "
+           "missed_by_host=%d unmatched_host=%u "
+           "(recall=%.1f%% precision=%.1f%%)\n",
+           n_gri, hg_decoded, hg_matched, n_missed, hg_unmatched,
+           recall, precision);
+    printf("GOLDEN: histogram exact=%u close(BER<5%%)=%u partial(<25%%)=%u "
+           "divergent(>=25%%)=%u\n",
+           hg_exact, hg_close, hg_partial, hg_divergent);
+    if (hg_total_bits > 0) {
+        printf("GOLDEN: overall BER %u/%u = %.2f%% "
+               "(length_eq=%u length_short=%u)\n",
+               hg_total_errors, hg_total_bits,
+               100.0 * (double)hg_total_errors / (double)hg_total_bits,
+               hg_len_eq, hg_len_short);
+    }
+    for (int i = 0; i < hg_n_rows; i++) {
+        const hg_row_t *r = &hg_rows[i];
+        if (r->bucket == 4 && r->gri_id < 0) {
+            printf("GOLDEN[%d]: UNMATCHED host_n=%d\n", i, r->host_n_bits);
+        } else {
+            const char *tag = r->bucket == 0 ? "EXACT"
+                            : r->bucket == 1 ? "CLOSE"
+                            : r->bucket == 2 ? "PARTIAL"
+                            :                  "DIVERG";
+            printf("GOLDEN[%d]: gri_id=%d conf=%d%% %s "
+                   "raw_err=%d/%d (host_n=%d gri_n=%d)\n",
+                   i, r->gri_id, r->gri_conf, tag, r->errors,
+                   r->compared_bits, r->host_n_bits, r->gri_n_bits);
+        }
+    }
+    for (int g = 0; g < n_gri; g++) {
+        if (hg_claimed[g]) continue;
+        const golden_burst_t *e = &FIXTURE_ALBQ_RAW_GOLDEN_BURSTS[g];
+        printf("GOLDEN-MISSED: gri_id=%d start=%llu freq_off=%ld "
+               "conf=%d gri_n_bits=%d\n",
+               e->gri_id, (unsigned long long)e->start_sample_2500k,
+               (long)e->freq_offset_hz, e->conf_pct, e->gri_n_bits);
+    }
 }
 
 int main(void) {
@@ -312,6 +476,15 @@ int main(void) {
         if (res.uw_res.direction != UW_DIR_UNKNOWN) uw_found++;
         if (res.demod_ok) {
             decoded++;
+            // Device-equivalent compare: same tolerance window, same
+            // bucketing as worker_core1.c's golden_compare_burst().
+            // rel_freq_hz derived from center_bin via the same formula
+            // dsp_processor uses.
+            int signed_bin = tags[i].center_bin - FBT_FFT_SIZE / 2;
+            float rel_freq_hz = (float)signed_bin * (float)INPUT_FS_HZ
+                                 / (float)FBT_FFT_SIZE;
+            host_golden_compare((uint32_t)begin, rel_freq_hz,
+                                 res.frame.bits, res.frame.n_bits);
             free(res.frame.bits);
         }
     }
@@ -324,6 +497,8 @@ int main(void) {
     printf("\nReference: gr-iridium decodes 65 on this fixture; path A\n");
     printf("(polyphase channelizer) currently at 17/99; path C (Python\n");
     printf("scipy front end + manifest tagging) at 64/65.\n");
+
+    host_golden_print_summary();
 
     fft_burst_tagger_destroy(t);
     free(window_250);
