@@ -357,7 +357,7 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
              retry_start += RETRY_STEP_10SPS) {
             s_profile_loops_retry++;
             if (try_decode_frame(adj_burst, adj_n, retry_start,
-                                  result, /*dump=*/false)) {
+                                  result, /*dump=*/true)) {
                 break;
             }
         }
