@@ -429,6 +429,16 @@ static int radix2_ifft_q15(int32_t *re, int32_t *im, int N, int log_N,
 
 #if CORR_USE_FLOAT_FFT
 
+// Diagnostic counters at file scope, visible to both host and target.
+// Timer updates inside #if defined(ESP_PLATFORM) (esp_timer isn't on
+// host); counters stay 0 there. Smoke-test consumer reads them on
+// target only.
+volatile uint64_t g_pie_fft_inner_us = 0;   // FFT + bit-rev (target only)
+volatile uint64_t g_pie_fft_outer_us = 0;   // interleave + de-interleave
+volatile uint32_t g_pie_fft_calls    = 0;
+volatile uint64_t g_uw_specmul_us    = 0;
+volatile uint64_t g_uw_magsearch_us  = 0;
+
 #if defined(ESP_PLATFORM)
 // Task #58/#67: PIE float FFT wrapper. Replaces ~3× radix2_fft_f32 calls
 // per uw_correlator_find with esp-dsp's dsps_fft2r_fc32_arp4 (8-lane
@@ -453,16 +463,6 @@ static int radix2_ifft_q15(int32_t *re, int32_t *im, int N, int log_N,
 static float *s_pie_fft_scratch = NULL;   // 2*CORR_FFT_N floats interleaved IQ
 static float *s_pie_fft_w_table = NULL;   // 1*CORR_FFT_N floats twiddle table
 static bool   s_pie_fft_inited  = false;
-
-// Cumulative timers for the PIE FFT wrapper -- distinguishes the
-// FFT math itself (dsps_fft2r_fc32_arp4 + dsps_bit_rev_fc32_ansi)
-// from the de-interleave/interleave wrapper overhead.
-volatile uint64_t g_pie_fft_inner_us = 0;   // FFT + bit-rev
-volatile uint64_t g_pie_fft_outer_us = 0;   // interleave + de-interleave
-volatile uint32_t g_pie_fft_calls    = 0;
-// Per-uw_correlator_find sub-counters for the non-FFT work.
-volatile uint64_t g_uw_specmul_us   = 0;
-volatile uint64_t g_uw_magsearch_us = 0;
 
 static void pie_fft_fc32_init(void)
 {
@@ -1277,22 +1277,26 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
                    s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
 #endif
 
-    // DL path (float)
+    // DL path (float). Timer markers (esp_timer_get_time + g_uw_*) feed
+    // the smoke-test diagnostic substages on target; host stubs them
+    // out via the guards since esp_timer isn't available there.
+#if defined(ESP_PLATFORM)
     int64_t _t0 = esp_timer_get_time();
+#endif
     for (int k = 0; k < CORR_FFT_N; k++) {
         float ar = fburst_re[k], ai = fburst_im[k];
         float br = s_sync_dl_fft_re_f[k], bi = s_sync_dl_fft_im_f[k];
         fifft_re[k] = ar * br - ai * bi;
         fifft_im[k] = ar * bi + ai * br;
     }
-    g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
 #if defined(ESP_PLATFORM)
+    g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
     pie_ifft_fc32_2048(fifft_re, fifft_im);
+    _t0 = esp_timer_get_time();
 #else
     radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
                     s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
 #endif
-    _t0 = esp_timer_get_time();
     for (int k = 0; k < search_complex; k++) {
         int idx = k + L_minus_1;
         if (idx >= CORR_FFT_N) break;
@@ -1310,23 +1314,25 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
             best_dl_im_f = im;
         }
     }
+#if defined(ESP_PLATFORM)
     g_uw_magsearch_us += (uint64_t)(esp_timer_get_time() - _t0);
     // UL path (float)
     _t0 = esp_timer_get_time();
+#endif
     for (int k = 0; k < CORR_FFT_N; k++) {
         float ar = fburst_re[k], ai = fburst_im[k];
         float br = s_sync_ul_fft_re_f[k], bi = s_sync_ul_fft_im_f[k];
         fifft_re[k] = ar * br - ai * bi;
         fifft_im[k] = ar * bi + ai * br;
     }
-    g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
 #if defined(ESP_PLATFORM)
+    g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
     pie_ifft_fc32_2048(fifft_re, fifft_im);
+    _t0 = esp_timer_get_time();
 #else
     radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
                     s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
 #endif
-    _t0 = esp_timer_get_time();
     for (int k = 0; k < search_complex; k++) {
         int idx = k + L_minus_1;
         if (idx >= CORR_FFT_N) break;
@@ -1339,7 +1345,9 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
             best_ul_im_f = im;
         }
     }
+#if defined(ESP_PLATFORM)
     g_uw_magsearch_us += (uint64_t)(esp_timer_get_time() - _t0);
+#endif
 
     // Bridge float-path results to the int64 names the downstream
     // direction-pick + SNR code uses (those originated with the Q15 BFP

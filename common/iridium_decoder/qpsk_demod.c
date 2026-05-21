@@ -92,9 +92,15 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         return 0;
     }
     if (n_symbols > QPSK_MAX_SYMBOLS) {
-        ESP_LOGE(TAG, "n_symbols %d > QPSK_MAX_SYMBOLS %d -- bursts capped at one frame upstream",
+        // Cap rather than reject: production callers feed at most one
+        // frame (191 syms ≤ 256), but the host test_demod_albq does a
+        // brute-force rotation×offset search over ALBQ_2SPS_LEN (~554
+        // syms) and benefits from us processing whatever first window
+        // fits. Truncating mirrors what gri does -- it processes the
+        // first frame_size symbols and ignores the rest.
+        ESP_LOGD(TAG, "n_symbols %d > QPSK_MAX_SYMBOLS %d -- truncating",
                  n_symbols, QPSK_MAX_SYMBOLS);
-        return 0;
+        n_symbols = QPSK_MAX_SYMBOLS;
     }
 
     // Buffers are sized for the maximum frame length and live on the
