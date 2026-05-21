@@ -428,11 +428,14 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
         e2_bch = bch_decode_block(block2, data2);
 
         if (e1_bch >= 0 && e2_bch >= 0) {
-            ESP_LOGI(TAG, "BCH PASS: errors=%d/%d (real decode)",
+            // Per-frame BCH outcomes demoted to LOGD: the GOLDEN summary
+            // aggregates counts (clean/corrected/failed/skipped) so the
+            // per-frame logs are just diagnostic noise during runs.
+            ESP_LOGD(TAG, "BCH PASS: errors=%d/%d (real decode)",
                      e1_bch, e2_bch);
             s_bursts_bch_decoded++;
         } else {
-            ESP_LOGI(TAG, "BCH FAIL: e1=%d e2=%d (false-positive "
+            ESP_LOGD(TAG, "BCH FAIL: e1=%d e2=%d (false-positive "
                            "qpsk_demod success — bits unusable)",
                      e1_bch, e2_bch);
             s_bursts_bch_failed++;
