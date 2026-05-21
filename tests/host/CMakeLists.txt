@@ -396,6 +396,7 @@ add_executable(test_pipeline_direct_if_albq
     ${COMMON_DIR}/uw_correlator_tables.c
     ${COMMON_DIR}/qpsk_demod.c
     ${COMMON_DIR}/sym_timing.c
+    ${COMMON_DIR}/rotate_to_dc.c
 )
 target_include_directories(test_pipeline_direct_if_albq PRIVATE
     ${COMMON_DIR}

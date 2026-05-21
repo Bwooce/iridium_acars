@@ -1278,21 +1278,23 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 #endif
 
     // DL path (float)
+#if defined(ESP_PLATFORM)
     int64_t _t0 = esp_timer_get_time();
+#endif
     for (int k = 0; k < CORR_FFT_N; k++) {
         float ar = fburst_re[k], ai = fburst_im[k];
         float br = s_sync_dl_fft_re_f[k], bi = s_sync_dl_fft_im_f[k];
         fifft_re[k] = ar * br - ai * bi;
         fifft_im[k] = ar * bi + ai * br;
     }
-    g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
 #if defined(ESP_PLATFORM)
+    g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
     pie_ifft_fc32_2048(fifft_re, fifft_im);
+    _t0 = esp_timer_get_time();
 #else
     radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
                     s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
 #endif
-    _t0 = esp_timer_get_time();
     for (int k = 0; k < search_complex; k++) {
         int idx = k + L_minus_1;
         if (idx >= CORR_FFT_N) break;
@@ -1310,23 +1312,29 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
             best_dl_im_f = im;
         }
     }
+#if defined(ESP_PLATFORM)
     g_uw_magsearch_us += (uint64_t)(esp_timer_get_time() - _t0);
+#endif
     // UL path (float)
+#if defined(ESP_PLATFORM)
     _t0 = esp_timer_get_time();
+#endif
     for (int k = 0; k < CORR_FFT_N; k++) {
         float ar = fburst_re[k], ai = fburst_im[k];
         float br = s_sync_ul_fft_re_f[k], bi = s_sync_ul_fft_im_f[k];
         fifft_re[k] = ar * br - ai * bi;
         fifft_im[k] = ar * bi + ai * br;
     }
+#if defined(ESP_PLATFORM)
     g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
+#endif
 #if defined(ESP_PLATFORM)
     pie_ifft_fc32_2048(fifft_re, fifft_im);
+    _t0 = esp_timer_get_time();
 #else
     radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
                     s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
 #endif
-    _t0 = esp_timer_get_time();
     for (int k = 0; k < search_complex; k++) {
         int idx = k + L_minus_1;
         if (idx >= CORR_FFT_N) break;
@@ -1339,7 +1347,9 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
             best_ul_im_f = im;
         }
     }
+#if defined(ESP_PLATFORM)
     g_uw_magsearch_us += (uint64_t)(esp_timer_get_time() - _t0);
+#endif
 
     // Bridge float-path results to the int64 names the downstream
     // direction-pick + SNR code uses (those originated with the Q15 BFP
