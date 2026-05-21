@@ -177,12 +177,18 @@ static void process_one(const frame_queue_item_t *it)
     case IR_FRAME_LW:
         if (classified.lw_subtype == IR_LW_DA) {
             atomic_fetch_add_explicit(&s_class_lw_da, 1, memory_order_relaxed);
-            ESP_LOGI(TAG, "FRAME: LW.DA bin=%ld snr=%.1f freq=%lu",
-                     (long)it->peak_bin, (double)it->snr_db,
-                     (unsigned long)it->freq_hz);
-            // Run the IDA -> SBD -> ACARS chain.
+            // Run the IDA -> SBD -> ACARS chain. Log the IDA header
+            // fields up front so we can see what kind of DA content is
+            // in the stream (CRC pass/fail, payload length, flags).
             ida_decoded_t ida = { 0 };
             int rc_ida = ida_decode(&classified, &ida);
+            ESP_LOGI(TAG, "FRAME: LW.DA bin=%ld snr=%.1f "
+                          "bch_ok=%d blocks=%d/%d errs=%d "
+                          "hdr_ok=%d ctr=%d len=%u crc=%s",
+                     (long)it->peak_bin, (double)it->snr_db,
+                     ida.ok, ida.blocks_ok, ida.n_blocks, ida.total_errors,
+                     ida.header_ok, ida.da_ctr, (unsigned)ida.payload_len,
+                     ida.crc_ok ? "OK" : "BAD");
             if (rc_ida == 0 && ida.ok && ida.header_ok) {
                 sbd_message_t sbd;
                 int rc_sbd = sbd_reassembler_feed(&s_sbd, &ida,
