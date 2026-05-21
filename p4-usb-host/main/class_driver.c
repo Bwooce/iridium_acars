@@ -177,6 +177,9 @@ void class_driver_task(void *arg)
     // Core 0 cycle stage breakdown. Convert and push happen on Core 1
     // (ingest task) post-Step 5; only read and feed live here now.
     uint64_t cycle_read_us = 0;
+    uint64_t cycle_handle_events_us = 0;  // time blocked in usb_host_client_handle_events
+    uint64_t cycle_take_converted_us = 0; // time blocked in ingest_core1_take_converted
+    uint32_t cycle_iterations = 0;
     int64_t last_idle_log = esp_timer_get_time();
     int64_t last_taskdump = esp_timer_get_time();
     int64_t last_recovery_us = esp_timer_get_time();
@@ -191,7 +194,10 @@ void class_driver_task(void *arg)
         // task would never get to run and TWDT would trigger every 5 s.
         esp_task_wdt_reset();
 
+        int64_t t_he0 = esp_timer_get_time();
         usb_host_client_handle_events(s_driver_obj.client_hdl, 10);
+        cycle_handle_events_us += (uint64_t)(esp_timer_get_time() - t_he0);
+        cycle_iterations++;
 
         // Periodic status / recovery watchdog while no device is open.
         if (s_driver_obj.dev_addr == 0) {
@@ -266,7 +272,9 @@ void class_driver_task(void *arg)
             // it's already been converted + signal_buffer_pushed).
             if (prev_dsp_slot >= 0) {
                 size_t n_int16 = 0;
+                int64_t t_tc0 = esp_timer_get_time();
                 int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
+                cycle_take_converted_us += (uint64_t)(esp_timer_get_time() - t_tc0);
                 int64_t t_pre_feed = esp_timer_get_time();
 
                 dsp_processor_feed(converted, n_int16 / 2);
@@ -315,6 +323,9 @@ void class_driver_task(void *arg)
             snap.dsp_total_time_us = dsp_total_time_us;
             snap.dsp_frame_count   = dsp_frame_count;
             snap.cycle_read_us     = cycle_read_us;
+            snap.cycle_handle_events_us = cycle_handle_events_us;
+            snap.cycle_take_converted_us = cycle_take_converted_us;
+            snap.cycle_iterations  = cycle_iterations;
             snap.psram_free_bytes  = (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
             esp_libusb_get_stream_stats(&snap.us);
             dsp_processor_get_stage_stats(&snap.dsp);
@@ -357,6 +368,9 @@ void class_driver_task(void *arg)
             dsp_total_time_us = 0;
             dsp_frame_count = 0;
             cycle_read_us = 0;
+            cycle_handle_events_us = 0;
+            cycle_take_converted_us = 0;
+            cycle_iterations = 0;
         }
     }
 

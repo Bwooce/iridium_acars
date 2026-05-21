@@ -42,9 +42,11 @@ static void emit(const status_snapshot_t *s)
     float read_us_avg = (float)s->cycle_read_us / feed_n;
 
     float ingest_n = (s->ingest.dispatches > 0) ? (float)s->ingest.dispatches : 1.0f;
-    float ingest_convert_us_avg = (float)s->ingest.convert_us_total / ingest_n;
-    float ingest_push_us_avg    = (float)s->ingest.push_us_total    / ingest_n;
-    float ingest_wait_us_avg    = (s->ingest.consumer_waits > 0)
+    float ingest_convert_us_avg  = (float)s->ingest.convert_us_total  / ingest_n;
+    float ingest_push_us_avg     = (float)s->ingest.push_us_total     / ingest_n;
+    float ingest_resample_us_avg = (float)s->ingest.resample_us_total / ingest_n;
+    float ingest_sbpush_us_avg   = (float)s->ingest.sbpush_us_total   / ingest_n;
+    float ingest_wait_us_avg     = (s->ingest.consumer_waits > 0)
         ? (float)s->ingest.slot_wait_total_us / (float)s->ingest.consumer_waits : 0.0f;
 
     float producer_peak_pct = 100.0f * (float)s->us.producer_rb_max_used / (512.0f * 1024.0f);
@@ -68,9 +70,30 @@ static void emit(const status_snapshot_t *s)
     ESP_LOGI(TAG, "Cycle (Core0 us avg): read=%.0f feed=%.0f",
              read_us_avg, feed_us_avg);
 
+    // Per-iteration cycle breakdown. cycle_iterations is the raw
+    // loop tick count over the window; if >> feed_calls then the loop
+    // is spinning idle in handle_events. take_converted_us tells us
+    // how often Core 0 blocks waiting for Core 1 ingest to finish.
+    float ci_n = (s->cycle_iterations > 0) ? (float)s->cycle_iterations : 1.0f;
+    float he_avg_per_iter = (float)s->cycle_handle_events_us / ci_n;
+    float tc_avg_per_feed = (s->feed_calls_window > 0)
+        ? (float)s->cycle_take_converted_us / (float)s->feed_calls_window : 0.0f;
+    float ci_per_sec = ci_n * 1e6f / (float)(s->window_us > 0 ? s->window_us : 1);
+    float he_pct = 100.0f * (float)s->cycle_handle_events_us
+                            / (float)(s->window_us > 0 ? s->window_us : 1);
+    float tc_pct = 100.0f * (float)s->cycle_take_converted_us
+                            / (float)(s->window_us > 0 ? s->window_us : 1);
+    ESP_LOGI(TAG, "Cycle (Core0): iter=%u (%.0f/s) handle_events=%.0f us/iter (%.1f%% of window)  "
+                  "take_converted=%.0f us/feed (%.1f%% of window)",
+             s->cycle_iterations, ci_per_sec,
+             he_avg_per_iter, he_pct,
+             tc_avg_per_feed, tc_pct);
+
     ESP_LOGI(TAG, "Ingest (Core1 us avg): convert=%.0f push=%.0f "
+                  "(resample=%.0f sbpush=%.0f) "
                   "dispatches=%u consumer_waits=%u (avg_wait=%.0f us)",
              ingest_convert_us_avg, ingest_push_us_avg,
+             ingest_resample_us_avg, ingest_sbpush_us_avg,
              s->ingest.dispatches, s->ingest.consumer_waits, ingest_wait_us_avg);
 
     // Capacity %: how much wall-clock each subsystem consumed in this

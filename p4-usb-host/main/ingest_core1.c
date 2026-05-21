@@ -54,7 +54,9 @@ static int s_next_acquire_slot = 0;
 
 // Diagnostic accumulators (reset by ingest_core1_get_stats).
 static volatile uint64_t s_acc_convert_us = 0;
-static volatile uint64_t s_acc_push_us = 0;
+static volatile uint64_t s_acc_push_us = 0;      // == resample + signal_buffer_push total
+static volatile uint64_t s_acc_resample_us = 0;  // resample step only
+static volatile uint64_t s_acc_sbpush_us = 0;    // signal_buffer_push (AXI DMA wait) only
 static volatile uint32_t s_acc_dispatches = 0;
 static volatile uint32_t s_acc_slot_wait_us = 0;
 static volatile uint32_t s_acc_consumer_waits = 0;
@@ -113,12 +115,17 @@ static void ingest_task(void *arg)
                                                          s_resamp[msg.slot]);
         int n_out_int16 = n_out_complex * 2;
         s_resamp_n_int16[msg.slot] = (size_t)n_out_int16;
+        int64_t t1b = esp_timer_get_time();
+        s_acc_resample_us += (uint64_t)(t1b - t1);
 
         // 3. Push resampled samples into the PSRAM circular buffer.
         // signal_buffer_push is itself async (AXI-GDMA from Step 2) so the
-        // CPU cost here is just descriptor programming + cache flush.
+        // CPU cost here is just descriptor programming + cache flush --
+        // the visible wait inside signal_buffer_push is the semaphore
+        // take for the PREVIOUS DMA to complete.
         signal_buffer_push(s_resamp[msg.slot], (size_t)n_out_complex);
         int64_t t2 = esp_timer_get_time();
+        s_acc_sbpush_us += (uint64_t)(t2 - t1b);
         s_acc_push_us += (uint64_t)(t2 - t1);
 
         s_acc_dispatches++;
@@ -234,11 +241,15 @@ void ingest_core1_get_stats(ingest_stats_t *out)
 {
     out->convert_us_total   = s_acc_convert_us;
     out->push_us_total      = s_acc_push_us;
+    out->resample_us_total  = s_acc_resample_us;
+    out->sbpush_us_total    = s_acc_sbpush_us;
     out->dispatches         = s_acc_dispatches;
     out->slot_wait_total_us = s_acc_slot_wait_us;
     out->consumer_waits     = s_acc_consumer_waits;
     s_acc_convert_us = 0;
     s_acc_push_us = 0;
+    s_acc_resample_us = 0;
+    s_acc_sbpush_us = 0;
     s_acc_dispatches = 0;
     s_acc_slot_wait_us = 0;
     s_acc_consumer_waits = 0;

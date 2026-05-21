@@ -28,6 +28,9 @@ typedef struct {
     uint64_t dsp_total_time_us;     // sum of feed wall time
     uint32_t dsp_frame_count;       // FFT frames processed in this window
     uint64_t cycle_read_us;         // sum of esp_libusb_read_stream wall time
+    uint64_t cycle_handle_events_us; // sum of usb_host_client_handle_events wall time
+    uint64_t cycle_take_converted_us;// sum of ingest_core1_take_converted wall time
+    uint32_t cycle_iterations;       // count of class_driver loop iterations
     int      psram_free_bytes;      // heap_caps_get_free_size(MALLOC_CAP_SPIRAM)
 
     usb_stream_stats_t  us;

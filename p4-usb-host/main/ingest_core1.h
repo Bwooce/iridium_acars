@@ -46,7 +46,9 @@ void ingest_core1_release(int slot);
 // Diagnostics
 typedef struct {
     uint64_t convert_us_total;   // sum of convert wall-clock since last get
-    uint64_t push_us_total;      // sum of signal_buffer_push wall-clock
+    uint64_t push_us_total;      // sum of resample + signal_buffer_push wall-clock
+    uint64_t resample_us_total;  // resample step only
+    uint64_t sbpush_us_total;    // signal_buffer_push (AXI DMA wait) only
     uint32_t dispatches;         // count of dispatches handled
     uint32_t slot_wait_total_us; // time the consumer waited for a slot
     uint32_t consumer_waits;     // count of times consumer had to block
