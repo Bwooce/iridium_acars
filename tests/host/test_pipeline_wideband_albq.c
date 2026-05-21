@@ -121,10 +121,20 @@ static int load_25msps_cf32(const char *path, int16_t **out_iq) {
 // the dsp_compare.py stagewise tool against gri's debug dumps for the
 // same physical burst. Default: gri id=30 lands near bin 1209
 // (freq +225 kHz / bin_width 1220 Hz + N/2).
+//
+// DUMP_START_SAMPLE is the unambiguous selector: target the burst
+// whose start_sample (in 2.5 MSPS units) is closest to the given value.
+// Use when multiple bursts share a bin -- e.g. gri_id=0 is at
+// start_sample=1045958 and bin 1038, but other bursts also hit bin 1038.
 static int parse_dump_target_bin(void) {
     const char *s = getenv("DUMP_TARGET_BIN");
     if (!s) return -1;
     return atoi(s);
+}
+static long long parse_dump_start_sample(void) {
+    const char *s = getenv("DUMP_START_SAMPLE");
+    if (!s) return -1;
+    return atoll(s);
 }
 
 // =========================================================================
@@ -398,11 +408,36 @@ int main(void) {
     int decoded = 0;
     int pipeline_ok = 0;
     int uw_found = 0;
-    // Stage-dump targeting (env-driven).
+    // Stage-dump targeting (env-driven). DUMP_START_SAMPLE takes priority
+    // over DUMP_TARGET_BIN when both are set.
     int target_bin = parse_dump_target_bin();
+    long long target_start = parse_dump_start_sample();
     int best_dump_match_idx = -1;
-    int best_dump_match_dist = 1 << 30;
-    if (target_bin >= 0) {
+    long long best_dump_match_dist = (long long)1 << 60;
+    if (target_start >= 0) {
+        // When both DUMP_START_SAMPLE and DUMP_TARGET_BIN are given,
+        // restrict to tags within ±4 bins of target_bin (~5 kHz) so a
+        // burst at the same time but different frequency doesn't win.
+        for (int i = 0; i < n_tags; i++) {
+            if (target_bin >= 0 && abs(tags[i].center_bin - target_bin) > 4) continue;
+            long long dist = (long long)tags[i].start_sample - target_start;
+            if (dist < 0) dist = -dist;
+            if (dist < best_dump_match_dist) {
+                best_dump_match_dist = dist;
+                best_dump_match_idx = i;
+            }
+        }
+        if (best_dump_match_idx >= 0) {
+            printf("Will dump stages for burst %d (start_sample=%llu bin=%d, "
+                   "target start=%lld bin=%d)\n",
+                   best_dump_match_idx,
+                   (unsigned long long)tags[best_dump_match_idx].start_sample,
+                   tags[best_dump_match_idx].center_bin, target_start, target_bin);
+        } else {
+            printf("DUMP_START_SAMPLE=%lld bin=%d: no matching tag found\n",
+                   target_start, target_bin);
+        }
+    } else if (target_bin >= 0) {
         for (int i = 0; i < n_tags; i++) {
             int dist = abs(tags[i].center_bin - target_bin);
             if (dist < best_dump_match_dist) {
