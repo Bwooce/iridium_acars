@@ -395,8 +395,19 @@ static void smoke_test_run_live_sdr(void)
 }
 #endif
 
+// Task #67: PIE FFT bit-exact diff harness. Runs at the very start of
+// smoke so the comparison numbers land in the log before any other
+// noise. Declared here rather than via header since the harness is
+// self-contained and only called from this one place.
+extern void pie_fft_diff_run(void);
+
 void smoke_test_run(void)
 {
+    // Run the PIE FFT diff harness first so its log lines are easy to
+    // find. Tiny one-shot ~10 ms of synthetic FFT comparisons; doesn't
+    // affect downstream smoke results.
+    pie_fft_diff_run();
+
 #if CONFIG_SMOKE_TEST_LIVE_SDR
     smoke_test_run_live_sdr();
     vTaskSuspend(NULL);
