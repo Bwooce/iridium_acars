@@ -98,3 +98,15 @@ idf_component_register(
     # direct_if_decim on target uses dsps_fird_s16_arp4.
     PRIV_REQUIRES esp_mm espressif__esp-dsp
 )
+
+# Hot DSP inner loops -- push past the project-wide -O2 to -O3 with
+# loop unrolling. Same rationale as the per-file overrides in
+# p4-usb-host/main/CMakeLists.txt: these files contain MAC inner
+# loops where the compiler can do significantly more (unroll fully,
+# vectorise scalar accumulators, hoist invariant loads). Functional
+# regression coverage by the host ctest suite gates the more
+# aggressive scheduling.
+set_source_files_properties(resample_256_to_250.c
+    PROPERTIES COMPILE_FLAGS
+    "-O3 -funroll-loops"
+)
