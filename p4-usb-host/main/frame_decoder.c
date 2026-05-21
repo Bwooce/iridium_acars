@@ -198,8 +198,9 @@ static void process_one(const frame_queue_item_t *it)
                 if (rc_sbd == 1) {
                     atomic_fetch_add_explicit(&s_sbd_complete, 1,
                                               memory_order_relaxed);
-                    ESP_LOGI(TAG, "SBD: type=0x%04x %s len=%u (msg %u/%u)",
-                             sbd.type, sbd.uplink ? "UL" : "DL",
+                    ESP_LOGI(TAG, "SBD: type=%s %s len=%u (msg %u/%u)",
+                             sbd_type_wire_name(sbd.type),
+                             sbd.uplink ? "UL" : "DL",
                              sbd.payload_len, sbd.msg_no, sbd.msg_count);
                     try_acars(&sbd);
                 }

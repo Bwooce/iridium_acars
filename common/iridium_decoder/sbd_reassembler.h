@@ -55,6 +55,12 @@ typedef enum {
     SBD_TYPE_DATA_UL_760E,
 } sbd_type_t;
 
+// Returns the on-the-wire protocol byte pair as a short ASCII string
+// (e.g. "7608" for SBD_TYPE_DATA_DL_7608, "0600" for HELLO, "????" for
+// UNKNOWN). The log lines use this to print the actual protocol type
+// instead of the enum ordinal.
+const char *sbd_type_wire_name(sbd_type_t t);
+
 typedef struct {
     sbd_type_t  type;
     bool        uplink;

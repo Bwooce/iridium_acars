@@ -5,6 +5,22 @@
 
 #define SBD_TIMEOUT_US  (5ULL * 1000000ULL)   // 5 s
 
+const char *sbd_type_wire_name(sbd_type_t t)
+{
+    switch (t) {
+    case SBD_TYPE_UNKNOWN:       return "????";
+    case SBD_TYPE_HELLO_0600:    return "0600";
+    case SBD_TYPE_DATA_DL_7608:  return "7608";
+    case SBD_TYPE_DATA_DL_7609:  return "7609";
+    case SBD_TYPE_DATA_DL_760A:  return "760a";
+    case SBD_TYPE_DATA_DL_760B:  return "760b";
+    case SBD_TYPE_DATA_UL_760C:  return "760c";
+    case SBD_TYPE_DATA_UL_760D:  return "760d";
+    case SBD_TYPE_DATA_UL_760E:  return "760e";
+    }
+    return "????";
+}
+
 void sbd_reassembler_init(sbd_reassembler_t *ctx)
 {
     if (!ctx) return;
