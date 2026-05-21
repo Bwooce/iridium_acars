@@ -126,7 +126,17 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
                               int search_start,
                               burst_pipeline_result_t *result, bool dump)
 {
-    const int SYNC_SEARCH_LEN = (64 + 12 + 8) * UW_SPS;     // 840
+    // The base 840 (= 84 symbols) was sized for gri's tight burst windows
+    // where the UW lands within the first ~80 symbols. Our wideband tagger
+    // gone-event windows are 2.4x wider than gri's (task #70), so frame
+    // 0's UW can be deeper into the buffer. Widen to 2520 = 252 symbols.
+    //
+    // Cost on P4: UW correlation work scales linearly with search_complex,
+    // so 3x compute per try_decode_frame call. Acceptable for now since
+    // first try usually succeeds (no retries) -- net cost is bounded.
+    // Long-term fix: tighten D13 to match gri's narrower trim (task #70),
+    // then this can revert to 840.
+    const int SYNC_SEARCH_LEN = (64 + 12 + 8) * UW_SPS * 3; // 2520
     int remaining = adj_n - search_start;
     if (remaining < SYNC_RRC_LEN_GUARD) return false;
     int search_complex = SYNC_SEARCH_LEN;
