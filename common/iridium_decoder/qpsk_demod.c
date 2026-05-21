@@ -145,101 +145,40 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         omega_hat += PLL_BETA * angle;
     }
 
-    // 3. UW Check. Two paths in parallel:
-    //   (a) Hard-decision rotation-aware match (kept for backward
-    //       compatibility with existing host fixtures — these decode
-    //       cleanly under rot=0 with dl_diffs=0).
-    //   (b) Complex correlation against the UW patterns interpreted
-    //       as QPSK symbols. The correlation magnitude measures match
-    //       strength independent of constellation rotation and absorbs
-    //       small per-symbol noise gracefully. Used as a fallback when
-    //       the hard-decision check fails but a correlation peak is
-    //       clearly present.
+    // 3. UW Check — exact port of gr-iridium's check_sync_word()
+    // (lib/iridium_qpsk_demod_impl.cc:291). For each direction (DL/UL):
+    //   diffs = sum_i |hard_decisions[i] - UW[i]|  with the wrap-around
+    //   case diff==3 normalised to 1 (adjacent quadrants).
+    //   Accept if diffs <= 2.
     //
-    // Whichever path declares a match first wins. DQPSK below is
-    // rotation-invariant so bit output is unaffected by the rotation
-    // applied.
-    int dl_diffs = IR_UW_LENGTH + 1;
-    int ul_diffs = IR_UW_LENGTH + 1;
-    int dl_rot = 0, ul_rot = 0;
-    for (int rot = 0; rot < 4; rot++) {
-        int dl = 0, ul = 0;
-        for (int i = 0; i < IR_UW_LENGTH; i++) {
-            int v = (hard_decisions[i] - rot + 4) & 3;
-            dl += (v != IR_UW_DL[i]);
-            ul += (v != IR_UW_UL[i]);
-        }
-        if (dl < dl_diffs) { dl_diffs = dl; dl_rot = rot; }
-        if (ul < ul_diffs) { ul_diffs = ul; ul_rot = rot; }
+    // This metric gives partial credit per symbol (a 1-quadrant slip
+    // costs 1, a 2-quadrant slip costs 2, never costs 3) and lets a
+    // single-symbol total slip pass. gri does NOT search rotations and
+    // does NOT have a complex-correlation fallback -- pre-rotation in
+    // burst_pipeline (peak_re/peak_im conjugate) is expected to align
+    // the UW to absolute quadrants before this check runs.
+    //
+    // Earlier versions had a 4-rotation search plus a 0.6-threshold
+    // complex-correlation fallback. The fallback was explicitly tuned
+    // "for some smoke-test bursts" (~3% false positives accepted),
+    // which is test-tailoring rather than gri-alignment.
+    int dl_diffs = 0;
+    int ul_diffs = 0;
+    for (int i = 0; i < IR_UW_LENGTH; i++) {
+        int d = hard_decisions[i] - IR_UW_DL[i];
+        if (d < 0) d = -d;
+        if (d == 3) d = 1;
+        dl_diffs += d;
+        d = hard_decisions[i] - IR_UW_UL[i];
+        if (d < 0) d = -d;
+        if (d == 3) d = 1;
+        ul_diffs += d;
     }
-
-    int chosen_rot = 0;
-    if (dl_diffs <= 2)      { out->direction = DIR_DOWNLINK; chosen_rot = dl_rot; }
-    else if (ul_diffs <= 2) { out->direction = DIR_UPLINK;   chosen_rot = ul_rot; }
-    else                    { out->direction = DIR_UNKNOWN; }
-
-    // Complex correlation fallback — only runs if the hard-decision
-    // path didn't find a match. Build UW reference as complex QPSK
-    // symbols, correlate, peak magnitude indicates match strength.
-    if (out->direction == DIR_UNKNOWN) {
-        static const int8_t QUAD_TO_RE[4] = {  1, -1, -1,  1 };
-        static const int8_t QUAD_TO_IM[4] = {  1,  1, -1, -1 };
-        float c_dl_re = 0, c_dl_im = 0, c_ul_re = 0, c_ul_im = 0;
-        float pll_energy = 0;
-        for (int i = 0; i < IR_UW_LENGTH; i++) {
-            float re_y = crealf(pll_out[i]);
-            float im_y = cimagf(pll_out[i]);
-            pll_energy += re_y * re_y + im_y * im_y;
-            // conj(uw_dl[i]) × pll_out[i], where uw_dl[i] has unit
-            // magnitude per QUAD_TO_RE/IM (×M_SQRT1_2 scaling absorbed
-            // into the threshold).
-            float u_re = QUAD_TO_RE[IR_UW_DL[i]];
-            float u_im = QUAD_TO_IM[IR_UW_DL[i]];
-            // conj(u) * y = (u_re - j*u_im) * (re_y + j*im_y)
-            c_dl_re += u_re * re_y + u_im * im_y;
-            c_dl_im += u_re * im_y - u_im * re_y;
-            u_re = QUAD_TO_RE[IR_UW_UL[i]];
-            u_im = QUAD_TO_IM[IR_UW_UL[i]];
-            c_ul_re += u_re * re_y + u_im * im_y;
-            c_ul_im += u_re * im_y - u_im * re_y;
-        }
-        // Match strength: |c|² normalised by per-symbol energy ×
-        // N. For a perfect match c_mag² ≈ (2 × N × avg_y_mag²),
-        // i.e. accept_ratio of 1.0 means perfect alignment. Random
-        // hd → c_mag² ≈ avg_y_mag² × N → accept_ratio ≈ 0.5.
-        // Threshold at 0.75: requires significantly better than
-        // random.
-        if (pll_energy > 1e-3f) {
-            float c_dl_mag2 = c_dl_re * c_dl_re + c_dl_im * c_dl_im;
-            float c_ul_mag2 = c_ul_re * c_ul_re + c_ul_im * c_ul_im;
-            float peak2     = 2.0f * (float)IR_UW_LENGTH * pll_energy;
-            float dl_ratio  = c_dl_mag2 / peak2;
-            float ul_ratio  = c_ul_mag2 / peak2;
-            // Threshold of 0.6: random hd correlates at ~0.5; we want
-            // measurably above that but the strict 0.75 was too tight
-            // for some of the smoke-test bursts. 0.6 still catches false
-            // positives at ~0.4% per burst per UW per rotation × 4 × 2 ≈
-            // 3% per burst — BCH catches the rest as bit-error garbage.
-            if (dl_ratio >= 0.6f && dl_ratio >= ul_ratio) {
-                out->direction = DIR_DOWNLINK;
-                chosen_rot = dl_rot;
-            } else if (ul_ratio >= 0.6f) {
-                out->direction = DIR_UPLINK;
-                chosen_rot = ul_rot;
-            }
-        }
-    }
-
-    // Apply the chosen rotation to hard_decisions so the DQPSK decode
-    // below produces bits anchored to the right quadrant reference.
-    // DQPSK is differential so uniform rotation doesn't change the
-    // diff sequence — but it does change the first-symbol baseline,
-    // which the downstream consumers may rely on.
-    if (out->direction != DIR_UNKNOWN && chosen_rot != 0) {
-        for (int i = 0; i < n_symbols; i++) {
-            hard_decisions[i] = (hard_decisions[i] - chosen_rot + 4) & 3;
-        }
-    }
+    bool dl_uw_ok = (dl_diffs <= 2);
+    bool ul_uw_ok = (ul_diffs <= 2);
+    if (dl_uw_ok)      out->direction = DIR_DOWNLINK;
+    else if (ul_uw_ok) out->direction = DIR_UPLINK;
+    else               out->direction = DIR_UNKNOWN;
 
     if (out->direction == DIR_UNKNOWN) {
         // Diagnostic: show how close we were to each UW + the actual
@@ -247,8 +186,8 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         // "PLL never locked" (random hard_decisions) from "wrong
         // burst alignment" (decisions structured but offset).
         ESP_LOGI(TAG,
-            "UW no match: dl=%d (rot %d) ul=%d (rot %d) omega=%.4f hd[0..11]=[%d %d %d %d %d %d %d %d %d %d %d %d]",
-            dl_diffs, dl_rot, ul_diffs, ul_rot, (double)omega_hat,
+            "UW no match: dl_diffs=%d ul_diffs=%d omega=%.4f hd[0..11]=[%d %d %d %d %d %d %d %d %d %d %d %d]",
+            dl_diffs, ul_diffs, (double)omega_hat,
             hard_decisions[0], hard_decisions[1], hard_decisions[2],
             hard_decisions[3], hard_decisions[4], hard_decisions[5],
             hard_decisions[6], hard_decisions[7], hard_decisions[8],
