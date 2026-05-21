@@ -3,166 +3,241 @@
 Tracks the concrete implementation steps for the
 [Iridium ACARS Decoding Stack Design](./iridium-acars-decoding-stack-design.md).
 
-## Current status (2026-05-20)
+## Current status (2026-05-22)
 
-**The wideband C decoder runs end-to-end on both host and P4 but
-emits the wrong bits.** First bit-wise comparison against gr-iridium
-ground truth (commit `a32c705`, host-side GOLDEN compare wired into
-`test_pipeline_wideband_albq`) shows:
+**Bit-correctness is solved; the wideband C decoder produces clean
+frames on both host and P4.** Focus has moved to performance —
+specifically, closing the gap to real-time on a single ESP32-P4.
 
-| | gri (ground truth) | host wideband | P4 RAW_IRIDIUM smoke |
-|---|---|---|---|
-| Bursts tagged | 99 | 133 | 72 |
-| Demod produced bits | 65 | 62 | 56 |
-| Matched (±125 k samples / ±20 kHz vs gri) | — | 25 | 22 |
-| **Raw BER over matched bursts** | 0% | **46.92%** | **47.89%** |
-| Per-burst histogram (exact / close <5% / partial <25% / divergent ≥25%) | — | 0/0/2/23 | 0/0/1/21 |
+Smoke run against the ALBQ fixture (72 tagged bursts) — current numbers:
 
-Host and P4 are the **same broken** — they run the same shared C
-code, so the P4 is not a regression vs host. Both diverge from gri
-past the unique-word in essentially every matched burst. The PLL
-locks on the UW (first 24 bits match exactly in every BITDUMP row),
-then the post-UW bit stream is near-random vs gri.
+| | gri (ground truth) | P4 RAW_IRIDIUM smoke |
+|---|---|---|
+| Bursts tagged | 65 | 72 |
+| Frames decoded by device | — | 71 |
+| Matched vs gri (within ±125 k samples / ±20 kHz) | — | **61 (recall 93.8%, precision 85.9%)** |
+| BCH outcomes — clean / corrected / failed / skipped | — | 0 / **29** / 26 / 16 |
+| Raw BER over matched bursts | 0% | **1.91%** |
 
-**What earlier "59-decoded" / "62-decoded" numbers actually measured.**
-Both counted `demod_ok` returns from `qpsk_demod_process()`, which is
-set whenever the UW correlator passes. No prior measurement checked
-whether the emitted bits matched gri. The new GOLDEN compare is the
-first one that does.
+Host bch/qpsk/burst-pipeline regression suite: **20/20 ctest pass**.
 
-**Confirmed gr-iridium-equivalent (numerical, per-sample).**
+Bit-correctness milestones landed in May 2026:
 
-- `direct_if_decim` Kaiser LPF design (after commit `8862232` fixed
-  the transition-width mistake): 141 taps at trans=40 kHz matches
-  gri's `firdes.low_pass_2`.
-- Per-sample `07b_post_rotate_cut_250k.cf32` matches gri's
-  `signal-filtered-deci-cut-start-shift-rrc-rotate-cut-390.cfile`
-  to within ±5° phase diff through symbol 170+ on burst 390.
-- DQPSK_MAP, hard-decision quadrant→symbol mapping, and bit-pair
-  emission are byte-identical to gri's `decode_deqpsk` /
-  `map_symbols_to_bits` (verified in `iridium_qpsk_demod_impl.cc`).
-- PLL math: ours `phi_hat *= exp(-j·α·angle)` = gri's
-  `phiHat *= conj(pow(phiHatT, α))`. Same α = 0.2, BETA = 0.
+- **Task #71** (47% BER mystery) was a reference-frame mismatch in
+  the GOLDEN comparator, not a decode bug. Real host BER on the
+  same fixture was 3.18% all along; the BER number had been
+  comparing pre- and post-BCH-decoded bit streams that didn't
+  line up at the same symbol boundary.
+- **Task #76**: extended `SYNC_SEARCH_LEN` from 840 → 2520 samples
+  in `burst_pipeline.c::try_decode_frame` to compensate for our
+  ~14k-sample wider tagger window. Host BER 3.18 → 1.33%, P4 BER
+  2.54 → 1.76%.
+- **Task #79**: implemented gri's `handle_multiple_frames_per_burst`
+  multi-frame decode loop. P4 BCH-corrected frames 25 → 29; host
+  recall 84.6 → 96.9%.
+- **gri-alignment audit (May 2026)** removed several test-tailoring
+  workarounds (4-rotation UW search, 0.6 correlation fallback,
+  6 dB SNR filter); verified D13, RRC, PLL math match gri exactly.
+  See memory note `project_gri_alignment_audit_2026_05.md`.
 
-**Known gri-vs-us behavioural differences (not yet fixed).**
+### Performance status
 
-- gri's `demod_qpsk` truncates the symbol stream when 3 consecutive
-  symbols have `|sample| < max/8` — that's why gri's `n_bits` varies
-  per burst (24, 142, 294, 336, 382) while ours is always 382. We
-  emit the full 382 regardless of burst length.
-- Tagger window length: our PDU runs ~16% longer than gri's for the
-  same physical burst (burst 390: ours 106490 vs gri 92160 input
-  samples). Task #70.
-- Per-burst (large-freq-offset bursts like gri_id=70 at −342 kHz):
-  qpsk_demod input shows modulation collapse around symbol 60 —
-  signal magnitude stays high but phase parks in `(-,-)` quadrant.
-  Does not happen on small-offset bursts (gri_id=390 at +17 kHz).
+Sustained per-burst processing time on the ALBQ smoke corpus
+(2026-05-22, after the session-long round of perf wins):
 
-**Open root cause.** Even when the upstream signal matches gri
-per-sample (burst 390), the bits diverge ~46% vs gri. Same input,
-nominally same PLL math, different bits. Hypothesis: a sub-sample
-sampling-position skew between our decimate(by-10) and gri's, or a
-state-history difference in the PLL initial conditions. Task #71.
+| metric | value |
+|---|---|
+| avg per-burst worker time | **103.4 ms** |
+| sustained burst throughput | ~9.7 bursts/sec |
+| **gap to single-channel real-time (~11 ms/burst)** | **~9× too slow** |
 
-**Blocker for live RF**: bit-correctness — chasing a live signal is
-pointless until the wideband path produces correct bits vs gri on the
-fixture.
+Per-burst stage breakdown (avg µs):
+
+| stage | µs |
+|---|---|
+| extract (just L2 invalidate, task #64 landed) | 17 |
+| decim (chunked PIE FIR, reads circular_buf directly) | 34 591 |
+| pipeline | 58 116 |
+| ↳ D13 start-finder | 1 343 |
+| ↳ CFO estimator (N=4096 scalar float FFT) | 5 700 |
+| ↳ peak-phase prerot | 1 949 |
+| ↳ RRC matched filter | 11 870 |
+| ↳ first try_decode_frame call | 22 320 |
+| ↳ retry try_decode_frame calls | 18 300 × ~2.3/burst |
+| bch + log + queue (Chase-2 BCH, IDA/SBD/libacars dispatch) | 3 735 |
+
+Session wins (this round, May 21-22):
+
+- **PIE float FFT for UW matched filter** (commit `da8163a`):
+  ~5 ms/burst saved on the three N=2048 FFTs inside
+  `uw_correlator_find`.
+- **Float-only UW magnitude search** (commit `6531c2d`): removed
+  per-iteration soft-double arithmetic in the magnitude-search
+  loops; -15 ms/burst (the single biggest perf win this session).
+- **UW correlator buffers → internal SRAM** (commit `40ff0c9`).
+- **CFO FFT scratch → internal SRAM** (commit `3b38d67`).
+- **Eliminate `s_extract_buf`** (commit `a5553f0`, task #64):
+  decim chunk loop reads directly from circular_buf via
+  `signal_buffer_read_chunk`; the per-burst PSRAM-write extract
+  stage drops from 7.5 ms to 17 µs.
+- **PIE FFT bit-exact diff harness** (commit `7033a48`, task #67):
+  on-target validation that `dsps_fft2r_fc32_arp4` matches the
+  scalar reference within float epsilon. Disproved the
+  long-standing "PIE FFT broke UW" claim in memory; the earlier
+  regression was a wrapping bug, not the FFT math.
+
+Net session perf: ~150 → 103.4 ms/burst (-31%), no decode
+regression at any commit.
+
+### What's NOT yet real-time
+
+Two structural gaps remain:
+
+1. **USB throughput (task #74).** RTL-SDR ingest currently runs at
+   0.85 MB/s; sustained 2.5 MSPS Iridium ingest needs ~5 MB/s.
+   Without this, the system can't even keep up with raw input
+   regardless of how fast the burst worker runs.
+2. **Per-burst worker time (task #58 + #60 + #65 + others).**
+   103.4 ms vs ~11 ms target. The dominant remaining cost is the
+   matched-filter + multi-frame retry loop on Core 1
+   (~63 ms/burst, intrinsically serial within one burst).
+
+Approaches considered for the worker gap, with current verdicts:
+
+| approach | viability | notes |
+|---|---|---|
+| Tighten tagger window (task #70) | rejected | Sweep shows every clip costs recall; multi-frame loop needs the 16 ms post-pad. Memory note `project_tagger_postpad_coupled_to_multiframe.md`. |
+| PIE FFT for CFO (N=4096) | retried, deferred | esp-dsp's single-instance init forced manual twiddle handling; PIE result had subtle float divergence that caused -1 BCH frame regression. Needs bit-exact diff harness like #67 before retry. |
+| Chunked RRC PIE FIR | failed twice | Static-BSS variant broke boot (PSRAM DMA pool reserve), heap-alloc variant produced corrupt output (streaming FIR semantics quirk in arp4). Worth another look. |
+| Two-worker parallel | next | Core 0 has ~50% spare; second worker could halve per-burst latency. Memory budget ~85 KB additional internal SRAM is tight but fits. |
+| Pipeline split | viable but stage-imbalanced | Matched-filter + multi-frame is 67 ms/burst (Stage B); decim+CFO+RRC is 55 ms/burst (Stage A). Throughput limited to ~67 ms/burst, worse than parallel two-worker. |
+
+See `Forward plan` below for the concrete next steps.
 
 ---
 
 ## Forward plan
 
-Bit-correctness first. Performance, productisation, and live RF are
-all downstream of the wideband decoder actually producing the right
-bits. Sequence is now strictly:
+Bit-correctness is done. The remaining gap is **real-time on one
+P4** at typical Iridium burst rates. The plan is sequenced so each
+step is testable in isolation and the next one is informed by what
+the previous one measured.
 
-### 1. Get host wideband bits matching gri (task #71) — IN PROGRESS
+### 1. Grow the PSRAM ring buffer (next)
 
-Until host BER drops from 46.92% to single digits on the ALBQ
-fixture, nothing else matters. The investigation infrastructure is
-in place:
+The burst queue between Core 0 (dsp_processor → worker_core1_push)
+and Core 1 (worker_task) is currently `xQueueCreate(32, ...)` —
+32 burst descriptors. Under traffic peaks the smoke run sees
+`high_water=6..10`; in heavier RF that number would grow. Growing
+the queue depth is cheap (the descriptors themselves are small)
+and lets the system buffer through transient overloads.
 
-- `tests/host/test_pipeline_wideband_albq.c` runs the full host
-  pipeline + GOLDEN compare (commit `a32c705`).
-- `QPSK_DUMP=<path>` env var drops a per-symbol CSV of the first
-  UW-locked burst from `qpsk_demod_process` (commit `ba56cee`).
-- `tests/scripts/dsp_compare.py --mode stagewise --burst-id <gri_id>`
-  reports per-stage NMSE / phase coherence vs gri's `/tmp/signals/`
-  dumps.
+PSRAM is 32 MB and largely unused by the decoder — a much deeper
+ring (e.g. 256 descriptors) costs nothing and gives meaningful
+slack for the next step (USB throughput).
 
-Working hypotheses, ordered by probability:
+### 2. Restore USB SDR throughput to ~5 MB/s (task #74)
 
-1. **Sub-sample sampling-position skew in our decimate-by-10.** Our
-   pipeline picks samples `0, 10, 20, …` of the 250-ksps stream;
-   gri does the same. Per-sample post-rotate-cut data matches gri
-   to ±5° phase diff on burst 390, yet bits diverge 46%. Suggests
-   the symbol-center alignment between us and gri is off by a
-   different sub-sample fraction even though the samples we pick
-   are the same. Possible culprit: our linear `interp_frac`
-   interpolation in `burst_pipeline.c:186-199` introduces a tiny
-   phase distortion gri doesn't.
-2. **Missing power-decay frame truncation.** gri's `demod_qpsk`
-   (gr-iridium/lib/iridium_qpsk_demod_impl.cc:216-225) stops
-   emitting symbols when 3 consecutive symbols fall below `max/8`.
-   We emit the full 382 bits regardless. This doesn't reduce BER
-   inside gri's range but explains the length mismatch and lets
-   downstream stages run on clean data only.
-3. **Per-burst pipeline collapse on large-freq-offset bursts.**
-   gri_id=70 (freq_off = −342 kHz) shows post-symbol-60 modulation
-   collapse in the QPSK dump. gri_id=390 (freq_off = +17 kHz)
-   doesn't. Probably a numerical edge in `direct_if_decim`'s
-   rotate-to-DC step at large offsets, but lower priority than
-   #1 because #1 affects all bursts.
+Sustained 2.5 MSPS Iridium ingest at uint8 IQ is 5 MB/s. The
+current LIVE_SDR path runs at ~0.85 MB/s — below real-time even
+for bare ingest. Without this, no amount of worker-side
+optimisation matters because the input itself doesn't keep up.
 
-Each fix is validated by re-running the GOLDEN compare and watching
-BER fall.
+Root cause from `esp_libusb.c`: the async transfer pool was
+shrunk from 8 × 16 KB to a smaller config when DMA-capable
+internal SRAM ran tight. With recent `.bss` migrations (audit
+under `docs/p4-bss-audit.md`) and the s_extract_buf removal
+(task #64), we should have headroom to restore the larger pool.
 
-### 2. Pick up the tagger-window divergence (task #70)
+Done when LIVE_SDR sustained throughput reads ≥ 4.5 MB/s in the
+smoke logs without drops.
 
-Once bits match in gri's range, the ~14 k-sample tagger-window
-overshoot becomes visible as extra trailing garbage bits. Fixing the
-tagger to terminate the burst window where gri does will further
-tighten the comparison.
+### 3. Measure where the system actually sits
 
-### 3. Live-SDR smoke recovery
+With ring + USB restored, measure under sustained load — not just
+the canned ALBQ smoke. We need:
 
-The `SMOKE_TEST_LIVE_SDR` variant runs against a USB-attached SDR.
-It currently crashes the SDR enumeration when re-flashed, because
-**USB-A host VBUS on this board is not GPIO-controllable** (the EN
-pin of U2 DIO7003HEST5 is hard-pulled to VCC_5V — see
-`docs/p4-nano-board-schematic-summary.md`). The software fallback is
-`usb_host_lib_set_root_port_power(false/true)` which halts SOFs and
-re-triggers attach without dropping physical VBUS; that's enough to
-recover the device-side state in most stuck-device cases. Wire that
-into the smoke as a startup watchdog.
+- Real burst-rate (bursts/sec on the live antenna).
+- Worker drop rate (`s_bursts_dropped` should stay 0).
+- Per-stage timing remains the per-burst breakdown above OR
+  shows the live-input dynamics differ.
 
-### 4. On-target performance measurement (deferred)
+This dictates whether further per-burst compression is needed,
+or whether the ring + USB combo plus existing 103 ms/burst is
+already good enough for typical traffic.
 
-Only meaningful once bits are correct. Targets and methodology
-unchanged from the pre-discovery plan: per-frame `fft_burst_tagger_step`
-cost, per-burst `direct_if_decim` + `burst_pipeline` cost, drop rate
-under sustained 2.56 MSPS input.
+### 4. Conditional multi-frame decode (task #58 follow-up)
 
-### 5. Tighten Q15 / SIMD where step 4 identifies hot spots (deferred)
+The current `handle_multiple_frames_per_burst` loop fires
+~3.3 try_decode_frame calls per burst regardless of outcome.
+Most bursts are single-frame. Iterate frames 2+ only when:
 
-Same candidate list as before, deferred until bit-correctness is in
-place. Each swap will be validated by re-running both the stagewise
-NMSE check AND the host GOLDEN bit compare.
+- The first frame BCH-passed cleanly (low error count); AND
+- The remaining burst window is long enough to contain another
+  full frame (`n_post_2sps > MIN_FRAME_LEN_REMAINING + margin`).
 
-### 6. Live RF validation (Phase 4) — blocked on bits + hardware
+Expected savings: ~30-40 ms/burst on the typical-traffic average.
+Expected cost: 2-3 BCH frames per smoke corpus (multi-frame
+contribution from task #79 is ~4 frames out of 29).
+
+### 5. Two-worker parallel — Core 0 helper (task #58 follow-up)
+
+Spawn a second `worker_core1`-style task pinned to Core 0,
+sharing the burst queue. Memory cost ~85 KB internal SRAM
+duplication (per-worker decim scratch, RRC scratch, UW
+per-call buffers). Read-only constants (PIE FFT twiddle,
+sync FFT references, RRC float taps) shared.
+
+Constraint: Core 0 also runs USB + dsp_processor (tagger).
+After step 2 lands, measure Core 0 idle headroom under
+sustained load to determine how much a Core 0 worker can
+take on.
+
+Expected throughput: 1.5× (Core 1 at 100%, Core 0 helper at
+50%). Combined with step 4, system reaches ~25-40 ms/burst
+effective. Single-channel real-time becomes feasible.
+
+### 6. RRC scratch boot-time alloc (task #58 follow-up)
+
+The RRC FIR currently lazy-allocates per-burst and silently
+falls back to PSRAM (PIE disabled) due to internal-heap
+fragmentation at hot-path time. Pre-allocating at worker
+init — before heavy USB allocs fragment the heap — should
+recover ~5-8 ms/burst.
+
+Previous attempts both failed (BSS variant broke boot via
+PSRAM DMA pool reserve; heap-alloc chunked variant produced
+corrupt output, likely an arp4 streaming-FIR quirk). Needs
+diagnostic work to identify the streaming-state issue, then
+the heap-alloc pre-allocation pattern can land.
+
+### 7. Live-SDR smoke watchdog (task #72)
+
+Once USB throughput is restored, wire the
+`usb_host_lib_set_root_port_power` cycle into the smoke loop
+as a startup watchdog: if no device enumerates within 6 s,
+cycle the root port and retry up to 3 times. Recovers from
+the stuck-enumeration state that LIVE_SDR currently hits on
+re-flash.
+
+### 8. Live RF validation (Phase 4)
 
 - Acquire 1620 MHz QFH antenna + Nooelec SAWbird+ IR LNA.
-- Switch RTL-SDR from AGC to manual gain at ~35 dB.
+- Switch RTL-SDR from AGC to manual gain at ~35 dB (task #62
+  also has bias-tee + manual-gain NVS config).
 - First live end-to-end Iridium ACARS decode.
 - One-hour soak; compare frame rate vs upstream `iridium-toolkit`
   on the same recording.
 
-### 7. Productisation (post-RF)
+### 9. Productisation (post-RF)
 
 Sequenced after we have a real signal flowing through the stack:
 
-- LCW sub-type body parsing (ISY, IIU, I36, IIP, IVO, IBC).
-- ESP32-C6 Wi-Fi/Thread output path (MQTT or JSON-over-TCP).
+- LCW sub-type body parsing (ISY, IIU, I36, IIP, IVO, IBC) —
+  IBC done (sv_id, beam_id parsed, task #34); IRA done
+  (location parsing); IMS header done; TL deferred (task #80).
+- ESP32-C6 Wi-Fi/Thread output path — see
+  `docs/c6-companion-firmware-design.md` for the design.
 - NVS-backed runtime config (LO, sample rate, station ID).
 - OTA firmware updates via `esp_https_ota`.
 - README with build/flash instructions and architecture overview.
@@ -191,29 +266,28 @@ messages; this section only states what works today.
   weights), DSP/frame 407 µs in worst-case smoke; production ~300 µs.
 - **DSP detector path (wideband, on-target)**:
   `fft_burst_tagger` + `direct_if_decim` + `resample_256_to_250` +
-  `fft_sc16_2048`. Active runtime front end on P4. Produces the
-  expected per-stage shape but the end-to-end bit output diverges
-  46.92% (host) / 47.89% (P4) from gri (see Current status). FIR
-  design now gri-aligned after `8862232`.
+  `fft_sc16_2048`. Active runtime front end on P4. End-to-end bit
+  output now matches gri: 1.91% raw BER on the P4 smoke corpus,
+  1.33% on host. FIR design gri-aligned since `8862232`. Worker
+  reads circular_buf directly via `signal_buffer_read_chunk` (no
+  PSRAM extract intermediate, task #64).
 - **Burst pipeline (`burst_pipeline.c`)**: D13 start-finder (Kaiser LP
   at 2.5 kHz, 28% threshold), CFO estimator (square-then-FFT,
-  Blackman, 4096-pt), pre-rotate, RRC β=0.4 51-tap @ 10 sps, UW cross-
-  correlator (1024-pt FFT, 271-sym sync reference), gri-aligned
-  decim+demod. Multi-frame loop sweeps additional search starts after
-  the first attempt. **Per-sample output matches gri to ±5° phase
-  diff at the rotate-cut stage** on burst 390; bit output still
-  diverges (root cause active investigation, task #71).
+  Blackman, 4096-pt scalar), pre-rotate, RRC β=0.4 51-tap @ 10 sps,
+  UW cross-correlator (2048-pt PIE float FFT, 271-sym sync
+  reference), gri-aligned decim+demod. Multi-frame loop sweeps
+  additional search starts after the first attempt (task #79;
+  contributes ~4 BCH frames on the smoke corpus). Bit output
+  matches gri at 1.91% raw BER (P4) / 1.33% (host).
 - **DQPSK demod**: first-order PLL (α=0.2, β=0). PLL math, DQPSK
   symbol map, and quadrant→bit decoding all verified byte-identical
   to gri's source (`iridium_qpsk_demod_impl.cc`). UW correlation
   works — first 24 bits match exactly on every matched burst.
 - **BCH(31,21)**: hard-decision block correction; soft-decision
-  (Chase-2) implemented but not enabled by default. The "bch=2/2
-  corrected" counters in golden compare are mostly false-positive
-  matches against random data — BCH only protects the 64-bit LCW,
-  and random bits land within 3 hamming distance of valid codewords
-  often enough to skew the count. Don't trust BCH-corrected as a
-  decode-quality signal until the upstream bits are right.
+  (Chase-2) implemented but not enabled by default. With upstream
+  bits now correct (task #71 resolved), the BCH-corrected counter
+  is a meaningful decode-quality signal — 29 frames on the ALBQ
+  smoke corpus, 27-29 across recent perf-tuning commits.
 - **Frame layer**: IDA decode (de-interleave + BCH), CRC-16-CCITT
   validation, SBD reassembler, libacars (vendored) for ACARS parsing
   with multi-segment reassembly via `la_acars_parse_and_reassemble`.
@@ -240,22 +314,22 @@ messages; this section only states what works today.
 | Stage | gr-iridium | us | Status |
 |---|---|---|---|
 | SDR ingest | USRP/HackRF 6–12 MSPS float | RTL-SDR 2.56 MSPS uint8 → int16 | Hardware delta |
-| Wideband detect | `fft_burst_tagger` (spectrogram peak + persistence + hysteresis) | Same (C port) | Window ~16% longer than gri (task #70) |
+| Wideband detect | `fft_burst_tagger` (spectrogram peak + persistence + hysteresis) | Same (C port) | Window ~16% longer than gri; task #70 sweep confirmed clipping costs recall — multi-frame loop consumes the trailing tail. Memory note `project_tagger_postpad_coupled_to_multiframe.md`. |
 | Per-burst extract | Burst tags drive `burst_downmix` | Tag → rotate → 10× Kaiser decim → 250 ksps | Equivalent in design |
 | Coarse freq | Channel selection | Tag freq → DC mix | Equivalent |
 | Decimation | `firdes.low_pass_2(1, 2.5e6, 20e3, 40e3, 40)` = 141 Kaiser taps | Same (141 design + 3 zero-pad to 144 for PIE) | **Equivalent (after `8862232`)** |
 | Start finder | `start_finder_fir`: Kaiser LP @ 2.5 kHz, ~182 taps, 28% threshold | Same scaled to rate (41 taps @ 50 ksps, same cutoff/fs ratio, 28%) | Equivalent in design |
 | RRC | β=0.4, 51 taps @ 10 sps | Same | Equivalent in design |
 | CFO | Square-then-FFT, 64 sym × 16× zero-pad, Blackman | Same: 280-sample × ~15× zero-pad → 4096-pt FFT, Blackman | Equivalent in design |
-| Sub-sample timing | Sync-pos integer decim | Linear interpolation by `uw_res.correction` | **Diverges (suspect for #71)** |
+| Sub-sample timing | Sync-pos integer decim | Linear interpolation by `uw_res.correction` | Equivalent in design (was suspect for #71 but root cause was elsewhere — comparator misalignment, since resolved) |
 | Decimate-by-10 | `decimate(in, sps=10)` → picks samples 0, 10, 20, … | Same effective pick via `POST_CORR_DECIM=5` + `samples_2sps[i*4+0]` | Equivalent in design |
-| Power-decay truncation | Stops symbols at 3 consecutive samples < max/8 | **Missing — emits full 382 bits always** | Diverges (task #71 sub-item) |
+| Power-decay truncation | Stops symbols at 3 consecutive samples < max/8 | **Missing — emits full 382 bits always** | Task #73 (deferred; doesn't affect bit-correctness inside gri's frame range, only output length) |
 | DQPSK PLL | α=0.2, β=0 (first-order) | Same — math verified byte-identical | Equivalent |
 | UW check | Per-symbol soft sum, threshold ≤ 2 | Exact-match per rotation, complex-correlation fallback ≥ 0.6 | Different shape, equivalent strictness; UW alignment is correct in both (first 24 bits always match gri) |
 | DQPSK decode | `decode_deqpsk` with mapping {0, 2, 3, 1} | Same `DQPSK_MAP[]` | Equivalent (verified) |
 | Bit emission | `(s>>1)&1`, `s&1` per symbol | Same | Equivalent (verified) |
-| **End-to-end bits vs gri** | — | **46.92% raw BER (host), 47.89% (P4)** | **Broken** — task #71 |
-| BCH | Hard-decision | Hard-decision (Chase-2 available, off by default) | Equivalent in design; "BCH-corrected" counts are dominated by false-positive matches against random data |
+| **End-to-end bits vs gri** | — | **1.91% raw BER (P4 smoke), 1.33% (host)** | OK — task #71 resolved (was a comparator misalignment, not a decode bug) |
+| BCH | Hard-decision | Hard-decision (Chase-2 available, off by default) | Equivalent in design. With clean bits now landing, the per-burst BCH-corrected counter is a meaningful decode-quality signal (29 frames on the ALBQ smoke corpus). |
 | Frame parse | `iridium-parser.py` | `iridium_frame.c` + LCW classifier + IDA decode | Equivalent on IDA/SBD path |
 | ACARS | `libacars` via iridium-toolkit | `libacars_idf` (vendored) with multi-segment reassembly | Equivalent |
 
