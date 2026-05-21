@@ -338,10 +338,15 @@ extern const float               s_corr_tw_im_f[CORR_FFT_N / 2]; // generated
 // duplicates the RRC + FFT chain. Left in PSRAM via
 // EXT_RAM_BSS_ATTR. Sequential read pattern in the matched-filter
 // inner loop is cache-friendly.
-static EXT_RAM_BSS_ATTR float    s_sync_dl_fft_re_f[CORR_FFT_N];
-static EXT_RAM_BSS_ATTR float    s_sync_dl_fft_im_f[CORR_FFT_N];
-static EXT_RAM_BSS_ATTR float    s_sync_ul_fft_re_f[CORR_FFT_N];
-static EXT_RAM_BSS_ATTR float    s_sync_ul_fft_im_f[CORR_FFT_N];
+// Pre-computed reversed-conjugate sync FFTs. 4 * 8 KiB = 32 KiB,
+// read once per spectrum-multiply loop (2 per uw_correlator_find call,
+// ~6.6 reads per burst with the multi-frame loop). Held in INTERNAL
+// SRAM: PSRAM round-trips here were a measurable chunk of the 16 ms/
+// call UW cost (multi-frame fires uw_correlator_find ~3.3x per burst).
+static float s_sync_dl_fft_re_f[CORR_FFT_N] __attribute__((aligned(16)));
+static float s_sync_dl_fft_im_f[CORR_FFT_N] __attribute__((aligned(16)));
+static float s_sync_ul_fft_re_f[CORR_FFT_N] __attribute__((aligned(16)));
+static float s_sync_ul_fft_im_f[CORR_FFT_N] __attribute__((aligned(16)));
 #endif
 
 // Block-floating-point Q15 radix-2 DIT FFT. Buffers are int32 to
@@ -1209,14 +1214,16 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 #if CORR_USE_FLOAT_FFT
     // Float-precision matched filter — mirrors gr-iridium's volk-based
     // chain exactly (no BFP, no SYNC_TARGET_MAX renormalisation).
-    // Per-burst FFT/IFFT scratch -- 4 * 8 KiB = 32 KiB. Moved to
-    // PSRAM via EXT_RAM_BSS_ATTR so DMA-internal SRAM stays free for
-    // the USB transfer pool. The matched-filter runs once per
-    // detected burst (~10-100 bursts/s worst case); PSRAM latency
-    // adds a few hundred us per burst at most. See docs/p4-bss-audit.md
-    // win #2.
-    static EXT_RAM_BSS_ATTR float fburst_re[CORR_FFT_N], fburst_im[CORR_FFT_N];
-    static EXT_RAM_BSS_ATTR float fifft_re[CORR_FFT_N], fifft_im[CORR_FFT_N];
+    // Per-burst FFT/IFFT scratch -- 4 * 8 KiB = 32 KiB. Held in
+    // INTERNAL SRAM (.bss): the multi-frame loop fires uw_correlator_find
+    // ~3.3 times per burst, and the prior PSRAM placement showed up as
+    // ~12 ms/call of memory stalls inside the TDF_UW substage (PIE FFT
+    // itself is ~1.5 ms × 3 = 4.5 ms, so the rest was I/O wait on
+    // 16 KB-per-stage spectrum data going through L2 cache from PSRAM).
+    static float fburst_re[CORR_FFT_N] __attribute__((aligned(16)));
+    static float fburst_im[CORR_FFT_N] __attribute__((aligned(16)));
+    static float fifft_re[CORR_FFT_N]  __attribute__((aligned(16)));
+    static float fifft_im[CORR_FFT_N]  __attribute__((aligned(16)));
     memset(fburst_re, 0, sizeof(fburst_re));
     memset(fburst_im, 0, sizeof(fburst_im));
     int load_n = n_complex < CORR_FFT_N ? n_complex : CORR_FFT_N;
