@@ -270,10 +270,40 @@ void burst_pipeline_get_stage_us(uint32_t out[6], uint32_t *first_calls,
     if (retry_calls) { *retry_calls = s_profile_loops_retry; s_profile_loops_retry = 0; }
 }
 
+// Internal helper for the legacy single-frame wrapper.
+typedef struct {
+    burst_pipeline_result_t *out;
+    int n_seen;
+} legacy_first_frame_ctx_t;
+
+static void legacy_first_frame_cb(burst_pipeline_result_t *res, void *ctx)
+{
+    legacy_first_frame_ctx_t *lc = (legacy_first_frame_ctx_t *)ctx;
+    if (lc->n_seen == 0) {
+        // Shallow-copy: result->frame.bits ownership transfers to caller.
+        *lc->out = *res;
+    } else {
+        // Extra frames -- caller of legacy API doesn't take them.
+        free(res->frame.bits);
+    }
+    lc->n_seen++;
+}
+
 bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
                                     burst_pipeline_result_t *result)
 {
     memset(result, 0, sizeof(*result));
+    legacy_first_frame_ctx_t lc = { .out = result, .n_seen = 0 };
+    burst_pipeline_process_burst(iq250, n_complex,
+                                  legacy_first_frame_cb, &lc);
+    // Match the historical return contract: true means "pipeline ran end-
+    // to-end". The caller checks result->demod_ok separately.
+    return true;
+}
+
+int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
+                                  burst_pipeline_frame_cb cb, void *ctx)
+{
     PROFILE_T0();
 
     // 1. D13 envelope start_finder. Search depth matches gr-iridium's
@@ -298,13 +328,12 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
         burst_start = uw_correlator_find_burst_start(
                           iq250, n_complex, /*search_max=*/search_depth);
     }
-    result->burst_start = burst_start;
     int16_t *adj_burst = iq250 + burst_start * 2;
     int adj_n = n_complex - burst_start;
     if (adj_n < UW_SPS * 28) {
         // Less than one full sync word worth — can't even run the
         // matched filter; bail out cleanly.
-        return false;
+        return 0;
     }
     PROFILE_LOG(D13);
 
@@ -312,7 +341,6 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
 
     // 2. Pre-RRC squared-FFT CFO estimate on the trimmed burst.
     float omega_coarse = uw_correlator_estimate_cfo(adj_burst, adj_n);
-    result->omega_coarse = omega_coarse;
     PROFILE_LOG(CFO);
 
     // 3. Phase-correct adj_burst in place by exp(+j·omega/sps·n).
@@ -325,16 +353,8 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     // p ← p · exp(j·dphi) with >>15 truncation loses ~0.012%
     // magnitude per sample; over 7900-sample bursts that decays to
     // ~5% of initial, collapsing the modulation into a constant-phase
-    // tone for large-residual-carrier bursts (gri_id=70 freq_off
-    // -342 kHz was a clean example: post-CFO phases clustered at
-    // ±170° instead of swinging through quadrants -- hd diverged at
-    // first post-UW symbol with 180° flip). See memory note
+    // tone for large-residual-carrier bursts. See memory note
     // `feedback_q15_incremental_phasor_decays.md`.
-    //
-    // rotate_to_dc_q15_simd_at periodically renormalises pr_q/pi_q
-    // to the exact absolute-phase quantisation so the magnitude
-    // stays at Q15 unit length, matching gr-iridium's volk-based
-    // per-sample rotation exactly.
     if (omega_coarse != 0.0f) {
         float dphi = omega_coarse / (float)UW_SPS;
         rotate_to_dc_q15_simd_at(adj_burst, adj_n,
@@ -351,38 +371,90 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     dump_iq_cf32("06_post_rrc_250k", adj_burst, adj_n);
 
     // 5-8. Per-frame matched filter + pre-rotate + decim + demod.
-    //      First attempt: search the matched filter from the start of
-    //      adj_burst. If demod fails AND the burst is long enough for
-    //      another frame, advance the search start in steps of
-    //      MIN_FRAME_LENGTH_NORMAL × sps / 2 = 655 samples (half the
-    //      minimum frame size, so each retry's matched-filter window
-    //      overlaps the previous by half — sub-frame preambles never
-    //      fall at the edge of every search range). Mirrors gri's
-    //      handle_multiple_frames_per_burst loop (burst_downmix_impl.cc:
-    //      890-905), with smaller advance steps because we don't have
-    //      gri's exact handled_samples count to advance by.
-    bool decoded = try_decode_frame(adj_burst, adj_n, 0, result,
-                                     /*dump=*/true);
-    s_profile_loops_first++;
-    PROFILE_LOG(LOOP_FIRST);
+    //
+    // Multi-frame loop mirrors gri's handle_multiple_frames_per_burst
+    // (lib/burst_downmix_impl.cc:890-905):
+    //   * First frame: try at search_start=0. If qpsk_demod's UW
+    //     direction check rejects, fall through to a half-frame retry
+    //     loop -- needed for our wider tagger windows (task #70) where
+    //     the first try sometimes lands on a non-UW correlation peak.
+    //   * Subsequent frames: advance the search position by one frame
+    //     length (191 sym × 10 sps = 1910 samples) from each emitted
+    //     frame's UW position, and try again. gri advances even on
+    //     failure; we do the same so the loop reaches all sub-frame
+    //     positions in a multi-frame burst.
+    //
+    // Each successful frame fires the callback with its result and
+    // freshly malloc'd frame.bits. The callback owns the bits.
+    const int FRAME_LEN_SAMPLES = 191 * UW_SPS;             // 1910
+    const int RETRY_STEP_10SPS  = (131 * UW_SPS) / 2;       // 655
 
-    if (!decoded) {
-        // gr-iridium's MIN_FRAME_LENGTH_NORMAL = 131 symbols = 1310
-        // samples at sps=10. Half-step gives 655.
-        const int RETRY_STEP_10SPS = (131 * UW_SPS) / 2;        // 655
+    int n_emitted        = 0;
+    int next_search_start = -1;    // -1 = haven't found first frame yet
+
+    burst_pipeline_result_t res;
+    memset(&res, 0, sizeof(res));
+    res.burst_start  = burst_start;
+    res.omega_coarse = omega_coarse;
+
+    // First frame: try at 0, then retry on failure.
+    bool found = try_decode_frame(adj_burst, adj_n, 0, &res,
+                                   /*dump=*/true);
+    s_profile_loops_first++;
+    int first_used_search_start = 0;
+    if (!found) {
         for (int retry_start = RETRY_STEP_10SPS;
              retry_start + SYNC_SEARCH_LEN_GUARD <= adj_n;
              retry_start += RETRY_STEP_10SPS) {
             s_profile_loops_retry++;
             if (try_decode_frame(adj_burst, adj_n, retry_start,
-                                  result, /*dump=*/false)) {
+                                  &res, /*dump=*/false)) {
+                found = true;
+                first_used_search_start = retry_start;
                 break;
             }
+        }
+    }
+    PROFILE_LOG(LOOP_FIRST);
+
+    if (found) {
+        res.burst_start  = burst_start;
+        res.omega_coarse = omega_coarse;
+        // uw_res.uw_offset is relative to first_used_search_start; convert
+        // to an absolute position within adj_burst so the multi-frame
+        // step can advance by FRAME_LEN_SAMPLES correctly.
+        int first_uw_abs = first_used_search_start
+                         + (int)res.uw_res.uw_offset;
+        cb(&res, ctx);   // ownership of res.frame.bits transfers
+        n_emitted++;
+        next_search_start = first_uw_abs + FRAME_LEN_SAMPLES;
+    }
+
+    // Multi-frame: iterate until burst exhausted.
+    while (found && next_search_start >= 0 &&
+           next_search_start + SYNC_SEARCH_LEN_GUARD <= adj_n) {
+        memset(&res, 0, sizeof(res));
+        res.burst_start  = burst_start;
+        res.omega_coarse = omega_coarse;
+        s_profile_loops_retry++;
+        bool ok = try_decode_frame(adj_burst, adj_n, next_search_start,
+                                    &res, /*dump=*/false);
+        if (ok) {
+            int uw_abs = next_search_start + (int)res.uw_res.uw_offset;
+            cb(&res, ctx);
+            n_emitted++;
+            // Anchor next search to THIS frame's UW position so timing
+            // drift across sub-frames doesn't accumulate.
+            next_search_start = uw_abs + FRAME_LEN_SAMPLES;
+        } else {
+            // gri advances by frame_size even when a frame fails to
+            // decode -- the loop continues to the next sub-frame slot.
+            next_search_start += FRAME_LEN_SAMPLES;
         }
     }
     PROFILE_LOG(LOOP_RETRY);
 
     // Clear the one-shot dump trigger so subsequent bursts don't dump.
     s_dump_pending = 0;
-    return true;
+    return n_emitted;
 }

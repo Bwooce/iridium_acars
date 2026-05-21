@@ -69,8 +69,37 @@ typedef struct {
 // Side-effects: NONE outside `iq250` and `*result`. No logging, no
 // allocation beyond decoded_frame_t.bits (which is the caller's to
 // free when demod_ok).
+//
+// LEGACY SINGLE-FRAME API. For multi-frame bursts this only returns
+// the first decoded frame. Prefer burst_pipeline_process_burst() for
+// new code so additional sub-frames are not lost.
 bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
                                     burst_pipeline_result_t *result);
+
+// Callback fired once per successfully-decoded frame within a burst.
+// The result is borrowed for the duration of the callback; the
+// callback OWNS result->frame.bits and must free it (or hand it off)
+// before returning. ctx is the user-provided context pointer.
+typedef void (*burst_pipeline_frame_cb)(burst_pipeline_result_t *res, void *ctx);
+
+// Multi-frame variant. Runs D13/CFO/RRC once on the burst, then
+// iterates the per-frame stages (UW correlator + pre-rotate + decim +
+// qpsk_demod) along the burst -- mirroring gri's
+// handle_multiple_frames_per_burst (lib/burst_downmix_impl.cc:890-905).
+//
+// Behaviour:
+//   - First frame: same retry-on-failure logic as the legacy single-
+//     frame API to recover bursts where the first try misses the UW.
+//   - Subsequent frames: advance the search position by one frame
+//     length (191 sym × 10 sps = 1910 samples at 250 ksps), starting
+//     from each emitted frame's UW position. Stops when no room is
+//     left for another frame.
+//   - Each successful frame fires the callback with the result and
+//     freshly malloc'd frame.bits (callback owns).
+//
+// Returns the number of frames emitted (0 if no decode).
+int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
+                                  burst_pipeline_frame_cb cb, void *ctx);
 
 // Diagnostic: override D13's burst_start for the NEXT call only,
 // then auto-clear. Used by the path-C host harness to bypass our

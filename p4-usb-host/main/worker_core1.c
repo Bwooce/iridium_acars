@@ -378,6 +378,72 @@ static direct_if_decim_t s_decim;
 // scalar FPU is acceptable for first cutover; task #58 covers a
 // cordic/table replacement if profiling shows it dominates.)
 
+// Per-burst context passed to worker_emit_frame. The callback fires
+// once per decoded sub-frame within a multi-frame burst (gri's
+// handle_multiple_frames_per_burst behaviour).
+typedef struct {
+    const detected_burst_t *burst;
+    uint64_t                t_bch_accum;   // accumulated BCH+log+queue time
+} wb_worker_ctx_t;
+
+static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
+{
+    wb_worker_ctx_t *wctx = (wb_worker_ctx_t *)ctx;
+    int64_t t_bch0 = esp_timer_get_time();
+
+    ESP_LOGI(TAG, "D13 start=%d  UW dir=%s off=%d corr=%.3f SNR=%.1f omega=%.3f",
+             bres->burst_start,
+             bres->uw_res.direction == UW_DIR_DOWNLINK ? "DL" :
+             bres->uw_res.direction == UW_DIR_UPLINK   ? "UL" : "??",
+             bres->uw_res.uw_offset,
+             (double)bres->uw_res.correction,
+             (double)bres->uw_res.snr_estimate_db,
+             (double)bres->uw_res.omega_per_sym);
+
+    if (!bres->demod_ok) {
+        // Failed sub-frames still fire the callback for diagnostic
+        // logging; just free the bits and return.
+        free(bres->frame.bits);
+        wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);
+        return;
+    }
+
+    decoded_frame_t frame = bres->frame;
+    ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)",
+             frame.direction == DIR_DOWNLINK ? "DL" : "UL",
+             frame.n_bits);
+
+    int e1_bch = -1, e2_bch = -1;
+    if (frame.n_bits >= 24 + 64) {
+        const uint8_t *payload = frame.bits + 24;
+        uint8_t block1[32], block2[32];
+        uint8_t data1[21], data2[21];
+
+        iridium_deinterleave(payload, block1, block2);
+        e1_bch = bch_decode_block(block1, data1);
+        e2_bch = bch_decode_block(block2, data2);
+
+        if (e1_bch >= 0 && e2_bch >= 0) {
+            ESP_LOGI(TAG, "BCH PASS: errors=%d/%d (real decode)",
+                     e1_bch, e2_bch);
+            s_bursts_bch_decoded++;
+        } else {
+            ESP_LOGI(TAG, "BCH FAIL: e1=%d e2=%d (false-positive "
+                           "qpsk_demod success — bits unusable)",
+                     e1_bch, e2_bch);
+            s_bursts_bch_failed++;
+        }
+    }
+#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
+    golden_compare_burst(wctx->burst, &frame, e1_bch, e2_bch);
+#endif
+    frame_decoder_push(frame.bits, frame.n_bits,
+                       frame.direction, 0u,
+                       wctx->burst->peak_bin, wctx->burst->peak_snr_db);
+    free(frame.bits);
+    wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);
+}
+
 void worker_task(void *arg)
 {
     ESP_LOGI(TAG, "Worker Task started on Core %d", xPortGetCoreID());
@@ -508,75 +574,25 @@ void worker_task(void *arg)
                 continue;
             }
 
-            // 4. Per-burst pipeline at 250 ksps.
+            // 4. Per-burst pipeline at 250 ksps. Multi-frame callback
+            //    fires once per decoded sub-frame so multi-frame bursts
+            //    (gri's handle_multiple_frames_per_burst) yield all
+            //    their frames instead of just the first one.
             int64_t t_pipe0 = esp_timer_get_time();
-            burst_pipeline_result_t bres;
-            burst_pipeline_process_250khz(s_decim_buf, n_250k, &bres);
+            wb_worker_ctx_t worker_ctx = {
+                .burst = &burst,
+                .t_bch_accum = 0,
+            };
+            int n_frames = burst_pipeline_process_burst(
+                                s_decim_buf, n_250k,
+                                worker_emit_frame, &worker_ctx);
             int64_t t_pipe1 = esp_timer_get_time();
-            s_t_pipeline_us += (uint64_t)(t_pipe1 - t_pipe0);
-
-            ESP_LOGI(TAG, "D13 start=%d/%d  UW dir=%s off=%d corr=%.3f SNR=%.1f omega=%.3f",
-                     bres.burst_start, n_250k,
-                     bres.uw_res.direction == UW_DIR_DOWNLINK ? "DL" :
-                     bres.uw_res.direction == UW_DIR_UPLINK   ? "UL" : "??",
-                     bres.uw_res.uw_offset,
-                     (double)bres.uw_res.correction,
-                     (double)bres.uw_res.snr_estimate_db,
-                     (double)bres.uw_res.omega_per_sym);
-
-            decoded_frame_t frame = bres.frame;
-            int64_t t_bch0 = esp_timer_get_time();
-            if (bres.demod_ok) {
-                ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)",
-                         frame.direction == DIR_DOWNLINK ? "DL" : "UL",
-                         frame.n_bits);
-
-                int e1_bch = -1, e2_bch = -1;
-                if (frame.n_bits >= 24 + 64) {
-                    const uint8_t *payload = frame.bits + 24;
-                    uint8_t block1[32], block2[32];
-                    uint8_t data1[21], data2[21];
-
-                    iridium_deinterleave(payload, block1, block2);
-                    e1_bch = bch_decode_block(block1, data1);
-                    e2_bch = bch_decode_block(block2, data2);
-
-                    if (e1_bch >= 0 && e2_bch >= 0) {
-                        ESP_LOGI(TAG, "BCH PASS: errors=%d/%d (real decode)",
-                                 e1_bch, e2_bch);
-                        s_bursts_bch_decoded++;
-                    } else {
-                        // DEMOD SUCCESS but BCH FAIL — the qpsk_demod
-                        // produced bits but the frame's BCH-protected
-                        // payload is uncorrupted-but-corrupted past
-                        // the (31,21) code's 3-error budget. The
-                        // app-layer frame_decoder will still attempt
-                        // classification on these bits and most will
-                        // come back as UNKNOWN (no LCW type field
-                        // matched).
-                        ESP_LOGI(TAG, "BCH FAIL: e1=%d e2=%d (false-positive "
-                                       "qpsk_demod success — bits unusable)",
-                                 e1_bch, e2_bch);
-                        s_bursts_bch_failed++;
-                    }
-                }
-#if CONFIG_SMOKE_TEST_RAW_IRIDIUM
-                // Golden compare runs AFTER BCH so the comparison row
-                // can record post-BCH quality (block-1 and block-2
-                // correctable-error counts). e1/e2 = -1 means BCH was
-                // not attempted (frame too short). BCH(31,21) corrects
-                // up to 3 errors per block; >3 returns a negative value
-                // meaning the block could not be decoded.
-                golden_compare_burst(&burst, &frame, e1_bch, e2_bch);
-#endif
-
-                frame_decoder_push(frame.bits, frame.n_bits,
-                                   frame.direction, 0u,
-                                   burst.peak_bin, burst.peak_snr_db);
-                free(frame.bits);
-            }
-            int64_t t_bch1 = esp_timer_get_time();
-            s_t_bch_us += (uint64_t)(t_bch1 - t_bch0);
+            // burst_pipeline includes the per-frame BCH+log+queue cost
+            // inside the callback. Subtract that out so s_t_pipeline_us
+            // reflects DSP-only time.
+            s_t_pipeline_us += (uint64_t)(t_pipe1 - t_pipe0) - worker_ctx.t_bch_accum;
+            s_t_bch_us += worker_ctx.t_bch_accum;
+            (void)n_frames;
 
             s_bursts_processed++;
             s_burst_total_us += (uint64_t)(esp_timer_get_time() - burst_t0);
