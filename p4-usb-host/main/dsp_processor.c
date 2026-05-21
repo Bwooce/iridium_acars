@@ -32,16 +32,16 @@ static const char *TAG = "DSP_PROC";
 //   14  | fixed  |   70   |   56    |   86%
 //
 // Firmware uses 14 dB because per-burst processing went up with
-// variable windows (~178 ms vs 132 ms fixed-window) and the worker
-// can't keep up with 133 bursts/sec in the 16-deep queue. 70
-// bursts/sec at 178 ms = 12.5 sec worker time per 1 sec of fixture;
-// with slow-feed smoke (15.6 sec playback) this fits. Host runs
-// thr=10 for the full 60-burst decode peak — the host has no
-// queue, just flat memory.
+// 14 dB. This is TIGHTER than gri-equivalent (host uses 10 dB which
+// is the closest gri-aligned match given our tagger ENBW handling --
+// see fft_burst_tagger.c:131-141 and test_pipeline_wideband_albq.c).
+// We CANNOT match host's 10 dB here because the worker can't keep up:
+// tested 2026-05-21 -> dropped=57/147 (39% drop rate), recall regressed
+// 81.5% -> 49.2%, BCH-corrected frames 24 -> 15.
 //
-// Once burst_pipeline PIE acceleration lands and per-burst cost
-// drops, revisit thr=10 on firmware to recover the 3 missed
-// decodes vs the host peak.
+// So this is a perf workaround, not a gri-aligned threshold. Documented
+// honestly. Task #58 / #74 cover the perf work needed before this can
+// move to 10 dB and match the host.
 #define FBT_THRESHOLD_DB    14.0f
 
 // Burst window padding in INPUT samples (at FS_DETECT_HZ). gri's
