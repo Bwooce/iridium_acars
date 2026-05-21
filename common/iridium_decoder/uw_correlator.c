@@ -831,6 +831,15 @@ static float cfo_fine_estimate_q15(const int16_t *burst_2sps,
 // FFT path (their volk_32fc_*_32fc + d_cfo_est_fft.execute()). The
 // Q15 BFP version below is kept for the optional CFO_USE_Q15_FFT
 // build path.
+// Note on PIE FFT swap for CFO N=4096:
+// esp-dsp's dsps_fft2r_init_fc32 is single-instance globally
+// (`if (dsps_fft2r_initialized != 0) return;` at the top). The UW
+// correlator already initialises it for N=2048; a second init for
+// N=4096 is silently ignored and the FFT call would produce garbage.
+// Sharing a single max-N twiddle table requires layout-aware indexing
+// that doesn't match the bit-rev table esp-dsp builds at init time.
+// Kept as scalar radix-2 DIT here; the internal-SRAM move above still
+// helps the per-burst PSRAM stalls.
 static void cfo_fft_f32(float *re, float *im)
 {
     // Bit-reverse permute.
@@ -942,12 +951,12 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     // FFT scratch — float for the gr-iridium-aligned full-precision
     // path. Q15 BFP was losing peak-vs-noise resolution at borderline
     // SNR; float matches gr-iridium's volk_32fc_*_32fc + fft_complex
-    // exactly. 32 KB scratch — moved to PSRAM (EXT_RAM_BSS_ATTR) to
-    // free internal DMA SRAM for the USB transfer pool. CFO runs once
-    // per detected burst; PSRAM latency on a single-threaded float
-    // FFT pass is invisible at burst rates. See docs/p4-bss-audit.md
-    // win #2.
-    static EXT_RAM_BSS_ATTR float re[CFO_FFT_N], im[CFO_FFT_N];
+    // exactly. 32 KB scratch in INTERNAL SRAM: PIE FFT (via
+    // pie_cfo_fft_fc32) requires its operands to live where it can
+    // read them, and the magnitude search below benefits from the same
+    // L2 hit-rate improvement we measured on UW (was PSRAM).
+    static float re[CFO_FFT_N] __attribute__((aligned(16)));
+    static float im[CFO_FFT_N] __attribute__((aligned(16)));
     memset(re, 0, sizeof(re));
     memset(im, 0, sizeof(im));
 
