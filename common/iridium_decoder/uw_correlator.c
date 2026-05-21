@@ -113,6 +113,13 @@ static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
 // (= late end of the impulse response after dsps_fird's reversal),
 // giving a clean 91-sample group delay we compensate by feeding 91
 // trailing zeros and using outputs[91..91+search_max-1].
+//
+// Task #75 tested (and rejected): putting these in TCM via
+// SPM_DRAM_ATTR (.spm.data at 0x30100000) caused the PIE FIR to
+// double in time (first_decode 38.6 -> 77.6 ms/burst) and recall
+// crashed from 93.8% to 53.8%. The PIE asm cannot read TCM
+// efficiently. Coefficients must stay in regular DRAM (.bss) where
+// the PIE vld.128 instructions work correctly.
 static int16_t s_start_lp_taps_padded[/*START_LP_NTAPS_PADDED*/ 184]
     __attribute__((aligned(16)));
 static fir_s16_t s_start_lp_fir;
@@ -136,6 +143,8 @@ static int s_start_lp_fir_inited = 0;
 static int16_t s_rrc_taps_q14[RRC_NTAPS];
 
 #ifdef ESP_PLATFORM
+// Task #75 attempted SPM_DRAM_ATTR here -- caused PIE FIR slowdown.
+// PIE asm reads TCM ineffectively; coefficients must stay in DRAM .bss.
 static int16_t s_rrc_taps_padded[RRC_NTAPS_PADDED] __attribute__((aligned(16)));
 static fir_s16_t s_rrc_fir_i, s_rrc_fir_q;
 static int16_t *s_rrc_scr_in_i  = NULL;   // INTERNAL preferred, lazy;
