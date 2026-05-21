@@ -15,6 +15,12 @@
 // for internal SRAM) is invisible at frame rates. Lives in PSRAM
 // to free DMA-capable internal SRAM for the USB transfer pool.
 // See docs/p4-bss-audit.md win #1.
+//
+// Tested 2026-05-21: moving to regular internal .bss (drop the
+// EXT_RAM_BSS_ATTR) made no measurable difference to bch stage
+// timing (3580 us baseline -> 3843 us, within run-to-run noise).
+// The L2 cache hides PSRAM latency for this read-mostly 8 KB table.
+// Reverted to keep 8 KB of internal SRAM available for other uses.
 static EXT_RAM_BSS_ATTR struct { int errs; uint32_t locator; } syn_ra[1024];
 
 static uint32_t gf2_remainder(uint32_t poly, uint32_t val)
