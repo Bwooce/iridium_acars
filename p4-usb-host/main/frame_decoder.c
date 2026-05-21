@@ -19,6 +19,7 @@
 #include "ida_decode.h"
 #include "ibc_decode.h"
 #include "ira_decode.h"
+#include "ims_decode.h"
 #include "sbd_reassembler.h"
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
@@ -131,12 +132,29 @@ static void process_one(const frame_queue_item_t *it)
     }
 
     switch (classified.type) {
-    case IR_FRAME_MS:
+    case IR_FRAME_MS: {
         atomic_fetch_add_explicit(&s_class_ms, 1, memory_order_relaxed);
-        ESP_LOGI(TAG, "FRAME: MS bin=%ld snr=%.1f freq=%lu",
-                 (long)it->peak_bin, (double)it->snr_db,
-                 (unsigned long)it->freq_hz);
+        // D15: extract MS header (block, frame, group, length). Body
+        // parsing (paging/alphanumeric) is out of scope -- complex
+        // tables and not on ACARS critical path. Header tells us the
+        // super-frame coordinates and message length.
+        ims_decoded_t ims = { 0 };
+        ims_decode(&classified, &ims);
+        if (ims.bch_ok) {
+            const char *grp = (ims.ms_type == 1) ? "Acq" :
+                              (ims.group == 0) ? "B"  :
+                              (ims.group == 1) ? "C"  :
+                              (ims.group == 2) ? "D"  : "E";
+            ESP_LOGI(TAG, "FRAME: IMS block=%d frame=%d grp=%s len=%d "
+                          "bin=%ld snr=%.1f",
+                     ims.block, ims.frame, grp, ims.bch_blocks,
+                     (long)it->peak_bin, (double)it->snr_db);
+        } else {
+            ESP_LOGI(TAG, "FRAME: IMS (bch_fail) bin=%ld snr=%.1f",
+                     (long)it->peak_bin, (double)it->snr_db);
+        }
         break;
+    }
     case IR_FRAME_TL:
         atomic_fetch_add_explicit(&s_class_tl, 1, memory_order_relaxed);
         ESP_LOGI(TAG, "FRAME: TL bin=%ld snr=%.1f freq=%lu",

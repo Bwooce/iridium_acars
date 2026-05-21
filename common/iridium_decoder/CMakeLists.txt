@@ -39,6 +39,11 @@ idf_component_register(
         # sv_id / beam_id + 3D satellite position (x, y, z in 4-km
         # units, converted to geocentric lat/lon/altitude).
         "ira_decode.c"
+        # Phase D15: IMS (Iridium Messaging) header parser -- extracts
+        # ms_type / block / frame / bch_blocks / group from the first
+        # post-header BCH block. Body parsing (paging/alphanumeric) is
+        # out of scope -- complex tables, not on ACARS critical path.
+        "ims_decode.c"
         # Fine carrier frequency estimator for the worker (legacy companion
         # to the channelizer; retained for diagnostic use).
         "freq_estimator.c"
