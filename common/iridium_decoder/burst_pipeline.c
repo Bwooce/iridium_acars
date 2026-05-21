@@ -126,17 +126,25 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
                               int search_start,
                               burst_pipeline_result_t *result, bool dump)
 {
-    // The base 840 (= 84 symbols) was sized for gri's tight burst windows
-    // where the UW lands within the first ~80 symbols. Our wideband tagger
-    // gone-event windows are 2.4x wider than gri's (task #70), so frame
-    // 0's UW can be deeper into the buffer. Widen to 2520 = 252 symbols.
+    // Search range = just under one frame (191 sym × 10 sps - 1 = 1909).
     //
-    // Cost on P4: UW correlation work scales linearly with search_complex,
-    // so 3x compute per try_decode_frame call. Acceptable for now since
-    // first try usually succeeds (no retries) -- net cost is bounded.
-    // Long-term fix: tighten D13 to match gri's narrower trim (task #70),
-    // then this can revert to 840.
-    const int SYNC_SEARCH_LEN = (64 + 12 + 8) * UW_SPS * 3; // 2520
+    // gr-iridium uses 840 = (64 preamble + 12 UW + 8 margin) × sps for
+    // its tight burst windows, where the UW lands within the first ~80
+    // symbols of adj_burst. Our wideband tagger gone-event windows are
+    // 2.4x wider than gri's (task #70), so frame 0's UW can be deeper
+    // in the buffer. We scale the search range accordingly, but cap it
+    // STRICTLY below one frame length so the correlator cannot
+    // accidentally pick frame N+1's UW (which would land at +1910
+    // samples past frame 0's UW).
+    //
+    // Tested values: 840 (gri-exact) regresses BER 1.30 -> 2.12% on this
+    // corpus because our wider buffer pushes some UWs past 840. Values
+    // 1909, 2520, 3000 all give identical BER 1.30% -- 1909 is the
+    // smallest that captures all UWs while remaining < 1 frame.
+    //
+    // Long-term, task #70 fix (tighten the tagger gone-event window)
+    // would let this revert to 840 to match gri exactly.
+    const int SYNC_SEARCH_LEN = 191 * UW_SPS - 1;          // 1909
     int remaining = adj_n - search_start;
     if (remaining < SYNC_RRC_LEN_GUARD) return false;
     int search_complex = SYNC_SEARCH_LEN;
