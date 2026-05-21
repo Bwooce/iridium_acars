@@ -636,6 +636,30 @@ void smoke_test_run(void)
                       "UW=%lu PREROT=%lu DECIM=%lu QPSK=%lu",
                  (unsigned long)bp[6], (unsigned long)bp[7],
                  (unsigned long)bp[8], (unsigned long)bp[9]);
+        extern volatile uint64_t g_pie_fft_inner_us;
+        extern volatile uint64_t g_pie_fft_outer_us;
+        extern volatile uint32_t g_pie_fft_calls;
+        extern volatile uint64_t g_uw_specmul_us;
+        extern volatile uint64_t g_uw_magsearch_us;
+        uint64_t pi_inner = g_pie_fft_inner_us;
+        uint64_t pi_outer = g_pie_fft_outer_us;
+        uint32_t pi_calls = g_pie_fft_calls;
+        uint64_t uw_sm   = g_uw_specmul_us;
+        uint64_t uw_ms   = g_uw_magsearch_us;
+        g_pie_fft_inner_us = 0;
+        g_pie_fft_outer_us = 0;
+        g_pie_fft_calls    = 0;
+        g_uw_specmul_us    = 0;
+        g_uw_magsearch_us  = 0;
+        ESP_LOGI(TAG, "  pie_fft: calls=%lu inner=%llu us outer=%llu us "
+                      "(per-call: inner=%.0f us outer=%.0f us)",
+                 (unsigned long)pi_calls,
+                 (unsigned long long)pi_inner,
+                 (unsigned long long)pi_outer,
+                 pi_calls ? (double)pi_inner / pi_calls : 0.0,
+                 pi_calls ? (double)pi_outer / pi_calls : 0.0);
+        ESP_LOGI(TAG, "  uw_inner: specmul=%llu us magsearch=%llu us",
+                 (unsigned long long)uw_sm, (unsigned long long)uw_ms);
         if (ws.bursts_dropped > 0) {
             ESP_LOGW(TAG, "  %u bursts dropped — queue overflow",
                      (unsigned)ws.bursts_dropped);
