@@ -430,9 +430,17 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
         next_search_start = first_uw_abs + FRAME_LEN_SAMPLES;
     }
 
-    // Multi-frame: iterate until burst exhausted.
+    // Multi-frame: iterate until burst no longer has room for another
+    // frame. gri uses MIN_FRAME_LENGTH_NORMAL × sps = 1310 samples as
+    // the cutoff (burst_downmix_impl.cc: "if (burst_size - start <
+    // min_frame_length) return 0"). Using SYNC_SEARCH_LEN_GUARD (300)
+    // here would let the loop iterate 4-5 times across the post-burst
+    // padding for single-frame bursts -- wasted try_decode_frame work
+    // at ~18 ms each. 1310 matches gri's bound and saves ~45 ms per
+    // single-frame burst.
+    const int MIN_FRAME_LEN_REMAINING = 131 * UW_SPS;       // 1310
     while (found && next_search_start >= 0 &&
-           next_search_start + SYNC_SEARCH_LEN_GUARD <= adj_n) {
+           next_search_start + MIN_FRAME_LEN_REMAINING <= adj_n) {
         memset(&res, 0, sizeof(res));
         res.burst_start  = burst_start;
         res.omega_coarse = omega_coarse;
