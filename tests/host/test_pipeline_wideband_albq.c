@@ -325,15 +325,19 @@ int main(void) {
     printf("Loaded fixture: %d complex samples at 2.5 MSPS (%.2f ms)\n",
            n25, (double)n25 / 2.5e3);
 
-    // 2) Init the burst tagger.
+    // 2) Init the burst tagger. Threshold 10 dB. This LOOKS 3 dB tighter
+    // than gr-iridium's 7 dB default, but our tagger doesn't fold the
+    // window ENBW into the threshold while gri does (see
+    // fft_burst_tagger.c:131-141). Net effective threshold:
+    //   gri:  7.0 dB - 10*log10(ENBW) ≈ 4.6 dB  (after ENBW absorbed)
+    //   ours: 10.0 dB - 10*log10(ENBW) ≈ 7.6 dB (no ENBW absorption)
+    // So our 10 dB is ~0.6 dB tighter than gri's 7 dB on the same
+    // mag²/baseline comparison. Defensible. (Tested 7 dB: matched drops
+    // 54→4 -- our downstream pipeline doesn't handle gri's false-positive
+    // tag rate gracefully yet.)
     fft_burst_tagger_t *t = fft_burst_tagger_init(
         BURST_PRE_LEN, BURST_POST_LEN,
         /*burst_width=*/ 32,
-        // 10 dB matches the firmware setting in dsp_processor.c —
-        // gives 59/65 = 91% gri-equivalent decode rate. The 14 dB
-        // tradeoff for fewer tags is no longer needed since the
-        // PIE FIR fix (commit 7eab12a) made per-burst cost low
-        // enough for the worker to handle 133 tags/sec.
         /*threshold_db=*/ 10.0f,
         s_baseline_history);
     if (!t) { fprintf(stderr, "tagger init\n"); free(iq25); return 2; }
