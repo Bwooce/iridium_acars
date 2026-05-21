@@ -412,6 +412,18 @@ int main(void) {
     // over DUMP_TARGET_BIN when both are set.
     int target_bin = parse_dump_target_bin();
     long long target_start = parse_dump_start_sample();
+    // CLIP_WINDOW_N: hypothesis-test knob. Caps every burst's 250 ksps
+    // window length at the given sample count before the pipeline runs.
+    // Used to test task #70: gri's gone-event windows for clean bursts
+    // average ~4000-4500 samples at 250 ksps; ours come in at ~9000+ for
+    // the same bursts. Capping at e.g. 5000 simulates gri's tighter window
+    // boundary -- if gri_id=0 / 550 then decode cleanly, the tagger
+    // window-length divergence is confirmed as the residual BER lever.
+    const char *clip_env = getenv("CLIP_WINDOW_N");
+    int clip_window_n = clip_env ? atoi(clip_env) : 0;
+    if (clip_window_n > 0) {
+        printf("CLIP_WINDOW_N=%d (post-decim 250 ksps samples)\n", clip_window_n);
+    }
     int best_dump_match_idx = -1;
     long long best_dump_match_dist = (long long)1 << 60;
     if (target_start >= 0) {
@@ -496,6 +508,9 @@ int main(void) {
                                                     scr_in_i, scr_in_q,
                                                     scr_out_i, scr_out_q);
         if (n_out <= 0) continue;
+        if (clip_window_n > 0 && n_out > clip_window_n) {
+            n_out = clip_window_n;
+        }
 
         // Pipeline
         burst_pipeline_result_t res;
