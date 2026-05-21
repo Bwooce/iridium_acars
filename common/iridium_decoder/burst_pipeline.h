@@ -126,8 +126,12 @@ void burst_pipeline_set_dump_once(const char *dir);
 // Diagnostic — read accumulated per-stage wall-times since the last
 // call, plus loop iteration counts. Order:
 //   out[0]=D13, out[1]=CFO, out[2]=PREROT, out[3]=RRC,
-//   out[4]=first try_decode_frame call, out[5]=retry-loop total.
+//   out[4]=first try_decode_frame call (whole), out[5]=retry-loop total.
+//   out[6]=TDF_UW (matched filter), out[7]=TDF_PREROT (peak-phase rotate),
+//   out[8]=TDF_DECIM (sub-sample interp + decim), out[9]=TDF_QPSK
+//   (qpsk_demod_process). out[6..9] accumulate across BOTH first and
+//   retry calls.
 // Returns first/retry call counts via out params so per-call cost
 // can be derived.
-void burst_pipeline_get_stage_us(uint32_t out[6], uint32_t *first_calls,
+void burst_pipeline_get_stage_us(uint32_t out[10], uint32_t *first_calls,
                                   uint32_t *retry_calls);

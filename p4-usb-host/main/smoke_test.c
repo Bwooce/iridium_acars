@@ -623,7 +623,7 @@ void smoke_test_run(void)
                  (double)ws.bch_us);
         // burst_pipeline substage breakdown — only useful when the
         // "pipeline" stage above is the dominant cost.
-        uint32_t bp[6], bp_first, bp_retry;
+        uint32_t bp[10], bp_first, bp_retry;
         burst_pipeline_get_stage_us(bp, &bp_first, &bp_retry);
         ESP_LOGI(TAG, "  pipeline substages: D13=%lu CFO=%lu prerot=%lu "
                       "RRC=%lu first=%lu retry=%lu (first_calls=%lu "
@@ -632,6 +632,10 @@ void smoke_test_run(void)
                  (unsigned long)bp[2], (unsigned long)bp[3],
                  (unsigned long)bp[4], (unsigned long)bp[5],
                  (unsigned long)bp_first, (unsigned long)bp_retry);
+        ESP_LOGI(TAG, "  try_decode substages (all calls): "
+                      "UW=%lu PREROT=%lu DECIM=%lu QPSK=%lu",
+                 (unsigned long)bp[6], (unsigned long)bp[7],
+                 (unsigned long)bp[8], (unsigned long)bp[9]);
         if (ws.bursts_dropped > 0) {
             ESP_LOGW(TAG, "  %u bursts dropped — queue overflow",
                      (unsigned)ws.bursts_dropped);

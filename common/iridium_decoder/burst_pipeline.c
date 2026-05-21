@@ -122,6 +122,37 @@ static void q15_freq_shift_inplace(int16_t *iq, int n_complex,
 // inside process_next_frame; if a future port needs the per-frame CFO
 // (some bursts have measurable carrier drift across frames), it can be
 // added inside this helper before the matched filter.
+
+// Profile-counter wiring used by both try_decode_frame and the outer
+// burst_pipeline_process_burst stages. Definitions live up here so the
+// PROFILE_T0/PROFILE_LOG macros are in scope inside try_decode_frame
+// (which is declared above the outer driver).
+#ifdef ESP_PLATFORM
+#include "esp_timer.h"
+#define PROFILE_T0()           int64_t _pt0 = esp_timer_get_time()
+#define PROFILE_NOW()          esp_timer_get_time()
+#define PROFILE_LOG(name)      do { \
+    int64_t _pt_now = esp_timer_get_time(); \
+    s_profile_us[BP_##name] += (uint32_t)(_pt_now - _pt0); \
+    _pt0 = _pt_now; \
+} while (0)
+#else
+#define PROFILE_T0()           do { } while (0)
+#define PROFILE_LOG(name)      do { } while (0)
+#endif
+
+enum {
+    BP_D13, BP_CFO, BP_PREROT, BP_RRC, BP_LOOP_FIRST, BP_LOOP_RETRY,
+    // try_decode_frame substages (accumulated across all calls — first +
+    // retries — within the run). Lets us see what dominates the 35.5 ms
+    // first-call cost vs the 11.8 ms retry cost.
+    BP_TDF_UW, BP_TDF_PREROT, BP_TDF_DECIM, BP_TDF_QPSK,
+    BP_N
+};
+static volatile uint32_t s_profile_us[BP_N] = { 0 };
+static volatile uint32_t s_profile_loops_first = 0;
+static volatile uint32_t s_profile_loops_retry = 0;
+
 static bool try_decode_frame(int16_t *adj_burst, int adj_n,
                               int search_start,
                               burst_pipeline_result_t *result, bool dump)
@@ -161,10 +192,12 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     // the cases this multi-frame loop catches. Per-iter CFO can be
     // revisited once path A's channelizer SNR loss (D7+) is addressed.
 
+    PROFILE_T0();
     uw_corr_result_t tmp;
     memset(&tmp, 0, sizeof(tmp));
     uw_correlator_find(adj_burst + search_start * 2, remaining,
                        search_complex, &tmp);
+    PROFILE_LOG(TDF_UW);
     if (tmp.direction == UW_DIR_UNKNOWN) return false;
     result->uw_res = tmp;
 
@@ -190,6 +223,7 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
         dump_iq_cf32("07_post_prerot_250k",
                      adj_burst + search_start * 2, remaining);
     }
+    PROFILE_LOG(TDF_PREROT);
 
     // Sub-sample interp + UW-start trim.
     float true_pos = (float)tmp.uw_offset + tmp.correction;
@@ -229,37 +263,18 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     }
     result->n_post_2sps = n_post_cplx;
     if (dump) dump_iq_cf32("08_decim_2sps", src, n_post_cplx);
+    PROFILE_LOG(TDF_DECIM);
 
-    if (qpsk_demod_process(src, n_post_cplx * 2, &result->frame)) {
+    bool ok = qpsk_demod_process(src, n_post_cplx * 2, &result->frame);
+    PROFILE_LOG(TDF_QPSK);
+    if (ok) {
         result->demod_ok = true;
         return true;
     }
     return false;
 }
 
-#ifdef ESP_PLATFORM
-#include "esp_timer.h"
-#define PROFILE_T0()           int64_t _pt0 = esp_timer_get_time()
-#define PROFILE_NOW()          esp_timer_get_time()
-#define PROFILE_LOG(name)      do { \
-    int64_t _pt_now = esp_timer_get_time(); \
-    s_profile_us[BP_##name] += (uint32_t)(_pt_now - _pt0); \
-    _pt0 = _pt_now; \
-} while (0)
-#else
-#define PROFILE_T0()           do { } while (0)
-#define PROFILE_LOG(name)      do { } while (0)
-#endif
-
-enum {
-    BP_D13, BP_CFO, BP_PREROT, BP_RRC, BP_LOOP_FIRST, BP_LOOP_RETRY,
-    BP_N
-};
-static volatile uint32_t s_profile_us[BP_N] = { 0 };
-static volatile uint32_t s_profile_loops_first = 0;
-static volatile uint32_t s_profile_loops_retry = 0;
-
-void burst_pipeline_get_stage_us(uint32_t out[6], uint32_t *first_calls,
+void burst_pipeline_get_stage_us(uint32_t out[10], uint32_t *first_calls,
                                   uint32_t *retry_calls)
 {
     for (int i = 0; i < BP_N; i++) {
