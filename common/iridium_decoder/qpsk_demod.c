@@ -73,12 +73,17 @@ static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 // band PLL.
 #define M_SQRT1_2f      0.70710678f
 
+// Iridium frame is at most 191 symbols (MAX_FRAME_LEN_NORMAL_10SPS / 5 / 2
+// in burst_pipeline.c). 256 leaves headroom and is power-of-two for
+// stack alignment.
+#define QPSK_MAX_SYMBOLS  256
+
 int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame_t *out)
 {
     // n_samples is the number of int16_t values (I, Q interleaved) at 2 sps.
     // Each complex sample is 2 int16_t.
     int n_complex_samples_2sps = n_samples / 2;
-    
+
     // We want to decimate 2sps to 1sps (1 symbol per sample).
     int n_symbols = n_complex_samples_2sps / 2;
 
@@ -86,16 +91,21 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         ESP_LOGD(TAG, "Not enough symbols for UW check (%d < %d)", n_symbols, IR_UW_LENGTH);
         return 0;
     }
-
-    float complex *symbols = malloc(n_symbols * sizeof(float complex));
-    float complex *pll_out = malloc(n_symbols * sizeof(float complex));
-    int *hard_decisions = malloc(n_symbols * sizeof(int));
-    
-    if (!symbols || !pll_out || !hard_decisions) {
-        ESP_LOGE(TAG, "Failed to allocate demod buffers");
-        free(symbols); free(pll_out); free(hard_decisions);
+    if (n_symbols > QPSK_MAX_SYMBOLS) {
+        ESP_LOGE(TAG, "n_symbols %d > QPSK_MAX_SYMBOLS %d -- bursts capped at one frame upstream",
+                 n_symbols, QPSK_MAX_SYMBOLS);
         return 0;
     }
+
+    // Buffers are sized for the maximum frame length and live on the
+    // caller's stack -- avoiding 3 malloc/free pairs per try_decode_frame
+    // call (with multi-frame this fires ~3.5x per burst). Worker stack
+    // is 16 KB on P4 (xTaskCreatePinnedToCore in worker_core1.c:638);
+    // 3.8 KB of locals here fits with headroom. On host all callers
+    // run on the main thread with default 8 MB stack.
+    float complex symbols[QPSK_MAX_SYMBOLS];
+    float complex pll_out[QPSK_MAX_SYMBOLS];
+    int hard_decisions[QPSK_MAX_SYMBOLS];
 
     // 1. Fixed decimation to 1 sps. Symbol timing recovery (D10) is
     // available as sym_timing_correct_2sps but is NOT yet wired
@@ -192,7 +202,6 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
             hard_decisions[3], hard_decisions[4], hard_decisions[5],
             hard_decisions[6], hard_decisions[7], hard_decisions[8],
             hard_decisions[9], hard_decisions[10], hard_decisions[11]);
-        free(symbols); free(pll_out); free(hard_decisions);
         return 0;
     }
 
@@ -246,6 +255,5 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     }
 #endif
 
-    free(symbols); free(pll_out); free(hard_decisions);
     return 1;
 }
