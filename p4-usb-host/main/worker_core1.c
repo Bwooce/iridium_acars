@@ -502,14 +502,17 @@ void worker_task(void *arg)
                 ext_len = WB_EXTRACT_MAX;
             }
 
-            // 1. Extract wideband window from signal_buffer at FS_DETECT_HZ.
-            // start_sample_idx is the burst start in tagger frame; back up
-            // by WB_PRE_PAD_SAMPLES so the FIR transient finishes before
-            // the burst proper.
+            // 1. Prepare wideband window: invalidate L2 cache for the
+            // whole range so the per-chunk reads in step 2+3 see
+            // fresh DMA-written data. Task #64: skip the PSRAM
+            // intermediate `s_extract_buf`; the decim chunk loop
+            // reads directly from circular_buf via
+            // signal_buffer_read_chunk, saving the extract-stage
+            // PSRAM write (~3 ms/burst on the smoke corpus).
             uint32_t ext_start = burst.start_sample_idx
                                   - WB_PRE_PAD_SAMPLES;
             int64_t t_ext0 = esp_timer_get_time();
-            signal_buffer_extract(ext_start, ext_len, s_extract_buf);
+            signal_buffer_invalidate_range(ext_start, ext_len);
             int64_t t_ext1 = esp_timer_get_time();
             s_t_extract_us += (uint64_t)(t_ext1 - t_ext0);
 
@@ -550,11 +553,14 @@ void worker_task(void *arg)
             for (int off = 0; off < (int)ext_len; off += DECIM_CHUNK_IN) {
                 int chunk = (int)ext_len - off;
                 if (chunk > DECIM_CHUNK_IN) chunk = DECIM_CHUNK_IN;
-                // Pull chunk from PSRAM extract_buf into the internal-
-                // SRAM chunk buffer (single linear memcpy, cache-warm).
-                memcpy(s_chunk_iq,
-                       s_extract_buf + (size_t)off * 2,
-                       (size_t)chunk * 2 * sizeof(int16_t));
+                // Pull chunk DIRECTLY from circular_buf (PSRAM) into the
+                // internal-SRAM chunk buffer. Task #64: skips the
+                // s_extract_buf intermediate -- L2 was already
+                // invalidated for the whole window above, so this
+                // single linear PSRAM read fills internal scratch
+                // without a PSRAM intermediate.
+                signal_buffer_read_chunk(ext_start + (uint32_t)off,
+                                          (uint32_t)chunk, s_chunk_iq);
                 // Rotate the chunk in internal SRAM. sample_offset = off
                 // keeps the absolute-phase renorm aligned across the
                 // burst as if it were a single rotate call.
@@ -640,14 +646,21 @@ esp_err_t worker_core1_init(void)
     size_t scr_out_bytes  = (size_t)(DECIM_CHUNK_IN / DIDECIM_DECIM)
                                                         * sizeof(int16_t);
     size_t chunk_iq_bytes = (size_t)DECIM_CHUNK_IN * 2 * sizeof(int16_t);
-    s_extract_buf      = heap_caps_malloc(ext_bytes,     MALLOC_CAP_SPIRAM);
+    // Task #64: s_extract_buf removed -- decim loop reads directly
+    // from signal_buffer via signal_buffer_read_chunk(). The static
+    // pointer is kept null; init failure check below ignores it.
+    // Saves ~2.5 MB of PSRAM and the 7.5 ms/burst extract-stage
+    // PSRAM write.
+    (void)ext_bytes;
+    s_extract_buf      = NULL;
     s_decim_buf        = heap_caps_malloc(dec_bytes,     MALLOC_CAP_SPIRAM);
     s_chunk_iq         = heap_caps_aligned_alloc(16, chunk_iq_bytes, MALLOC_CAP_INTERNAL);
     s_decim_scr_in_i   = heap_caps_aligned_alloc(16, scr_in_bytes,  MALLOC_CAP_INTERNAL);
     s_decim_scr_in_q   = heap_caps_aligned_alloc(16, scr_in_bytes,  MALLOC_CAP_INTERNAL);
     s_decim_scr_out_i  = heap_caps_aligned_alloc(16, scr_out_bytes, MALLOC_CAP_INTERNAL);
     s_decim_scr_out_q  = heap_caps_aligned_alloc(16, scr_out_bytes, MALLOC_CAP_INTERNAL);
-    if (!s_extract_buf || !s_decim_buf || !s_chunk_iq
+    // s_extract_buf intentionally NULL since task #64; don't check it.
+    if (!s_decim_buf || !s_chunk_iq
         || !s_decim_scr_in_i || !s_decim_scr_in_q
         || !s_decim_scr_out_i || !s_decim_scr_out_q) {
         ESP_LOGE(TAG, "Worker buffer alloc failed");

@@ -152,3 +152,48 @@ void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest)
         dest[i * 2 + 1] = circular_buf[idx * 2 + 1];
     }
 }
+
+void signal_buffer_invalidate_range(uint32_t start_idx, uint32_t length)
+{
+    if (!circular_buf) return;
+    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
+    uint32_t actual_start = start_idx % total_cap;
+    size_t bytes_to_read = length * 4;
+    uint8_t *base = (uint8_t *)circular_buf;
+    uint32_t start_bytes = actual_start * 4;
+    size_t to_end_bytes = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
+
+    if (bytes_to_read <= to_end_bytes) {
+        esp_cache_msync(base + start_bytes, bytes_to_read,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    } else {
+        esp_cache_msync(base + start_bytes, to_end_bytes,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+        size_t rem = bytes_to_read - to_end_bytes;
+        esp_cache_msync(base, rem,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    }
+}
+
+void signal_buffer_read_chunk(uint32_t start_idx, uint32_t length, int16_t *dest)
+{
+    if (!circular_buf) return;
+    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
+    uint32_t actual_start = start_idx % total_cap;
+    // Fast path: chunk is fully contiguous (no wrap). memcpy beats the
+    // per-element loop -- it can do 16-byte burst PSRAM reads via the
+    // L2 cache prefetcher.
+    if (actual_start + length <= total_cap) {
+        memcpy(dest, &circular_buf[actual_start * 2],
+               (size_t)length * 4);
+        return;
+    }
+    // Wrap: two memcpys.
+    uint32_t to_end = total_cap - actual_start;
+    memcpy(dest, &circular_buf[actual_start * 2], (size_t)to_end * 4);
+    memcpy(dest + to_end * 2, &circular_buf[0],
+           (size_t)(length - to_end) * 4);
+}
