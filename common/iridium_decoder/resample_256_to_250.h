@@ -29,10 +29,14 @@
 #define RS25_DELAY_SIZE    9
 
 typedef struct {
-    int16_t     coeffs[RS25_DELAY_SIZE * RS25_INTERP];   // shared by I/Q
-    int16_t     delay_i[RS25_DELAY_SIZE];
-    int16_t     delay_q[RS25_DELAY_SIZE];
-    firmr_s16_t fir_i;
+    int16_t     coeffs[RS25_DELAY_SIZE * RS25_INTERP];   // legacy layout (used by firmr_s16 host comparison)
+    // Linear delay buffers (newest sample at index 0; manually shifted
+    // down on each input). 16 int16 wide so the active 9 are flanked
+    // by zero-padded tail slots for future PIE 128-bit loads.
+    int16_t     delay_i[16] __attribute__((aligned(16)));
+    int16_t     delay_q[16] __attribute__((aligned(16)));
+    int         start_pos;     // phase counter (shared by I/Q)
+    firmr_s16_t fir_i;         // retained for host comparison build only
     firmr_s16_t fir_q;
 } resample_256_to_250_t;
 
