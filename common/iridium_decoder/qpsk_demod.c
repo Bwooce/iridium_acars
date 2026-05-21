@@ -117,12 +117,26 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
                    + (float)samples_2sps[i * 4 + 1] * _Complex_I;
     }
 
-    // 2. Second-order PLL (D9). Tracks both phase (phi_hat) and
-    // frequency (omega_hat, rad/sym). Per symbol:
+    // 2. First-order PLL (matches gr-iridium's qpskFirstOrderPLL). Per
+    // symbol:
     //   pll_out = symbol × phi_hat
     //   err = arg(conj(x_hat) × pll_out)            // signed phase error
-    //   phi_hat ← phi_hat × exp(-j(α·err + ω_hat))   // phase + freq feed-fwd
-    //   ω_hat += β · err                              // frequency integrator
+    //   phi_hat ← phi_hat × exp(-j·α·err)            // phase correction
+    //
+    // PLL_BETA = 0 here (gri-aligned, no frequency integrator), so the
+    // omega_hat term is statically zero and elided. The omega_hat
+    // local is kept so the diagnostic "UW no match" log can still
+    // report it without ifdef gymnastics.
+    //
+    // Per-symbol optimisations vs the historical version:
+    //   - cargf(er / |er|) → cargf(er): phase is invariant under
+    //     positive-real scaling, so the magnitude division cancels
+    //     and the cabsf is unnecessary.
+    //   - per-symbol phi_hat normalisation removed: hard decisions
+    //     depend only on the SIGNS of re/im, which are insensitive
+    //     to phi_hat magnitude drift. Float roundoff over 191 mults
+    //     is sub-1e-4 anyway -- no quadrant slips.
+    //   - PLL_BETA path elided (compile-time 0).
     float complex phi_hat = 1.0f + 0.0f * _Complex_I;
     float omega_hat = 0.0f;
     for (int i = 0; i < n_symbols; i++) {
@@ -139,20 +153,15 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         else                        { x_hat = M_SQRT1_2f - M_SQRT1_2f * _Complex_I; hard_decisions[i] = 3; }
 
         float complex er = conjf(x_hat) * pll_out[i];
-        float er_mag = cabsf(er);
-        float angle = (er_mag > 1e-10f) ? cargf(er / er_mag) : 0.0f;
+        float angle = cargf(er);
 
-        // Combined rotation: alpha·err (proportional) + omega_hat (integral).
-        // phi_hat *= exp(-j*total) to oppose the measured drift.
-        float total = PLL_ALPHA * angle + omega_hat;
-        float complex correction = cosf(total) + sinf(total) * _Complex_I;
-        phi_hat = conjf(correction) * phi_hat;
-        // Normalise to prevent drift.
-        float mag = cabsf(phi_hat);
-        if (mag > 1e-10f) phi_hat /= mag;
-
-        // Frequency integrator update. omega_hat is in rad/sym.
-        omega_hat += PLL_BETA * angle;
+        // First-order phase correction: phi_hat *= exp(-j·α·angle).
+        float total = PLL_ALPHA * angle;
+        float c = cosf(total), s = sinf(total);
+        // exp(-j·t) = cos(t) - j·sin(t). Multiply: (c - j·s) * phi_hat.
+        float ph_re = crealf(phi_hat);
+        float ph_im = cimagf(phi_hat);
+        phi_hat = (c * ph_re + s * ph_im) + (c * ph_im - s * ph_re) * _Complex_I;
     }
 
     // 3. UW Check — exact port of gr-iridium's check_sync_word()
