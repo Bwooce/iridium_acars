@@ -391,7 +391,11 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
     wb_worker_ctx_t *wctx = (wb_worker_ctx_t *)ctx;
     int64_t t_bch0 = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "D13 start=%d  UW dir=%s off=%d corr=%.3f SNR=%.1f omega=%.3f",
+    // Verbose D13/UW info -- one line per FRAME now (with multi-frame
+    // this fires multiple times per burst). Demoted to ESP_LOGD; the
+    // BCH outcome below stays at ESP_LOGI as the per-frame outcome
+    // marker.
+    ESP_LOGD(TAG, "D13 start=%d  UW dir=%s off=%d corr=%.3f SNR=%.1f omega=%.3f",
              bres->burst_start,
              bres->uw_res.direction == UW_DIR_DOWNLINK ? "DL" :
              bres->uw_res.direction == UW_DIR_UPLINK   ? "UL" : "??",
