@@ -17,6 +17,7 @@
 #include "frame_queue.h"
 #include "iridium_frame.h"
 #include "ida_decode.h"
+#include "ibc_decode.h"
 #include "sbd_reassembler.h"
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
@@ -141,12 +142,37 @@ static void process_one(const frame_queue_item_t *it)
                  (long)it->peak_bin, (double)it->snr_db,
                  (unsigned long)it->freq_hz);
         break;
-    case IR_FRAME_BC:
+    case IR_FRAME_BC: {
         atomic_fetch_add_explicit(&s_class_bc, 1, memory_order_relaxed);
-        ESP_LOGI(TAG, "FRAME: BC bin=%ld snr=%.1f freq=%lu",
-                 (long)it->peak_bin, (double)it->snr_db,
-                 (unsigned long)it->freq_hz);
+        // D15: extract IBC body fields (sv_id, beam, time). The
+        // post-BCH 168-bit payload tells us which satellite/cell sent
+        // the broadcast and (for bc_type=0 sub=1) the L-band frame
+        // counter timestamp.
+        ibc_decoded_t ibc = { 0 };
+        ibc_decode(&classified, &ibc);
+        if (ibc.header_ok && ibc.bc_type == 0 && ibc.block0_ok) {
+            if (ibc.block1_subtype == 1 && ibc.iri_time > 0) {
+                uint64_t ux = ibc_iri_time_to_unix(ibc.iri_time);
+                ESP_LOGI(TAG, "FRAME: IBC sv=%d beam=%d slot=%d acq=%d "
+                              "time=%llu (iri=%lu) bin=%ld snr=%.1f",
+                         ibc.sv_id, ibc.beam_id, ibc.slot, ibc.sv_blocking,
+                         (unsigned long long)ux, (unsigned long)ibc.iri_time,
+                         (long)it->peak_bin, (double)it->snr_db);
+            } else {
+                ESP_LOGI(TAG, "FRAME: IBC sv=%d beam=%d slot=%d acq=%d "
+                              "sub=%d bin=%ld snr=%.1f",
+                         ibc.sv_id, ibc.beam_id, ibc.slot, ibc.sv_blocking,
+                         ibc.block1_subtype,
+                         (long)it->peak_bin, (double)it->snr_db);
+            }
+        } else {
+            ESP_LOGI(TAG, "FRAME: IBC (hdr_ok=%d bc_type=%d blk0_ok=%d "
+                          "blk1_ok=%d) bin=%ld snr=%.1f",
+                     ibc.header_ok, ibc.bc_type, ibc.block0_ok, ibc.block1_ok,
+                     (long)it->peak_bin, (double)it->snr_db);
+        }
         break;
+    }
     case IR_FRAME_LW:
         if (classified.lw_subtype == IR_LW_DA) {
             atomic_fetch_add_explicit(&s_class_lw_da, 1, memory_order_relaxed);

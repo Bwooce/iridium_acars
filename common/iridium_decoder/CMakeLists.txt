@@ -30,6 +30,11 @@ idf_component_register(
         "ida_decode.c"
         # Phase D part 5: SBD multi-frame reassembler.
         "sbd_reassembler.c"
+        # Phase D15: IBC (Iridium Broadcast) body parser -- extracts
+        # sv_id / beam_id / slot + bc_type=1 iri_time. Lets the frame
+        # decoder log "which satellite / which beam / what time" for
+        # the broadcast frames in the stream.
+        "ibc_decode.c"
         # Fine carrier frequency estimator for the worker (legacy companion
         # to the channelizer; retained for diagnostic use).
         "freq_estimator.c"
