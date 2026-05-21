@@ -32,30 +32,21 @@ typedef struct
 // capable internal SRAM (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM
 // is disabled for errata hardening -- see sdkconfig.defaults).
 //
-// Total budget here = COUNT * SIZE. The original real-time target
-// is 8 * 16 KB = 128 KB; ingest's only remaining DMA-internal demand
-// is s_raw (2 * 16 KB = 32 KB), so the combined DMA-internal pool
-// usage is ~160 KB. CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL is set to
-// match in sdkconfig.defaults.
-//
-// More transfers / larger transfers = less back-pressure on the SDR
-// (smaller pool causes rb_full_drops once the consumer falls behind
-// for even a few ms).
+// Total budget here = COUNT * SIZE. The post-s_conv-move DMA-internal
+// pool has ~70 KB free pre-stream; 8 * 8 KB = 64 KB fits with margin.
+// More transfers = less back-pressure on the SDR (smaller pool causes
+// rb_full_drops once the consumer falls behind for even a few ms).
 //
 // History:
-//  - 8 x 16 KB (128 KB) original. Failed ESP_ERR_NO_MEM after the
-//    wideband C front end's static allocations consumed the budget
-//    when ingest_core1's s_conv was also DMA-internal.
-//  - 4 x 8 KB (32 KB) fit in the constrained pool but throttled the
-//    SDR to ~0.85 MB/s vs 5 MB/s needed -> rb_full_drops.
-//  - 8 x 8 KB (64 KB) post-s_conv-move setting. Worked but still
-//    throttled below sustained 2.5 MSPS ingest.
-//  - 8 x 16 KB (128 KB) restored (task #74). s_conv is in PSRAM, so
-//    only s_raw (32 KB) competes for DMA-internal alongside the
-//    USB pool. Total 160 KB DMA-internal, with reserve bumped to
-//    180 KB in sdkconfig.defaults to give headroom.
+//  - 8 x 16 KB (128 KB) original. Fails ESP_ERR_NO_MEM after the
+//    wideband C front end's static allocations (~96 KB DMA-internal
+//    for ingest_core1 raw+conv) consume the budget.
+//  - 4 x 8 KB (32 KB) fits in the constrained pool but throttles
+//    the SDR to ~0.85 MB/s vs 2.5 MB/s needed -> rb_full_drops.
+//  - 8 x 8 KB (64 KB) is the post-s_conv-move setting. Verified the
+//    DMA-internal heap accommodates this comfortably.
 #define ASYNC_TRANSFER_COUNT 8
-#define ASYNC_TRANSFER_SIZE (16 * 1024)
+#define ASYNC_TRANSFER_SIZE (8 * 1024)
 
 typedef struct
 {

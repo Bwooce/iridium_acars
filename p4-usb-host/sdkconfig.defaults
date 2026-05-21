@@ -28,20 +28,18 @@ CONFIG_SPIRAM_MEMTEST=y
 #    (2 × 16 KB raw + 2 × 32 KB conv = 96 KB).
 #  - 118784 (116 KB) added headroom for fft_sc16_2048's twiddle +
 #    dsp_processor's s_accum + uw_correlator scratch.
-#  - 147456 (144 KB) bumped further for 4 × 8 KB then 8 × 8 KB
-#    esp_libusb async bulk-IN transfer pool. Sufficient when
-#    ingest_core1's s_conv was in PSRAM (so ingest only needed
-#    s_raw = 32 KB DMA-internal).
-#  - 196608 (192 KB) — task #74. Restore the original 8 × 16 KB
-#    (128 KB) transfer pool to lift sustained USB throughput
-#    above the ~0.85 MB/s ceiling. Combined demand: 128 KB pool +
-#    32 KB ingest s_raw + small driver-side allocs = ~160 KB
-#    peak DMA-internal usage; 192 KB reserve adds margin.
+#  - 180224 (176 KB) needed once esp_libusb's 4 × 8 KB = 32 KB async
+#    bulk-IN transfer pool is also DMA-capable internal allocated
+#    (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n per the errata
+#    hardening means usb_host_transfer_alloc cannot land buffers in
+#    PSRAM). Without this bump, transfer_alloc returns
+#    ESP_ERR_NO_MEM at start-stream because internal DMA heap is
+#    exhausted by the wideband front-end's static allocations.
 #
 # ingest_core1's resample output (s_resamp) stays in PSRAM — AXI-
 # GDMA reads PSRAM sources fine and the resample's CPU touch is one
 # linear write per cycle.
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=196608
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=147456
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 # Enables EXT_RAM_BSS_ATTR placement of static .bss variables into
 # PSRAM. The .bss audit (docs/p4-bss-audit.md) identified ~140 KiB
