@@ -1278,17 +1278,21 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
         snr_db = 10.0f * log10f((float)(peak_mag2 / avg_off_peak));
     }
 
-    // Reject low-SNR peaks. Threshold of 6 dB is conservative —
-    // legitimate Iridium UW correlation peaks are typically 12-20 dB
-    // above the off-peak floor; 6 dB filters out noise events.
-    // (Tested 9 dB on the ALBQ corpus: lost more legitimate
-    // borderline bursts than it gained in noise rejection. 6 dB
-    // matches what gr-iridium tolerates in practice.)
-    if (snr_db < 6.0f) {
-        out_result->snr_estimate_db = snr_db;
-        out_result->peak_value = peak_mag2;
-        return;
-    }
+    // gr-iridium's UW correlator (burst_downmix_impl.cc:632, 643) has
+    // NO SNR filter -- it picks std::max_element() and proceeds. The
+    // downstream qpsk_demod's check_sync_word() is the actual gate.
+    //
+    // We previously had a 6 dB cutoff here -- a tuning knob added to
+    // filter noise events. That was gri-misalignment: gri does no
+    // filtering at this stage. Reverted to gri-aligned behavior: always
+    // accept the peak, let qpsk_demod's UW direction check be the
+    // arbiter of "real burst vs noise".
+    //
+    // Side-effect: low-SNR bursts that previously got UNKNOWN here will
+    // now go through the rest of burst_pipeline + qpsk_demod. The UW
+    // direction check (diffs<=2) will still reject genuinely-bad bursts.
+    // Just records the SNR for diagnostics.
+    out_result->snr_estimate_db = snr_db;
 
     // Parabolic interpolation around the peak. Recompute the RRC-
     // shaped matched-filter magnitudes at peak_k-1 and peak_k+1.
