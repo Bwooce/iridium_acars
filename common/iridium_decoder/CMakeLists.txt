@@ -35,6 +35,10 @@ idf_component_register(
         # decoder log "which satellite / which beam / what time" for
         # the broadcast frames in the stream.
         "ibc_decode.c"
+        # Phase D15: IRA (Iridium Ring Alert) body parser -- extracts
+        # sv_id / beam_id + 3D satellite position (x, y, z in 4-km
+        # units, converted to geocentric lat/lon/altitude).
+        "ira_decode.c"
         # Fine carrier frequency estimator for the worker (legacy companion
         # to the channelizer; retained for diagnostic use).
         "freq_estimator.c"

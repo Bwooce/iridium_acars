@@ -22,6 +22,8 @@ typedef enum {
     IR_FRAME_LW,         // LW  — Link Control Word frame
                          //       superclass of IDA / VOC / IIU / DA / etc.
                          //       sub-discrimination happens in Phase B
+    IR_FRAME_RA,         // RA  — Ring Alert (paging broadcast on simplex)
+                         //       carries sat sv_id + 3D position + TMSI pages
 } ir_frame_type_t;
 
 typedef enum {

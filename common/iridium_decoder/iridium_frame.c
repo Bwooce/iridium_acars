@@ -103,6 +103,52 @@ static void de_interleave_pair(const uint8_t *in, size_t n_in,
     }
 }
 
+// 3-way de-interleave for RA frames. Mirrors iridium-toolkit's
+// de_interleave3 (bitsparser.py:1991). Input is `n_in` bits arranged as
+// `n_in/2` 2-bit symbols (sym[i] = in[2i+1] || in[2i]). The function
+// distributes those symbols round-robin into three output codewords --
+// "third" gets symbols at indices ..., 3, 0; "second" gets ..., 4, 1;
+// "first" gets ..., 5, 2 (each walking down by 3).
+//
+// Each output gets ceil(n_in/6) symbols × 2 bits = ceil(n_in/3) bits.
+// For RA's 96-bit input → three 32-bit outputs.
+static void de_interleave3(const uint8_t *in, size_t n_in,
+                            uint8_t *first_out, uint8_t *second_out,
+                            uint8_t *third_out)
+{
+    int n_sym = (int)(n_in / 2);
+    int third_idx = 0, second_idx = 0, first_idx = 0;
+    for (int s = n_sym - 3; s >= 0; s -= 3) {
+        third_out[third_idx++] = in[2 * s + 1] & 1;
+        third_out[third_idx++] = in[2 * s + 0] & 1;
+    }
+    for (int s = n_sym - 2; s >= 0; s -= 3) {
+        second_out[second_idx++] = in[2 * s + 1] & 1;
+        second_out[second_idx++] = in[2 * s + 0] & 1;
+    }
+    for (int s = n_sym - 1; s >= 0; s -= 3) {
+        first_out[first_idx++] = in[2 * s + 1] & 1;
+        first_out[first_idx++] = in[2 * s + 0] & 1;
+    }
+}
+
+// RA (Ring Alert) classifier. iridium-toolkit/bitsparser.py:317.
+// First 96 bits = 3 × 32 = 48 symbols, 3-way interleaved into three
+// codewords. Each codeword is 31-bit BCH(31, 21) with poly=1207
+// (ringalert poly) + 1 trailing parity bit. All three must divide
+// cleanly to classify as RA.
+#define RA_HEAD_BITS 96
+static int classify_ra(const uint8_t *p, size_t avail)
+{
+    if (avail < RA_HEAD_BITS) return 0;
+    uint8_t cw1[32], cw2[32], cw3[32];
+    de_interleave3(p, RA_HEAD_BITS, cw1, cw2, cw3);
+    if (iridium_bch_ndivide(1207u, cw1, 31) != 0) return 0;
+    if (iridium_bch_ndivide(1207u, cw2, 31) != 0) return 0;
+    if (iridium_bch_ndivide(1207u, cw3, 31) != 0) return 0;
+    return 1;
+}
+
 static int classify_bc(const uint8_t *p, size_t avail)
 {
     if (avail < BC_HDR_LEN + BC_BLOCK_LEN) return 0;
@@ -267,6 +313,14 @@ int iridium_frame_classify(const uint8_t *bits, size_t n_bits,
         return 0;
     }
 
+    // RA (Ring Alert): no header. 3 × 32-bit BCH(31,21) codewords
+    // 3-way interleaved over the first 96 bits. iridium-toolkit/
+    // bitsparser.py:317-324.
+    if (classify_ra(swapped, swap_len)) {
+        out->type = IR_FRAME_RA;
+        return 0;
+    }
+
     return 0;
 }
 
@@ -277,6 +331,7 @@ const char *iridium_frame_type_name(ir_frame_type_t type)
     case IR_FRAME_TL:      return "TL";
     case IR_FRAME_BC:      return "BC";
     case IR_FRAME_LW:      return "LW";
+    case IR_FRAME_RA:      return "RA";
     case IR_FRAME_UNKNOWN: return "??";
     }
     return "??";

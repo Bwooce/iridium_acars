@@ -18,6 +18,7 @@
 #include "iridium_frame.h"
 #include "ida_decode.h"
 #include "ibc_decode.h"
+#include "ira_decode.h"
 #include "sbd_reassembler.h"
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
@@ -205,6 +206,28 @@ static void process_one(const frame_queue_item_t *it)
                      (unsigned long)it->freq_hz);
         }
         break;
+    case IR_FRAME_RA: {
+        // D15: Iridium Ring Alert -- carries the satellite's broadcast
+        // position. Log sv_id/beam + lat/lon/alt where the BCH decoded.
+        // Counted in the "BC" bucket for now (the smoke test's
+        // expected counts predate RA classification).
+        atomic_fetch_add_explicit(&s_class_bc, 1, memory_order_relaxed);
+        ira_decoded_t ira = { 0 };
+        ira_decode(&classified, &ira);
+        if (ira.bch_ok) {
+            ESP_LOGI(TAG, "FRAME: IRA sv=%d beam=%d pos=(%+d, %+d, %+d) "
+                          "lat=%+.2f lon=%+.2f alt=%.0fkm "
+                          "bin=%ld snr=%.1f",
+                     ira.sv_id, ira.beam_id, ira.pos_x, ira.pos_y, ira.pos_z,
+                     (double)ira.lat_deg, (double)ira.lon_deg,
+                     (double)ira.alt_km,
+                     (long)it->peak_bin, (double)it->snr_db);
+        } else {
+            ESP_LOGI(TAG, "FRAME: IRA (bch_fail) bin=%ld snr=%.1f",
+                     (long)it->peak_bin, (double)it->snr_db);
+        }
+        break;
+    }
     case IR_FRAME_UNKNOWN:
     default:
         atomic_fetch_add_explicit(&s_class_unknown, 1, memory_order_relaxed);
