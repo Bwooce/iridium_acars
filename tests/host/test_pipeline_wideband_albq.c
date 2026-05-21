@@ -204,7 +204,8 @@ static void host_golden_compare(uint32_t start_sample, float rel_freq_hz,
     for (int k = 0; k < cmp_n; k++) {
         if (bits[k] != e->gri_bits[k]) errors++;
     }
-    if (hg_dump_count < 3) {
+    int ber_pct_for_dump = cmp_n > 0 ? errors * 100 / cmp_n : 0;
+    if (hg_dump_count < 3 || ber_pct_for_dump >= 5) {
         char dev_str[400], gri_str[400];
         int nd = cmp_n < 384 ? cmp_n : 384;
         for (int k = 0; k < nd; k++) {
@@ -212,10 +213,23 @@ static void host_golden_compare(uint32_t start_sample, float rel_freq_hz,
             gri_str[k] = e->gri_bits[k] ? '1' : '0';
         }
         dev_str[nd] = 0; gri_str[nd] = 0;
-        printf("GOLDEN-BITDUMP gri_id=%d host_n=%d gri_n=%d\n",
-               e->gri_id, n_bits, e->gri_n_bits);
+        printf("GOLDEN-BITDUMP gri_id=%d host_n=%d gri_n=%d errors=%d/%d\n",
+               e->gri_id, n_bits, e->gri_n_bits, errors, cmp_n);
         printf("GOLDEN-BITDUMP   dev=%s\n", dev_str);
         printf("GOLDEN-BITDUMP   gri=%s\n", gri_str);
+        // Error-position histogram: count errors per 32-bit window.
+        if (errors > 0 && cmp_n > 0) {
+            printf("GOLDEN-BITDUMP   err_per_32bits:");
+            for (int w = 0; w < cmp_n; w += 32) {
+                int we = 0;
+                int we_end = w + 32 < cmp_n ? w + 32 : cmp_n;
+                for (int k = w; k < we_end; k++) {
+                    if (bits[k] != e->gri_bits[k]) we++;
+                }
+                printf(" [%d-%d]=%d", w, we_end - 1, we);
+            }
+            printf("\n");
+        }
         hg_dump_count++;
     }
     hg_matched++;
