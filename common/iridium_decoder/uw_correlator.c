@@ -449,9 +449,20 @@ static int radix2_ifft_q15(int32_t *re, int32_t *im, int N, int log_N,
 // ~1e-4 worst case, impulse case bit-exact at 0.0.
 #include "dsps_fft2r.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 static float *s_pie_fft_scratch = NULL;   // 2*CORR_FFT_N floats interleaved IQ
 static float *s_pie_fft_w_table = NULL;   // 1*CORR_FFT_N floats twiddle table
 static bool   s_pie_fft_inited  = false;
+
+// Cumulative timers for the PIE FFT wrapper -- distinguishes the
+// FFT math itself (dsps_fft2r_fc32_arp4 + dsps_bit_rev_fc32_ansi)
+// from the de-interleave/interleave wrapper overhead.
+volatile uint64_t g_pie_fft_inner_us = 0;   // FFT + bit-rev
+volatile uint64_t g_pie_fft_outer_us = 0;   // interleave + de-interleave
+volatile uint32_t g_pie_fft_calls    = 0;
+// Per-uw_correlator_find sub-counters for the non-FFT work.
+volatile uint64_t g_uw_specmul_us   = 0;
+volatile uint64_t g_uw_magsearch_us = 0;
 
 static void pie_fft_fc32_init(void)
 {
@@ -473,18 +484,25 @@ static void pie_fft_fc32_2048(float *re, float *im)
     if (!s_pie_fft_inited) pie_fft_fc32_init();
     if (!s_pie_fft_inited) return;   // alloc failed -> no-op (will mis-decode)
 
+    int64_t t0 = esp_timer_get_time();
     // Interleave re/im into internal-SRAM scratch.
     for (int i = 0; i < CORR_FFT_N; i++) {
         s_pie_fft_scratch[2 * i + 0] = re[i];
         s_pie_fft_scratch[2 * i + 1] = im[i];
     }
+    int64_t t1 = esp_timer_get_time();
     dsps_fft2r_fc32_arp4(s_pie_fft_scratch, CORR_FFT_N);
     dsps_bit_rev_fc32_ansi(s_pie_fft_scratch, CORR_FFT_N);
+    int64_t t2 = esp_timer_get_time();
     // De-interleave back to caller's arrays.
     for (int i = 0; i < CORR_FFT_N; i++) {
         re[i] = s_pie_fft_scratch[2 * i + 0];
         im[i] = s_pie_fft_scratch[2 * i + 1];
     }
+    int64_t t3 = esp_timer_get_time();
+    g_pie_fft_outer_us += (uint64_t)((t1 - t0) + (t3 - t2));
+    g_pie_fft_inner_us += (uint64_t)(t2 - t1);
+    g_pie_fft_calls    += 1;
 }
 
 // IFFT via conjugate-FFT-conjugate. gri convention: no 1/N scaling
@@ -1203,6 +1221,16 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     // implicit ×1 from twiddle quantisation; the multiply's >>15
     // normalises one of them out so the IFFT operates on values
     // comparable to a single-FFT output).
+    // float path uses float accumulators; Q15 path keeps int64 (below).
+    // P4 RISC-V has hardware float but NOT double precision -- using
+    // double in the mag-search inner loop forced soft-float emulation
+    // and was the single largest non-FFT cost (~5 ms/uw_call). Float
+    // precision is adequate: peak magnitudes are O(1e15) with ~1e7
+    // resolution per float ULP, well below the noise floor.
+    float   best_dl_f = 0.0f, best_ul_f = 0.0f;
+    float   best_dl_re_f = 0.0f, best_dl_im_f = 0.0f;
+    float   best_ul_re_f = 0.0f, best_ul_im_f = 0.0f;
+    float   sum_dl_f = 0.0f, sum_ul_f = 0.0f;
     int64_t best_dl = 0, best_ul = 0;
     int     best_dl_k = 0, best_ul_k = 0;
     int32_t best_dl_re = 0, best_dl_im = 0;
@@ -1241,61 +1269,81 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 #endif
 
     // DL path (float)
+    int64_t _t0 = esp_timer_get_time();
     for (int k = 0; k < CORR_FFT_N; k++) {
         float ar = fburst_re[k], ai = fburst_im[k];
         float br = s_sync_dl_fft_re_f[k], bi = s_sync_dl_fft_im_f[k];
         fifft_re[k] = ar * br - ai * bi;
         fifft_im[k] = ar * bi + ai * br;
     }
+    g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
 #if defined(ESP_PLATFORM)
     pie_ifft_fc32_2048(fifft_re, fifft_im);
 #else
     radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
                     s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
 #endif
+    _t0 = esp_timer_get_time();
     for (int k = 0; k < search_complex; k++) {
         int idx = k + L_minus_1;
         if (idx >= CORR_FFT_N) break;
         float re = fifft_re[idx], im = fifft_im[idx];
-        double m2 = (double)re * re + (double)im * im;
-        sum_dl += (int64_t)m2;
+        float m2 = re * re + im * im;
+        sum_dl_f += m2;
         if (k == 0) valid_count = 0;
         valid_count++;
-        if ((int64_t)m2 > best_dl) {
-            best_dl = (int64_t)m2; best_dl_k = k;
-            // Stash the complex peak as scaled int32 — the downstream
-            // code (Q15 phase-rotation logic) uses peak_re/peak_im in
-            // their original sign+magnitude convention. The PHASE is
-            // what matters for rotation; absolute scale cancels.
-            best_dl_re = (int32_t)re;
-            best_dl_im = (int32_t)im;
+        if (m2 > best_dl_f) {
+            best_dl_f = m2; best_dl_k = k;
+            // Stash the complex peak — downstream code (Q15 phase-
+            // rotation logic) uses peak_re/peak_im purely for phase;
+            // absolute scale cancels.
+            best_dl_re_f = re;
+            best_dl_im_f = im;
         }
     }
+    g_uw_magsearch_us += (uint64_t)(esp_timer_get_time() - _t0);
     // UL path (float)
+    _t0 = esp_timer_get_time();
     for (int k = 0; k < CORR_FFT_N; k++) {
         float ar = fburst_re[k], ai = fburst_im[k];
         float br = s_sync_ul_fft_re_f[k], bi = s_sync_ul_fft_im_f[k];
         fifft_re[k] = ar * br - ai * bi;
         fifft_im[k] = ar * bi + ai * br;
     }
+    g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
 #if defined(ESP_PLATFORM)
     pie_ifft_fc32_2048(fifft_re, fifft_im);
 #else
     radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
                     s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
 #endif
+    _t0 = esp_timer_get_time();
     for (int k = 0; k < search_complex; k++) {
         int idx = k + L_minus_1;
         if (idx >= CORR_FFT_N) break;
         float re = fifft_re[idx], im = fifft_im[idx];
-        double m2 = (double)re * re + (double)im * im;
-        sum_ul += (int64_t)m2;
-        if ((int64_t)m2 > best_ul) {
-            best_ul = (int64_t)m2; best_ul_k = k;
-            best_ul_re = (int32_t)re;
-            best_ul_im = (int32_t)im;
+        float m2 = re * re + im * im;
+        sum_ul_f += m2;
+        if (m2 > best_ul_f) {
+            best_ul_f = m2; best_ul_k = k;
+            best_ul_re_f = re;
+            best_ul_im_f = im;
         }
     }
+    g_uw_magsearch_us += (uint64_t)(esp_timer_get_time() - _t0);
+
+    // Bridge float-path results to the int64 names the downstream
+    // direction-pick + SNR code uses (those originated with the Q15 BFP
+    // path which still uses int64; sharing the variable names keeps the
+    // post-mag-search code identical for both paths).
+    best_dl    = (int64_t)best_dl_f;
+    best_ul    = (int64_t)best_ul_f;
+    sum_dl     = (int64_t)sum_dl_f;
+    sum_ul     = (int64_t)sum_ul_f;
+    best_dl_re = (int32_t)best_dl_re_f;
+    best_dl_im = (int32_t)best_dl_im_f;
+    best_ul_re = (int32_t)best_ul_re_f;
+    best_ul_im = (int32_t)best_ul_im_f;
 #else
     // Q15 BFP matched filter (legacy path).
     static int32_t burst_re[CORR_FFT_N], burst_im[CORR_FFT_N];
