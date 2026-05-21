@@ -624,13 +624,38 @@ void worker_task(void *arg)
 
 esp_err_t worker_core1_init(void)
 {
-    // Queue depth 32: enough to absorb the per-burst-length variability
-    // under gone-trigger (single-frame ~130 ms, multi-frame up to
-    // 250 ms processing time). With 16-deep, we saw 5-7 drops per
-    // smoke run at peak load. 32 absorbs the variability without
-    // hitting the queue cap.
-    burst_queue = xQueueCreate(32, sizeof(detected_burst_t));
+    // Burst queue depth 1024, storage in PSRAM. Each detected_burst_t
+    // is 28 bytes, so 1024 entries cost ~28 KB of PSRAM (trivial out
+    // of 32 MB). At the current 103 ms/burst worker time this is
+    // ~100 seconds of buffering -- well past any transient overload.
+    //
+    // History: we ran 16, then 32, growing as the wideband front end
+    // produced multi-frame bursts that take longer to process. 32
+    // still hit high_water=10 on the smoke corpus and would queue-
+    // overflow under live RF with bursty traffic. Going large is
+    // safer than guessing; PSRAM is cheap and the per-enqueue cost
+    // (a 28-byte memcpy via L2 cache) is invisible at burst rates.
+    //
+    // Static queue: control block in internal-SRAM .bss, storage
+    // array in PSRAM heap. xQueueCreateStatic binds the two.
+    #define BURST_QUEUE_DEPTH 1024
+    static StaticQueue_t s_burst_queue_buf;
+    static uint8_t *s_burst_queue_storage = NULL;
+    size_t storage_bytes = (size_t)BURST_QUEUE_DEPTH * sizeof(detected_burst_t);
+    s_burst_queue_storage = (uint8_t *)heap_caps_malloc(storage_bytes,
+                                                        MALLOC_CAP_SPIRAM);
+    if (!s_burst_queue_storage) {
+        ESP_LOGE(TAG, "Burst queue PSRAM alloc failed (%zu B)", storage_bytes);
+        return ESP_ERR_NO_MEM;
+    }
+    burst_queue = xQueueCreateStatic(BURST_QUEUE_DEPTH,
+                                      sizeof(detected_burst_t),
+                                      s_burst_queue_storage,
+                                      &s_burst_queue_buf);
     if (!burst_queue) return ESP_ERR_NO_MEM;
+    ESP_LOGI(TAG, "Burst queue: depth=%d × %u B = %zu B PSRAM",
+             BURST_QUEUE_DEPTH, (unsigned)sizeof(detected_burst_t),
+             storage_bytes);
 
     // Wideband buffers. Big working surfaces stay in PSRAM (extract +
     // decim output). The PIE FIR scratch must live in INTERNAL SRAM,
