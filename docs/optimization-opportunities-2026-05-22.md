@@ -1,0 +1,197 @@
+# Optimization Opportunities — 2026-05-22
+
+Snapshot of the next batch of perf opportunities after the session of
+2026-05-21/22 (queue → 1024 in PSRAM, s_extract_buf removal, PIE FFT
+swap, float-only UW magsearch, internal-SRAM moves, resampler
+specialised + -O3 + PIE asm). Ranked by expected impact × confidence ×
+feasibility on the ESP32-P4 platform.
+
+Current state at time of writing:
+
+| metric | value |
+|---|---|
+| RAW_IRIDIUM smoke avg burst | 84.5 ms (was 150 ms session-start) |
+| RAW_IRIDIUM smoke decode | 29 BCH, 61 matched, 93.8% recall, 1.91% BER |
+| LIVE_SDR sustained throughput | 4.25 MB/s (was 0.85 MB/s, 5.0× faster) |
+| LIVE_SDR rb_full_drops | ~13% (RTL emits 5.12 MB/s) |
+| Resample per dispatch | 2.67 ms (was 17.9 ms) |
+| Host bch/qpsk/pipeline ctest | 20/20 pass |
+
+---
+
+## 1. Drop RTL-SDR rate from 2.56 → 2.0 MSPS (gri-aligned)
+
+**What:** Change `FS_IN_HZ` in `dsp_processor.h:20` from `2560000` to
+`2000000`. gr-iridium ships `sample_rate=2000000`; librtlsdr
+explicitly warns "sample loss is to be expected for rates > 2400000".
+The 125/128 resampler becomes 250/200 — drop the resampler entirely
+(or retune to 2.5 MSPS native via R820T xtal divider 48.18).
+
+**Impact:** USB byte rate 5.12 → 4.0 MB/s (-22%). Eliminates resampler
+(~2.67 ms × ~125 dispatches/s = 333 ms/s of Core 1 freed). RTL stops
+dropping at the source. Ringbuf drops should evaporate.
+
+**Effort:** ~2 hours. Also retune `burst_post_len` (40000 → 32000 at
+2 MSPS) and `direct_if_decim`'s decim (10× → 8× at FS_DETECT_HZ=2 MSPS).
+
+**Risk:** Low — gri runs at this rate. Validate by re-running ALBQ
+smoke (fixture stays at 2.5 MSPS; live-rate change is orthogonal).
+
+## 2. PIE-accelerate the burst-tagger EMA + magnitude loops
+
+**What:** `compute_magnitude_shifted()` and `update_baseline_ema()` in
+`fft_burst_tagger.c:197/380` are the per-step hotspots after the FFT.
+Both are perfectly vectorisable: mag² is 8-lane int16×int16→int32
+reduction; EMA is `int32_t baseline_sum[k] -= old[k]; baseline_sum[k]
++= mag[k]` — pure SIMD add/sub on 2048 int32. esp-dsp doesn't have a
+direct int32 add helper, but `esp.vmulas.s32.qacc` / `esp.vld.128`
+sequences are straightforward (same pattern as `resample_arp4.S`).
+2048 ops ÷ 8 lanes = ~256 vector iters/loop.
+
+**Impact:** Tagger is at 81% of Core 0 cap. PIE the inner arithmetic +
+ensure the active history slot is in INTERNAL SRAM → expect 2-3×
+tagger speedup, Core 0 utilization 81% → ~30-40%, unblocks Core 0
+second worker.
+
+**Effort:** 1-2 days (hand-roll 2 PIE asm helpers, validate against
+scalar with diff-harness pattern from `pie_fft_diff_test.c`).
+
+**Risk:** Medium. Bit-exact validation; bin-count consistency vs ALBQ
+smoke (must keep tagger output identical or recall drops).
+
+## 3. Move `baseline_history` access pattern out of PSRAM
+
+**What:** The 4 MB `baseline_history` ring in `dsp_processor.c:201` is
+PSRAM. Every step reads + writes the current slot (8 KB). At 200 MHz
+PSRAM bandwidth that's a real cost; the 12.8 ms sequential pattern
+churns the 256 KB L2 unhelpfully. Allocate INTERNAL-SRAM 8 KB scratch;
+EMA against scratch; lazy-spill stale slot back to PSRAM in idle
+windows. Optionally shrink HISTORY_SIZE 512 → 256.
+
+**Impact:** ~0.5-1 ms/step (× 125/s = 60-125 ms/s of Core 0).
+Compounds with #2.
+
+**Effort:** Half a day.
+
+**Risk:** Low if HISTORY stays at 512.
+
+## 4. Conditional multi-frame iteration
+
+**What:** `burst_pipeline.c:457` always iterates until window
+exhausted, regardless of frame 1 outcome. Retry loop is ~3.3× per
+burst × 18.3 ms = 60 ms/burst, but multi-frame contributes only ~4
+BCH frames out of 29 (per task #79 attribution). Gate frames 2+ on:
+`frame[0] BCH-clean OR (frame[0] corrected AND remaining_window >
+2×MIN_FRAME)`.
+
+**Impact:** Estimated 40-50 ms/burst on the average (most bursts are
+single-frame). Per-burst time 84.5 → ~40 ms.
+
+**Effort:** ~3 hours. Sweep "frame_1_ok_required" flag against ALBQ
+smoke; expect 27-28 BCH frames vs current 29 (acceptable).
+
+**Risk:** Low — gate is configurable; ALBQ corpus tells you the cost
+exactly.
+
+## 5. Retry `dsps_fft2r_sc16_arp4` swap in the tagger with diff harness
+
+**What:** Per memory note `feedback_pie_fft_swap_needs_validation.md`,
+the sc16 PIE FFT swap previously broke decode 58 → 0; root cause was
+likely the `dsps_fft2r_init_sc16(NULL,N)` size-arg bug + N2≤2 tail
+divergence. Build the same bit-exact diff harness pattern that
+`pie_fft_diff_test.c` provides for fc32 but for sc16; verify
+sinusoid / impulse / random / chirp; then enable.
+
+**Impact:** Tagger FFT 1.77 → 0.61 ms/step ≈ 1.16 ms/step × 125
+steps/s = 145 ms/s freed on Core 0. Same 3× factor we got on the fc32
+UW FFT.
+
+**Effort:** 1-2 days (parameterise the existing diff harness; smoke
+validation).
+
+**Risk:** Medium. N2≤2 tail special-case is the known divergence —
+needs harness coverage.
+
+## 6. Swap UW matched-filter to radix-4 (`dsps_fft4r_fc32_arp4`)
+
+**What:** Available in
+`esp-dsp/modules/fft/float/dsps_fft4r_fc32_arp4.S`. At N=2048,
+radix-4 is typically 25-30% faster than radix-2 for the same SIMD
+width. Three FFTs per `uw_correlator_find`, fired ~3.3×/burst.
+
+**Impact:** Those FFTs cost ~5 ms/burst now (PIE radix-2). Radix-4
+saves ~1.5 ms/burst.
+
+**Effort:** ~4 hours. Init API identical; output bit-rev order
+different — use existing `pie_fft_diff_test.c` to verify.
+
+**Risk:** Low (validated harness exists).
+
+## 7. Q15 absolute-phase phasor table for rotate-to-DC
+
+**What:** Per memory `feedback_q15_incremental_phasor_decays.md`, you
+switched to per-sample float `cosf/sinf` to avoid Q15 incremental
+decay. But that's a scalar float trig call per sample × ~40 K
+samples/burst. A precomputed sin/cos LUT at 2.5 MSPS phase resolution
+(or 16 K entries with linear interp) keeps absolute-phase semantics,
+eliminates trig, and trivially vectorises the IQ complex-mul into PIE
+fixed-point.
+
+**Impact:** Rotate cost likely 3-6 ms/burst now. PIE Q15 complex-mul
+with table lookup: target ~0.5 ms.
+
+**Effort:** 1 day (LUT generator + lookup + 1 PIE asm helper for cplx
+mul).
+
+**Risk:** Low. Validate against existing host stagewise NMSE/phase-
+coherence harness.
+
+## 8. SNR-gate + tagger threshold relaxation (after #1-#3)
+
+**What:** Tagger is at 14 dB threshold because the worker can't keep
+up. After #1-#3 land, lower to 10 dB to recover the missing 4 BCH
+frames (host runs 92% recall at 10 dB vs 88% at 14). Two changes
+coupled — don't lower threshold without first having Core 0 / worker
+headroom.
+
+**Impact:** +2-4 BCH frames on ALBQ; gri-alignment-correct.
+
+**Effort:** Trivial (one #define), blocked on #1-#3 landing.
+
+**Risk:** Needs smoke recall check.
+
+---
+
+## Non-opportunities (deprioritised)
+
+- **Resampler closer to 0.5 ms floor:** Current 2.67 ms is dominated
+  by per-sample delay-line shift in C and the IQ deinterleave/store.
+  Floor is ~1.2 ms, not 0.5. With #1 (drop resampler) this is moot.
+- **BCH soft-decision:** Chase-2 adds ~2× BCH time for ~2-3 frames;
+  net loss against #4.
+- **Pipeline split (Stage A/B across cores):** Worse than two-worker
+  parallel (67 ms/burst limited).
+- **PLL convergence shortcut:** ~5 µs/burst total, not a target.
+
+---
+
+## References
+
+- gr-iridium `examples/rtl-sdr.conf` — 2.0 MSPS reference rate
+- gr-iridium `fft_burst_tagger_impl.cc:215-280` — volk-vectorised EMA
+- esp-dsp `modules/fft/float/dsps_fft4r_fc32_arp4.S` — radix-4 PIE FFT
+- esp-dsp `modules/fft/fixed/dsps_fft2r_sc16_arp4.S` — sc16 PIE FFT
+- `pie_fft_diff_test.c` — proven bit-exact PIE-vs-scalar harness
+- Memory notes: `feedback_pie_fft_swap_needs_validation.md`,
+  `feedback_q15_incremental_phasor_decays.md`,
+  `project_tagger_postpad_coupled_to_multiframe.md`,
+  `feedback_usb_pool_size_not_throttle.md`
+
+## Key file paths
+
+- `common/iridium_decoder/fft_burst_tagger.c` (EMA/mag loops, PIE candidate)
+- `common/iridium_decoder/fft_sc16_2048.c` (already PIE; sc16 swap reference)
+- `common/iridium_decoder/uw_correlator.c:444` (fft4r candidate)
+- `common/iridium_decoder/burst_pipeline.c:457` (multi-frame gate)
+- `p4-usb-host/main/dsp_processor.h:20` (FS_IN_HZ)
+- `p4-usb-host/main/dsp_processor.c:201` (baseline_history PSRAM alloc)
