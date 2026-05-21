@@ -13,16 +13,36 @@
 #define EXT_RAM_BSS_ATTR
 #endif
 
-// Per-phase contiguous tap layout for the fast path. Index as
-// s_coeffs_pp[phase * RS25_DELAY_SIZE + tap]. Built once in init()
-// from the per-instance `coeffs` (which is in [tap × INTERP + phase]
-// order). Singleton because we only ever have one resampler instance
-// (ingest_core1::s_rs), and putting this in the struct grew its .bss
-// past the boot-time DMA-pool reserve budget on P4. Read-only after
-// init, accessed via L2 cache from PSRAM. 1125 × int16 = 2.2 KB.
-static EXT_RAM_BSS_ATTR int16_t s_coeffs_pp[RS25_DELAY_SIZE * RS25_INTERP]
+// Per-phase contiguous tap layout. Each phase gets 16 int16 slots
+// (9 real taps + 7 zero pad), so the PIE-asm hot path can do two
+// 8-lane vmulas covering all 16 with the pad contributing 0. INTERP
+// = 125 phases × 16 = 2000 int16 = 4 KB. Singleton (read-only after
+// init), placed in PSRAM .bss because adding it to the struct's
+// internal-SRAM footprint broke the boot-time DMA-pool reserve.
+// Access cost is L2 cache only (read-mostly).
+#define RS25_PADDED_TAPS 16
+static EXT_RAM_BSS_ATTR int16_t s_coeffs_pp[RS25_PADDED_TAPS * RS25_INTERP]
     __attribute__((aligned(16)));
 static int s_coeffs_pp_ready = 0;
+
+#if defined(__riscv) && __has_include("soc/soc_caps.h")
+#include "soc/soc_caps.h"
+#endif
+
+// PIE-accelerated 9-tap MAC, defined in resample_arp4.S. Pads to 16
+// taps (zero-padded). Computes one output sample pair from
+// pre-loaded delay lines + per-phase tap pointer. Self-gates on
+// __riscv && SOC_CPU_HAS_PIE in the .S file.
+#if defined(__riscv) && defined(SOC_CPU_HAS_PIE)
+extern void resample_125_128_mac_arp4(const int16_t *pc,
+                                       const int16_t *di,
+                                       const int16_t *dq,
+                                       int16_t *out_i,
+                                       int16_t *out_q);
+#define RS25_USE_PIE_ASM 1
+#else
+#define RS25_USE_PIE_ASM 0
+#endif
 
 // Modified Bessel I0, for Kaiser window. Copy of the same function in
 // direct_if_decim.c — could be deduped, but the two modules are
@@ -135,12 +155,15 @@ static void make_resample_coeffs(int16_t *coeffs)
 void resample_256_to_250_init(resample_256_to_250_t *r)
 {
     make_resample_coeffs(r->coeffs);
-    // Build per-phase contiguous layout once, in PSRAM .bss (s_coeffs_pp).
-    // s_coeffs_pp[phase * DSIZE + tap] == coeffs[tap * INTERP + phase].
-    // Singleton across all instances; idempotent re-init re-populates.
+    // Build per-phase contiguous layout, padded to RS25_PADDED_TAPS=16
+    // so the PIE-asm inner can do exactly two vmulas covering all
+    // 16 lanes (the last 7 padding zeros contribute 0). Indexed as
+    // s_coeffs_pp[phase * 16 + tap]; tap [0..8] = original
+    // coeffs[tap × INTERP + phase], tap [9..15] = 0.
+    memset(s_coeffs_pp, 0, sizeof(s_coeffs_pp));
     for (int phase = 0; phase < RS25_INTERP; phase++) {
         for (int tap = 0; tap < RS25_DELAY_SIZE; tap++) {
-            s_coeffs_pp[phase * RS25_DELAY_SIZE + tap] =
+            s_coeffs_pp[phase * RS25_PADDED_TAPS + tap] =
                 r->coeffs[tap * RS25_INTERP + phase];
         }
     }
@@ -207,16 +230,22 @@ int resample_256_to_250_process(resample_256_to_250_t *r,
         // matching the 125/128 ratio.
         if (start_pos < RS25_INTERP) {
             const int16_t *__restrict pc =
-                &coeffs_pp[start_pos * RS25_DELAY_SIZE];
-            // int64 accumulator: max 9 × Q30 = ~9.6e9 exceeds int32
-            // signed range. Adding the 0x7fff rounding term first
-            // matches the firmr_s16 reference's pre-shift rounding.
+                &coeffs_pp[start_pos * RS25_PADDED_TAPS];
+#if RS25_USE_PIE_ASM
+            // PIE asm: two esp.vmulas.s16.xacc per channel (covers
+            // 16 zero-padded taps), one esp.srs.s.xacc shift per
+            // output. Bit-exact to the C fallback below (same Q15
+            // 0x7fff rounding, same >>15 truncation).
+            resample_125_128_mac_arp4(pc, di, dq,
+                                       &out_iq[2 * n_out + 0],
+                                       &out_iq[2 * n_out + 1]);
+#else
+            // C fallback (host build / non-PIE targets). int64 acc:
+            // max 9 × Q30 = ~9.6e9 exceeds int32 signed range. Adding
+            // the 0x7fff rounding term first matches the firmr_s16
+            // reference.
             int64_t acc_i = 0x7fff;
             int64_t acc_q = 0x7fff;
-            // Compiler unrolls this. Each iteration is 1 vmac equivalent
-            // (int16 × int16 + accumulate). With per-phase contiguous
-            // pc[] and linear delay di[]/dq[], modern compilers emit
-            // tight load-MAC sequences here.
             for (int k = 0; k < RS25_DELAY_SIZE; k++) {
                 int32_t c = pc[k];
                 acc_i += (int32_t)di[k] * c;
@@ -224,6 +253,7 @@ int resample_256_to_250_process(resample_256_to_250_t *r,
             }
             out_iq[2 * n_out + 0] = (int16_t)(acc_i >> 15);
             out_iq[2 * n_out + 1] = (int16_t)(acc_q >> 15);
+#endif
             n_out++;
             start_pos += RS25_DECIM;
         }

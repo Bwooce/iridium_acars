@@ -71,6 +71,10 @@ idf_component_register(
         "fft_burst_tagger.c"
         "direct_if_decim.c"
         "resample_256_to_250.c"
+        # PIE asm 9-tap MAC for the resampler hot path. Self-gates
+        # on __riscv && SOC_CPU_HAS_PIE so it compiles to a no-op
+        # on host (and on non-P4 targets).
+        "resample_arp4.S"
         # Absolute-phase IQ rotation shared with the host wideband
         # test. Lives here (not in worker_core1 / the test) because
         # both call sites need the SAME Q15-magnitude-decay-avoiding
