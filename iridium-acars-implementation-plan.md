@@ -91,26 +91,25 @@ regression at any commit.
 
 ### What's NOT yet real-time
 
-Two structural gaps remain:
+USB throughput (task #74) is closed — we're at 4.57 MB/s sustained
+(was 0.85 MB/s). That's 89% of the 5.12 MB/s target. The remaining
+gap is structural: ~85 ms/burst worker time vs ~11 ms target for
+single-channel real-time. The dominant remaining cost is the
+matched-filter + multi-frame retry loop on Core 1
+(~63 ms/burst, intrinsically serial within one burst).
 
-1. **USB throughput (task #74).** RTL-SDR ingest currently runs at
-   0.85 MB/s; sustained 2.5 MSPS Iridium ingest needs ~5 MB/s.
-   Without this, the system can't even keep up with raw input
-   regardless of how fast the burst worker runs.
-2. **Per-burst worker time (task #58 + #60 + #65 + others).**
-   103.4 ms vs ~11 ms target. The dominant remaining cost is the
-   matched-filter + multi-frame retry loop on Core 1
-   (~63 ms/burst, intrinsically serial within one burst).
-
-Approaches considered for the worker gap, with current verdicts:
+Approaches considered for the worker gap, with current verdicts
+(updated 2026-05-22):
 
 | approach | viability | notes |
 |---|---|---|
 | Tighten tagger window (task #70) | rejected | Sweep shows every clip costs recall; multi-frame loop needs the 16 ms post-pad. Memory note `project_tagger_postpad_coupled_to_multiframe.md`. |
 | PIE FFT for CFO (N=4096) | retried, deferred | esp-dsp's single-instance init forced manual twiddle handling; PIE result had subtle float divergence that caused -1 BCH frame regression. Needs bit-exact diff harness like #67 before retry. |
 | Chunked RRC PIE FIR | failed twice | Static-BSS variant broke boot (PSRAM DMA pool reserve), heap-alloc variant produced corrupt output (streaming FIR semantics quirk in arp4). Worth another look. |
-| Two-worker parallel | next | Core 0 has ~50% spare; second worker could halve per-burst latency. Memory budget ~85 KB additional internal SRAM is tight but fits. |
-| Pipeline split | viable but stage-imbalanced | Matched-filter + multi-frame is 67 ms/burst (Stage B); decim+CFO+RRC is 55 ms/burst (Stage A). Throughput limited to ~67 ms/burst, worse than parallel two-worker. |
+| Two-worker burst pool | **blocked (memory)** | Each instance needs ~34 KB internal SRAM (chunk_iq + decim scratches) plus uw_correlator API refactor for its ~50 KB FFT scratches. Largest contiguous internal SRAM block after init = 31 KB. Doesn't fit without further internal-SRAM freeing. |
+| Two-worker parallel resample | **architecture built, blocked (L2)** | Within-chunk split implemented and validated bit-exact (commit `aad9735`). At split>0, FFT cost on Core 0 jumps 263→443 µs due to L2 contention not addressable today. Default split_pct=0 ships. See `docs/split-resample-sweep-2026-05-22.md`. |
+| Conditional multi-frame iteration | **tried, reverted** | Saved ~40 ms/burst but cost matched 61→56 and BCH 29→25 — quality regression. Quality-must-not-be-compromised policy. |
+| Drop input to 2.0 MSPS (task #1 in opt doc) | **available, deferred** | Deletes the resampler entirely, closes the 11% USB gap. Trade-off: ~22% less spectrum captured. Worth it only if real-RF reveals the gap is binding. |
 
 See `Forward plan` below for the concrete next steps.
 
@@ -118,86 +117,76 @@ See `Forward plan` below for the concrete next steps.
 
 ## Forward plan
 
-Bit-correctness is done. The remaining gap is **real-time on one
-P4** at typical Iridium burst rates. The plan is sequenced so each
-step is testable in isolation and the next one is informed by what
-the previous one measured.
+Bit-correctness is done. USB ingest is now at **4.57 MB/s** on
+LIVE_SDR (was 0.85 MB/s — task #74 closed via the resample +
+coeffs-internal + PSRAM-stacks work). The remaining gap is **~11%
+short of true realtime** (5.12 MB/s at 2.56 MSPS) and the existing
+~85 ms/burst decode budget. The plan is sequenced so each step is
+testable in isolation and the next one is informed by what the
+previous one measured.
 
-### 1. Grow the PSRAM ring buffer (next)
+### 1. ~~Grow the PSRAM ring buffer~~ — DONE
 
-The burst queue between Core 0 (dsp_processor → worker_core1_push)
-and Core 1 (worker_task) is currently `xQueueCreate(32, ...)` —
-32 burst descriptors. Under traffic peaks the smoke run sees
-`high_water=6..10`; in heavier RF that number would grow. Growing
-the queue depth is cheap (the descriptors themselves are small)
-and lets the system buffer through transient overloads.
+Burst queue is now 1024 entries × 28 B in PSRAM. Plenty of slack
+for transient overloads; `qmax` stays low even at peak fixture
+rate.
 
-PSRAM is 32 MB and largely unused by the decoder — a much deeper
-ring (e.g. 256 descriptors) costs nothing and gives meaningful
-slack for the next step (USB throughput).
+### 2. ~~Restore USB SDR throughput~~ — DONE (LIVE_SDR ≈ 4.57 MB/s)
 
-### 2. Restore USB SDR throughput to ~5 MB/s (task #74)
+Resample-and-related work brought the consumer-side pipeline from
+~0.85 MB/s to 4.57 MB/s, well within the "above 4.5 MB/s no drops"
+acceptance criterion. The 11% gap to true 5.12 MB/s is from the
+remaining ~2.7 ms resample on Core 1.
 
-Sustained 2.5 MSPS Iridium ingest at uint8 IQ is 5 MB/s. The
-current LIVE_SDR path runs at ~0.85 MB/s — below real-time even
-for bare ingest. Without this, no amount of worker-side
-optimisation matters because the input itself doesn't keep up.
+### 3. Live RF validation (Phase 4)
 
-Root cause from `esp_libusb.c`: the async transfer pool was
-shrunk from 8 × 16 KB to a smaller config when DMA-capable
-internal SRAM ran tight. With recent `.bss` migrations (audit
-under `docs/p4-bss-audit.md`) and the s_extract_buf removal
-(task #64), we should have headroom to restore the larger pool.
+Highest leverage next step — actual antenna signal is what
+validates the whole stack end-to-end:
 
-Done when LIVE_SDR sustained throughput reads ≥ 4.5 MB/s in the
-smoke logs without drops.
+- Acquire 1620 MHz QFH antenna + Nooelec SAWbird+ IR LNA.
+- Switch RTL-SDR from AGC to manual gain at ~35 dB (task #62
+  also has bias-tee + manual-gain NVS config).
+- First live end-to-end Iridium ACARS decode.
+- One-hour soak; compare frame rate vs upstream
+  `iridium-toolkit` on the same recording.
 
-### 3. Measure where the system actually sits
+This validates the assumed burst rate, gives real-input dynamics
+data (signal_buffer overruns? worker queue depth?), and shows
+whether the 89% realtime ceiling is binding in practice or
+whether typical traffic is well below saturation anyway.
 
-With ring + USB restored, measure under sustained load — not just
-the canned ALBQ smoke. We need:
+### 4. ~~Conditional multi-frame decode~~ — TRIED, REVERTED
 
-- Real burst-rate (bursts/sec on the live antenna).
-- Worker drop rate (`s_bursts_dropped` should stay 0).
-- Per-stage timing remains the per-burst breakdown above OR
-  shows the live-input dynamics differ.
+Tested in this session: gating frames 2+ on first-frame outcome
+saved ~40 ms/burst but cost matched=61→56, BCH=29→25 — quality
+regression, reverted. User policy: quality must not be
+compromised. Not retrying without a different gate criterion.
 
-This dictates whether further per-burst compression is needed,
-or whether the ring + USB combo plus existing 103 ms/burst is
-already good enough for typical traffic.
+### 5. ~~Two-worker parallel resample~~ — BLOCKED (L2 contention)
 
-### 4. Conditional multi-frame decode (task #58 follow-up)
+Architecture built and validated bit-exact, but split>0 collapses
+FFT cost on Core 0 (263 → 443 µs at split=25, ~+71%) due to
+L2 cache contention that isn't fixable today. Investigated:
 
-The current `handle_multiple_frames_per_burst` loop fires
-~3.3 try_decode_frame calls per burst regardless of outcome.
-Most bursts are single-frame. Iterate frames 2+ only when:
+- s_resamp PSRAM writes → NOT the evictor (verified by redirecting
+  to internal SRAM — FFT still slow).
+- L2 cache size 256→128 KB → frees enough heap but USB throughput
+  regresses 13%.
+- s_conv → internal SRAM → would help but needs heap headroom we
+  don't have.
 
-- The first frame BCH-passed cleanly (low error count); AND
-- The remaining burst window is long enough to contain another
-  full frame (`n_post_2sps > MIN_FRAME_LEN_REMAINING + margin`).
+Closed out 2026-05-22; see `docs/split-resample-sweep-2026-05-22.md`.
 
-Expected savings: ~30-40 ms/burst on the typical-traffic average.
-Expected cost: 2-3 BCH frames per smoke corpus (multi-frame
-contribution from task #79 is ~4 frames out of 29).
+### 6. ~~Two-worker burst decode pool~~ — BLOCKED (internal SRAM)
 
-### 5. Two-worker parallel — Core 0 helper (task #58 follow-up)
+Per-instance memory: ~34 KB internal SRAM for chunk_iq + decim
+scratches alone, plus a uw_correlator API refactor to make its
+static-global FFT scratches per-instance. Largest contiguous
+internal SRAM block after init: 31 KB. **Doesn't fit** without
+freeing more internal SRAM first — and the two ways tried (peaks-
+PSRAM, L2 reduction) both regressed something else.
 
-Spawn a second `worker_core1`-style task pinned to Core 0,
-sharing the burst queue. Memory cost ~85 KB internal SRAM
-duplication (per-worker decim scratch, RRC scratch, UW
-per-call buffers). Read-only constants (PIE FFT twiddle,
-sync FFT references, RRC float taps) shared.
-
-Constraint: Core 0 also runs USB + dsp_processor (tagger).
-After step 2 lands, measure Core 0 idle headroom under
-sustained load to determine how much a Core 0 worker can
-take on.
-
-Expected throughput: 1.5× (Core 1 at 100%, Core 0 helper at
-50%). Combined with step 4, system reaches ~25-40 ms/burst
-effective. Single-channel real-time becomes feasible.
-
-### 6. RRC scratch boot-time alloc (task #58 follow-up)
+### 7. RRC scratch boot-time alloc (task #58 follow-up)
 
 The RRC FIR currently lazy-allocates per-burst and silently
 falls back to PSRAM (PIE disabled) due to internal-heap
@@ -211,23 +200,21 @@ corrupt output, likely an arp4 streaming-FIR quirk). Needs
 diagnostic work to identify the streaming-state issue, then
 the heap-alloc pre-allocation pattern can land.
 
-### 7. Live-SDR smoke watchdog (task #72)
+### 8. Live-SDR smoke watchdog (task #72)
 
-Once USB throughput is restored, wire the
-`usb_host_lib_set_root_port_power` cycle into the smoke loop
-as a startup watchdog: if no device enumerates within 6 s,
-cycle the root port and retry up to 3 times. Recovers from
-the stuck-enumeration state that LIVE_SDR currently hits on
-re-flash.
+Wire the `usb_host_lib_set_root_port_power` cycle into the smoke
+loop as a startup watchdog: if no device enumerates within 6 s,
+cycle the root port and retry up to 3 times. Recovers from the
+stuck-enumeration state that LIVE_SDR currently hits on re-flash.
 
-### 8. Live RF validation (Phase 4)
+### 9. Drop input rate to 2.0 MSPS (task #1 in opt doc)
 
-- Acquire 1620 MHz QFH antenna + Nooelec SAWbird+ IR LNA.
-- Switch RTL-SDR from AGC to manual gain at ~35 dB (task #62
-  also has bias-tee + manual-gain NVS config).
-- First live end-to-end Iridium ACARS decode.
-- One-hour soak; compare frame rate vs upstream `iridium-toolkit`
-  on the same recording.
+Last-resort structural change if Phase 4 reveals 4.57 MB/s isn't
+enough for typical-traffic operation. Eliminates the resampler
+entirely, deletes the 2.7 ms/dispatch Core 1 cost. gr-iridium
+ships at 2.0 MSPS by default so we'd be standards-aligned.
+Trade-off: ~22% less of the Iridium spectrum captured per receive
+window. Skip unless real-RF data shows the gap matters.
 
 ### 9. Productisation (post-RF)
 

@@ -68,15 +68,53 @@ typedef struct {
 static resample_worker_t s_worker_a;
 static resample_worker_t s_worker_b;
 
+// L2-CONTENTION ISOLATION TEST (2026-05-22): redirect Worker A's
+// output writes to a static internal-SRAM scratch instead of the
+// PSRAM out_iq. If FFT cost on Core 0 stays flat at split>0 with
+// this enabled, s_resamp PSRAM writes were the L2 evictor and the
+// fix is clear (move s_resamp to internal too, or partial). If FFT
+// still slows down, the contention is elsewhere (PIE shared state,
+// cache coherency between cores, etc.) and not easily addressable.
+//
+// Disabled by default. Decode is GARBAGE with this on — we only
+// care about the FFT timing data, not the decode result.
+// Set to 1 to redirect Worker A's output writes from PSRAM s_resamp
+// to an internal-SRAM scratch — used to isolate whether the FFT
+// slowdown on Core 0 at split>0 was caused by Worker A's PSRAM
+// output writes evicting tagger L2 cache lines. Result (2026-05-22):
+// FFT cost UNCHANGED at split=25 even with this fix (536 µs vs
+// 443 µs with PSRAM writes — slightly worse). So PSRAM writes are
+// NOT the evictor; the contention is something more fundamental
+// (Worker A's PSRAM reads of s_conv input, shared L2 churn between
+// cores writing to different regions, or PIE-internal state).
+// Disabled. Documented for posterity.
+#define WORKER_OUT_TO_INTERNAL_SCRATCH 0
+
+#if WORKER_OUT_TO_INTERNAL_SCRATCH
+// Heap-alloc'd at init in MALLOC_CAP_INTERNAL — sized for half a
+// slot (8 KB int16) which is more than Worker A produces at any
+// split ratio. Static .bss broke the DMA pool reserve at 32 KB so
+// we runtime-alloc instead.
+#define WORKER_OUT_SCRATCH_INT16  4096
+static int16_t *s_worker_out_scratch = NULL;
+#endif
+
 static void resample_worker_task(void *arg)
 {
     resample_worker_t *w = (resample_worker_t *)arg;
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+#if WORKER_OUT_TO_INTERNAL_SCRATCH
+        int16_t *out_target = s_worker_out_scratch;
+        int      max_out_target = WORKER_OUT_SCRATCH_INT16 / 2;
+#else
+        int16_t *out_target = w->out_iq;
+        int      max_out_target = w->max_out;
+#endif
         w->n_out = resample_256_to_250_process_explicit(
             w->delay_i, w->delay_q, &w->start_pos,
             w->in_iq, w->n_in_complex,
-            w->out_iq, w->max_out);
+            out_target, max_out_target);
         // Ensure output buffer writes are globally visible before
         // the coord (possibly on another core) reads them / kicks
         // signal_buffer_push (AXI-GDMA reading from PSRAM).
@@ -307,6 +345,16 @@ esp_err_t ingest_core1_init(void)
     memset(s_persist_delay_i, 0, sizeof(s_persist_delay_i));
     memset(s_persist_delay_q, 0, sizeof(s_persist_delay_q));
     s_persist_start_pos = 0;
+#if WORKER_OUT_TO_INTERNAL_SCRATCH
+    s_worker_out_scratch = heap_caps_aligned_alloc(64,
+        WORKER_OUT_SCRATCH_INT16 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+    if (!s_worker_out_scratch) {
+        ESP_LOGE(TAG, "iso: worker_out_scratch alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGW("ISO", "worker_out_scratch at %p (8 KB INTERNAL)",
+             s_worker_out_scratch);
+#endif
     {
         resample_256_to_250_t *tmp = (resample_256_to_250_t *)
             heap_caps_calloc(1, sizeof(*tmp),

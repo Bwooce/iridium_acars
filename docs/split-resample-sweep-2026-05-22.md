@@ -62,14 +62,63 @@ P4) or moving the FFT off Core 0.
 The split-resample architecture is correct, validated, and ready
 to use — but it's blocked behind reducing Core 0 load. Specifically:
 
-- **Opportunity #5 (PIE-FFT swap)** — would cut tagger FFT from
-  ~263 → ~85 µs/step, freeing 21% of Core 0. After that, split=12
-  is likely a net win.
+- **Opportunity #5 (PIE-FFT swap)** — ~~would cut tagger FFT~~
+  TURNS OUT TO BE ALREADY DONE (2026-05-22). The 263 µs/step we
+  measure IS the PIE-optimised FFT. No further speedup available
+  from that lever. See updated entry in
+  `optimization-opportunities-2026-05-22.md`.
 - **Opportunity #1 (drop to 2.0 MSPS)** — deletes the resampler
   entirely, making the split architecture moot.
 
-Either path opens the door. Until then, `s_split_pct = 0` is the
+Until something like Opp #1 lands, `s_split_pct = 0` is the
 correct default.
+
+## Deeper investigation closed out (2026-05-22 follow-up)
+
+Investigated whether the FFT slowdown at split>0 (263 → 443 µs)
+was caused by Worker A's PSRAM writes to s_resamp evicting tagger
+L2 cache lines. Test: redirect Worker A's output to an internal-
+SRAM scratch (`WORKER_OUT_TO_INTERNAL_SCRATCH=1` in
+`ingest_core1.c`) and re-measure at split=25.
+
+**Result: FFT cost UNCHANGED (536 µs, slightly worse than 443 µs
+with PSRAM writes).** So PSRAM writes are NOT the L2 evictor. The
+slowdown is from something more fundamental:
+
+- Worker A's PSRAM **reads** of `s_conv` input (one fetch per MAC
+  tap, ~4000 outputs × 9 taps × 2 bytes = 72 KB PSRAM traffic
+  per dispatch via L2)
+- Inter-core L2 line invalidation pattern when both cores are
+  writing to PSRAM concurrently
+- PIE coprocessor internal shared state we don't visibility into
+
+None of these have a clean fix today. The split-resample
+architecture stays gated behind reducing Core 0 tagger load via
+some structural change (Opp #1 the most concrete).
+
+## Alternative considered: split burst_worker instead
+
+Could we split the burst-decode worker (worker_core1) into two
+unpinned tasks instead, getting parallelism elsewhere? Memory cost
+analysis (2026-05-22):
+
+- Each new instance needs ~34 KB internal SRAM (s_chunk_iq 16 KB
+  + decim_scr_in_i/q 16 KB + small).
+- Plus the `uw_correlator` module has static-global FFT scratches
+  (~32-50 KB internal) that would need to become per-instance —
+  bigger API refactor.
+- Total per new worker: ~50–70 KB internal SRAM (after API rework).
+
+But `post-ingest_core1` heap state today: INT free=68 KB,
+**largest contiguous block = 31 KB**. The 34 KB chunk_iq alone
+exceeds the largest block. **Doesn't fit without freeing more
+internal SRAM first** — and we already tried (peaks-PSRAM broke
+decode, L2 reduction hurt USB).
+
+Net: this alternative is also blocked. Both parallelism levers
+require the same prerequisite work (Opp #1 to delete the
+resampler, or a different way to free internal SRAM that we
+haven't found).
 
 ## How to re-run
 
