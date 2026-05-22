@@ -15,7 +15,7 @@ static const char *TAG = "INGEST";
 
 // Per-slot state. Two slots alternated per consumer cycle.
 static uint8_t *s_raw[INGEST_NUM_SLOTS];     // raw uint8 USB ingress, internal SRAM, DMA-aligned
-static int16_t *s_conv[INGEST_NUM_SLOTS];    // converted int16 Q15 @ 2.56 MSPS (scratch, internal SRAM)
+static int16_t *s_conv[INGEST_NUM_SLOTS];    // PSRAM heap-alloc'd
 static int16_t *s_resamp[INGEST_NUM_SLOTS];  // resampled int16 Q15 @ 2.5 MSPS (downstream feed, internal SRAM)
 static size_t   s_resamp_n_int16[INGEST_NUM_SLOTS];  // int16 element count in s_resamp
 
@@ -31,7 +31,7 @@ static int     s_persist_start_pos = 0;
 // Fraction (0–50%) of each dispatch's input handed to Worker A on
 // Core 0. 0 = single-thread inline path on Core 1 (default).
 // Tunable at runtime via ingest_core1_set_split_pct().
-static volatile uint8_t s_split_pct = 0;     /* default OFF — split adds Core 0 load that overloads tagger today; see docs/split-resample-sweep-2026-05-22.md */
+static volatile uint8_t s_split_pct = 0;     /* default OFF — see docs/split-resample-sweep-2026-05-22.md */
 
 // 125/128 polyphase: number of outputs emitted by processing `k`
 // inputs starting from phase counter `S0`. Derivation: pre_(i+1) =
@@ -264,22 +264,26 @@ esp_err_t ingest_core1_init(void)
     //   PSRAM). AXI handles PSRAM sources fine. CPU touch is one
     //   linear write pass per cycle. Already in PSRAM.
     for (int i = 0; i < INGEST_NUM_SLOTS; i++) {
-        s_raw[i] = heap_caps_aligned_alloc(64, 16 * 1024,
-                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-        // s_conv lives in PSRAM. We TRIED MALLOC_CAP_INTERNAL to
-        // bypass L2 cache contention with the tagger when Worker A
-        // runs on Core 0 (sweep 2026-05-22 showed FFT cost +30%
-        // with PSRAM s_conv). Result: DSP/frame did improve (574 →
-        // 543 µs) but the extra 64 KB of internal SRAM consumed
-        // pushed total free below the ~115 KB threshold a mystery
-        // downstream allocation needs as a contiguous block,
-        // recreating the SAME silent decode regression the worker
-        // stacks hit (matched 61 → 44, recall 93.8 → 67.7%). Same
-        // root cause, different trigger. Until we find the victim
-        // allocation and either resize or relocate it, s_conv stays
-        // in PSRAM.
+        ESP_LOGW("HEAP", "slot %d pre-alloc  INT free=%zu largest=%zu  DMA-INT free=%zu largest=%zu",
+                 i,
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        // s_conv lives in PSRAM. We explored moving it to internal
+        // SRAM (L2-cache contention bypass for Worker A) and that
+        // required reducing L2 cache from 256→128 KB to free heap
+        // headroom — measured cost: -13% LIVE_SDR throughput (4.57
+        // → 3.97 MB/s), +160% USB handle_events latency, +62%
+        // sbpush. Net regression. Sticking with PSRAM s_conv.
         s_conv[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_raw[i] = heap_caps_aligned_alloc(64, 16 * 1024,
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        ESP_LOGW("HEAP", "slot %d s_raw=%p  DMA-INT now free=%zu largest=%zu",
+                 i, s_raw[i],
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
         s_resamp[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         if (!s_raw[i] || !s_conv[i] || !s_resamp[i]) {

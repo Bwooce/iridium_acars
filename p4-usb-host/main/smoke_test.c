@@ -450,34 +450,52 @@ void smoke_test_run(void)
 
     // Bring up the production DSP path. Order matches action_start_stream
     // in class_driver.c.
+    // Per-phase heap diagnostic: tracks how internal-SRAM fragmentation
+    // evolves through init. Prints total + largest-contiguous free for
+    // MALLOC_CAP_INTERNAL (all internal) and MALLOC_CAP_INTERNAL|DMA
+    // (DMA-capable subset, used by s_raw / USB pool).
+    #define HEAP_LOG(where) do { \
+        size_t fi  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL); \
+        size_t li  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL); \
+        size_t fid = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA); \
+        size_t lid = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA); \
+        ESP_LOGW("HEAP", "%-22s INT free=%6zu largest=%6zu  DMA-INT free=%6zu largest=%6zu", \
+                 where, fi, li, fid, lid); \
+    } while (0)
+
+    HEAP_LOG("pre-signal_buffer");
     if (signal_buffer_init() != ESP_OK) {
         ESP_LOGE(TAG, "signal_buffer_init failed -> SMOKE_FAIL");
         return;
     }
+    HEAP_LOG("post-signal_buffer");
 #if CONFIG_SMOKE_TEST_REAL_IRIDIUM || CONFIG_SMOKE_TEST_RAW_IRIDIUM
-    // Full-stack mode: bring up the worker chain (qpsk_demod + BCH +
-    // legacy MS decode) and the frame_decoder task so detected bursts
-    // get classified, not just counted.
     worker_core1_init();
+    HEAP_LOG("post-worker_core1");
     bch_decoder_init();
+    HEAP_LOG("post-bch_decoder");
     if (frame_decoder_init() != ESP_OK) {
         ESP_LOGE(TAG, "frame_decoder_init failed -> SMOKE_FAIL");
         return;
     }
+    HEAP_LOG("post-frame_decoder");
     if (dsp_processor_init(on_burst_full_chain) != ESP_OK) {
         ESP_LOGE(TAG, "dsp_processor_init failed -> SMOKE_FAIL");
         return;
     }
+    HEAP_LOG("post-dsp_processor");
 #else
     if (dsp_processor_init(on_burst) != ESP_OK) {
         ESP_LOGE(TAG, "dsp_processor_init failed -> SMOKE_FAIL");
         return;
     }
+    HEAP_LOG("post-dsp_processor");
 #endif
     if (ingest_core1_init() != ESP_OK) {
         ESP_LOGE(TAG, "ingest_core1_init failed -> SMOKE_FAIL");
         return;
     }
+    HEAP_LOG("post-ingest_core1");
 
     // Stack-borrowed scratch is too small for 16 KB; use a static buffer.
     // Lives in PSRAM (EXT_RAM_BSS_ATTR) — the buffer is filled then

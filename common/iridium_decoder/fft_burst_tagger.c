@@ -84,6 +84,12 @@ struct fft_burst_tagger_s {
     // Lives in the struct (heap-backed) rather than on the stack
     // because at sort_key = int64 it's 32 KB — too big for the smoke
     // task's stack and just wasteful churn on every step regardless.
+    //
+    // Attempted to move this to PSRAM (2026-05-22) to shrink the
+    // struct's contiguous internal-SRAM footprint from 65 → 33 KB.
+    // Decode collapsed (matched 61 → 44, recall 93.8% → 67.7%) for
+    // reasons not fully diagnosed — possibly bubble-sort PSRAM
+    // bandwidth pressure or write-pattern aliasing. Keep inline.
     struct {
         int     bin;
         int64_t sort_key;   // relative_magnitude × HISTORY (gri sort order)
@@ -205,7 +211,12 @@ fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
 
 void fft_burst_tagger_destroy(fft_burst_tagger_t *t)
 {
+    if (!t) return;
+#if defined(ESP_PLATFORM)
+    heap_caps_free(t);
+#else
     free(t);
+#endif
 }
 
 void fft_burst_tagger_flush(fft_burst_tagger_t *t,
