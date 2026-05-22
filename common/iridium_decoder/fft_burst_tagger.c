@@ -34,6 +34,8 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #define FBT_NOW_US() ((uint64_t)esp_timer_get_time())
 #else
 #include <time.h>
@@ -138,7 +140,30 @@ fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
                                            int32_t *baseline_history_ext)
 {
     if (!baseline_history_ext) return NULL;
+#if defined(ESP_PLATFORM)
+    // AUDIT (2026-05-22): plain calloc was spilling to PSRAM when
+    // internal SRAM was fragmented (e.g. by task stacks). Tagger
+    // fields then lived in PSRAM, decode silently regressed.
+    // Force MALLOC_CAP_INTERNAL so the alloc FAILS LOUDLY if there
+    // isn't room — and log the address so we can verify placement.
+    fft_burst_tagger_t *t = (fft_burst_tagger_t *)
+        heap_caps_calloc(1, sizeof(*t),
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (t) {
+        ESP_LOGI("FBT_INIT",
+                 "fft_burst_tagger_t alloc OK at %p (size=%u, INTERNAL, free_int_after=%u)",
+                 t, (unsigned)sizeof(*t),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    } else {
+        ESP_LOGE("FBT_INIT",
+                 "fft_burst_tagger_t INTERNAL alloc FAILED (size=%u, free_int=%u, largest_int=%u)",
+                 (unsigned)sizeof(*t),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+#else
     fft_burst_tagger_t *t = (fft_burst_tagger_t *)calloc(1, sizeof(*t));
+#endif
     if (!t) return NULL;
     t->burst_pre_len  = burst_pre_len;
     t->burst_post_len = burst_post_len;
