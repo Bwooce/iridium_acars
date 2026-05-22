@@ -324,10 +324,17 @@ esp_err_t frame_decoder_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t ok = xTaskCreatePinnedToCore(decoder_task, "frame_decoder",
-                                            DECODER_STACK, NULL,
-                                            DECODER_PRIO, &s_task,
-                                            DECODER_CORE);
+    // PSRAM stack — see feedback_task_stacks_in_psram memory note.
+    // frame_decoder runs at per-frame rate (lower than tagger) doing
+    // IDA + libacars parsing; ms-scale compute per wake, so PSRAM
+    // stack overhead is < 1%. Frees DECODER_STACK bytes of internal
+    // SRAM that would otherwise fragment a contiguous region the
+    // tagger init needs.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(decoder_task, "frame_decoder",
+                                                    DECODER_STACK, NULL,
+                                                    DECODER_PRIO, &s_task,
+                                                    DECODER_CORE,
+                                                    MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreatePinnedToCore failed");
         frame_queue_destroy(s_queue);

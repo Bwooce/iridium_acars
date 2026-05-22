@@ -199,8 +199,11 @@ esp_err_t status_logger_init(void)
     s_queue = xQueueCreate(2, sizeof(status_snapshot_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
 
-    BaseType_t ok = xTaskCreatePinnedToCore(logger_task, "status_logger",
-                                            6144, NULL, 1, NULL, 1);
+    // PSRAM stack — see feedback_task_stacks_in_psram memory note.
+    // 1 Hz periodic logging; PSRAM stack overhead is negligible.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(logger_task, "status_logger",
+                                                    6144, NULL, 1, NULL, 1,
+                                                    MALLOC_CAP_SPIRAM);
     return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
 }
 

@@ -695,8 +695,13 @@ esp_err_t worker_core1_init(void)
     // direct_if_decim is idempotent at init; safe to call here.
     direct_if_decim_init(&s_decim);
 
-    xTaskCreatePinnedToCore(worker_task, "worker_core1", 16384, NULL,
-                             5, NULL, 1);
+    // PSRAM stack — see feedback_task_stacks_in_psram memory note.
+    // 16 KB internal stack would fragment the main internal-SRAM
+    // pool and silently regress decode (verified empirically with
+    // the resample worker tasks). Burst-decode runs ~5–10/s on real
+    // RF with ~85 ms compute each → PSRAM stack overhead is < 0.1%.
+    xTaskCreatePinnedToCoreWithCaps(worker_task, "worker_core1", 16384, NULL,
+                                     5, NULL, 1, MALLOC_CAP_SPIRAM);
     return ESP_OK;
 }
 
