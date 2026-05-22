@@ -55,3 +55,24 @@ void resample_256_to_250_init(resample_256_to_250_t *r);
 int resample_256_to_250_process(resample_256_to_250_t *r,
                                  const int16_t *in_iq, int n_in_complex,
                                  int16_t *out_iq);
+
+// Caller-managed-state variant of _process. The polyphase delay
+// line (delay_i[16], delay_q[16] — only [0..8] are live, [9..15] are
+// the PIE 128-bit-load zero-pad slots) and `start_pos` phase
+// counter are owned by the caller, not the resample_256_to_250_t
+// struct. Used by the split-ingest worker pool so two workers can
+// run concurrently on different output slices of the same chunk.
+// Returns number of complex outputs written, bounded by max_out.
+int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *delay_q,
+                                          int *start_pos_io,
+                                          const int16_t *in_iq, int n_in_complex,
+                                          int16_t *out_iq, int max_out);
+
+// "Advance only" — process inputs but do NOT emit outputs. Used to
+// pre-position Worker B's (delay_line, start_pos) to the chunk's
+// midpoint before it starts its MAC slice. Same state evolution as
+// _process_explicit, just no per-output MAC work. ~30 ns/input
+// scalar, ~60 µs over 2048 inputs.
+void resample_256_to_250_advance(int16_t *delay_i, int16_t *delay_q,
+                                  int *start_pos_io,
+                                  const int16_t *in_iq, int n_in_complex);

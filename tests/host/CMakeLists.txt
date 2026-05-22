@@ -162,6 +162,19 @@ add_executable(test_fft_sc16_2048
 target_include_directories(test_fft_sc16_2048 PRIVATE ${COMMON_DIR})
 target_link_libraries(test_fft_sc16_2048 PRIVATE m)
 
+# Validates the within-chunk split-resample path (used by
+# p4-usb-host/main/ingest_core1.c). Worker A processes input[0..mid],
+# Worker B processes input[mid..end] with state derived via
+# closed-form. Must be bit-exact vs the sequential reference; any
+# divergence here predicts a USB-ingest decode regression on target.
+add_executable(test_resample_split
+    test_resample_split.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+)
+target_include_directories(test_resample_split PRIVATE ${COMMON_DIR})
+target_link_libraries(test_resample_split PRIVATE m)
+
 # Phase 3.6.M: wideband fft_burst_tagger smoke test. Feeds the ALBQ
 # raw fixture through the tagger and checks the burst-count + bin
 # distribution looks sane (≥30 bursts emitted, multiple bins hit, EMA
@@ -446,6 +459,7 @@ add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
+add_test(NAME resample_split        COMMAND test_resample_split)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
