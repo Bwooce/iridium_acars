@@ -59,21 +59,27 @@ scalar with diff-harness pattern from `pie_fft_diff_test.c`).
 **Risk:** Medium. Bit-exact validation; bin-count consistency vs ALBQ
 smoke (must keep tagger output identical or recall drops).
 
-## 3. Move `baseline_history` access pattern out of PSRAM
+## 3. ~~Move `baseline_history` access pattern out of PSRAM~~ — TRIED, REVERTED
 
-**What:** The 4 MB `baseline_history` ring in `dsp_processor.c:201` is
-PSRAM. Every step reads + writes the current slot (8 KB). At 200 MHz
-PSRAM bandwidth that's a real cost; the 12.8 ms sequential pattern
-churns the 256 KB L2 unhelpfully. Allocate INTERNAL-SRAM 8 KB scratch;
-EMA against scratch; lazy-spill stale slot back to PSRAM in idle
-windows. Optionally shrink HISTORY_SIZE 512 → 256.
+**Status (2026-05-22):** Rewrote `update_baseline_ema` to use an
+8 KB internal-SRAM scratch (bulk PSRAM→SRAM memcpy in, in-SRAM
+EMA, bulk SRAM→PSRAM memcpy out). Measured `base` cost 73 → 99
+µs/step (+36% WORSE). The fused interleaved per-bin loop is
+already L2-prefetch-friendly at -O3; the split-into-three-passes
+rewrite added memcpy setup overhead without saving bandwidth.
 
-**Impact:** ~0.5-1 ms/step (× 125/s = 60-125 ms/s of Core 0).
-Compounds with #2.
+**Don't retry this** unless you're attacking it from a different
+angle (e.g. background DMA prefetch of the next slot while CPU
+operates on the current, which is more complex).
 
-**Effort:** Half a day.
-
-**Risk:** Low if HISTORY stays at 512.
+**See also:** s_conv → internal SRAM (would help L2 contention
+when split-resample's Worker A runs on Core 0, DSP/frame 574 →
+543 µs at split=0) — tried, also reverted because the extra 64 KB
+of internal SRAM consumed pushed total free below the ~115 KB
+threshold the mystery downstream allocation needs (silently
+regressed decode matched 61 → 44, recall 93.8 → 67.7%, same
+pattern as the worker-stack bug). Blocked behind finding/
+relocating that victim allocation.
 
 ## 4. Conditional multi-frame iteration
 
@@ -117,20 +123,21 @@ already baked into the current 80% Core 0 cap number.
 unlock. Before claiming "Tagger FFT is the next lever" in future
 docs, re-check the linker map.
 
-## 6. Swap UW matched-filter to radix-4 (`dsps_fft4r_fc32_arp4`)
+## 6. ~~Swap UW matched-filter to radix-4~~ — NOT APPLICABLE
 
-**What:** Available in
-`esp-dsp/modules/fft/float/dsps_fft4r_fc32_arp4.S`. At N=2048,
-radix-4 is typically 25-30% faster than radix-2 for the same SIMD
-width. Three FFTs per `uw_correlator_find`, fired ~3.3×/burst.
+**Status (2026-05-22):** `dsps_fft4r_fc32_*` requires N to be a
+power of 4 (rejects with `if ((log2N & 0x01) != 0)` at
+`dsps_fft4r_fc32_ansi.c:112`). Our `CORR_FFT_N = 2048` has
+log2N=11 (odd), so radix-4 init returns ESP_ERR_DSP_INVALID_LENGTH
+and the FFT no-ops. Pure radix-4 N values are 1024, 4096, 16384.
 
-**Impact:** Those FFTs cost ~5 ms/burst now (PIE radix-2). Radix-4
-saves ~1.5 ms/burst.
+To use radix-4 here we'd have to double the FFT size to 4096,
+which doubles the work — defeats the purpose. Stay with radix-2
+PIE.
 
-**Effort:** ~4 hours. Init API identical; output bit-rev order
-different — use existing `pie_fft_diff_test.c` to verify.
-
-**Risk:** Low (validated harness exists).
+(If a future change moves the matched-filter to a power-of-4 N
+for some other reason, the radix-4 swap becomes worth ~25% of
+the FFT cost.)
 
 ## 7. Q15 absolute-phase phasor table for rotate-to-DC
 

@@ -266,6 +266,18 @@ esp_err_t ingest_core1_init(void)
     for (int i = 0; i < INGEST_NUM_SLOTS; i++) {
         s_raw[i] = heap_caps_aligned_alloc(64, 16 * 1024,
                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        // s_conv lives in PSRAM. We TRIED MALLOC_CAP_INTERNAL to
+        // bypass L2 cache contention with the tagger when Worker A
+        // runs on Core 0 (sweep 2026-05-22 showed FFT cost +30%
+        // with PSRAM s_conv). Result: DSP/frame did improve (574 →
+        // 543 µs) but the extra 64 KB of internal SRAM consumed
+        // pushed total free below the ~115 KB threshold a mystery
+        // downstream allocation needs as a contiguous block,
+        // recreating the SAME silent decode regression the worker
+        // stacks hit (matched 61 → 44, recall 93.8 → 67.7%). Same
+        // root cause, different trigger. Until we find the victim
+        // allocation and either resize or relocate it, s_conv stays
+        // in PSRAM.
         s_conv[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         s_resamp[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),

@@ -428,13 +428,22 @@ static inline void ema_step_inner(int32_t * __restrict__ bsum,
                                    int n)
 {
     for (int k = 0; k < n; k++) {
-        int32_t old = slot[k];                  // one PSRAM read
+        int32_t old = slot[k];                  // one PSRAM read (L2 cached)
         int32_t cur = mag[k];                   // in-SRAM read
         bsum[k] = bsum[k] - old + cur;          // in-SRAM RMW
-        slot[k] = cur;                          // one PSRAM write
+        slot[k] = cur;                          // one PSRAM write (L2 writeback)
     }
 }
 
+// EMA update: subtract oldest, add newest, advance index. gri only
+// updates when no bursts are active OR a long-burst forces a refresh;
+// we mirror that — if any burst is active, freeze the EMA.
+//
+// Fused per-bin read+RMW+write loop. -O3 + restrict make this L2-
+// prefetch-friendly (sequential PSRAM access pattern), beating any
+// "bulk memcpy + in-SRAM operate + bulk memcpy back" rewrite by
+// ~25 µs/step (opp #3 in opt doc was tried 2026-05-22, regressed
+// base 73 → 99 µs and was reverted).
 static void update_baseline_ema(fft_burst_tagger_t *t)
 {
     if (t->n_bursts > 0) return;     // burst active → freeze EMA
