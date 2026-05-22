@@ -137,3 +137,15 @@ bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 // so subsequent _step calls start fresh.
 void fft_burst_tagger_flush(fft_burst_tagger_t *t,
                              fbt_burst_t *out_gone_bursts, int *n_gone);
+
+// Diagnostic — read accumulated per-stage wall-times (µs) since the
+// last call, plus the number of steps that contributed. Order:
+//   out[0] = window_multiply
+//   out[1] = fft_sc16_2048
+//   out[2] = compute_magnitude_shifted
+//   out[3] = update_bursts + create_new_bursts + delete_gone_bursts
+//   out[4] = update_baseline_ema (incl. PSRAM history slot R/W)
+// Counters reset after read. Costs are accumulated across all step()
+// calls; per-step values are out[i] / *steps. Safe to call without
+// instrumentation enabled — returns zeros.
+void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps);

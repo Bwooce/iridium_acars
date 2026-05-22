@@ -32,7 +32,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(ESP_PLATFORM)
+#include "esp_timer.h"
+#define FBT_NOW_US() ((uint64_t)esp_timer_get_time())
+#else
+#include <time.h>
+static inline uint64_t fbt_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+#define FBT_NOW_US() fbt_now_us()
+#endif
+
 #define N FBT_FFT_SIZE
+
+// Per-stage timer accumulators (single-tagger process — fine for our
+// usage). Order matches fft_burst_tagger_get_stage_us() docs.
+static uint64_t s_acc_wind_us;
+static uint64_t s_acc_fft_us;
+static uint64_t s_acc_mag_us;
+static uint64_t s_acc_detect_us;
+static uint64_t s_acc_base_us;
+static uint32_t s_acc_steps;
 
 struct fft_burst_tagger_s {
     int      burst_pre_len;
@@ -194,15 +217,30 @@ static void window_multiply(fft_burst_tagger_t *t, const int16_t *input)
 // Compute |FFT output|² with FFT-shift (bin 0 = -fs/2, bin N/2 = DC,
 // bin N-1 = +fs/2 - bin_width). gri does this internally; we do it
 // here so downstream uses DC-centred bin numbering.
+//
+// The FFT-shift swaps the upper and lower halves of fft_buf. Rather
+// than the modulo-based gather (which defeats vectorisation), we
+// split into two contiguous mag² passes: src=N/2..N-1 → dst=0..N/2-1
+// and src=0..N/2-1 → dst=N/2..N-1. Each inner loop is a simple
+// re²+im² → int32 store and -O3 will SLP-vectorise it.
+static inline void mag_sq_pass(const int16_t * __restrict__ src_iq,
+                                int32_t * __restrict__ dst, int n)
+{
+    for (int k = 0; k < n; k++) {
+        int32_t re = src_iq[2 * k + 0];
+        int32_t im = src_iq[2 * k + 1];
+        dst[k] = re * re + im * im;
+    }
+}
+
 static void compute_magnitude_shifted(fft_burst_tagger_t *t)
 {
-    for (int k = 0; k < N; k++) {
-        // FFT-shift: bin k in output → bin (k + N/2) % N in shifted view.
-        int src = (k + N / 2) % N;
-        int32_t re = t->fft_buf[src * 2 + 0];
-        int32_t im = t->fft_buf[src * 2 + 1];
-        t->magnitude_shifted[k] = re * re + im * im;
-    }
+    const int16_t *fb = t->fft_buf;
+    int32_t       *out = t->magnitude_shifted;
+    // Pass A: upper half of fft_buf → lower half of output.
+    mag_sq_pass(fb + 2 * (N / 2), out, N / 2);
+    // Pass B: lower half of fft_buf → upper half of output.
+    mag_sq_pass(fb, out + N / 2, N / 2);
 }
 
 // Returns true if mag² is above threshold at this bin.
@@ -377,16 +415,32 @@ static int delete_gone_bursts_internal(fft_burst_tagger_t *t,
 // EMA update: subtract oldest, add newest, advance index. gri only
 // updates when no bursts are active OR a long-burst forces a refresh;
 // we mirror that — if any burst is active, freeze the EMA.
+//
+// The hot path reads `old_slot` once (8 KB from PSRAM), updates the
+// in-SRAM baseline_sum, then writes the new magnitude back into the
+// same PSRAM slot. We fuse the two scans of baseline_sum into one,
+// load each `old_slot[k]` exactly once, and overlap the PSRAM write
+// with the same iteration so memcpy() isn't a separate sequential
+// pass. restrict + -O3 SLPvec the int32 inner.
+static inline void ema_step_inner(int32_t * __restrict__ bsum,
+                                   int32_t * __restrict__ slot,
+                                   const int32_t * __restrict__ mag,
+                                   int n)
+{
+    for (int k = 0; k < n; k++) {
+        int32_t old = slot[k];                  // one PSRAM read
+        int32_t cur = mag[k];                   // in-SRAM read
+        bsum[k] = bsum[k] - old + cur;          // in-SRAM RMW
+        slot[k] = cur;                          // one PSRAM write
+    }
+}
+
 static void update_baseline_ema(fft_burst_tagger_t *t)
 {
     if (t->n_bursts > 0) return;     // burst active → freeze EMA
 
     int32_t *old_slot = HIST(t, t->history_index);
-    for (int k = 0; k < N; k++) {
-        t->baseline_sum[k] -= old_slot[k];
-        t->baseline_sum[k] += t->magnitude_shifted[k];
-    }
-    memcpy(old_slot, t->magnitude_shifted, sizeof(int32_t) * N);
+    ema_step_inner(t->baseline_sum, old_slot, t->magnitude_shifted, N);
 
     t->history_index++;
     if (t->history_index >= FBT_HISTORY_SIZE) {
@@ -408,24 +462,59 @@ bool fft_burst_tagger_step(fft_burst_tagger_t *t,
     if (n_new) *n_new = 0;
     if (n_gone) *n_gone = 0;
 
+    uint64_t t0 = FBT_NOW_US();
     window_multiply(t, input);
+    uint64_t t1 = FBT_NOW_US();
     fft_sc16_2048(t->fft_buf);
+    uint64_t t2 = FBT_NOW_US();
     compute_magnitude_shifted(t);
+    uint64_t t3 = FBT_NOW_US();
+
+    s_acc_wind_us += (t1 - t0);
+    s_acc_fft_us  += (t2 - t1);
+    s_acc_mag_us  += (t3 - t2);
+    s_acc_steps   += 1;
 
     if (!t->history_primed) {
+        uint64_t b0 = FBT_NOW_US();
         update_baseline_ema(t);
+        s_acc_base_us += (FBT_NOW_US() - b0);
         t->d_index += N;
         return false;
     }
 
+    uint64_t d0 = FBT_NOW_US();
     update_bursts_internal(t);
     int n_new_out = create_new_bursts_internal(t, out_new_bursts, max_new);
     int n_gone_out = delete_gone_bursts_internal(t, out_gone_bursts, max_gone);
+    uint64_t d1 = FBT_NOW_US();
+    s_acc_detect_us += (d1 - d0);
+
     if (n_new) *n_new = n_new_out;
     if (n_gone) *n_gone = n_gone_out;
 
+    uint64_t b0 = FBT_NOW_US();
     update_baseline_ema(t);
+    s_acc_base_us += (FBT_NOW_US() - b0);
 
     t->d_index += N;
     return true;
+}
+
+void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps)
+{
+    if (out) {
+        out[0] = s_acc_wind_us;
+        out[1] = s_acc_fft_us;
+        out[2] = s_acc_mag_us;
+        out[3] = s_acc_detect_us;
+        out[4] = s_acc_base_us;
+    }
+    if (steps) *steps = s_acc_steps;
+    s_acc_wind_us = 0;
+    s_acc_fft_us = 0;
+    s_acc_mag_us = 0;
+    s_acc_detect_us = 0;
+    s_acc_base_us = 0;
+    s_acc_steps = 0;
 }

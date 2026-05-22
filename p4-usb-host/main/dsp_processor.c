@@ -257,25 +257,37 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
 void dsp_processor_get_stage_stats(dsp_stage_stats_t *out)
 {
     uint32_t frames = s_acc_input_samples / FBT_FFT_SIZE;
+    uint64_t tag_stage_us[5] = {0};
+    uint32_t tag_steps = 0;
+    fft_burst_tagger_get_stage_us(tag_stage_us, &tag_steps);
+
     if (frames == 0) {
         memset(out, 0, sizeof(*out));
     } else {
         float fn = (float)frames;
+        float ts = (tag_steps > 0) ? (float)tag_steps : 1.0f;
         out->frames      = frames;
-        out->wind_us     = 0.0f;
-        out->fft_us      = (float)s_acc_step_us / fn;  // tagger step total
-        out->mag_us      = 0.0f;
-        out->detect_us   = 0.0f;
-        out->baseline_us = 0.0f;
-        out->total_us    = out->fft_us;
+        out->wind_us     = (float)tag_stage_us[0] / ts;
+        out->fft_us      = (float)tag_stage_us[1] / ts;
+        out->mag_us      = (float)tag_stage_us[2] / ts;
+        out->detect_us   = (float)tag_stage_us[3] / ts;
+        out->baseline_us = (float)tag_stage_us[4] / ts;
+        out->total_us    = (float)s_acc_step_us / fn;
     }
 
     ESP_LOGI(TAG,
-             "fbt: new=%u gone=%u frames=%u step_us=%lu",
+             "fbt: new=%u gone=%u frames=%u step_us=%lu "
+             "wind=%lu fft=%lu mag=%lu det=%lu base=%lu (us/step, steps=%u)",
              (unsigned)s_acc_new_bursts,
              (unsigned)s_acc_gone_bursts,
              (unsigned)frames,
-             (unsigned long)s_acc_step_us);
+             (unsigned long)s_acc_step_us,
+             (unsigned long)(tag_steps ? tag_stage_us[0] / tag_steps : 0),
+             (unsigned long)(tag_steps ? tag_stage_us[1] / tag_steps : 0),
+             (unsigned long)(tag_steps ? tag_stage_us[2] / tag_steps : 0),
+             (unsigned long)(tag_steps ? tag_stage_us[3] / tag_steps : 0),
+             (unsigned long)(tag_steps ? tag_stage_us[4] / tag_steps : 0),
+             (unsigned)tag_steps);
 
     s_acc_step_us       = 0;
     s_acc_input_samples = 0;

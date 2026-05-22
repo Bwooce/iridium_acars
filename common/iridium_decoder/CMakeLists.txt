@@ -114,3 +114,14 @@ set_source_files_properties(resample_256_to_250.c
     PROPERTIES COMPILE_FLAGS
     "-O3 -funroll-loops"
 )
+
+# fft_burst_tagger's compute_magnitude_shifted (per-bin re²+im²) and
+# update_baseline_ema (per-bin sub-old/add-new int32 RMW) are
+# per-tagger-step SIMD candidates. -O3 + unroll lets the compiler
+# SLP-vectorise the contiguous int32 inner loops, eliminating the
+# scalar lower bound observed on -O2 (89 µs mag / 158 µs EMA per
+# step on RAW_IRIDIUM smoke).
+set_source_files_properties(fft_burst_tagger.c
+    PROPERTIES COMPILE_FLAGS
+    "-O3 -funroll-loops"
+)
