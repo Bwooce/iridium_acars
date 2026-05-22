@@ -9,8 +9,8 @@
 
 #if __has_include("esp_attr.h")
 #include "esp_attr.h"
-#else
-#define DRAM_ATTR
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #endif
 
 // Per-phase contiguous tap layout. Each phase gets 16 int16 slots
@@ -19,17 +19,28 @@
 // = 125 phases × 16 = 2000 int16 = 4 KB. Singleton (read-only after
 // init).
 //
-// Placement: internal SRAM .dram.bss. PIE vld instructions cannot
-// efficiently fetch from .spm.data (TCM — see task #75), and PSRAM
-// reads cost ~315 ns/MAC, dominating the 14 ns PIE-instruction
-// floor. Plain internal-SRAM .bss puts the taps on the standard
-// load path at SRAM speed. The earlier PSRAM placement was a
-// workaround for a struct-level DMA-pool conflict that no longer
-// applies to this file-scope static (link-time .bss reservation,
-// not runtime heap_caps alloc).
+// Placement: heap-allocated in internal SRAM at init time via
+// MALLOC_CAP_INTERNAL. PIE vld instructions cannot efficiently
+// fetch from .spm.data (TCM — see task #75), and PSRAM reads cost
+// ~315 ns/MAC, dominating the 14 ns PIE-instruction floor.
+//
+// We can't use a static .dram.bss array: that lands BEFORE the
+// PSRAM driver's 144 KB DMA-pool reserve, fragmenting the largest
+// contiguous internal-SRAM region below the reserve's threshold
+// and panic'ing boot with ESP_ERR_NO_MEM. Runtime heap_caps_alloc
+// runs AFTER the DMA pool is set up, so it allocates from the
+// non-reserved internal pool and avoids the conflict.
+//
+// On host builds we fall back to a plain static array — no DMA
+// pool, no internal/external distinction.
 #define RS25_PADDED_TAPS 16
-static DRAM_ATTR int16_t s_coeffs_pp[RS25_PADDED_TAPS * RS25_INTERP]
+#if defined(ESP_PLATFORM)
+static int16_t *s_coeffs_pp = NULL;
+#else
+static int16_t  s_coeffs_pp_storage[RS25_PADDED_TAPS * RS25_INTERP]
     __attribute__((aligned(16)));
+static int16_t *s_coeffs_pp = s_coeffs_pp_storage;
+#endif
 static int s_coeffs_pp_ready = 0;
 
 #if defined(__riscv) && __has_include("soc/soc_caps.h")
@@ -40,7 +51,7 @@ static int s_coeffs_pp_ready = 0;
 // taps (zero-padded). Computes one output sample pair from
 // pre-loaded delay lines + per-phase tap pointer. Self-gates on
 // __riscv && SOC_CPU_HAS_PIE in the .S file.
-#if defined(__riscv) && defined(SOC_CPU_HAS_PIE)
+#if defined(__riscv) && defined(SOC_CPU_HAS_PIE) && !defined(RS25_DISABLE_PIE_ASM)
 extern void resample_125_128_mac_arp4(const int16_t *pc,
                                        const int16_t *di,
                                        const int16_t *dq,
@@ -162,12 +173,41 @@ static void make_resample_coeffs(int16_t *coeffs)
 void resample_256_to_250_init(resample_256_to_250_t *r)
 {
     make_resample_coeffs(r->coeffs);
+
+    // First-time allocation of the per-phase tap singleton. On
+    // ESP_PLATFORM we request MALLOC_CAP_INTERNAL (NOT _DMA) so the
+    // request comes out of the post-DMA-reserve internal-SRAM pool;
+    // a static .dram.bss array would fragment the pre-reserve heap
+    // and trip esp_psram's 144 KB DMA-pool reservation (boot panic
+    // with ESP_ERR_NO_MEM). On host the storage is a plain static
+    // array already aliased to s_coeffs_pp.
+#if defined(ESP_PLATFORM)
+    if (s_coeffs_pp == NULL) {
+        s_coeffs_pp = (int16_t *)heap_caps_aligned_alloc(
+            16, RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_coeffs_pp == NULL) {
+            // Boot will crash downstream when the resampler is hit;
+            // this is fatal and the caller has no fallback.
+            return;
+        }
+        // Log the actual address so we can verify the alloc landed
+        // in internal SRAM (0x4FFxxxxx region) and not PSRAM
+        // (0x48xxxxxx). A PSRAM fallback would preserve correctness
+        // but eat the perf gain.
+        ESP_LOGI("RS25", "s_coeffs_pp allocated at %p (size=%u B)",
+                 s_coeffs_pp,
+                 (unsigned)(RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t)));
+    }
+#endif
+
     // Build per-phase contiguous layout, padded to RS25_PADDED_TAPS=16
     // so the PIE-asm inner can do exactly two vmulas covering all
     // 16 lanes (the last 7 padding zeros contribute 0). Indexed as
     // s_coeffs_pp[phase * 16 + tap]; tap [0..8] = original
     // coeffs[tap × INTERP + phase], tap [9..15] = 0.
-    memset(s_coeffs_pp, 0, sizeof(s_coeffs_pp));
+    memset(s_coeffs_pp, 0,
+           RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t));
     for (int phase = 0; phase < RS25_INTERP; phase++) {
         for (int tap = 0; tap < RS25_DELAY_SIZE; tap++) {
             s_coeffs_pp[phase * RS25_PADDED_TAPS + tap] =
