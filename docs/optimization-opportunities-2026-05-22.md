@@ -93,24 +93,29 @@ smoke; expect 27-28 BCH frames vs current 29 (acceptable).
 **Risk:** Low — gate is configurable; ALBQ corpus tells you the cost
 exactly.
 
-## 5. Retry `dsps_fft2r_sc16_arp4` swap in the tagger with diff harness
+## 5. ~~Retry `dsps_fft2r_sc16_arp4` swap in the tagger~~ — **ALREADY DONE**
 
-**What:** Per memory note `feedback_pie_fft_swap_needs_validation.md`,
-the sc16 PIE FFT swap previously broke decode 58 → 0; root cause was
-likely the `dsps_fft2r_init_sc16(NULL,N)` size-arg bug + N2≤2 tail
-divergence. Build the same bit-exact diff harness pattern that
-`pie_fft_diff_test.c` provides for fc32 but for sc16; verify
-sinusoid / impulse / random / chirp; then enable.
+**Status correction (2026-05-22):** Already landed; this doc was
+stale. `fft_sc16_2048.c` on ESP_PLATFORM calls `dsps_fft2r_sc16`
+which on P4 resolves to `dsps_fft2r_sc16_arp4` (verified via
+linker map: `dsps_fft2r_sc16_arp4_` is the actual symbol called
+from `fft_sc16_2048.c.obj`). The known traps from
+`feedback_pie_fft_swap_needs_validation.md` are mitigated in-source:
 
-**Impact:** Tagger FFT 1.77 → 0.61 ms/step ≈ 1.16 ms/step × 125
-steps/s = 145 ms/s freed on Core 0. Same 3× factor we got on the fc32
-UW FFT.
+- Caller-owned twiddle table (`s_w_table`) passed to
+  `dsps_fft2r_init_sc16` — sidesteps the size-arg-ignored bug
+- Internal-SRAM scratch (`s_fft_scratch`) — PIE can't service
+  PSRAM addresses on `vld.128.ip`
+- ANSI bit-reversal at the end (no PIE bit-rev exists for sc16)
 
-**Effort:** 1-2 days (parameterise the existing diff harness; smoke
-validation).
+**Measured:** Tagger FFT at 263 µs/step (verified 2026-05-22 from
+`SMOKE: Perf check`), well below this doc's earlier 610 µs
+estimate. The ~6.7× win over the pre-PIE 1.77 ms baseline is
+already baked into the current 80% Core 0 cap number.
 
-**Risk:** Medium. N2≤2 tail special-case is the known divergence —
-needs harness coverage.
+**Implication:** there is no further sc16 PIE FFT speedup to
+unlock. Before claiming "Tagger FFT is the next lever" in future
+docs, re-check the linker map.
 
 ## 6. Swap UW matched-filter to radix-4 (`dsps_fft4r_fc32_arp4`)
 
