@@ -393,6 +393,6 @@ esp_err_t http_server_start(void)
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
     }
 
-    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages; POST /config");
+    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages; POST /config, /reset");
     return ESP_OK;
 }

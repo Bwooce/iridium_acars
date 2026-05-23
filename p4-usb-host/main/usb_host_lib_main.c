@@ -18,6 +18,7 @@
 #include "agc.h"
 #include "wifi_link.h"
 #include "http_server.h"
+#include "captive_dns.h"
 
 #if CONFIG_SMOKE_TEST_MODE
 #include "smoke_test.h"
@@ -162,6 +163,12 @@ void app_main(void)
 #if !CONFIG_SMOKE_TEST_MODE
     wifi_link_start();
     http_server_start();
+    // Only in AP-fallback mode: hijack DNS so phones auto-open the
+    // config form via captive-portal detection. STA mode leaves DNS
+    // alone (the user has a router that does it properly).
+    if (wifi_link_is_ap_mode()) {
+        captive_dns_start();
+    }
 #endif
 
 #if CONFIG_SMOKE_TEST_MODE
