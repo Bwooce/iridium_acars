@@ -27,6 +27,7 @@
 #include "dsps_fft2r.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #endif
 
 #define N      FFT_SC16_2048_N    // 2048
@@ -65,6 +66,8 @@ void fft_sc16_2048_init(void)
     // without stride-correcting). Pass our own N=2048-sized buffer.
     (void)dsps_fft2r_init_sc16(s_w_table, N);
     s_inited = true;
+    ESP_LOGI("FFT2048", "s_w_table=%p s_fft_scratch=%p [early]",
+             s_w_table, s_fft_scratch);
 }
 
 void fft_sc16_2048(int16_t *data)

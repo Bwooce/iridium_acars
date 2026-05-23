@@ -21,6 +21,7 @@
 #include "worker_core1.h"
 #include "ingest_core1.h"
 #include "resample_256_to_250.h"
+#include "fft_sc16_2048.h"
 #include "bch_decoder.h"
 #include "rtl-sdr.h"
 #include "status_logger.h"
@@ -91,9 +92,11 @@ static void action_start_stream(class_driver_t *driver_obj)
     rtlsdr_reset_buffer(rtldev);
 
     ESP_LOGI(TAG, "Initializing System Buffers...");
-    // s_coeffs_pp must land at the magic top-of-RAM address (see
-    // project_heap_position_decode_bug.md); alloc it FIRST.
+    // Allocate PIE-position-sensitive buffers FIRST so they land at
+    // known-working addresses regardless of upstream heap growth.
+    // See project_heap_position_decode_bug.md.
     resample_256_to_250_alloc_coeffs();
+    fft_sc16_2048_init();
     signal_buffer_init();
     worker_core1_init();
     ingest_core1_init();

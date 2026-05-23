@@ -16,6 +16,7 @@
 #include "esp_task_wdt.h"
 #include "esp_attr.h"
 #include "resample_256_to_250.h"
+#include "fft_sc16_2048.h"
 #include "esp_chip_info.h"
 #include "sdkconfig.h"
 #include "ingest_core1.h"
@@ -464,14 +465,20 @@ void smoke_test_run(void)
                  where, fi, li, fid, lid); \
     } while (0)
 
-    // CRITICAL: allocate s_coeffs_pp FIRST so the TLSF allocator
-    // deterministically places it in the 18 KB small-RAM region
-    // (currently 0x4ff3e330). Any later ordering risks placing it
-    // at a position the PIE asm path can't handle, which silently
-    // collapses decode 61 → 44. See memory note
-    // project_heap_position_decode_bug.md.
+    // CRITICAL early-alloc dance to keep PIE-asm-position-sensitive
+    // buffers at known-working addresses. See
+    // project_heap_position_decode_bug.md. Each of these buffers,
+    // if shifted by upstream heap changes (e.g., struct growth),
+    // can silently corrupt PIE output.
+    //
+    //   1. s_coeffs_pp (4 KB) — resampler polyphase coefficients
+    //   2. s_w_table (4 KB) + s_fft_scratch (8 KB) — fft_sc16_2048
+    //      The PIE FFT operates ON s_fft_scratch directly; if it
+    //      lands in the broken zone (e.g., 0x4ff6_xxxx), the
+    //      tagger FFT silently corrupts and decode collapses.
     resample_256_to_250_alloc_coeffs();
-    HEAP_LOG("post-coeffs_pp");
+    fft_sc16_2048_init();
+    HEAP_LOG("post-pie-buffers");
     HEAP_LOG("pre-signal_buffer");
     if (signal_buffer_init() != ESP_OK) {
         ESP_LOGE(TAG, "signal_buffer_init failed -> SMOKE_FAIL");

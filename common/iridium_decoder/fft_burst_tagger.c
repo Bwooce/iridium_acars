@@ -36,6 +36,8 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #define FBT_NOW_US() ((uint64_t)esp_timer_get_time())
 #else
 #include <time.h>
@@ -58,6 +60,36 @@ static uint64_t s_acc_mag_us;
 static uint64_t s_acc_detect_us;
 static uint64_t s_acc_base_us;
 static uint32_t s_acc_steps;
+
+#if defined(ESP_PLATFORM)
+// Pipelined helper task (Core 1): does mag+detect+EMA on the
+// fft_buf that tagger JUST FFT'd, in parallel with tagger doing
+// window+FFT for the NEXT step on the OTHER fft_buf.
+//
+// Tagger and helper communicate via xTaskNotify. Single helper
+// instance; tagger waits for helper completion at the START of
+// each call (returning previous step's bursts to caller).
+//
+// Priority 9 — above ingest_coord (8) — so helper preempts ingest
+// for its ~58 µs of compute per FFT step. Lower priority gets
+// starved by ingest's 2.5 ms resample chunks.
+static TaskHandle_t        s_pipe_helper_task = NULL;
+static TaskHandle_t        s_pipe_coord_task  = NULL;
+static fft_burst_tagger_t *s_pipe_state_t     = NULL;
+
+static void tagger_pipe_post_fft(fft_burst_tagger_t *t);
+
+static void fbt_pipe_helper_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s_pipe_state_t) tagger_pipe_post_fft(s_pipe_state_t);
+        __sync_synchronize();
+        if (s_pipe_coord_task) xTaskNotifyGive(s_pipe_coord_task);
+    }
+}
+#endif
 
 struct fft_burst_tagger_s {
     int      burst_pre_len;
@@ -98,6 +130,33 @@ struct fft_burst_tagger_s {
     float    window_enbw;        // Blackman ENBW, computed at init
     uint64_t d_index;            // sample index of CURRENT FFT step's start
     uint64_t burst_id;
+
+    // Pipelined helper state (ESP_PLATFORM only).
+    //
+    // Two fft_buf instances ping-pong: tagger window+FFTs the
+    // "active" buffer on Core 0; helper does mag+detect+EMA on the
+    // "pending" buffer on Core 1, IN PARALLEL. Each step, swap
+    // roles. Helper output is staged here and returned via the
+    // NEXT call to fft_burst_tagger_step (1-step API latency).
+    //
+    // fft_buf (inline above, internal SRAM) is one of the two
+    // buffers. fft_buf_alt (PSRAM heap, fft_sc16_2048 bounces both
+    // through its internal scratch so PSRAM is fine) is the other.
+    int16_t      *fft_buf_alt;
+    int           pipe_active_idx;       // 0 or 1: which buf tagger writes
+    bool          pipe_in_flight;        // helper currently processing
+    int           pipe_pending_idx;      // which buf helper is processing
+    uint64_t      pipe_pending_d_index;  // d_index snapshot at dispatch
+    // Staged outputs — heap-allocated (PSRAM) to keep the struct
+    // size unchanged from baseline. Inline arrays would grow the
+    // struct by ~6 KB, shifting downstream allocations enough to
+    // trip the P4 PIE position-sensitivity bug in unknown ways.
+    fbt_burst_t  *staged_new;
+    int           staged_n_new;
+    int           staged_max_new;        // upper bound caller passed
+    fbt_burst_t  *staged_gone;
+    int           staged_n_gone;
+    int           staged_max_gone;
 };
 
 // Build a Q15 Blackman window of length N.
@@ -206,6 +265,46 @@ fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
     t->n_bursts = 0;
     t->d_index = 0;
     t->burst_id = 0;
+
+#if defined(ESP_PLATFORM)
+    // Pipelined helper: allocate the alt fft_buf in PSRAM (fft_sc16_2048
+    // copies through internal scratch internally, so PSRAM is fine for
+    // the source buffer). Spawn the helper task on Core 1.
+    t->fft_buf_alt = (int16_t *)heap_caps_aligned_alloc(
+        16, 2 * N * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!t->fft_buf_alt) {
+        ESP_LOGE("FBT_INIT", "fft_buf_alt PSRAM alloc failed (pipelining disabled)");
+    }
+    // Staged outputs in PSRAM, keeps the struct small.
+    t->staged_new  = (fbt_burst_t *)heap_caps_calloc(
+        FBT_MAX_BURSTS, sizeof(fbt_burst_t), MALLOC_CAP_SPIRAM);
+    t->staged_gone = (fbt_burst_t *)heap_caps_calloc(
+        FBT_MAX_BURSTS, sizeof(fbt_burst_t), MALLOC_CAP_SPIRAM);
+    if (!t->staged_new || !t->staged_gone) {
+        ESP_LOGE("FBT_INIT", "staged_new/gone PSRAM alloc failed");
+    }
+    t->pipe_active_idx       = 0;       // tagger starts writing to fft_buf (inline)
+    t->pipe_in_flight        = false;
+    t->pipe_pending_idx      = 0;
+    t->pipe_pending_d_index  = 0;
+    t->staged_n_new          = 0;
+    t->staged_n_gone         = 0;
+    t->staged_max_new        = FBT_MAX_BURSTS;
+    t->staged_max_gone       = FBT_MAX_BURSTS;
+
+    if (s_pipe_helper_task == NULL && t->fft_buf_alt) {
+        BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
+            fbt_pipe_helper_task, "fbt_pipe", 4096, NULL,
+            /*prio=*/ 9, &s_pipe_helper_task,
+            /*core=*/ 1, MALLOC_CAP_SPIRAM);
+        if (ok != pdPASS) {
+            ESP_LOGW("FBT_INIT", "pipe helper spawn failed; sequential fallback");
+            s_pipe_helper_task = NULL;
+        } else {
+            ESP_LOGI("FBT_INIT", "pipe helper on Core 1 (window+FFT ‖ mag+detect+EMA)");
+        }
+    }
+#endif
     return t;
 }
 
@@ -213,6 +312,9 @@ void fft_burst_tagger_destroy(fft_burst_tagger_t *t)
 {
     if (!t) return;
 #if defined(ESP_PLATFORM)
+    if (t->fft_buf_alt) heap_caps_free(t->fft_buf_alt);
+    if (t->staged_new)  heap_caps_free(t->staged_new);
+    if (t->staged_gone) heap_caps_free(t->staged_gone);
     heap_caps_free(t);
 #else
     free(t);
@@ -239,14 +341,18 @@ void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start)
     t->d_index = start;
 }
 
-// Window-multiply the input into the FFT scratch buffer. Q15 × Q15 → Q15.
-static void window_multiply(fft_burst_tagger_t *t, const int16_t *input)
+// Window-multiply the input into a caller-provided FFT scratch
+// buffer. Q15 × Q15 → Q15. Buffer-pointer parameter so pipelined
+// mode can ping-pong between two fft_buf instances.
+static void window_multiply(fft_burst_tagger_t *t,
+                             const int16_t *input,
+                             int16_t *fb_out)
 {
     for (int i = 0; i < N; i++) {
         int32_t re = (int32_t)input[i * 2 + 0] * (int32_t)t->window[i];
         int32_t im = (int32_t)input[i * 2 + 1] * (int32_t)t->window[i];
-        t->fft_buf[i * 2 + 0] = (int16_t)(re >> 15);
-        t->fft_buf[i * 2 + 1] = (int16_t)(im >> 15);
+        fb_out[i * 2 + 0] = (int16_t)(re >> 15);
+        fb_out[i * 2 + 1] = (int16_t)(im >> 15);
     }
 }
 
@@ -269,10 +375,10 @@ static inline void mag_sq_pass(const int16_t * __restrict__ src_iq,
     }
 }
 
-static void compute_magnitude_shifted(fft_burst_tagger_t *t)
+static void compute_magnitude_shifted(fft_burst_tagger_t *t,
+                                       const int16_t *fb)
 {
-    const int16_t *fb = t->fft_buf;
-    int32_t       *out = t->magnitude_shifted;
+    int32_t *out = t->magnitude_shifted;
     // Pass A: upper half of fft_buf → lower half of output.
     mag_sq_pass(fb + 2 * (N / 2), out, N / 2);
     // Pass B: lower half of fft_buf → upper half of output.
@@ -494,6 +600,61 @@ static void update_baseline_ema(fft_burst_tagger_t *t)
     }
 }
 
+// Helper: pick fft_buf pointer by index.
+static inline int16_t *fbt_buf_at(fft_burst_tagger_t *t, int idx)
+{
+#if defined(ESP_PLATFORM)
+    return (idx == 0) ? t->fft_buf : t->fft_buf_alt;
+#else
+    (void)idx;
+    return t->fft_buf;
+#endif
+}
+
+// Post-FFT pipeline body: mag + detect + EMA, against the
+// fft_buf indexed by t->pipe_pending_idx, using the snapshotted
+// d_index. Used only by the Core 1 helper task.
+//
+// d_index handling: tagger advances t->d_index BEFORE notifying
+// (see step function); helper saves the post-advance value, sets
+// t->d_index to the snapshot for the duration of post-FFT work,
+// and restores afterwards. So step N+1's tagger sees the correct
+// post-advance value when it next reads t->d_index.
+static void tagger_pipe_post_fft(fft_burst_tagger_t *t)
+{
+    int16_t *fb = fbt_buf_at(t, t->pipe_pending_idx);
+    uint64_t saved_d = t->d_index;
+    t->d_index = t->pipe_pending_d_index;
+
+    uint64_t t2 = FBT_NOW_US();
+    compute_magnitude_shifted(t, fb);
+    uint64_t t3 = FBT_NOW_US();
+    s_acc_mag_us += (t3 - t2);
+
+    if (!t->history_primed) {
+        uint64_t b0 = FBT_NOW_US();
+        update_baseline_ema(t);
+        s_acc_base_us += (FBT_NOW_US() - b0);
+        t->staged_n_new  = 0;
+        t->staged_n_gone = 0;
+    } else {
+        uint64_t d0 = FBT_NOW_US();
+        update_bursts_internal(t);
+        t->staged_n_new  = create_new_bursts_internal(
+            t, t->staged_new, t->staged_max_new);
+        t->staged_n_gone = delete_gone_bursts_internal(
+            t, t->staged_gone, t->staged_max_gone);
+        uint64_t d1 = FBT_NOW_US();
+        s_acc_detect_us += (d1 - d0);
+
+        uint64_t b0 = FBT_NOW_US();
+        update_baseline_ema(t);
+        s_acc_base_us += (FBT_NOW_US() - b0);
+    }
+
+    t->d_index = saved_d;
+}
+
 bool fft_burst_tagger_step(fft_burst_tagger_t *t,
                             const int16_t *input,
                             const int16_t *lookback,
@@ -502,17 +663,76 @@ bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 {
     (void)lookback;     // reserved for future per-burst-cut step
 
-    int max_new = (n_new && out_new_bursts) ? *n_new : 0;
+    int max_new  = (n_new  && out_new_bursts ) ? *n_new  : 0;
     int max_gone = (n_gone && out_gone_bursts) ? *n_gone : 0;
-    if (n_new) *n_new = 0;
+    if (n_new)  *n_new  = 0;
     if (n_gone) *n_gone = 0;
 
+#if defined(ESP_PLATFORM)
+    // PIPELINED PATH: helper task running on Core 1 in parallel.
+    //
+    // Tagger does window+FFT for step N on Core 0 while helper
+    // does mag+detect+EMA for step N-1 on Core 1. Caller gets
+    // step N-1's bursts (1-step API latency).
+    if (s_pipe_helper_task && t->fft_buf_alt) {
+        bool was_primed = t->history_primed;
+
+        // 1. Drain previous helper run, copy staged bursts to caller.
+        if (t->pipe_in_flight) {
+            ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+            t->pipe_in_flight = false;
+            int n_new_out  = (t->staged_n_new  < max_new ) ? t->staged_n_new  : max_new;
+            int n_gone_out = (t->staged_n_gone < max_gone) ? t->staged_n_gone : max_gone;
+            for (int i = 0; i < n_new_out;  i++) out_new_bursts [i] = t->staged_new [i];
+            for (int i = 0; i < n_gone_out; i++) out_gone_bursts[i] = t->staged_gone[i];
+            if (n_new ) *n_new  = n_new_out;
+            if (n_gone) *n_gone = n_gone_out;
+        }
+
+        // 2. Window+FFT this step into the buffer NOT held by helper.
+        int next_idx = 1 - t->pipe_active_idx;
+        int16_t *fb  = fbt_buf_at(t, next_idx);
+
+        uint64_t t0 = FBT_NOW_US();
+        window_multiply(t, input, fb);
+        uint64_t t1 = FBT_NOW_US();
+        fft_sc16_2048(fb);
+        uint64_t t2 = FBT_NOW_US();
+        s_acc_wind_us += (t1 - t0);
+        s_acc_fft_us  += (t2 - t1);
+        s_acc_steps   += 1;
+
+        // 3. Snapshot pending state, ADVANCE d_index, then notify.
+        //    Race-fix: t->d_index must be at its post-advance value
+        //    BEFORE the helper task starts (since helper does
+        //    `saved_d = t->d_index; ...; t->d_index = saved_d` and
+        //    would overwrite a post-notify advance).
+        t->pipe_pending_idx     = next_idx;
+        t->pipe_pending_d_index = t->d_index;     // step N's value
+        t->staged_max_new       = max_new;
+        t->staged_max_gone      = max_gone;
+        s_pipe_state_t          = t;
+        s_pipe_coord_task       = xTaskGetCurrentTaskHandle();
+        t->pipe_active_idx      = next_idx;
+        t->pipe_in_flight       = true;
+        t->d_index             += N;              // advance BEFORE notify
+        xTaskNotifyGive(s_pipe_helper_task);
+
+        // Return value: was the step BEFORE this one "primed" enough
+        // to produce bursts? On the FIRST call (no in-flight previous),
+        // history isn't primed yet; later calls reflect the state
+        // observed before the drain.
+        return was_primed;
+    }
+#endif
+
+    // SEQUENTIAL FALLBACK (host build, or pipeline unavailable).
     uint64_t t0 = FBT_NOW_US();
-    window_multiply(t, input);
+    window_multiply(t, input, t->fft_buf);
     uint64_t t1 = FBT_NOW_US();
     fft_sc16_2048(t->fft_buf);
     uint64_t t2 = FBT_NOW_US();
-    compute_magnitude_shifted(t);
+    compute_magnitude_shifted(t, t->fft_buf);
     uint64_t t3 = FBT_NOW_US();
 
     s_acc_wind_us += (t1 - t0);
@@ -530,12 +750,12 @@ bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 
     uint64_t d0 = FBT_NOW_US();
     update_bursts_internal(t);
-    int n_new_out = create_new_bursts_internal(t, out_new_bursts, max_new);
+    int n_new_out  = create_new_bursts_internal(t, out_new_bursts, max_new);
     int n_gone_out = delete_gone_bursts_internal(t, out_gone_bursts, max_gone);
     uint64_t d1 = FBT_NOW_US();
     s_acc_detect_us += (d1 - d0);
 
-    if (n_new) *n_new = n_new_out;
+    if (n_new)  *n_new  = n_new_out;
     if (n_gone) *n_gone = n_gone_out;
 
     uint64_t b0 = FBT_NOW_US();
