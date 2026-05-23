@@ -226,6 +226,15 @@ static esp_err_t mount_sd(void)
     if (r != ESP_OK) {
         snprintf(s_stats.mount_error, sizeof(s_stats.mount_error),
                  "%s", esp_err_to_name(r));
+        // Power the card rail back off so a missing-card socket isn't
+        // sitting with VDD asserted.
+        gpio_set_level(PIN_PWR, 1);     // 1 = card power OFF
+        // NOTE: the SDMMC driver's slot state + FATFS context (~25 KB
+        // of internal DMA-capable SRAM) remain allocated even after
+        // a failed mount, which pushes the USB transfer pool short
+        // on the no-card boot path. A lazy mount path (e.g. only
+        // mount when /sd/mount is POST'd) would avoid the regression
+        // entirely. Tracked as a follow-up.
         return r;
     }
 
