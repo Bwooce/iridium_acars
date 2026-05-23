@@ -427,3 +427,12 @@ void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out)
     out->lw_da    = atomic_load_explicit(&s_class_lw_da,    memory_order_relaxed);
     out->lw_other = atomic_load_explicit(&s_class_lw_other, memory_order_relaxed);
 }
+
+uint64_t frame_decoder_acars_decoded_total(void)
+{
+    return atomic_load_explicit(&s_acars_decoded, memory_order_relaxed);
+}
+uint64_t frame_decoder_sbd_complete_total(void)
+{
+    return atomic_load_explicit(&s_sbd_complete, memory_order_relaxed);
+}

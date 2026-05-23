@@ -56,6 +56,11 @@ typedef struct {
 } frame_decoder_class_counts_t;
 void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out);
 
+// Lifetime totals (since boot) of the two ACARS-pipeline counters.
+// Cheap relaxed atomic loads; safe to call from any thread.
+uint64_t frame_decoder_acars_decoded_total(void);
+uint64_t frame_decoder_sbd_complete_total(void);
+
 #ifdef __cplusplus
 }
 #endif

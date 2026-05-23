@@ -14,6 +14,7 @@
 #include "wifi_link.h"
 #include "app_config.h"
 #include "msg_ring.h"
+#include "frame_decoder.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -53,7 +54,13 @@ static esp_err_t status_get(httpd_req_t *req)
 
     // Small fixed JSON. No allocator games; fits comfortably in a
     // single TCP segment.
-    char body[640];
+    frame_decoder_class_counts_t cc = {0};
+    frame_decoder_get_class_counts(&cc);
+    uint64_t acars_total = frame_decoder_acars_decoded_total();
+    uint64_t sbd_total   = frame_decoder_sbd_complete_total();
+    uint64_t msgs_total  = msg_ring_total();
+
+    char body[896];
     int n = snprintf(body, sizeof(body),
         "{"
             "\"build\":\"%s\","
@@ -66,7 +73,16 @@ static esp_err_t status_get(httpd_req_t *req)
             "\"station_id\":\"%s\","
             "\"lo_freq_hz\":%u,"
             "\"sample_rate_hz\":%u,"
-            "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s}"
+            "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
+            "\"decode\":{"
+                "\"messages_total\":%llu,"
+                "\"acars_decoded\":%llu,"
+                "\"sbd_complete\":%llu,"
+                "\"frames\":{"
+                    "\"ms\":%llu,\"tl\":%llu,\"bc\":%llu,"
+                    "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu"
+                "}"
+            "}"
         "}",
         app->version,
         app->date,
@@ -80,7 +96,13 @@ static esp_err_t status_get(httpd_req_t *req)
         (unsigned)cfg.sample_rate_hz,
         cfg.out_host,
         (unsigned)cfg.out_port,
-        (cfg.out_host[0] && cfg.out_port) ? "true" : "false");
+        (cfg.out_host[0] && cfg.out_port) ? "true" : "false",
+        (unsigned long long)msgs_total,
+        (unsigned long long)acars_total,
+        (unsigned long long)sbd_total,
+        (unsigned long long)cc.ms,    (unsigned long long)cc.tl,
+        (unsigned long long)cc.bc,    (unsigned long long)cc.lw_da,
+        (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown);
 
     if (n < 0 || n >= (int)sizeof(body)) {
         ESP_LOGW(TAG, "status body truncated (n=%d, cap=%d)", n, (int)sizeof(body));
