@@ -1,8 +1,19 @@
 # P4 ↔ C6 Wi-Fi Design
 
-Status: Implemented (commit `bba7817` — D17 redo, 2026-05-23).
-Supersedes the v0.1 design (UART-based standalone C6 firmware) — see the
-*History* section at the bottom for why that approach was abandoned.
+Status: D17 closed out 2026-05-23. SDIO transport landed in commit
+`bba7817`; provisioning + HTTP + UDP-push app layer landed in commits
+`093b8b4` through `c394dcf`. Supersedes the v0.1 design (UART-based
+standalone C6 firmware) — see the *History* section at the bottom for
+why that approach was abandoned.
+
+**Known limitations (not blocking ship, deferred to follow-up tasks):**
+- SoftAP is open (no WPA2). Anyone within range can read the config
+  form. Acceptable for desk testing; needs WPA2 + a printed default
+  password before any deployment.
+- Phone-test of the full provisioning flow not yet performed end-to-end.
+- C6 stays on factory firmware (Wi-Fi + BT, no Thread). Reflash via
+  PROG_C6 cable or future SDIO OTA path needed to enable OpenThread.
+- P4 OTA itself (D19) not yet wired — for now updates need the USB cable.
 
 ---
 
@@ -115,25 +126,35 @@ After shrink: at smoke entry DMA-INT free = 35 KB, largest contiguous
 = 27 KB (was 11 KB / 4.8 KB pre-shrink). Decode preserved at the
 baseline matched=61 on the RAW_IRIDIUM fixture.
 
-## 5. What still needs building on the P4 side
+## 5. Application layer — what's built (as of D17 closeout)
 
-The transport is up; the application layer on top of it is still to do.
-Tracked under task #36 (D17 in-progress) — the open items are:
+Everything that turns the Wi-Fi-equipped radio into a usable ACARS
+node lives on the P4. Source files in `p4-usb-host/main/`:
 
-- **NVS-driven STA join**: read `wifi_ssid`/`wifi_psk` from `APP_CFG`
-  (D18 already exposes these), call `esp_wifi_set_config()` + connect.
-  Fall back to soft-AP captive portal if NVS is empty.
-- **HTTP server**: `esp_http_server` with a single-page config UI
-  (gain, LO, bias-tee, station ID, Wi-Fi creds) and a streaming
-  endpoint for ACARS frames.
-- **Output**: at minimum a long-poll JSON endpoint; possibly UDP push
-  to a configurable peer.
-- **OTA**: `esp_https_ota` for the P4. Slave OTA for the C6 if we ever
-  want to update its firmware (e.g. to enable OpenThread — see *Thread
-  capability* below).
+| Module | Purpose |
+|---|---|
+| `wifi_link.{c,h}` | NVS-driven STA join; falls back to open SoftAP `iridium-XXXXXX` (last 3 bytes of MAC) when no credentials are stored. STA mode: `WIFI_AUTH_OPEN` threshold so open + WPA both work. |
+| `captive_dns.{c,h}` | UDP/53 responder that answers every A query with `192.168.4.1`. Started only in AP mode. Trips phone captive-portal detection so the config form auto-opens on associate. |
+| `http_server.{c,h}` | `esp_http_server` on port 80 with: `GET /` (HTML form), `GET /status` (JSON snapshot incl. build, mode, IP, decode counters), `GET /messages?since=ID` (chunked JSON of recent ACARS messages), `POST /config` (form → NVS + reboot), `POST /reset` (clear Wi-Fi NVS → reboot to AP). |
+| `msg_ring.{c,h}` | 32-slot PSRAM ring of recent ACARS messages with monotonically-increasing IDs; fed by `frame_decoder.try_acars()`. Backs `/messages`. |
+| `acars_push.{c,h}` | Optional UDP push of each decoded ACARS message (JSON, one datagram per message, newline-terminated). NVS keys `out_host` + `out_port`; no-op when either is unset. Non-blocking emit so a slow network can't back-pressure the decoder. |
 
-The captive portal flow that the prior design assigned to the C6 now
-lives on the P4 (with the C6 simply acting as the radio).
+App_config (D18) gained `out_host` (string) + `out_port` (uint16) NVS
+keys for the UDP push target.
+
+End-to-end flow on a fresh device:
+  1. Boot → `wifi_link` sees empty NVS, brings up AP `iridium-XXXXXX`.
+  2. Phone joins the AP. `captive_dns` redirects the OS probe; the
+     config form pops automatically (or browse `192.168.4.1` directly).
+  3. User fills in home Wi-Fi SSID/PSK and (optionally) UDP push
+     `host`/`port`, submits.
+  4. `/config` writes NVS, returns "saving" page, schedules a 1 s
+     deferred `esp_restart()`.
+  5. Next boot → STA mode → joins user's Wi-Fi → ACARS messages emit
+     as both `/messages` entries and (if configured) UDP datagrams
+     to the push target.
+  6. `POST /reset` (red button in the STA-mode form) clears Wi-Fi NVS
+     and reverts to AP for re-provisioning.
 
 ## 6. Thread capability
 
