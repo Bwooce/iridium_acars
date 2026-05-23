@@ -106,6 +106,7 @@ esp_err_t app_config_init(void)
     s_cfg.wifi_psk[0]  = '\0';
     s_cfg.out_host[0]  = '\0';
     s_cfg.out_port     = 0;
+    s_cfg.ota_url[0]   = '\0';
 
     esp_err_t r = nvs_flash_init();
     if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -153,6 +154,7 @@ esp_err_t app_config_init(void)
         }
     }
     s_cfg.out_port = out_port;
+    nvs_get_str_or(h, "ota_url",  s_cfg.ota_url,    APP_CONFIG_OTA_URL_LEN,   "");
     s_cfg.gain_mode = (gain_mode_t)gm;
     s_cfg.bias_tee  = (bool)bt;
 
@@ -304,6 +306,10 @@ esp_err_t app_config_set_out_port(uint16_t port)
     nvs_close(h);
     return r;
 }
+esp_err_t app_config_set_ota_url(const char *url)
+{
+    return set_str_field(s_cfg.ota_url, APP_CONFIG_OTA_URL_LEN, "ota_url", url);
+}
 
 void app_config_log(void)
 {
@@ -324,5 +330,10 @@ void app_config_log(void)
         ESP_LOGI(TAG, "UDP push: %s:%u", c.out_host, (unsigned)c.out_port);
     } else {
         ESP_LOGI(TAG, "UDP push: disabled (out_host/out_port unset)");
+    }
+    if (c.ota_url[0]) {
+        ESP_LOGI(TAG, "OTA URL: %s", c.ota_url);
+    } else {
+        ESP_LOGI(TAG, "OTA URL: unset (POST /ota will fail until set)");
     }
 }

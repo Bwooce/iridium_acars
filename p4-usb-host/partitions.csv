@@ -1,22 +1,25 @@
 # ESP32-P4 partition table for the iridium ACARS firmware.
 #
 # Board: Waveshare ESP32-P4-Nano with GigaDevice GD25Q128 16 MB SPI flash.
-# Default IDF templates use 1-1.5 MB factory partitions designed for 2-4 MB
-# flash. We have 16 MB; sizing the app partition generously gives room for
-# the IDA / SBD / libacars stack, future esp_hosted Wi-Fi (~600 KB), OTA
-# slots later, etc., without requiring another partition shuffle.
+# OTA-capable layout (D19): two 6 MB app slots + otadata, leaves ~2.5 MB
+# for the SPIFFS storage partition.
 #
-# Reserved:
-#   - storage (3 MB SPIFFS): future runtime IQ fixtures, decoded message
-#     log, station config. Not used by current firmware; declaring it now
-#     so we don't have to reshuffle later when we add it.
+# 6 MB per slot is sized to accommodate the dev build with the
+# SMOKE_TEST_RAW_IRIDIUM fixture embedded (~5.9 MB). The shipping
+# (no-smoke) build is ~1 MB, so there's plenty of headroom for the
+# Wi-Fi/HTTP/OTA layer to grow.
 #
-# Sizes are conservative: 12 MB factory + 24 KB NVS + 4 KB PHY + 3 MB
-# storage + ~600 KB headers/bootloader/partition table = ~15.6 MB used,
-# ~400 KB unallocated tail.
+# OTA flow: bootloader picks ota_0 or ota_1 based on otadata; on a
+# successful POST /ota the new image is staged into the inactive
+# slot, otadata is flipped, and the device reboots. If the new
+# firmware doesn't call esp_ota_mark_app_valid_cancel_rollback()
+# within the rollback window, the bootloader reverts to the
+# previous slot on next boot. Brick-recovery is the USB cable.
 #
 # Name,    Type, SubType, Offset,   Size,     Flags
 nvs,       data, nvs,     0x9000,   0x6000,
-phy_init,  data, phy,     0xf000,   0x1000,
-factory,   app,  factory, 0x10000,  12M,
-storage,   data, spiffs,  ,         3M,
+otadata,   data, ota,     0xf000,   0x2000,
+phy_init,  data, phy,     0x11000,  0x1000,
+ota_0,     app,  ota_0,   0x20000,  6M,
+ota_1,     app,  ota_1,   ,         6M,
+storage,   data, spiffs,  ,         2500K,

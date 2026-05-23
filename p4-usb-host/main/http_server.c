@@ -15,6 +15,7 @@
 #include "app_config.h"
 #include "msg_ring.h"
 #include "frame_decoder.h"
+#include "ota_runner.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -74,6 +75,7 @@ static esp_err_t status_get(httpd_req_t *req)
             "\"lo_freq_hz\":%u,"
             "\"sample_rate_hz\":%u,"
             "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
+            "\"ota_url\":\"%s\","
             "\"decode\":{"
                 "\"messages_total\":%llu,"
                 "\"acars_decoded\":%llu,"
@@ -97,6 +99,7 @@ static esp_err_t status_get(httpd_req_t *req)
         cfg.out_host,
         (unsigned)cfg.out_port,
         (cfg.out_host[0] && cfg.out_port) ? "true" : "false",
+        cfg.ota_url,
         (unsigned long long)msgs_total,
         (unsigned long long)acars_total,
         (unsigned long long)sbd_total,
@@ -144,10 +147,14 @@ static const char s_index_html[] =
     "<input type=\"text\" name=\"out_host\" maxlength=\"63\">"
     "<label>Port</label>"
     "<input type=\"number\" name=\"out_port\" min=\"0\" max=\"65535\" placeholder=\"e.g. 6700\">"
+    "<h2>OTA</h2>"
+    "<label>Firmware URL (http:// or https://)</label>"
+    "<input type=\"text\" name=\"ota_url\" maxlength=\"127\" placeholder=\"http://server/p4-usb-host.bin\">"
     "<button type=\"submit\">Save &amp; reboot</button>"
     "</form>"
     "<p><small>Current status: <a href=\"/status\">/status</a> · "
-    "Messages: <a href=\"/messages\">/messages</a></small></p>"
+    "Messages: <a href=\"/messages\">/messages</a> · "
+    "OTA progress: <a href=\"/ota\">/ota</a></small></p>"
     "</body></html>";
 
 // Shown only in STA mode (we're already at the form when in AP).
@@ -247,18 +254,25 @@ static esp_err_t config_post(httpd_req_t *req)
     form_field(body, total, "out_port", out_port_s, sizeof(out_port_s));
     uint16_t out_port = (uint16_t)strtoul(out_port_s, NULL, 10);
 
-    ESP_LOGI(TAG, "/config POST: saving ssid='%s' (psk %s), out=%s:%u",
+    // Optional OTA URL.
+    char ota_url[128] = {0};
+    form_field(body, total, "ota_url", ota_url, sizeof(ota_url));
+
+    ESP_LOGI(TAG, "/config POST: ssid='%s' (psk %s), out=%s:%u, ota_url=%s",
              ssid, psk[0] ? "set" : "empty",
-             out_host[0] ? out_host : "(none)", (unsigned)out_port);
+             out_host[0] ? out_host : "(none)", (unsigned)out_port,
+             ota_url[0] ? ota_url : "(none)");
 
     esp_err_t r1 = app_config_set_wifi_ssid(ssid);
     esp_err_t r2 = app_config_set_wifi_psk(psk);
     esp_err_t r3 = app_config_set_out_host(out_host);
     esp_err_t r4 = app_config_set_out_port(out_port);
-    if (r1 != ESP_OK || r2 != ESP_OK || r3 != ESP_OK || r4 != ESP_OK) {
-        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s",
+    esp_err_t r5 = app_config_set_ota_url(ota_url);
+    if (r1 || r2 || r3 || r4 || r5) {
+        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s",
                  esp_err_to_name(r1), esp_err_to_name(r2),
-                 esp_err_to_name(r3), esp_err_to_name(r4));
+                 esp_err_to_name(r3), esp_err_to_name(r4),
+                 esp_err_to_name(r5));
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "nvs write failed\n", HTTPD_RESP_USE_STRLEN);
     }
@@ -384,6 +398,51 @@ static esp_err_t messages_get(httpd_req_t *req)
     return httpd_resp_send_chunk(req, NULL, 0);   // end of chunked response
 }
 
+static esp_err_t ota_post(httpd_req_t *req)
+{
+    esp_err_t r = ota_runner_start();
+    if (r == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "OTA already running\n", HTTPD_RESP_USE_STRLEN);
+    }
+    if (r != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "OTA failed to start\n", HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    const char *html =
+        "<!doctype html><html><body style=\"font-family:system-ui;max-width:480px;margin:2em auto;padding:0 1em\">"
+        "<h1>OTA started</h1>"
+        "<p>The device is downloading the new firmware from the configured URL. "
+        "On success it will reboot automatically — typically 30-90 seconds. "
+        "Poll <a href=\"/ota\">/ota</a> for progress.</p>"
+        "</body></html>";
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t ota_get(httpd_req_t *req)
+{
+    ota_status_t s;
+    ota_runner_get_status(&s);
+    const char *state = "idle";
+    switch (s.state) {
+    case OTA_RUNNING: state = "running"; break;
+    case OTA_SUCCESS: state = "success"; break;
+    case OTA_FAILED:  state = "failed";  break;
+    default: break;
+    }
+    char body[300];
+    int n = snprintf(body, sizeof(body),
+        "{\"state\":\"%s\",\"http_status\":%d,\"bytes_written\":%d,\"last_error\":\"%s\"}",
+        state, s.http_status, s.bytes_written, s.last_error);
+    if (n < 0) n = 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, n);
+}
+
 static esp_err_t reset_post(httpd_req_t *req)
 {
     ESP_LOGW(TAG, "/reset POST: clearing Wi-Fi NVS + rebooting to AP mode");
@@ -432,13 +491,15 @@ esp_err_t http_server_start(void)
         { .uri = "/",         .method = HTTP_GET,  .handler = index_get,    .user_ctx = NULL },
         { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
         { .uri = "/messages", .method = HTTP_GET,  .handler = messages_get, .user_ctx = NULL },
+        { .uri = "/ota",      .method = HTTP_GET,  .handler = ota_get,      .user_ctx = NULL },
         { .uri = "/config",   .method = HTTP_POST, .handler = config_post,  .user_ctx = NULL },
         { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,   .user_ctx = NULL },
+        { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,     .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
     }
 
-    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages; POST /config, /reset");
+    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages, /ota; POST /config, /reset, /ota");
     return ESP_OK;
 }
