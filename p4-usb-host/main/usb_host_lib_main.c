@@ -21,6 +21,7 @@
 #include "captive_dns.h"
 #include "acars_push.h"
 #include "ota_runner.h"
+#include "sd_log.h"
 
 #if CONFIG_SMOKE_TEST_MODE
 #include "smoke_test.h"
@@ -174,6 +175,8 @@ void app_main(void)
     // ACARS UDP push (D17) — task is always created; emits only when
     // out_host/out_port are set in NVS.
     acars_push_init();
+    // SD card log (#63) — mounts the card if present; no-op if absent.
+    sd_log_init();
     // D19 OTA: if we got here without crashing, the current image is
     // healthy — cancel any pending rollback the bootloader was tracking.
     ota_runner_mark_valid();

@@ -24,6 +24,7 @@
 #include "sbd_reassembler.h"
 #include "msg_ring.h"
 #include "acars_push.h"
+#include "sd_log.h"
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
 #include <libacars/reassembly.h>
@@ -128,6 +129,7 @@ static void try_acars(const sbd_message_t *msg,
             }
             msg_ring_push(&out);
             acars_push_emit(&out);
+            sd_log_emit(&out);
         } else if (a->reasm_status == LA_REASM_IN_PROGRESS) {
             atomic_fetch_add_explicit(&s_acars_fragments, 1, memory_order_relaxed);
             ESP_LOGD(TAG, "ACARS fragment buffered: label='%.2s' block=%c "

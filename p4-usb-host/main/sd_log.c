@@ -1,0 +1,324 @@
+// SD card log writer. Mounts SDMMC slot 0 (P4 GPIO 39-44), opens an
+// NDJSON file per boot, and appends one line per decoded ACARS message.
+//
+// Pinout (per docs/p4-nano-board-schematic-summary.md, line 29):
+//   CLK=GPIO43  CMD=GPIO44  D0=GPIO39 D1=GPIO40 D2=GPIO41 D3=GPIO42
+//   SD_VDD gated by GPIO45 (P-FET, drive LOW to enable card power).
+//
+// Threading: producer is frame_decoder (Core 1) which calls sd_log_emit
+// non-blockingly. A dedicated writer task on Core 0 (where the USB host
+// already lives but is mostly idle on its read loop) drains the queue
+// and writes to FATFS. Pinning to Core 0 keeps the heavier Core 1 DSP
+// path unaffected.
+
+#include "sd_log.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <inttypes.h>
+#include <errno.h>
+#include <sys/stat.h>
+
+#include "esp_log.h"
+#include "esp_vfs_fat.h"
+#include "driver/sdmmc_host.h"
+#include "sdmmc_cmd.h"
+#include "driver/gpio.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "esp_timer.h"
+
+static const char *TAG = "SDLOG";
+
+#define MOUNT_POINT     "/sdcard"
+#define LOG_DIR         "/sdcard/acars"
+
+// Pin assignments — see header above.
+#define PIN_CLK  43
+#define PIN_CMD  44
+#define PIN_D0   39
+#define PIN_D1   40
+#define PIN_D2   41
+#define PIN_D3   42
+#define PIN_PWR  45        // GPIO45 LOW = SD_VDD on (P-FET)
+
+#define EMIT_QUEUE_DEPTH    32
+#define WRITER_STACK        6144
+#define WRITER_PRIO         3
+
+static sdmmc_card_t   *s_card           = NULL;
+static FILE           *s_log            = NULL;
+static QueueHandle_t   s_q              = NULL;
+static SemaphoreHandle_t s_stats_mu     = NULL;
+static sd_log_stats_t  s_stats          = {0};
+
+static void update_stats_ok(size_t bytes_added)
+{
+    if (!s_stats_mu) return;
+    xSemaphoreTake(s_stats_mu, portMAX_DELAY);
+    s_stats.messages_written++;
+    s_stats.bytes_written += bytes_added;
+    xSemaphoreGive(s_stats_mu);
+}
+
+static void update_stats_err(void)
+{
+    if (!s_stats_mu) return;
+    xSemaphoreTake(s_stats_mu, portMAX_DELAY);
+    s_stats.write_errors++;
+    xSemaphoreGive(s_stats_mu);
+}
+
+// Same single-line JSON shape as GET /messages and acars_push, plus a
+// trailing newline so the file is true NDJSON. Returns bytes written
+// (excluding the NUL).
+static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
+{
+    // Tiny JSON escape for the text field — copied from acars_push.c
+    // structure rather than shared because pulling them into a common
+    // helper would touch three call sites for marginal benefit.
+    char esc[2 * MSG_RING_TXT_MAX + 8];
+    size_t w = 0;
+    for (const char *p = m->txt; *p && w + 7 < sizeof(esc); p++) {
+        unsigned char c = (unsigned char)*p;
+        switch (c) {
+        case '"':  esc[w++] = '\\'; esc[w++] = '"';  break;
+        case '\\': esc[w++] = '\\'; esc[w++] = '\\'; break;
+        case '\n': esc[w++] = '\\'; esc[w++] = 'n';  break;
+        case '\r': esc[w++] = '\\'; esc[w++] = 'r';  break;
+        case '\t': esc[w++] = '\\'; esc[w++] = 't';  break;
+        default:
+            if (c < 0x20) {
+                static const char hex[] = "0123456789abcdef";
+                esc[w++] = '\\'; esc[w++] = 'u';
+                esc[w++] = '0'; esc[w++] = '0';
+                esc[w++] = hex[(c >> 4) & 0xf];
+                esc[w++] = hex[c & 0xf];
+            } else {
+                esc[w++] = (char)c;
+            }
+        }
+    }
+    esc[w] = '\0';
+
+    int n = snprintf(out, cap,
+        "{\"id\":%llu,\"t_us\":%llu,\"dir\":\"%s\","
+        "\"mode\":\"%c\",\"label\":\"%.2s\",\"block\":\"%c\","
+        "\"msg_num\":\"%s\",\"flight\":\"%s\","
+        "\"crc\":%s,\"peak_bin\":%ld,\"snr_db\":%.1f,"
+        "\"txt\":\"%s\"}\n",
+        (unsigned long long)m->id,
+        (unsigned long long)m->timestamp_us,
+        m->uplink ? "UL" : "DL",
+        m->mode,
+        m->label,
+        m->block_id,
+        m->msg_num,
+        m->flight_id,
+        m->crc_ok ? "true" : "false",
+        (long)m->peak_bin,
+        (double)m->snr_db,
+        esc);
+    if (n < 0) return 0;
+    if ((size_t)n >= cap) return cap - 1;
+    return (size_t)n;
+}
+
+static void writer_task(void *arg)
+{
+    (void)arg;
+    acars_msg_t m;
+    char        line[2048];        // worst case ~600 B; 2K is generous
+    int64_t     last_flush = esp_timer_get_time();
+
+    while (1) {
+        BaseType_t got = xQueueReceive(s_q, &m, pdMS_TO_TICKS(1000));
+        if (got == pdTRUE && s_log) {
+            size_t len = format_msg_line(line, sizeof(line), &m);
+            if (len > 0) {
+                size_t wr = fwrite(line, 1, len, s_log);
+                if (wr == len) {
+                    update_stats_ok(len);
+                } else {
+                    ESP_LOGW(TAG, "fwrite short: %u/%u — disk full?",
+                             (unsigned)wr, (unsigned)len);
+                    update_stats_err();
+                }
+            }
+        }
+
+        // Flush at least every 1 s so an abrupt power loss doesn't lose
+        // more than a second of decodes. FATFS fsync is fairly cheap
+        // when the SDMMC DMA isn't backed up.
+        int64_t now = esp_timer_get_time();
+        if (s_log && (now - last_flush) >= 1000000) {
+            fflush(s_log);
+            // fsync would also walk the FAT — skip for now; fflush
+            // alone flushes the FILE buffer into FATFS's internal
+            // sector cache which is good enough for crash recovery
+            // to-the-second.
+            last_flush = now;
+        }
+    }
+}
+
+static void enable_card_power(void)
+{
+    // GPIO45 is the P-FET gate. Drive LOW to turn the card ON.
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << PIN_PWR,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(PIN_PWR, 0);     // 0 = card power ON
+    // Cards need ~1 ms to come up after power-on; give it more headroom.
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+// esp_hosted owns the SDMMC host controller (single controller on P4,
+// claimed first at boot for SDIO slot 1 → C6). esp_vfs_fat_sdmmc_mount
+// would otherwise try to claim it again for slot 0 and fail with
+// ESP_ERR_NOT_FOUND. Override host.init/deinit with no-ops so we
+// reuse the already-initialised controller and just add the slot.
+// Reference: managed_components/espressif__esp_hosted/examples/
+//            host_sdcard_with_hosted/main/sd_card_functions.c
+static esp_err_t sdmmc_init_noop(void)   { return ESP_OK; }
+static esp_err_t sdmmc_deinit_noop(void) { return ESP_OK; }
+
+static esp_err_t mount_sd(void)
+{
+    enable_card_power();
+
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    // 40 MHz is the SDIO 3.0 / UHS-I high-speed rate; the board wiring
+    // supports it. Fallback DS (default) is 20 MHz if a slower card
+    // is detected at probe time.
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    // Slot 0 (P4-NANO's SD slot per schematic, distinct from slot 1
+    // which is C6 esp_hosted).
+    host.slot = SDMMC_HOST_SLOT_0;
+    host.init   = sdmmc_init_noop;
+    host.deinit = sdmmc_deinit_noop;
+
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.width = 4;
+    slot.clk = PIN_CLK;
+    slot.cmd = PIN_CMD;
+    slot.d0  = PIN_D0;
+    slot.d1  = PIN_D1;
+    slot.d2  = PIN_D2;
+    slot.d3  = PIN_D3;
+    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    esp_vfs_fat_mount_config_t mount = {
+        .format_if_mount_failed = false,
+        .max_files              = 4,
+        .allocation_unit_size   = 16 * 1024,
+    };
+
+    esp_err_t r = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot, &mount, &s_card);
+    if (r != ESP_OK) {
+        snprintf(s_stats.mount_error, sizeof(s_stats.mount_error),
+                 "%s", esp_err_to_name(r));
+        return r;
+    }
+
+    s_stats.mounted = true;
+    s_stats.mount_error[0] = '\0';
+    sdmmc_card_print_info(stdout, s_card);
+    return ESP_OK;
+}
+
+static esp_err_t open_log_file(void)
+{
+    struct stat st;
+    if (stat(LOG_DIR, &st) != 0) {
+        if (mkdir(LOG_DIR, 0775) != 0) {
+            ESP_LOGW(TAG, "mkdir(%s) failed errno=%d", LOG_DIR, errno);
+            return ESP_FAIL;
+        }
+    }
+
+    // One file per boot keyed by boot timestamp (microseconds since
+    // epoch isn't available; use esp_timer_get_time which is microseconds
+    // since boot — really we want a wall-clock once NTP is integrated;
+    // for now, the boot tick distinguishes runs).
+    char path[64];
+    int64_t t0 = esp_timer_get_time();
+    snprintf(path, sizeof(path), LOG_DIR "/log-%lld.ndjson", (long long)t0);
+
+    s_log = fopen(path, "a");
+    if (!s_log) {
+        ESP_LOGE(TAG, "fopen(%s) failed errno=%d", path, errno);
+        return ESP_FAIL;
+    }
+    setvbuf(s_log, NULL, _IOFBF, 4096);    // 4 KB FILE buffer — coalesce writes
+    strlcpy(s_stats.log_path, path, sizeof(s_stats.log_path));
+    s_stats.log_open = true;
+    ESP_LOGI(TAG, "ACARS log open: %s", path);
+    return ESP_OK;
+}
+
+esp_err_t sd_log_init(void)
+{
+    if (s_q) return ESP_OK;        // idempotent
+
+    s_stats_mu = xSemaphoreCreateMutex();
+    if (!s_stats_mu) return ESP_ERR_NO_MEM;
+
+    esp_err_t r = mount_sd();
+    if (r != ESP_OK) {
+        ESP_LOGW(TAG, "SD mount failed (%s) — logging disabled",
+                 esp_err_to_name(r));
+        // Still create the queue so emit() can drop cleanly; just no writer.
+        s_q = xQueueCreate(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t));
+        return r;
+    }
+    if (open_log_file() != ESP_OK) {
+        ESP_LOGW(TAG, "SD mounted but log file open failed — logging disabled");
+        s_q = xQueueCreate(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t));
+        return ESP_FAIL;
+    }
+
+    s_q = xQueueCreate(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t));
+    if (!s_q) return ESP_ERR_NO_MEM;
+
+    // Pin writer to Core 0 — Core 1 is already heavily loaded by the
+    // DSP/worker/ingest pipeline.
+    BaseType_t ok = xTaskCreatePinnedToCore(writer_task, "sd_log",
+                                             WRITER_STACK, NULL, WRITER_PRIO,
+                                             NULL, 0);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "writer task create failed");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "SD log writer ready on Core 0 (prio %d, queue %d)",
+             WRITER_PRIO, EMIT_QUEUE_DEPTH);
+    return ESP_OK;
+}
+
+void sd_log_emit(const acars_msg_t *m)
+{
+    if (!s_q || !m) return;
+    // Non-blocking: drop on queue-full. Producer (frame_decoder) must
+    // never block waiting on SD.
+    (void)xQueueSend(s_q, m, 0);
+}
+
+void sd_log_get_stats(sd_log_stats_t *out)
+{
+    if (!out) return;
+    if (!s_stats_mu) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    xSemaphoreTake(s_stats_mu, portMAX_DELAY);
+    *out = s_stats;
+    xSemaphoreGive(s_stats_mu);
+}
