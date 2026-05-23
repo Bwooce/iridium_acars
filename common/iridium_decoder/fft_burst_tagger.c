@@ -36,9 +36,11 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #define FBT_NOW_US() ((uint64_t)esp_timer_get_time())
+#define FBT_HOT IRAM_ATTR
 #else
 #include <time.h>
 static inline uint64_t fbt_now_us(void)
@@ -48,6 +50,7 @@ static inline uint64_t fbt_now_us(void)
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 #define FBT_NOW_US() fbt_now_us()
+#define FBT_HOT
 #endif
 
 #define N FBT_FFT_SIZE
@@ -351,7 +354,7 @@ void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start)
 // Window-multiply the input into a caller-provided FFT scratch
 // buffer. Q15 × Q15 → Q15. Buffer-pointer parameter so pipelined
 // mode can ping-pong between two fft_buf instances.
-static void window_multiply(fft_burst_tagger_t *t,
+static FBT_HOT void window_multiply(fft_burst_tagger_t *t,
                              const int16_t *input,
                              int16_t *fb_out)
 {
@@ -382,7 +385,7 @@ static inline void mag_sq_pass(const int16_t * __restrict__ src_iq,
     }
 }
 
-static void compute_magnitude_shifted(fft_burst_tagger_t *t,
+static FBT_HOT void compute_magnitude_shifted(fft_burst_tagger_t *t,
                                        const int16_t *fb)
 {
     int32_t *out = t->magnitude_shifted;
@@ -404,7 +407,7 @@ static inline bool above_threshold(int32_t mag2, int32_t baseline_sum,
 }
 
 // Update existing bursts' last_active timestamp.
-static void update_bursts_internal(fft_burst_tagger_t *t)
+static FBT_HOT void update_bursts_internal(fft_burst_tagger_t *t)
 {
     for (int b = 0; b < t->n_bursts; b++) {
         int cb = t->bursts[b].center_bin;
@@ -455,7 +458,7 @@ static void rebuild_burst_mask(fft_burst_tagger_t *t)
 //   (mag² × HISTORY_SIZE) / (baseline_sum + 1)
 // — same numerator we already form in above_threshold, so the cost
 // added by the sort-key swap is a single int64 divide per peak.
-static int create_new_bursts_internal(fft_burst_tagger_t *t,
+static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
                                        fbt_burst_t *out_new, int max_new)
 {
     int n_peaks = 0;
@@ -531,7 +534,7 @@ static int create_new_bursts_internal(fft_burst_tagger_t *t,
 
 // Erase bursts whose last_active is older than burst_post_len. Emit
 // the timed-out bursts in out_gone.
-static int delete_gone_bursts_internal(fft_burst_tagger_t *t,
+static FBT_HOT int delete_gone_bursts_internal(fft_burst_tagger_t *t,
                                         fbt_burst_t *out_gone, int max_gone)
 {
     int n_emitted = 0;
@@ -593,7 +596,7 @@ static inline void ema_step_inner(int32_t * __restrict__ bsum,
 // "bulk memcpy + in-SRAM operate + bulk memcpy back" rewrite by
 // ~25 µs/step (opp #3 in opt doc was tried 2026-05-22, regressed
 // base 73 → 99 µs and was reverted).
-static void update_baseline_ema(fft_burst_tagger_t *t)
+static FBT_HOT void update_baseline_ema(fft_burst_tagger_t *t)
 {
     if (t->n_bursts > 0) return;     // burst active → freeze EMA
 
@@ -627,7 +630,7 @@ static inline int16_t *fbt_buf_at(fft_burst_tagger_t *t, int idx)
 // t->d_index to the snapshot for the duration of post-FFT work,
 // and restores afterwards. So step N+1's tagger sees the correct
 // post-advance value when it next reads t->d_index.
-static void tagger_pipe_post_fft(fft_burst_tagger_t *t)
+static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
 {
     int16_t *fb = fbt_buf_at(t, t->pipe_pending_idx);
     uint64_t saved_d = t->d_index;
@@ -662,7 +665,7 @@ static void tagger_pipe_post_fft(fft_burst_tagger_t *t)
     t->d_index = saved_d;
 }
 
-bool fft_burst_tagger_step(fft_burst_tagger_t *t,
+FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
                             const int16_t *input,
                             const int16_t *lookback,
                             fbt_burst_t *out_new_bursts, int *n_new,

@@ -11,6 +11,9 @@
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#define RS25_HOT IRAM_ATTR
+#else
+#define RS25_HOT
 #endif
 
 // Per-phase contiguous tap layout. Each phase gets 16 int16 slots
@@ -245,7 +248,7 @@ void resample_256_to_250_init(resample_256_to_250_t *r)
 // live in caller-owned buffers. Used directly by the split-ingest
 // worker pool; the legacy resample_256_to_250_t wrapper delegates
 // here too.
-int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *delay_q,
+RS25_HOT int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *delay_q,
                                           int *start_pos_io,
                                           const int16_t *in_iq, int n_in_complex,
                                           int16_t *out_iq, int max_out)
