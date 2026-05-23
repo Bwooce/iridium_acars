@@ -12,7 +12,6 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "status_logger.h"
-#include "c6_forwarder.h"
 
 static const char *TAG = "CLASS";  // match the original tag for log continuity
 
@@ -192,31 +191,6 @@ static void logger_task(void *arg)
     while (1) {
         if (xQueueReceive(s_queue, &snap, portMAX_DELAY) == pdTRUE) {
             emit(&snap);
-
-            // D17: forward a thin summary to the C6 companion.
-            // Non-blocking; silently dropped if the c6_forwarder
-            // queue is full or the forwarder isn't initialised.
-            double dsp_pct    = (snap.window_us > 0)
-                ? 100.0 * (double)snap.dsp_total_time_us / (double)snap.window_us
-                : 0.0;
-            double worker_pct = (snap.window_us > 0)
-                ? 100.0 * (double)snap.ws.bursts_processed
-                        * (double)snap.ws.avg_burst_us
-                        / (double)snap.window_us
-                : 0.0;
-            double rate_mb_s  = (snap.window_us > 0)
-                ? ((double)snap.bytes_window * 1e6 / (double)snap.window_us) / (1024.0 * 1024.0)
-                : 0.0;
-            irp_status_snap_t s = {
-                .rate_mb_s      = (float)rate_mb_s,
-                .dsp_cap        = (float)dsp_pct,
-                .worker_cap     = (float)worker_pct,
-                .drops          = snap.us.rb_full_drops,
-                .frames         = snap.dsp_frame_count,
-                .processed      = snap.ws.bursts_processed,
-                .acars_decoded  = snap.ws.bursts_bch_decoded,
-            };
-            (void)c6_forwarder_post_status(&s);
         }
     }
 }

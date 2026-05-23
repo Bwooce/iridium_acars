@@ -15,7 +15,6 @@
 #include "esp_task_wdt.h"
 #include "frame_decoder.h"
 #include "frame_queue.h"
-#include "c6_forwarder.h"
 #include "iridium_frame.h"
 #include "ida_decode.h"
 #include "ibc_decode.h"
@@ -106,35 +105,6 @@ static void try_acars(const sbd_message_t *msg)
                      a->msg_num, a->flight_id,
                      a->crc_ok ? "OK" : "BAD",
                      a->txt ? a->txt : "");
-
-            // D17: forward to C6 companion. Non-blocking. Sequence
-            // number tracks decoded message order.
-            static uint32_t s_seq = 0;
-            irp_acars_msg_t out = {0};
-            out.seq = ++s_seq;
-            out.ts_us = msg->timestamp_us;
-            out.direction = msg->uplink ? 1 : 0;
-            out.mode = (uint8_t)(a->mode ? a->mode : '?');
-            memcpy(out.label, a->label, IRP_ACARS_LABEL_LEN);
-            {
-                size_t n = strnlen(a->flight_id, IRP_ACARS_FLIGHT_LEN);
-                memcpy(out.flight, a->flight_id, n);
-            }
-            {
-                size_t n = strnlen(a->msg_num, IRP_ACARS_MSGNUM_LEN);
-                memcpy(out.msg_num, a->msg_num, n);
-            }
-            if (a->txt) {
-                size_t n = strnlen(a->txt, IRP_ACARS_TEXT_LEN);
-                memcpy(out.text, a->txt, n);
-            }
-            // SBD message doesn't track per-message SNR/freq;
-            // these come from the burst metadata earlier in the
-            // pipeline. Defer until burst→ACARS provenance is
-            // threaded through (deferred to follow-up).
-            out.snr_db = 0.0f;
-            out.freq_hz = 0;
-            (void)c6_forwarder_post_acars(&out);
         } else if (a->reasm_status == LA_REASM_IN_PROGRESS) {
             atomic_fetch_add_explicit(&s_acars_fragments, 1, memory_order_relaxed);
             ESP_LOGD(TAG, "ACARS fragment buffered: label='%.2s' block=%c "
