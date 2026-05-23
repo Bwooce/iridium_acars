@@ -145,6 +145,17 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     //   - PLL_BETA path elided (compile-time 0).
     float complex phi_hat = 1.0f + 0.0f * _Complex_I;
     float omega_hat = 0.0f;
+    // Power-decay truncation (task #73, gri-aligned). Track the running
+    // peak magnitude across the burst; if three consecutive symbols
+    // come in below peak/8, the actual signal has ended and the rest
+    // is noise — truncate to before those 3 symbols so downstream
+    // BCH / UW / DQPSK isn't fed garbage from past-end samples.
+    // See gr-iridium iridium_qpsk_demod_impl.cc:216-225.
+    // Compare in squared magnitude (max/8 linear ≡ max²/64) so no sqrt
+    // per symbol.
+    float max_mag2 = 0.0f;
+    int   low_count = 0;
+    int   n_eff = n_symbols;
     for (int i = 0; i < n_symbols; i++) {
         pll_out[i] = symbols[i] * phi_hat;
 
@@ -168,6 +179,36 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         float ph_re = crealf(phi_hat);
         float ph_im = cimagf(phi_hat);
         phi_hat = (c * ph_re + s * ph_im) + (c * ph_im - s * ph_re) * _Complex_I;
+
+        // Power-decay tracking on the PRE-PLL symbol magnitude (matches
+        // gri — its d_magnitude_f is volk_32fc_magnitude_32f over the
+        // raw `burst` input, not the PLL output). No sqrt: max_mag2 is
+        // max(re² + im²).
+        float sym_re   = crealf(symbols[i]);
+        float sym_im   = cimagf(symbols[i]);
+        float mag2     = sym_re * sym_re + sym_im * sym_im;
+        if (mag2 > max_mag2) max_mag2 = mag2;
+        if (mag2 < max_mag2 * (1.0f / 64.0f)) {
+            if (++low_count == 3) {
+                n_eff = i - 2;       // drop the 3 low symbols themselves
+                if (n_eff < 0) n_eff = 0;
+                break;
+            }
+        } else {
+            low_count = 0;
+        }
+    }
+    if (n_eff < n_symbols) {
+        ESP_LOGD(TAG, "power-decay truncation: %d → %d symbols", n_symbols, n_eff);
+        n_symbols = n_eff;
+    }
+    // After truncation we may not have enough symbols left for the UW
+    // (e.g. an extremely short burst with noise immediately after the
+    // preamble). Reject before the UW check reads past the valid range.
+    if (n_symbols < IR_UW_LENGTH) {
+        ESP_LOGD(TAG, "truncated below UW length (%d < %d), reject",
+                 n_symbols, IR_UW_LENGTH);
+        return 0;
     }
 
     // 3. UW Check — exact port of gr-iridium's check_sync_word()
