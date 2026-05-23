@@ -115,10 +115,22 @@ static const char s_index_html[] =
     "<p><small>Current status: <a href=\"/status\">/status</a></small></p>"
     "</body></html>";
 
+// Shown only in STA mode (we're already at the form when in AP).
+static const char s_index_reset_block[] =
+    "<hr style=\"margin-top:2em\">"
+    "<form method=\"POST\" action=\"/reset\" onsubmit=\"return confirm('Clear Wi-Fi credentials and reboot to AP mode?');\">"
+    "<button type=\"submit\" style=\"background:#a00\">Reset Wi-Fi → AP mode</button>"
+    "</form>";
+
 static esp_err_t index_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, s_index_html, sizeof(s_index_html) - 1);
+    httpd_resp_send_chunk(req, s_index_html, sizeof(s_index_html) - 1);
+    if (!wifi_link_is_ap_mode()) {
+        httpd_resp_send_chunk(req, s_index_reset_block,
+                              sizeof(s_index_reset_block) - 1);
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 // URL-decode a single %XX or '+' from src to dst in-place. Returns bytes
@@ -326,6 +338,32 @@ static esp_err_t messages_get(httpd_req_t *req)
     return httpd_resp_send_chunk(req, NULL, 0);   // end of chunked response
 }
 
+static esp_err_t reset_post(httpd_req_t *req)
+{
+    ESP_LOGW(TAG, "/reset POST: clearing Wi-Fi NVS + rebooting to AP mode");
+
+    esp_err_t r1 = app_config_set_wifi_ssid("");
+    esp_err_t r2 = app_config_set_wifi_psk("");
+    if (r1 != ESP_OK || r2 != ESP_OK) {
+        ESP_LOGE(TAG, "NVS clear failed: ssid=%s psk=%s",
+                 esp_err_to_name(r1), esp_err_to_name(r2));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "nvs clear failed\n", HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    const char *ok =
+        "<!doctype html><html><body style=\"font-family:system-ui;max-width:480px;margin:2em auto;padding:0 1em\">"
+        "<h1>Reset — rebooting to AP mode</h1>"
+        "<p>Wi-Fi credentials cleared. The device will reboot and come "
+        "back up as an open AP. Re-join it to configure new credentials.</p>"
+        "</body></html>";
+    httpd_resp_send(req, ok, HTTPD_RESP_USE_STRLEN);
+
+    xTaskCreate(deferred_reboot_task, "reboot", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
 esp_err_t http_server_start(void)
 {
     if (s_server) return ESP_OK;
@@ -349,6 +387,7 @@ esp_err_t http_server_start(void)
         { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
         { .uri = "/messages", .method = HTTP_GET,  .handler = messages_get, .user_ctx = NULL },
         { .uri = "/config",   .method = HTTP_POST, .handler = config_post,  .user_ctx = NULL },
+        { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,   .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
