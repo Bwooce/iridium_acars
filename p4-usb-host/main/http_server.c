@@ -74,6 +74,7 @@ static esp_err_t status_get(httpd_req_t *req)
             "\"station_id\":\"%s\","
             "\"lo_freq_hz\":%u,"
             "\"sample_rate_hz\":%u,"
+            "\"bias_tee\":%s,"
             "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
             "\"ota_url\":\"%s\","
             "\"decode\":{"
@@ -96,6 +97,7 @@ static esp_err_t status_get(httpd_req_t *req)
         cfg.station_id,
         (unsigned)cfg.lo_freq_hz,
         (unsigned)cfg.sample_rate_hz,
+        cfg.bias_tee ? "true" : "false",
         cfg.out_host,
         (unsigned)cfg.out_port,
         (cfg.out_host[0] && cfg.out_port) ? "true" : "false",
@@ -142,6 +144,9 @@ static const char s_index_html[] =
     "<input type=\"text\" name=\"ssid\" required maxlength=\"32\">"
     "<label>Password</label>"
     "<input type=\"password\" name=\"psk\" maxlength=\"63\">"
+    "<h2>SDR</h2>"
+    "<label><input type=\"checkbox\" name=\"bias_tee\" value=\"1\"> "
+    "Enable RTL-SDR v4 bias tee (5 V on antenna line, for active antennas / LNAs)</label>"
     "<h2>ACARS push (optional, UDP)</h2>"
     "<label>Host (IP or hostname; leave empty to disable)</label>"
     "<input type=\"text\" name=\"out_host\" maxlength=\"63\">"
@@ -258,8 +263,14 @@ static esp_err_t config_post(httpd_req_t *req)
     char ota_url[128] = {0};
     form_field(body, total, "ota_url", ota_url, sizeof(ota_url));
 
-    ESP_LOGI(TAG, "/config POST: ssid='%s' (psk %s), out=%s:%u, ota_url=%s",
-             ssid, psk[0] ? "set" : "empty",
+    // Bias-tee checkbox: present in form body only if checked (HTML form
+    // convention). form_field returns ESP_OK iff the key is present.
+    char bias_tee_s[4] = {0};
+    bool bias_tee = (form_field(body, total, "bias_tee", bias_tee_s,
+                                sizeof(bias_tee_s)) == ESP_OK);
+
+    ESP_LOGI(TAG, "/config POST: ssid='%s' (psk %s), bias_tee=%d, out=%s:%u, ota_url=%s",
+             ssid, psk[0] ? "set" : "empty", (int)bias_tee,
              out_host[0] ? out_host : "(none)", (unsigned)out_port,
              ota_url[0] ? ota_url : "(none)");
 
@@ -268,11 +279,12 @@ static esp_err_t config_post(httpd_req_t *req)
     esp_err_t r3 = app_config_set_out_host(out_host);
     esp_err_t r4 = app_config_set_out_port(out_port);
     esp_err_t r5 = app_config_set_ota_url(ota_url);
-    if (r1 || r2 || r3 || r4 || r5) {
-        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s",
+    esp_err_t r6 = app_config_set_bias_tee(bias_tee);
+    if (r1 || r2 || r3 || r4 || r5 || r6) {
+        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s bias=%s",
                  esp_err_to_name(r1), esp_err_to_name(r2),
                  esp_err_to_name(r3), esp_err_to_name(r4),
-                 esp_err_to_name(r5));
+                 esp_err_to_name(r5), esp_err_to_name(r6));
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "nvs write failed\n", HTTPD_RESP_USE_STRLEN);
     }

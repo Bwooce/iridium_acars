@@ -120,13 +120,11 @@ static void action_start_stream(class_driver_t *driver_obj)
         // Convert tenths of dB to the RTL-SDR API unit (also tenths of dB).
         rtlsdr_set_tuner_gain(rtldev, cfg.gain_db_x10);
     }
-    // Bias tee: RTL-SDR v4 specific. Driver hook may not be present
-    // in this build — call only if available.
-#ifdef RTLSDR_HAS_BIAS_TEE
-    rtlsdr_set_bias_tee(rtldev, cfg.bias_tee ? 1 : 0);
-#else
-    (void)cfg.bias_tee;
-#endif
+    // Bias tee: RTL-SDR v4 specific. Drives the 5 V bias on the antenna
+    // line via the dongle's GPIO 0. Safe no-op on hardware without an
+    // active antenna or LNA.
+    int br = rtlsdr_set_bias_tee(rtldev, cfg.bias_tee ? 1 : 0);
+    ESP_LOGI(TAG, "bias_tee: %s (rc=%d)", cfg.bias_tee ? "ON" : "OFF", br);
     rtlsdr_reset_buffer(rtldev);
 
     ESP_LOGI(TAG, "Initializing System Buffers...");
