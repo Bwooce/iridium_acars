@@ -267,9 +267,16 @@ fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
     t->burst_id = 0;
 
 #if defined(ESP_PLATFORM)
-    // Pipelined helper: allocate the alt fft_buf in PSRAM (fft_sc16_2048
-    // copies through internal scratch internally, so PSRAM is fine for
-    // the source buffer). Spawn the helper task on Core 1.
+    // Pipelined helper: alt fft_buf in PSRAM.
+    //
+    // EXPERIMENT (2026-05-23) tried INTERNAL SRAM: fft_buf_alt
+    // landed at 0x4ff6b6b0 (middle of main RAM, PIE-broken zone),
+    // decode collapsed matched=61 → 41. fft_buf_alt is a PIE-
+    // touched buffer (window writes, fft_sc16_2048 reads via
+    // memcpy) and inherits the position-sensitivity bug. Small-RAM
+    // safe zone is already full (s_coeffs_pp + s_w_table +
+    // s_fft_scratch = 16 KB of the 18 KB region). PSRAM is the
+    // only reliable placement until the silicon bug is root-caused.
     t->fft_buf_alt = (int16_t *)heap_caps_aligned_alloc(
         16, 2 * N * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (!t->fft_buf_alt) {
