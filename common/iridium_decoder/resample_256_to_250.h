@@ -40,6 +40,14 @@ typedef struct {
     firmr_s16_t fir_q;
 } resample_256_to_250_t;
 
+// Early one-time allocation of the polyphase-coefficient singleton
+// (s_coeffs_pp, 4 KB internal SRAM). Call as the FIRST internal-SRAM
+// consumer in boot to guarantee deterministic placement at the
+// top-of-RAM address (~0x4ff7e300 on P4), which is required for
+// the PIE asm to produce correct outputs.
+// See memory note project_heap_position_decode_bug.md.
+void resample_256_to_250_alloc_coeffs(void);
+
 // Init the resampler. Generates the 125-phase Kaiser FIR taps
 // internally. Idempotent (safe to call multiple times — re-resets
 // state).

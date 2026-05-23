@@ -170,34 +170,46 @@ static void make_resample_coeffs(int16_t *coeffs)
     free(w);
 }
 
-void resample_256_to_250_init(resample_256_to_250_t *r)
+void resample_256_to_250_alloc_coeffs(void)
 {
-    make_resample_coeffs(r->coeffs);
-
-    // First-time allocation of the per-phase tap singleton. On
-    // ESP_PLATFORM we request MALLOC_CAP_INTERNAL (NOT _DMA) so the
-    // request comes out of the post-DMA-reserve internal-SRAM pool;
-    // a static .dram.bss array would fragment the pre-reserve heap
-    // and trip esp_psram's 144 KB DMA-pool reservation (boot panic
-    // with ESP_ERR_NO_MEM). On host the storage is a plain static
-    // array already aliased to s_coeffs_pp.
+    // Allocates s_coeffs_pp ONLY (no per-instance state). Provided
+    // as a separate entry point so callers can ensure the polyphase
+    // coefficient table lands at a deterministic internal-SRAM
+    // address by calling this BEFORE any other heap-touching init.
+    //
+    // Why: a latent bug in the PIE asm path requires s_coeffs_pp at
+    // exactly 0x4ff7e300 on P4 — any other heap-shift breaks decode
+    // (matched 61 → 44). See memory note
+    // project_heap_position_decode_bug.md. By calling this first,
+    // the TLSF allocator places s_coeffs_pp at the highest free block
+    // (which currently maps to the magic address).
 #if defined(ESP_PLATFORM)
     if (s_coeffs_pp == NULL) {
         s_coeffs_pp = (int16_t *)heap_caps_aligned_alloc(
             16, RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t),
             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (s_coeffs_pp == NULL) {
-            // Boot will crash downstream when the resampler is hit;
-            // this is fatal and the caller has no fallback.
-            return;
+        if (s_coeffs_pp) {
+            ESP_LOGI("RS25", "s_coeffs_pp allocated at %p (size=%u B) [early]",
+                     s_coeffs_pp,
+                     (unsigned)(RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t)));
+        } else {
+            ESP_LOGE("RS25", "s_coeffs_pp INTERNAL alloc FAILED");
         }
-        // Log the actual address so we can verify the alloc landed
-        // in internal SRAM (0x4FFxxxxx region) and not PSRAM
-        // (0x48xxxxxx). A PSRAM fallback would preserve correctness
-        // but eat the perf gain.
-        ESP_LOGI("RS25", "s_coeffs_pp allocated at %p (size=%u B)",
-                 s_coeffs_pp,
-                 (unsigned)(RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t)));
+    }
+#endif
+}
+
+void resample_256_to_250_init(resample_256_to_250_t *r)
+{
+    make_resample_coeffs(r->coeffs);
+
+    // Lazy fallback: if early alloc wasn't called, do it here.
+    // Production callers should call resample_256_to_250_alloc_coeffs
+    // before any other internal-SRAM consumer to guarantee placement.
+    resample_256_to_250_alloc_coeffs();
+#if defined(ESP_PLATFORM)
+    if (s_coeffs_pp == NULL) {
+        return;   // fatal; downstream PIE asm will crash
     }
 #endif
 

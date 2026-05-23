@@ -15,6 +15,7 @@
 #include "esp_random.h"
 #include "esp_task_wdt.h"
 #include "esp_attr.h"
+#include "resample_256_to_250.h"
 #include "esp_chip_info.h"
 #include "sdkconfig.h"
 #include "ingest_core1.h"
@@ -463,6 +464,14 @@ void smoke_test_run(void)
                  where, fi, li, fid, lid); \
     } while (0)
 
+    // CRITICAL: allocate s_coeffs_pp FIRST so the TLSF allocator
+    // deterministically places it in the 18 KB small-RAM region
+    // (currently 0x4ff3e330). Any later ordering risks placing it
+    // at a position the PIE asm path can't handle, which silently
+    // collapses decode 61 → 44. See memory note
+    // project_heap_position_decode_bug.md.
+    resample_256_to_250_alloc_coeffs();
+    HEAP_LOG("post-coeffs_pp");
     HEAP_LOG("pre-signal_buffer");
     if (signal_buffer_init() != ESP_OK) {
         ESP_LOGE(TAG, "signal_buffer_init failed -> SMOKE_FAIL");
