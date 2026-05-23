@@ -17,6 +17,38 @@ Current state at time of writing:
 | Resample per dispatch | 2.67 ms (was 17.9 ms) |
 | Host bch/qpsk/pipeline ctest | 20/20 pass |
 
+### 2026-05-23 update — post D17-redo (esp_wifi_remote + esp_hosted landed)
+
+Adding `esp_wifi_remote` + `esp_hosted` (commit `bba7817`) shifted code
+in flash and added ~30 KB of always-on runtime. Then `IRAM_ATTR`-ed
+the inner DSP kernels (commit `354f46f`) to mitigate the layout hit.
+Re-measured on the same RAW_IRIDIUM fixture + LIVE_SDR run:
+
+| metric | pre-D17-redo | post-D17-redo |
+|---|---|---|
+| RAW_IRIDIUM matched | 61 | **61** (same) |
+| RAW_IRIDIUM recall | 93.8% | **93.8%** (same) |
+| LIVE_SDR USB sustained | 4.25 MB/s | 3.58 MB/s |
+| DSP wind/frame | ~16 µs | 76 µs |
+| DSP fft/frame | ~256 µs | 256 µs |
+| DSP mag/frame | ~46 µs | 46 µs |
+| DSP detect/frame | ~33 µs | 94-177 µs |
+| Resample per dispatch | 2.67 ms | **3.79 ms** |
+| sbpush per dispatch | n/a | 0.19 ms |
+| convert per dispatch | n/a | 0.33 ms |
+
+The biggest change is resample (+1.1 ms/dispatch). At 225 dispatches/sec
+in live mode that's 250 ms/sec of extra Core 1 work — and resample is
+**85 % of one core** outright. **`resample_256_to_250_process_explicit`
+is now the dominant real-time lever** (was the throughput lever back at
+2.67 ms; now it's the throughput lever AND the only obviously-attackable
+one).
+
+Smoke perf bars rebaselined in `smoke_test.c` to current numbers + ~30 %
+headroom (commit landing alongside this doc update). The old bars (wind
+25 µs, detect 50 µs, push 130 µs) reflected the pre-Wi-Fi code layout
+and no longer reflect a useful regression gate.
+
 ---
 
 ## 1. Drop RTL-SDR rate from 2.56 → 2.0 MSPS (gri-aligned)

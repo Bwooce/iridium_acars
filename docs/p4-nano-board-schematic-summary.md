@@ -85,14 +85,29 @@ CHIP_PU (`ESP_EN`) is driven only by the RESET button and the CH343P's
 RTS/DTR (USB-CDC reset glue, via the discrete U6 transistor on the USB-to-UART
 sheet); the C6 has no hardware path to reset the P4.
 
-> **Ambiguity:** the PDF text dump shows six 1K series resistors (R15, R16,
-> R18-R21) for the C6↔P4 high-speed bus, but the visible GPIO labels in the
-> rendered schematic only confidently bind R15/R16 to GPIO17/GPIO16 (UART)
-> and R18-R21 to GPIO15/14/18/19. The exact SDIO CLK/CMD/D0..D3 lane
-> assignments depend on which side has the pull-up and which is open-drain;
-> ESP-Hosted's `sdio_slave` default on C6 uses IO19=CLK, IO18=CMD,
-> IO20/21/22/23=D0..D3. Cross-check against Waveshare's ESP-Hosted-MCU build
-> config before committing to a final mapping in firmware.
+> **Ambiguity (resolved 2026-05-23):** the PDF text dump shows six 1K series
+> resistors (R15, R16, R18-R21) for the C6↔P4 high-speed bus. The original
+> read of this doc labelled R15/R16 as UART (GPIO17/GPIO16 → C6
+> U0TXD/U0RXD) and R18-R21 as SDIO. **The empirical reality (D17 redo,
+> commit `bba7817`) is that the working transport uses all six lines as
+> SDIO**, mapping P4 GPIO 14-19 to C6 IO20/21/22/23 + IO18 + IO19:
+>
+> | P4 | C6 | Role |
+> |---|---|---|
+> | GPIO14 | IO20 | SDIO D0 |
+> | GPIO15 | IO21 | SDIO D1 |
+> | GPIO16 | IO22 | SDIO D2 |
+> | GPIO17 | IO23 | SDIO D3 |
+> | GPIO18 | IO18 | SDIO CLK |
+> | GPIO19 | IO19 | SDIO CMD |
+>
+> Whether the PDF's apparent "UART on R15/R16" net-label was a
+> mis-read or whether the board supports a UART-mode strap is not
+> known and not material — `esp_hosted` running over these pins
+> works end-to-end (Wi-Fi STA reaches the C6, RPC pings round-trip).
+> The previous c6-companion design's UART transport (commit
+> `20643e3`, reverted in `15c8205`) tried to drive these pins as
+> UART1 alongside SDIO and never reached the C6.
 
 ---
 
