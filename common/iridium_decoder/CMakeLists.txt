@@ -39,6 +39,10 @@ idf_component_register(
         # sv_id / beam_id + 3D satellite position (x, y, z in 4-km
         # units, converted to geocentric lat/lon/altitude).
         "ira_decode.c"
+        # Phase D15+: TL (Time/Location) body parser -- extracts the
+        # ITL version + sat plane number. Partial port; full PRS
+        # message decode (sat XYZ + UTC) is future work.
+        "tl_decode.c"
         # Phase D15: IMS (Iridium Messaging) header parser -- extracts
         # ms_type / block / frame / bch_blocks / group from the first
         # post-header BCH block. Body parsing (paging/alphanumeric) is

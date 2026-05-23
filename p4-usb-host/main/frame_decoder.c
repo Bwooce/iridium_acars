@@ -20,6 +20,7 @@
 #include "ibc_decode.h"
 #include "ira_decode.h"
 #include "ims_decode.h"
+#include "tl_decode.h"
 #include "sbd_reassembler.h"
 #include "msg_ring.h"
 #include "acars_push.h"
@@ -177,12 +178,23 @@ static void process_one(const frame_queue_item_t *it)
         }
         break;
     }
-    case IR_FRAME_TL:
+    case IR_FRAME_TL: {
         atomic_fetch_add_explicit(&s_class_tl, 1, memory_order_relaxed);
-        ESP_LOGI(TAG, "FRAME: TL bin=%ld snr=%.1f freq=%lu",
-                 (long)it->peak_bin, (double)it->snr_db,
-                 (unsigned long)it->freq_hz);
+        tl_decoded_t tl = { 0 };
+        tl_decode(&classified, &tl);
+        if (tl.version >= 1 && tl.plane >= 0) {
+            ESP_LOGI(TAG, "FRAME: TL V%d plane=%d bin=%ld snr=%.1f freq=%lu",
+                     tl.version, tl.plane,
+                     (long)it->peak_bin, (double)it->snr_db,
+                     (unsigned long)it->freq_hz);
+        } else {
+            ESP_LOGI(TAG, "FRAME: TL (v%d plane=%d unknown) bin=%ld snr=%.1f freq=%lu",
+                     tl.version, tl.plane,
+                     (long)it->peak_bin, (double)it->snr_db,
+                     (unsigned long)it->freq_hz);
+        }
         break;
+    }
     case IR_FRAME_BC: {
         atomic_fetch_add_explicit(&s_class_bc, 1, memory_order_relaxed);
         // D15: extract IBC body fields (sv_id, beam, time). The
