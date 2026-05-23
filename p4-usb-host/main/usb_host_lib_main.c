@@ -17,6 +17,7 @@
 #include "app_config.h"
 #include "agc.h"
 #include "wifi_link.h"
+#include "http_server.h"
 
 #if CONFIG_SMOKE_TEST_MODE
 #include "smoke_test.h"
@@ -154,11 +155,13 @@ void app_main(void)
     // D16 software AGC. Idle unless gain_mode==SOFTWARE_AGC.
     agc_init();
 
-    // D17 Wi-Fi STA via the C6 esp_hosted slave. No-op if no SSID set
-    // in NVS; the smoke-mode build also skips this since the SDIO link
-    // to the C6 isn't useful during the synthetic-fixture regression.
+    // D17 Wi-Fi via the C6 esp_hosted slave. STA if SSID in NVS, else
+    // open SoftAP for first-time config. The smoke-mode build skips
+    // Wi-Fi entirely since the SDIO link to the C6 isn't useful
+    // during the synthetic-fixture regression.
 #if !CONFIG_SMOKE_TEST_MODE
     wifi_link_start();
+    http_server_start();
 #endif
 
 #if CONFIG_SMOKE_TEST_MODE
