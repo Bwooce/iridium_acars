@@ -474,6 +474,25 @@ void worker_task(void *arg)
                 s_bursts_skipped++;
                 continue;
             }
+
+            // Stale-burst guard (task #60/#65): the producer may have
+            // lapped the signal buffer between when this burst was
+            // queued and when the worker dequeued it (queue backlog
+            // under live-SDR load). Reading the burst's window now
+            // would extract garbage from later ingest data. Skip.
+            //
+            // We use a conservative envelope (length + pre-pad) so the
+            // check matches what signal_buffer_invalidate_range +
+            // signal_buffer_read_chunk will touch later.
+            uint32_t check_start = burst.start_sample_idx - WB_PRE_PAD_SAMPLES;
+            uint32_t check_len   = burst.length_samples + WB_PRE_PAD_SAMPLES;
+            if (!signal_buffer_burst_valid(check_start, check_len)) {
+                ESP_LOGW(TAG, "stale burst: start=%lu len=%lu (head wrapped) — drop",
+                         (unsigned long)burst.start_sample_idx,
+                         (unsigned long)burst.length_samples);
+                s_bursts_skipped++;
+                continue;
+            }
             uint32_t safe_len = burst.length_samples;
             if (safe_len > (uint32_t)WB_MAX_BURST_SAMPLES) {
                 safe_len = (uint32_t)WB_MAX_BURST_SAMPLES;

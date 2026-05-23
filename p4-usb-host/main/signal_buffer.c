@@ -114,6 +114,29 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
     head = (head + (uint32_t)n_samples) % total_cap;
 }
 
+uint32_t signal_buffer_head(void)
+{
+    // Single 32-bit read of a producer-updated counter. The worker
+    // reading this can see at worst a slightly-stale value, which only
+    // biases stale-burst checks toward false-positive (skip a burst
+    // that was actually fine). That's acceptable; we never get a false
+    // negative (think a burst is valid when it's not).
+    return head;
+}
+
+bool signal_buffer_burst_valid(uint32_t start_idx, uint32_t length)
+{
+    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
+    if (length == 0 || length >= total_cap) return false;
+
+    // Distance from the burst's END (in producer order) to the current
+    // head, modulo wrap. If this exceeds (total_cap - length), the
+    // producer has lapped onto the burst's window — data is gone.
+    uint32_t end       = (start_idx + length) % total_cap;
+    uint32_t since_end = (head - end + total_cap) % total_cap;
+    return since_end <= (total_cap - length);
+}
+
 void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest)
 {
     if (!circular_buf) return;

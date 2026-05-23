@@ -25,4 +25,16 @@ void signal_buffer_invalidate_range(uint32_t start_idx, uint32_t length);
 // PSRAM write traffic when the chunked decim loop reads directly.
 void signal_buffer_read_chunk(uint32_t start_idx, uint32_t length, int16_t *dest);
 
+// Current write position (in complex samples). Useful for callers that
+// need to gauge how much capacity remains before a queued burst's
+// window gets overwritten.
+uint32_t signal_buffer_head(void);
+
+// True iff [start_idx, start_idx + length) of the circular buffer still
+// holds the original-pushed data — i.e. the producer hasn't yet lapped
+// onto the burst window. Returns false when the burst is stale and
+// would extract garbage; the worker uses this to skip rather than
+// decode noise.
+bool signal_buffer_burst_valid(uint32_t start_idx, uint32_t length);
+
 #endif
