@@ -96,6 +96,29 @@ None of these have a clean fix today. The split-resample
 architecture stays gated behind reducing Core 0 tagger load via
 some structural change (Opp #1 the most concrete).
 
+## Pipelined-tagger alternative (2026-05-23): attempted, parked
+
+Tried Pipelining the tagger stages: tagger does window+FFT for
+step N+1 on Core 0 while a Core 1 helper does mag+detect+EMA for
+step N. Expected gain: max(327 µs, 216 µs) per step instead of
+sequential 543 µs = ~14% Core 0 freed.
+
+Initial implementation got DSP/frame=470 µs at the cost of decode
+regression (matched=61 → 44). Diagnostic bisect revealed the
+regression was NOT in the pipelining code — it was a latent
+ESP32-P4 v1.3 silicon bug where PIE asm produces wrong output at
+specific HP-SRAM addresses. The struct expansion incidental to
+pipelining was triggering the bug by shifting `s_coeffs_pp` to a
+broken position.
+
+Workaround landed (commit `cfd2739`): `resample_256_to_250_alloc_coeffs()`
+called first in boot, deterministically placing the buffer at a
+known-working address. See `project_heap_position_decode_bug.md`
+and `project_p4_errata_status.md`.
+
+The pipelined-tagger refactor itself was REVERTED. Re-attempt
+should be feasible now that the silicon-bug trigger is mitigated.
+
 ## Alternative considered: split burst_worker instead
 
 Could we split the burst-decode worker (worker_core1) into two

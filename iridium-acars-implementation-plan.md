@@ -99,17 +99,18 @@ matched-filter + multi-frame retry loop on Core 1
 (~63 ms/burst, intrinsically serial within one burst).
 
 Approaches considered for the worker gap, with current verdicts
-(updated 2026-05-22):
+(updated 2026-05-23):
 
 | approach | viability | notes |
 |---|---|---|
 | Tighten tagger window (task #70) | rejected | Sweep shows every clip costs recall; multi-frame loop needs the 16 ms post-pad. Memory note `project_tagger_postpad_coupled_to_multiframe.md`. |
 | PIE FFT for CFO (N=4096) | retried, deferred | esp-dsp's single-instance init forced manual twiddle handling; PIE result had subtle float divergence that caused -1 BCH frame regression. Needs bit-exact diff harness like #67 before retry. |
 | Chunked RRC PIE FIR | failed twice | Static-BSS variant broke boot (PSRAM DMA pool reserve), heap-alloc variant produced corrupt output (streaming FIR semantics quirk in arp4). Worth another look. |
-| Two-worker burst pool | **blocked (memory)** | Each instance needs ~34 KB internal SRAM (chunk_iq + decim scratches) plus uw_correlator API refactor for its ~50 KB FFT scratches. Largest contiguous internal SRAM block after init = 31 KB. Doesn't fit without further internal-SRAM freeing. |
-| Two-worker parallel resample | **architecture built, blocked (L2)** | Within-chunk split implemented and validated bit-exact (commit `aad9735`). At split>0, FFT cost on Core 0 jumps 263→443 µs due to L2 contention not addressable today. Default split_pct=0 ships. See `docs/split-resample-sweep-2026-05-22.md`. |
-| Conditional multi-frame iteration | **tried, reverted** | Saved ~40 ms/burst but cost matched 61→56 and BCH 29→25 — quality regression. Quality-must-not-be-compromised policy. |
-| Drop input to 2.0 MSPS (task #1 in opt doc) | **available, deferred** | Deletes the resampler entirely, closes the 11% USB gap. Trade-off: ~22% less spectrum captured. Worth it only if real-RF reveals the gap is binding. |
+| Two-worker burst pool | blocked (memory) | Each instance needs ~34 KB internal SRAM. Largest contiguous block after init = 31 KB. Doesn't fit without further freeing. |
+| Two-worker parallel resample | architecture built, blocked (L2 contention) | Within-chunk split implemented and validated bit-exact (commit `aad9735`). At split>0, FFT cost on Core 0 jumps 263→443 µs. Default split_pct=0 ships. See `docs/split-resample-sweep-2026-05-22.md`. |
+| Pipelined tagger (FFT step N+1 ‖ post-FFT step N) | attempted, exposed silicon bug | Refactor surfaced a latent P4 v1.3 PIE position-dependent corruption bug (matched 61→44 on heap shift). Workaround landed (`resample_256_to_250_alloc_coeffs` early in boot, commit `cfd2739`). Pipelining itself parked. Memory note `project_heap_position_decode_bug.md`. |
+| Conditional multi-frame iteration | tried, reverted | Saved ~40 ms/burst but cost matched 61→56 and BCH 29→25 — quality regression. Quality-must-not-be-compromised policy. |
+| Drop input to 2.0 MSPS (task #1 in opt doc) | available, deferred | Deletes the resampler entirely, closes the 11% USB gap. Trade-off: ~22% less spectrum captured. Worth it only if real-RF reveals the gap is binding. |
 
 See `Forward plan` below for the concrete next steps.
 
@@ -185,6 +186,28 @@ static-global FFT scratches per-instance. Largest contiguous
 internal SRAM block after init: 31 KB. **Doesn't fit** without
 freeing more internal SRAM first — and the two ways tried (peaks-
 PSRAM, L2 reduction) both regressed something else.
+
+### 6.5 P4 v1.3 PIE position-dependent corruption — WORKAROUND LANDED
+
+Discovered 2026-05-23 while attempting pipelined tagger. PIE asm
+`esp.vld.128.ip` produces silently wrong output when
+`s_coeffs_pp` lands at certain HP-SRAM addresses (e.g.,
+0x4ff737e0). Decode collapses matched=61→44 with no other
+symptom. Not in the official ESP32-P4 v1.3 errata list; fits the
+pattern of "silent bus/address corruption on v1.3 silicon"
+alongside MSPI-750, APM-560, and IDF #18235.
+
+Workaround in commit `cfd2739`: new `resample_256_to_250_alloc_coeffs()`
+called as FIRST internal-SRAM consumer in boot, deterministically
+placing the 4 KB buffer at 0x4ff3e330 (small-RAM region). Future
+heap-growing changes are now position-independent for the
+resampler. See memory note `project_heap_position_decode_bug.md`
+and the errata audit `project_p4_errata_status.md`.
+
+The pipelined-tagger refactor itself is parked — it's blocked
+behind a clean way to extract mag/detect/EMA into a separately
+dispatched function. The expected gain (~14% Core 0 freed,
+DSP/frame 548→470 µs) is real but the refactor is non-trivial.
 
 ### 7. RRC scratch boot-time alloc (task #58 follow-up)
 

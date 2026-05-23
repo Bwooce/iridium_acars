@@ -174,6 +174,34 @@ headroom.
 
 ---
 
+## Cross-cutting constraint discovered 2026-05-23: PIE position-dependent corruption
+
+While attempting pipelined-tagger (FFT step N+1 ‖ post-FFT step N
+on Core 1), a latent silicon bug surfaced: PIE asm
+`esp.vld.128.ip` produces SILENTLY WRONG output for the polyphase
+coefficient buffer at certain HP-SRAM addresses on ESP32-P4 v1.3.
+Decode collapses matched=61 → 44 (recall 93.8% → 67.7%).
+
+- Not in any of the seven named v1.3 errata.
+- Three theory tests done (L1 d-cache writeback, invalidate,
+  non-cacheable alias) — all failed to fix or were rejected by
+  the silicon (PIE faults on the 0x40000000 alias).
+- Workaround: alloc `s_coeffs_pp` FIRST in boot via the new
+  `resample_256_to_250_alloc_coeffs()` API. TLSF places it at
+  0x4ff3e330 (small-RAM region), deterministic across builds.
+
+Implication for the opportunities below: **any future change that
+grows pre-resample internal-SRAM consumption must verify
+s_coeffs_pp still lands at a working address.** The alloc-first
+workaround eliminates the risk for the resampler's own coeffs,
+but if a similar pattern surfaces for another PIE-asm buffer
+(e.g., FFT twiddles, channelizer coefficients), the same workaround
+applies: alloc FIRST.
+
+See `project_heap_position_decode_bug.md`, `project_p4_errata_status.md`.
+
+---
+
 ## Non-opportunities (deprioritised)
 
 - **Resampler closer to 0.5 ms floor:** Current 2.67 ms is dominated
