@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "usb/usb_host.h"
 #include "sdkconfig.h"
+#include "app_config.h"
 
 #if CONFIG_SMOKE_TEST_MODE
 #include "smoke_test.h"
@@ -142,6 +143,12 @@ void app_main(void)
         }
         ESP_LOGW("BOOT", "reset reason: %s (%d)", name, (int)r);
     }
+
+    // Load runtime config from NVS (D18). Defaults are applied for any
+    // missing keys — system stays operational with no NVS data.
+    app_config_init();
+    app_config_log();
+
 #if CONFIG_SMOKE_TEST_MODE
     // Smoke test mode: bypass the USB stack entirely and run the
     // synthetic-IQ regression test on a single Core 0 task. The smoke

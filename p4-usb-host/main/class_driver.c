@@ -22,6 +22,7 @@
 #include "ingest_core1.h"
 #include "resample_256_to_250.h"
 #include "fft_sc16_2048.h"
+#include "app_config.h"
 #include "bch_decoder.h"
 #include "rtl-sdr.h"
 #include "status_logger.h"
@@ -85,10 +86,30 @@ static void action_open_dev(class_driver_t *driver_obj)
 
 static void action_start_stream(class_driver_t *driver_obj)
 {
-    ESP_LOGI(TAG, "Configuring RTL-SDR...");
-    rtlsdr_set_sample_rate(rtldev, FS_IN_HZ);
-    rtlsdr_set_center_freq(rtldev, IRIDIUM_CENTER_FREQ_HZ);
-    rtlsdr_set_tuner_gain_mode(rtldev, 0);
+    ESP_LOGI(TAG, "Configuring RTL-SDR from NVS config...");
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    rtlsdr_set_sample_rate(rtldev, cfg.sample_rate_hz);
+    rtlsdr_set_center_freq(rtldev, cfg.lo_freq_hz);
+    // gain_mode mapping (RTL-SDR side):
+    //   TUNER_AGC    -> rtlsdr gain_mode 0 (tuner internal AGC)
+    //   MANUAL       -> rtlsdr gain_mode 1 + set_tuner_gain
+    //   SOFTWARE_AGC -> rtlsdr gain_mode 1 + initial gain; D16 module
+    //                   adjusts at runtime
+    if (cfg.gain_mode == GAIN_MODE_TUNER_AGC) {
+        rtlsdr_set_tuner_gain_mode(rtldev, 0);
+    } else {
+        rtlsdr_set_tuner_gain_mode(rtldev, 1);
+        // Convert tenths of dB to the RTL-SDR API unit (also tenths of dB).
+        rtlsdr_set_tuner_gain(rtldev, cfg.gain_db_x10);
+    }
+    // Bias tee: RTL-SDR v4 specific. Driver hook may not be present
+    // in this build — call only if available.
+#ifdef RTLSDR_HAS_BIAS_TEE
+    rtlsdr_set_bias_tee(rtldev, cfg.bias_tee ? 1 : 0);
+#else
+    (void)cfg.bias_tee;
+#endif
     rtlsdr_reset_buffer(rtldev);
 
     ESP_LOGI(TAG, "Initializing System Buffers...");

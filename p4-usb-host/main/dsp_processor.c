@@ -17,6 +17,7 @@
 #include "dsp_processor.h"
 #include "fft_burst_tagger.h"
 #include "worker_core1.h"
+#include "app_config.h"
 
 static const char *TAG = "DSP_PROC";
 
@@ -183,9 +184,15 @@ void dsp_processor_flush(void)
 
 esp_err_t dsp_processor_init(burst_detected_cb_t cb)
 {
+    // Pull threshold from NVS-backed config (D18). Falls back to the
+    // compile-time default if app_config wasn't initialised.
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    float thr = cfg.tagger_threshold_db;
+    if (thr <= 0.0f || thr > 30.0f) thr = FBT_THRESHOLD_DB;   // sanity
     ESP_LOGI(TAG,
              "Initializing wideband fft_burst_tagger (N=%d, fs=%u Hz, thr=%.1f dB)",
-             FBT_FFT_SIZE, (unsigned)FS_DETECT_HZ, (double)FBT_THRESHOLD_DB);
+             FBT_FFT_SIZE, (unsigned)FS_DETECT_HZ, (double)thr);
     s_user_cb = cb;
 
     if (s_tagger) {
@@ -208,7 +215,7 @@ esp_err_t dsp_processor_init(burst_detected_cb_t cb)
     }
 
     s_tagger = fft_burst_tagger_init(FBT_BURST_PRE_LEN, FBT_BURST_POST_LEN,
-                                      FBT_BURST_WIDTH, FBT_THRESHOLD_DB,
+                                      FBT_BURST_WIDTH, thr,
                                       s_baseline_history);
     if (!s_tagger) {
         ESP_LOGE(TAG, "fft_burst_tagger_init failed");
