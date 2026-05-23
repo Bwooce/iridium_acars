@@ -107,3 +107,30 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---------------------------------------------------------------
+# D17: esp_hosted (Wi-Fi over SDIO RPC to the C6) — sized down so
+# the always-on transport doesn't starve internal SRAM / DMA-INT
+# below what the DSP pipeline needs. Without these, boot asserts in
+# sdio_mempool_create or pumps perf through the floor.
+#
+# - MEMPOOL_PREFER_SPIRAM: route transport buffers to PSRAM (P4 GDMA
+#   reaches PSRAM through cache, so this is free for our throughput).
+# - DFLT_TASK_FROM_SPIRAM: hosted task stacks in PSRAM (saves ~10 KB
+#   internal SRAM across the 3 hosted tasks).
+# - SDIO Q sizes shrunk 20 → 8: queue arrays live in internal SRAM
+#   even when mempool is PSRAM; 8 is plenty for our Wi-Fi traffic.
+# - MAX_SIMULTANEOUS_*_RPC_REQUESTS 5 → 2: trim RPC queue depth.
+# - MEM_MONITOR off / CLI off: unused features.
+# - Stacks: trimmed slightly (still in PSRAM now).
+# ---------------------------------------------------------------
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+CONFIG_ESP_HOSTED_DFLT_TASK_FROM_SPIRAM=y
+CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=8
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=8
+CONFIG_ESP_HOSTED_RPC_TASK_STACK=3072
+CONFIG_ESP_HOSTED_DFLT_TASK_STACK=2560
+CONFIG_ESP_HOSTED_MAX_SIMULTANEOUS_SYNC_RPC_REQUESTS=2
+CONFIG_ESP_HOSTED_MAX_SIMULTANEOUS_ASYNC_RPC_REQUESTS=2
+CONFIG_ESP_HOSTED_MEM_MONITOR=n
+CONFIG_ESP_HOSTED_CLI_ENABLED=n
