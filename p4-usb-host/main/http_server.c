@@ -13,6 +13,7 @@
 
 #include "wifi_link.h"
 #include "app_config.h"
+#include "msg_ring.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -221,6 +222,110 @@ static esp_err_t config_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Escape a string into a JSON value. Writes up to outsz-1 chars + NUL.
+// Returns chars written (not counting NUL).
+static size_t json_escape(char *out, size_t outsz, const char *in)
+{
+    size_t w = 0;
+    if (outsz == 0) return 0;
+    for (; *in && w + 7 < outsz; in++) {
+        unsigned char c = (unsigned char)*in;
+        switch (c) {
+        case '"':  out[w++] = '\\'; out[w++] = '"';  break;
+        case '\\': out[w++] = '\\'; out[w++] = '\\'; break;
+        case '\n': out[w++] = '\\'; out[w++] = 'n';  break;
+        case '\r': out[w++] = '\\'; out[w++] = 'r';  break;
+        case '\t': out[w++] = '\\'; out[w++] = 't';  break;
+        default:
+            if (c < 0x20) {
+                // \u00XX
+                static const char hex[] = "0123456789abcdef";
+                out[w++] = '\\'; out[w++] = 'u'; out[w++] = '0'; out[w++] = '0';
+                out[w++] = hex[(c >> 4) & 0xf];
+                out[w++] = hex[c & 0xf];
+            } else {
+                out[w++] = (char)c;
+            }
+        }
+    }
+    out[w] = '\0';
+    return w;
+}
+
+static esp_err_t messages_get(httpd_req_t *req)
+{
+    uint64_t since_id = 0;
+    char qbuf[64];
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+        char val[24];
+        if (httpd_query_key_value(qbuf, "since", val, sizeof(val)) == ESP_OK) {
+            since_id = strtoull(val, NULL, 10);
+        }
+    }
+
+    static acars_msg_t s_snap[MSG_RING_CAPACITY];   // ~9 KB; fine on logger task stack? no — too big.
+    // BSS-allocated above to avoid the 6 KB http_server task stack.
+    size_t n = msg_ring_snapshot(since_id, s_snap, MSG_RING_CAPACITY);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    // Stream: {"total":N,"messages":[ {...}, {...} ]}
+    char chunk[600];
+    int len = snprintf(chunk, sizeof(chunk),
+                       "{\"total\":%llu,\"messages\":[",
+                       (unsigned long long)msg_ring_total());
+    httpd_resp_send_chunk(req, chunk, len);
+
+    char esc_txt[2 * MSG_RING_TXT_MAX + 8];
+    char esc_flight[16];
+    char esc_msgnum[16];
+    char esc_label[8];
+    for (size_t i = 0; i < n; i++) {
+        const acars_msg_t *m = &s_snap[i];
+
+        char label_buf[3] = { m->label[0], m->label[1], 0 };
+        json_escape(esc_label,  sizeof(esc_label),  label_buf);
+        json_escape(esc_msgnum, sizeof(esc_msgnum), m->msg_num);
+        json_escape(esc_flight, sizeof(esc_flight), m->flight_id);
+        json_escape(esc_txt,    sizeof(esc_txt),    m->txt);
+
+        len = snprintf(chunk, sizeof(chunk),
+            "%s{"
+                "\"id\":%llu,"
+                "\"t_us\":%llu,"
+                "\"dir\":\"%s\","
+                "\"mode\":\"%c\","
+                "\"label\":\"%s\","
+                "\"block\":\"%c\","
+                "\"msg_num\":\"%s\","
+                "\"flight\":\"%s\","
+                "\"crc\":%s,"
+                "\"peak_bin\":%ld,"
+                "\"snr_db\":%.1f,"
+                "\"txt\":\"%s\""
+            "}",
+            (i == 0) ? "" : ",",
+            (unsigned long long)m->id,
+            (unsigned long long)m->timestamp_us,
+            m->uplink ? "UL" : "DL",
+            m->mode,
+            esc_label,
+            m->block_id,
+            esc_msgnum,
+            esc_flight,
+            m->crc_ok ? "true" : "false",
+            (long)m->peak_bin,
+            (double)m->snr_db,
+            esc_txt);
+        if (len > 0) {
+            httpd_resp_send_chunk(req, chunk, len);
+        }
+    }
+    httpd_resp_send_chunk(req, "]}", 2);
+    return httpd_resp_send_chunk(req, NULL, 0);   // end of chunked response
+}
+
 esp_err_t http_server_start(void)
 {
     if (s_server) return ESP_OK;
@@ -240,14 +345,15 @@ esp_err_t http_server_start(void)
     }
 
     httpd_uri_t routes[] = {
-        { .uri = "/",        .method = HTTP_GET,  .handler = index_get,   .user_ctx = NULL },
-        { .uri = "/status",  .method = HTTP_GET,  .handler = status_get,  .user_ctx = NULL },
-        { .uri = "/config",  .method = HTTP_POST, .handler = config_post, .user_ctx = NULL },
+        { .uri = "/",         .method = HTTP_GET,  .handler = index_get,    .user_ctx = NULL },
+        { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
+        { .uri = "/messages", .method = HTTP_GET,  .handler = messages_get, .user_ctx = NULL },
+        { .uri = "/config",   .method = HTTP_POST, .handler = config_post,  .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
     }
 
-    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status; POST /config");
+    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages; POST /config");
     return ESP_OK;
 }

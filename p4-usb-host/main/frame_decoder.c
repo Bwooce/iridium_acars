@@ -21,6 +21,7 @@
 #include "ira_decode.h"
 #include "ims_decode.h"
 #include "sbd_reassembler.h"
+#include "msg_ring.h"
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
 #include <libacars/reassembly.h>
@@ -72,7 +73,8 @@ static la_acars_msg *find_acars_msg(la_proto_node *node)
 
 // Try to parse the reassembled SBD payload as ACARS. Logs the
 // decoded fields if a recognisable ACARS frame is found.
-static void try_acars(const sbd_message_t *msg)
+static void try_acars(const sbd_message_t *msg,
+                       int32_t peak_bin, float snr_db)
 {
     if (!msg || msg->payload_len < 8) return;
     la_msg_dir dir = msg->uplink ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
@@ -105,6 +107,24 @@ static void try_acars(const sbd_message_t *msg)
                      a->msg_num, a->flight_id,
                      a->crc_ok ? "OK" : "BAD",
                      a->txt ? a->txt : "");
+
+            // Push to /messages-visible ring.
+            acars_msg_t out = {0};
+            out.timestamp_us = (uint64_t)msg->timestamp_us;
+            out.uplink       = msg->uplink;
+            out.mode         = a->mode ? a->mode : '?';
+            out.label[0]     = a->label[0];
+            out.label[1]     = a->label[1];
+            out.block_id     = a->block_id ? a->block_id : '?';
+            memcpy(out.msg_num,   a->msg_num,   4);
+            memcpy(out.flight_id, a->flight_id, 6);
+            out.crc_ok       = a->crc_ok;
+            out.peak_bin     = peak_bin;
+            out.snr_db       = snr_db;
+            if (a->txt) {
+                strlcpy(out.txt, a->txt, sizeof(out.txt));
+            }
+            msg_ring_push(&out);
         } else if (a->reasm_status == LA_REASM_IN_PROGRESS) {
             atomic_fetch_add_explicit(&s_acars_fragments, 1, memory_order_relaxed);
             ESP_LOGD(TAG, "ACARS fragment buffered: label='%.2s' block=%c "
@@ -220,7 +240,7 @@ static void process_one(const frame_queue_item_t *it)
                              sbd_type_wire_name(sbd.type),
                              sbd.uplink ? "UL" : "DL",
                              sbd.payload_len, sbd.msg_no, sbd.msg_count);
-                    try_acars(&sbd);
+                    try_acars(&sbd, it->peak_bin, it->snr_db);
                 }
             }
         } else {
@@ -315,6 +335,8 @@ esp_err_t frame_decoder_init(void)
         return ESP_ERR_NO_MEM;
     }
     sbd_reassembler_init(&s_sbd);
+    // D17 message ring — recent ACARS decodes, served via HTTP /messages.
+    msg_ring_init();
     // D14: libacars reassembly context for multi-block ACARS messages.
     s_reasm_ctx = la_reasm_ctx_new();
     if (!s_reasm_ctx) {
