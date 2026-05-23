@@ -119,6 +119,38 @@ and `project_p4_errata_status.md`.
 The pipelined-tagger refactor itself was REVERTED. Re-attempt
 should be feasible now that the silicon-bug trigger is mitigated.
 
+## Pipelining LANDED 2026-05-23, but split-resample STILL broken
+
+Pipelining successfully landed (commit `2b54ace`): DSP/frame 548 → 491 µs
+(-10.4%), decode preserved at matched=61 / BER=1.91%. Core 0 freed from
+the mag+detect+EMA workload — DSP cap dropped 79.9% → 45.6% in LIVE_SDR.
+
+Re-tested split-resample WITH pipelining active (2026-05-23):
+
+| config | DSP/frame | FFT | Decode |
+|---|---|---|---|
+| pipelined + split=0 | 491 µs | 257 | matched=61 ✓ |
+| pipelined + split=12 | 571 µs | 337 | matched=61 ✓ |
+
+**FFT slowdown returns: 257 → 337 µs (+31%) at split=12.** Decode is
+preserved but DSP cost is WORSE than pipelined-baseline. Net: split=12
+makes the system slower, not faster, even with mag/detect/EMA moved
+to Core 1.
+
+So Worker A on Core 0 still creates problems for the FFT, but the
+problem isn't L2 cache contention with mag/detect/EMA (that's now on
+Core 1). Most likely remaining theory: PSRAM bus contention from
+Worker A's reads of `s_conv` AND the pipelined tagger's PSRAM
+accesses to `fft_buf_alt` (the second fft_buf, PSRAM-allocated).
+
+Default remains `s_split_pct = 0`. The pipelining win stands; split
+remains blocked.
+
+Untested follow-up: move `fft_buf_alt` to internal SRAM (eliminating
+the tagger's PSRAM accesses), see if split-resample works then. Risk:
+heap-layout shift could re-trigger the PIE position bug — would need
+the early-alloc dance extended to cover fft_buf_alt too.
+
 ## Alternative considered: split burst_worker instead
 
 Could we split the burst-decode worker (worker_core1) into two

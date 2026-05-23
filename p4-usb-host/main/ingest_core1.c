@@ -31,7 +31,7 @@ static int     s_persist_start_pos = 0;
 // Fraction (0–50%) of each dispatch's input handed to Worker A on
 // Core 0. 0 = single-thread inline path on Core 1 (default).
 // Tunable at runtime via ingest_core1_set_split_pct().
-static volatile uint8_t s_split_pct = 0;     /* default OFF — see docs/split-resample-sweep-2026-05-22.md */
+static volatile uint8_t s_split_pct = 0;     /* default OFF — Worker A on Core 0 still slows FFT even with pipelined tagger (sweep 2026-05-23). See docs/split-resample-sweep-2026-05-22.md */
 
 // 125/128 polyphase: number of outputs emitted by processing `k`
 // inputs starting from phase counter `S0`. Derivation: pre_(i+1) =
