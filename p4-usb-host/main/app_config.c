@@ -104,6 +104,8 @@ esp_err_t app_config_init(void)
     s_cfg.station_id[APP_CONFIG_STATION_ID_LEN - 1] = '\0';
     s_cfg.wifi_ssid[0] = '\0';
     s_cfg.wifi_psk[0]  = '\0';
+    s_cfg.out_host[0]  = '\0';
+    s_cfg.out_port     = 0;
 
     esp_err_t r = nvs_flash_init();
     if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -141,6 +143,16 @@ esp_err_t app_config_init(void)
                    DEFAULT_STATION_ID);
     nvs_get_str_or(h, "wifi_ssid",s_cfg.wifi_ssid,  APP_CONFIG_WIFI_SSID_LEN, "");
     nvs_get_str_or(h, "wifi_psk", s_cfg.wifi_psk,   APP_CONFIG_WIFI_PSK_LEN,  "");
+    nvs_get_str_or(h, "out_host", s_cfg.out_host,   APP_CONFIG_OUT_HOST_LEN,  "");
+    uint16_t out_port = 0;
+    {
+        size_t sz = sizeof(out_port);
+        if (nvs_get_blob(h, "out_port", &out_port, &sz) != ESP_OK ||
+            sz != sizeof(out_port)) {
+            out_port = 0;
+        }
+    }
+    s_cfg.out_port = out_port;
     s_cfg.gain_mode = (gain_mode_t)gm;
     s_cfg.bias_tee  = (bool)bt;
 
@@ -274,6 +286,24 @@ esp_err_t app_config_set_wifi_psk(const char *psk)
 {
     return set_str_field(s_cfg.wifi_psk, APP_CONFIG_WIFI_PSK_LEN, "wifi_psk", psk);
 }
+esp_err_t app_config_set_out_host(const char *host)
+{
+    return set_str_field(s_cfg.out_host, APP_CONFIG_OUT_HOST_LEN, "out_host", host);
+}
+esp_err_t app_config_set_out_port(uint16_t port)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.out_port = port;
+    xSemaphoreGive(s_cfg_mu);
+    nvs_handle_t h;
+    esp_err_t r = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (r != ESP_OK) return r;
+    r = nvs_set_blob(h, "out_port", &port, sizeof(port));
+    if (r == ESP_OK) r = nvs_commit(h);
+    nvs_close(h);
+    return r;
+}
 
 void app_config_log(void)
 {
@@ -290,4 +320,9 @@ void app_config_log(void)
              (double)c.tagger_threshold_db, c.station_id);
     ESP_LOGI(TAG, "wifi_ssid='%s'  wifi_psk=%s",
              c.wifi_ssid, (c.wifi_psk[0] ? "(set)" : "(unset)"));
+    if (c.out_host[0] && c.out_port) {
+        ESP_LOGI(TAG, "UDP push: %s:%u", c.out_host, (unsigned)c.out_port);
+    } else {
+        ESP_LOGI(TAG, "UDP push: disabled (out_host/out_port unset)");
+    }
 }

@@ -24,6 +24,7 @@
 #define APP_CONFIG_STATION_ID_LEN  32
 #define APP_CONFIG_WIFI_SSID_LEN   32
 #define APP_CONFIG_WIFI_PSK_LEN    64
+#define APP_CONFIG_OUT_HOST_LEN    64    // UDP push target (hostname or IP); empty = disabled
 
 typedef enum {
     GAIN_MODE_TUNER_AGC      = 0,   // R820T/R828D internal AGC. Default
@@ -47,6 +48,8 @@ typedef struct {
     char       station_id[APP_CONFIG_STATION_ID_LEN];   // for upstream/log identification
     char       wifi_ssid[APP_CONFIG_WIFI_SSID_LEN];     // for D17 C6 wireless
     char       wifi_psk[APP_CONFIG_WIFI_PSK_LEN];       // for D17 C6 wireless
+    char       out_host[APP_CONFIG_OUT_HOST_LEN];       // UDP push target host; empty = no push
+    uint16_t   out_port;                                 // UDP push target port; 0 = no push
 } app_config_t;
 
 // Initialise from NVS. Missing keys get compile-time defaults.
@@ -77,6 +80,8 @@ esp_err_t app_config_set_tagger_threshold_db(float db);
 esp_err_t app_config_set_station_id(const char *id);
 esp_err_t app_config_set_wifi_ssid(const char *ssid);
 esp_err_t app_config_set_wifi_psk(const char *psk);
+esp_err_t app_config_set_out_host(const char *host);
+esp_err_t app_config_set_out_port(uint16_t port);
 
 // Log the current config (info-level). Useful at boot for diagnostics.
 void app_config_log(void);

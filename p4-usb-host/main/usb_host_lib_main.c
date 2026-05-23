@@ -19,6 +19,7 @@
 #include "wifi_link.h"
 #include "http_server.h"
 #include "captive_dns.h"
+#include "acars_push.h"
 
 #if CONFIG_SMOKE_TEST_MODE
 #include "smoke_test.h"
@@ -169,6 +170,9 @@ void app_main(void)
     if (wifi_link_is_ap_mode()) {
         captive_dns_start();
     }
+    // ACARS UDP push (D17) — task is always created; emits only when
+    // out_host/out_port are set in NVS.
+    acars_push_init();
 #endif
 
 #if CONFIG_SMOKE_TEST_MODE

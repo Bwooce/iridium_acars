@@ -22,6 +22,7 @@
 #include "ims_decode.h"
 #include "sbd_reassembler.h"
 #include "msg_ring.h"
+#include "acars_push.h"
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
 #include <libacars/reassembly.h>
@@ -125,6 +126,7 @@ static void try_acars(const sbd_message_t *msg,
                 strlcpy(out.txt, a->txt, sizeof(out.txt));
             }
             msg_ring_push(&out);
+            acars_push_emit(&out);
         } else if (a->reasm_status == LA_REASM_IN_PROGRESS) {
             atomic_fetch_add_explicit(&s_acars_fragments, 1, memory_order_relaxed);
             ESP_LOGD(TAG, "ACARS fragment buffered: label='%.2s' block=%c "

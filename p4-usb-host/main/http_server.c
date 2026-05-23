@@ -53,7 +53,7 @@ static esp_err_t status_get(httpd_req_t *req)
 
     // Small fixed JSON. No allocator games; fits comfortably in a
     // single TCP segment.
-    char body[512];
+    char body[640];
     int n = snprintf(body, sizeof(body),
         "{"
             "\"build\":\"%s\","
@@ -65,7 +65,8 @@ static esp_err_t status_get(httpd_req_t *req)
             "\"uptime_s\":%lld,"
             "\"station_id\":\"%s\","
             "\"lo_freq_hz\":%u,"
-            "\"sample_rate_hz\":%u"
+            "\"sample_rate_hz\":%u,"
+            "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s}"
         "}",
         app->version,
         app->date,
@@ -76,7 +77,10 @@ static esp_err_t status_get(httpd_req_t *req)
         (long long)(uptime_us / 1000000),
         cfg.station_id,
         (unsigned)cfg.lo_freq_hz,
-        (unsigned)cfg.sample_rate_hz);
+        (unsigned)cfg.sample_rate_hz,
+        cfg.out_host,
+        (unsigned)cfg.out_port,
+        (cfg.out_host[0] && cfg.out_port) ? "true" : "false");
 
     if (n < 0 || n >= (int)sizeof(body)) {
         ESP_LOGW(TAG, "status body truncated (n=%d, cap=%d)", n, (int)sizeof(body));
@@ -89,30 +93,39 @@ static esp_err_t status_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
-// Minimal HTML form for Wi-Fi credentials. Self-contained, no JS, no
-// external assets. Posts urlencoded form data to /config.
+// Minimal HTML form for Wi-Fi credentials + optional UDP push target.
+// Self-contained, no JS, no external assets. Posts urlencoded form
+// data to /config.
 static const char s_index_html[] =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>Iridium ACARS — config</title>"
     "<style>"
     "body{font-family:system-ui,sans-serif;max-width:480px;margin:2em auto;padding:0 1em;color:#222;background:#fafafa}"
-    "h1{font-size:1.3em}"
+    "h1{font-size:1.3em}h2{font-size:1.05em;margin-top:1.8em;color:#555}"
     "label{display:block;margin:1em 0 .3em;font-size:.9em;color:#555}"
-    "input[type=text],input[type=password]{width:100%;padding:.5em;border:1px solid #ccc;border-radius:4px;font-size:1em;box-sizing:border-box}"
+    "input[type=text],input[type=password],input[type=number]{width:100%;padding:.5em;border:1px solid #ccc;border-radius:4px;font-size:1em;box-sizing:border-box}"
     "button{margin-top:1.5em;padding:.7em 1.5em;border:0;background:#1976d2;color:#fff;border-radius:4px;font-size:1em}"
     "small{color:#888}"
     "</style></head><body>"
     "<h1>Iridium ACARS</h1>"
-    "<p>Configure Wi-Fi credentials. The device will reboot and connect.</p>"
+    "<p>Configure the device. Wi-Fi changes reboot the device on save; "
+    "UDP push fields take effect immediately.</p>"
     "<form method=\"POST\" action=\"/config\">"
-    "<label>Wi-Fi SSID</label>"
+    "<h2>Wi-Fi</h2>"
+    "<label>SSID</label>"
     "<input type=\"text\" name=\"ssid\" required maxlength=\"32\">"
-    "<label>Wi-Fi password</label>"
+    "<label>Password</label>"
     "<input type=\"password\" name=\"psk\" maxlength=\"63\">"
+    "<h2>ACARS push (optional, UDP)</h2>"
+    "<label>Host (IP or hostname; leave empty to disable)</label>"
+    "<input type=\"text\" name=\"out_host\" maxlength=\"63\">"
+    "<label>Port</label>"
+    "<input type=\"number\" name=\"out_port\" min=\"0\" max=\"65535\" placeholder=\"e.g. 6700\">"
     "<button type=\"submit\">Save &amp; reboot</button>"
     "</form>"
-    "<p><small>Current status: <a href=\"/status\">/status</a></small></p>"
+    "<p><small>Current status: <a href=\"/status\">/status</a> · "
+    "Messages: <a href=\"/messages\">/messages</a></small></p>"
     "</body></html>";
 
 // Shown only in STA mode (we're already at the form when in AP).
@@ -205,14 +218,25 @@ static esp_err_t config_post(httpd_req_t *req)
     }
     form_field(body, total, "psk", psk, sizeof(psk));  // psk optional (open AP)
 
-    ESP_LOGI(TAG, "/config POST: saving ssid='%s' (psk %s)",
-             ssid, psk[0] ? "set" : "empty");
+    // Optional UDP push target. Both fields empty / 0 = disabled.
+    char out_host[64] = {0};
+    char out_port_s[8] = {0};
+    form_field(body, total, "out_host", out_host,   sizeof(out_host));
+    form_field(body, total, "out_port", out_port_s, sizeof(out_port_s));
+    uint16_t out_port = (uint16_t)strtoul(out_port_s, NULL, 10);
+
+    ESP_LOGI(TAG, "/config POST: saving ssid='%s' (psk %s), out=%s:%u",
+             ssid, psk[0] ? "set" : "empty",
+             out_host[0] ? out_host : "(none)", (unsigned)out_port);
 
     esp_err_t r1 = app_config_set_wifi_ssid(ssid);
     esp_err_t r2 = app_config_set_wifi_psk(psk);
-    if (r1 != ESP_OK || r2 != ESP_OK) {
-        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s",
-                 esp_err_to_name(r1), esp_err_to_name(r2));
+    esp_err_t r3 = app_config_set_out_host(out_host);
+    esp_err_t r4 = app_config_set_out_port(out_port);
+    if (r1 != ESP_OK || r2 != ESP_OK || r3 != ESP_OK || r4 != ESP_OK) {
+        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s",
+                 esp_err_to_name(r1), esp_err_to_name(r2),
+                 esp_err_to_name(r3), esp_err_to_name(r4));
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "nvs write failed\n", HTTPD_RESP_USE_STRLEN);
     }
