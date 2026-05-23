@@ -147,6 +147,22 @@ static int s_next_acquire_slot = 0;
 
 // Diagnostic accumulators (reset by ingest_core1_get_stats).
 static volatile uint64_t s_acc_convert_us = 0;
+
+// D16 AGC: peak deviation of input uint8 from mid-point (127). The
+// AGC task reads + resets this every ~1 s to decide if the tuner is
+// saturating. peak_dev=127 means a sample was at 0 or 255 (full
+// saturation). peak_dev > ~100 generally means the gain is set
+// too high for the current signal.
+static volatile uint8_t  s_agc_peak_dev = 0;
+static volatile uint32_t s_agc_dispatches = 0;
+
+void ingest_core1_agc_sample(uint8_t *out_peak_dev, uint32_t *out_dispatches)
+{
+    if (out_peak_dev)   *out_peak_dev   = s_agc_peak_dev;
+    if (out_dispatches) *out_dispatches = s_agc_dispatches;
+    s_agc_peak_dev    = 0;
+    s_agc_dispatches  = 0;
+}
 static volatile uint64_t s_acc_push_us = 0;      // == resample + signal_buffer_push total
 static volatile uint64_t s_acc_resample_us = 0;  // resample step only
 static volatile uint64_t s_acc_sbpush_us = 0;    // signal_buffer_push (AXI DMA wait) only
@@ -180,6 +196,25 @@ static void ingest_task(void *arg)
         const uint8_t *__restrict src = s_raw[msg.slot];
         int16_t *__restrict dst = s_conv[msg.slot];
         size_t n = msg.bytes;
+
+        // AGC sampling (D16): scan the first 256 bytes for the
+        // maximum deviation from the mid-point (uint8 127). One
+        // pass through a tiny prefix, cheap, gives a peak signal
+        // estimate for the AGC task to decide whether the tuner
+        // is saturating. Doesn't change the convert math — just
+        // observes.
+        size_t agc_n = n < 256 ? n : 256;
+        uint8_t agc_max = 0;
+        for (size_t k = 0; k < agc_n; k++) {
+            int d = (int)src[k] - 127;
+            if (d < 0) d = -d;
+            if (d > (int)agc_max) agc_max = (uint8_t)d;
+        }
+        if (agc_max > s_agc_peak_dev) {
+            s_agc_peak_dev = agc_max;
+        }
+        s_agc_dispatches++;
+
         size_t n4 = n & ~(size_t)3;
         size_t i = 0;
         for (; i < n4; i += 4) {

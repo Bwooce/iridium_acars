@@ -1,4 +1,4 @@
-idf_component_register(SRCS "class_driver.c" "esp_libusb.c" "tuner_r82xx.c" "tuner_fc2580.c" "tuner_fc0013.c" "tuner_fc0012.c" "tuner_e4k.c" "librtlsdr.c" "usb_host_lib_main.c" "dsp_processor.c" "signal_buffer.c" "worker_core1.c" "ingest_core1.c" "status_logger.c" "smoke_test.c" "frame_decoder.c" "pie_fft_diff_test.c" "app_config.c"
+idf_component_register(SRCS "class_driver.c" "esp_libusb.c" "tuner_r82xx.c" "tuner_fc2580.c" "tuner_fc0013.c" "tuner_fc0012.c" "tuner_e4k.c" "librtlsdr.c" "usb_host_lib_main.c" "dsp_processor.c" "signal_buffer.c" "worker_core1.c" "ingest_core1.c" "status_logger.c" "smoke_test.c" "frame_decoder.c" "pie_fft_diff_test.c" "app_config.c" "agc.c"
                     INCLUDE_DIRS "." "../../tests/fixtures"
                     PRIV_REQUIRES usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash
                                   iridium_decoder)

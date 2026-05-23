@@ -23,6 +23,7 @@
 #include "resample_256_to_250.h"
 #include "fft_sc16_2048.h"
 #include "app_config.h"
+#include "class_driver.h"
 #include "bch_decoder.h"
 #include "rtl-sdr.h"
 #include "status_logger.h"
@@ -40,6 +41,22 @@
 
 static const char *TAG = "CLASS";
 static rtlsdr_dev_t *rtldev = NULL;
+static volatile int s_last_gain_dbx10 = -1;
+
+bool class_driver_set_tuner_gain_dbx10(int gain_dbx10)
+{
+    if (!rtldev) return false;
+    if (gain_dbx10 < 0) return false;
+    int r = rtlsdr_set_tuner_gain(rtldev, gain_dbx10);
+    if (r != 0) return false;
+    s_last_gain_dbx10 = gain_dbx10;
+    return true;
+}
+
+int class_driver_get_tuner_gain_dbx10(void)
+{
+    return s_last_gain_dbx10;
+}
 static class_driver_t s_driver_obj = {0};
 
 static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg)

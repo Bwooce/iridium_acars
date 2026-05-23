@@ -56,4 +56,10 @@ typedef struct {
 
 void ingest_core1_get_stats(ingest_stats_t *out);
 
+// D16 AGC peak-sample probe. Returns the maximum |raw uint8 - 127|
+// observed in the input prefix of any dispatch since the last call,
+// plus the number of dispatches sampled. Resets the counters after
+// reading. peak_dev=127 means a sample was at 0 or 255 (saturation).
+void ingest_core1_agc_sample(uint8_t *out_peak_dev, uint32_t *out_dispatches);
+
 #endif

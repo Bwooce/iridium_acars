@@ -34,14 +34,30 @@ static const char *TAG = "PIE_FFT_DIFF";
 // Scalar reference: identical algorithm to uw_correlator.c's radix2_fft_f32
 // (standard radix-2 DIT). Kept self-contained here so the harness doesn't
 // depend on uw_correlator internals.
-static uint16_t s_ref_brev[FFTN];
-static float    s_ref_tw_re[FFTN / 2];
-static float    s_ref_tw_im[FFTN / 2];
-static bool     s_ref_inited = false;
+//
+// 2026-05-23: moved 12 KB of static .bss to heap. This is a smoke-only
+// diagnostic harness; static .bss kept it in internal SRAM permanently
+// even in production builds. Heap-allocated lazily on first call, kept
+// alive after (the smoke test re-runs aren't expected, so we could free
+// — but keeping makes re-runs cheap). PSRAM is fine since these are
+// scalar C accesses (no PIE on these tables).
+static uint16_t *s_ref_brev   = NULL;
+static float    *s_ref_tw_re  = NULL;
+static float    *s_ref_tw_im  = NULL;
+static bool      s_ref_inited = false;
 
 static void ref_fft_init(void)
 {
     if (s_ref_inited) return;
+    if (!s_ref_brev) {
+        s_ref_brev  = (uint16_t *)heap_caps_malloc(FFTN * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+        s_ref_tw_re = (float    *)heap_caps_malloc((FFTN / 2) * sizeof(float), MALLOC_CAP_SPIRAM);
+        s_ref_tw_im = (float    *)heap_caps_malloc((FFTN / 2) * sizeof(float), MALLOC_CAP_SPIRAM);
+        if (!s_ref_brev || !s_ref_tw_re || !s_ref_tw_im) {
+            ESP_LOGE(TAG, "ref FFT table alloc failed");
+            return;
+        }
+    }
     // Bit-reversal table.
     for (int i = 0; i < FFTN; i++) {
         unsigned x = (unsigned)i;
@@ -129,18 +145,54 @@ static void pie_fft_init(void)
     s_pie_inited = true;
 }
 
+// Static scratches lazy-heap-allocated. Previously these were
+// 16 KB (pie_buf) + 16 KB (ref_re+ref_im) = 32 KB of static .bss
+// in internal SRAM, wasted in production where this harness never
+// runs. Now heap-allocated on first call.
+//   pie_buf must be in INTERNAL SRAM (PIE FFT requires it).
+//   ref_re / ref_im are scalar; PSRAM is fine.
+static float *s_run_pie_buf = NULL;
+static float *s_run_ref_re  = NULL;
+static float *s_run_ref_im  = NULL;
+
+static bool ensure_run_buffers(void)
+{
+    if (s_run_pie_buf && s_run_ref_re && s_run_ref_im) return true;
+    if (!s_run_pie_buf) {
+        s_run_pie_buf = (float *)heap_caps_aligned_alloc(
+            16, 2 * FFTN * sizeof(float), MALLOC_CAP_INTERNAL);
+    }
+    if (!s_run_ref_re) {
+        s_run_ref_re = (float *)heap_caps_malloc(FFTN * sizeof(float), MALLOC_CAP_SPIRAM);
+    }
+    if (!s_run_ref_im) {
+        s_run_ref_im = (float *)heap_caps_malloc(FFTN * sizeof(float), MALLOC_CAP_SPIRAM);
+    }
+    if (!s_run_pie_buf || !s_run_ref_re || !s_run_ref_im) {
+        ESP_LOGE(TAG, "diff buffer alloc failed");
+        return false;
+    }
+    return true;
+}
+
 // Run one test case: feed `in_re`/`in_im` (de-interleaved float) into
 // both implementations, compare outputs.
 static void run_diff_case(const char *name, const float *in_re,
                           const float *in_im, float tol,
                           pie_fft_diff_result_t *out)
 {
-    static float ref_re[FFTN], ref_im[FFTN];
-    static float pie_buf[2 * FFTN] __attribute__((aligned(16)));
+    if (!ensure_run_buffers()) {
+        memset(out, 0, sizeof(*out));
+        out->name = name;
+        return;
+    }
+    float *ref_re  = s_run_ref_re;
+    float *ref_im  = s_run_ref_im;
+    float *pie_buf = s_run_pie_buf;
 
     // Scalar reference path.
-    memcpy(ref_re, in_re, sizeof(ref_re));
-    memcpy(ref_im, in_im, sizeof(ref_im));
+    memcpy(ref_re, in_re, FFTN * sizeof(float));
+    memcpy(ref_im, in_im, FFTN * sizeof(float));
     ref_radix2_fft(ref_re, ref_im);
 
     // PIE path: interleaved IQ. dsps_fft2r_fc32_arp4 is in-place, output

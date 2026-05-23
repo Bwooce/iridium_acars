@@ -15,6 +15,7 @@
 #include "usb/usb_host.h"
 #include "sdkconfig.h"
 #include "app_config.h"
+#include "agc.h"
 
 #if CONFIG_SMOKE_TEST_MODE
 #include "smoke_test.h"
@@ -148,6 +149,9 @@ void app_main(void)
     // missing keys — system stays operational with no NVS data.
     app_config_init();
     app_config_log();
+
+    // D16 software AGC. Idle unless gain_mode==SOFTWARE_AGC.
+    agc_init();
 
 #if CONFIG_SMOKE_TEST_MODE
     // Smoke test mode: bypass the USB stack entirely and run the
