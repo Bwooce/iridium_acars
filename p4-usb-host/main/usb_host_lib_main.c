@@ -16,6 +16,7 @@
 #include "sdkconfig.h"
 #include "app_config.h"
 #include "agc.h"
+#include "c6_forwarder.h"
 
 #if CONFIG_SMOKE_TEST_MODE
 #include "smoke_test.h"
@@ -152,6 +153,14 @@ void app_main(void)
 
     // D16 software AGC. Idle unless gain_mode==SOFTWARE_AGC.
     agc_init();
+
+    // D17 C6 companion UART transport. Brings up the forwarder
+    // task + UART driver. Posts boot_complete once everything
+    // downstream has booted (status_logger will pick up the
+    // moment via post_status as a side effect — but explicit
+    // boot_complete here helps the C6 know the P4 is up.).
+    c6_forwarder_init();
+    c6_forwarder_post_boot_complete("p4-iridium-d17");
 
 #if CONFIG_SMOKE_TEST_MODE
     // Smoke test mode: bypass the USB stack entirely and run the

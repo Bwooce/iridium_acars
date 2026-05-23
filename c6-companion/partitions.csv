@@ -1,0 +1,12 @@
+# Name,   Type, SubType, Offset,   Size,   Flags
+# Default layout for ESP32-C6 with 4 MB flash.
+# - nvs (24 KB): Wi-Fi creds, station id, cached shadow of P4 NVS
+# - phy_init (4 KB): RF calibration
+# - factory (1.5 MB): main app
+# - ota_0 (1.5 MB): OTA update slot
+# - storage (~1 MB): SPIFFS for the static HTML/JS web UI assets
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xf000,   0x1000,
+factory,   app,  factory, 0x10000,  0x180000,
+ota_0,     app,  ota_0,   0x190000, 0x180000,
+storage,   data, spiffs,  0x310000, 0xc0000,

@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Iridium ACARS</title>
+<style>
+ body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #0e1116; color: #eee; }
+ header { background: #161b22; padding: 12px 16px; border-bottom: 1px solid #30363d; }
+ nav a { color: #58a6ff; margin-right: 12px; text-decoration: none; }
+ nav a.active { color: #fff; font-weight: bold; }
+ main { padding: 16px; max-width: 1200px; margin: 0 auto; }
+ h1 { margin: 0; font-size: 18px; }
+ #status { float: right; font-size: 12px; color: #8b949e; }
+ .stat { display: inline-block; margin-right: 18px; padding: 6px 10px; background: #161b22;
+         border: 1px solid #30363d; border-radius: 4px; }
+ .stat label { color: #8b949e; font-size: 11px; text-transform: uppercase; display: block; }
+ .stat value { font-size: 16px; font-weight: bold; }
+ table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #21262d; }
+ th { color: #8b949e; font-weight: normal; font-size: 11px; text-transform: uppercase; }
+ td.text { font-family: ui-monospace, monospace; max-width: 480px; overflow: hidden; text-overflow: ellipsis; }
+ td.dir { font-weight: bold; }
+ td.dir.UL { color: #ff7b72; }
+ td.dir.DL { color: #79c0ff; }
+ section { display: none; }
+ section.active { display: block; }
+ form { margin-top: 16px; max-width: 480px; }
+ form label { display: block; margin-bottom: 6px; color: #8b949e; }
+ form input { width: 100%; padding: 6px; margin-bottom: 12px;
+              background: #0e1116; color: #eee; border: 1px solid #30363d; border-radius: 4px; }
+ form button { background: #238636; color: white; border: 0; padding: 8px 16px;
+               border-radius: 4px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+ <h1>Iridium ACARS <span id="status">connecting…</span></h1>
+ <nav>
+  <a href="#messages" class="tab active" data-tab="messages">Messages</a>
+  <a href="#stats" class="tab" data-tab="stats">Stats</a>
+  <a href="#config" class="tab" data-tab="config">Config</a>
+ </nav>
+</header>
+<main>
+
+<section id="messages" class="active">
+ <div id="msgstat">
+  <span class="stat"><label>Decoded</label><value id="m_total">–</value></span>
+  <span class="stat"><label>P4</label><value id="m_p4">–</value></span>
+  <span class="stat"><label>Wi-Fi</label><value id="m_wifi">–</value></span>
+ </div>
+ <table>
+  <thead><tr><th>Seq</th><th>Dir</th><th>Label</th><th>Flight</th><th>Msg#</th><th>Text</th></tr></thead>
+  <tbody id="msgrows"></tbody>
+ </table>
+</section>
+
+<section id="stats">
+ <div>
+  <span class="stat"><label>USB rate</label><value id="s_rate">–</value> MB/s</span>
+  <span class="stat"><label>DSP cap</label><value id="s_dsp">–</value>%</span>
+  <span class="stat"><label>Worker cap</label><value id="s_wkr">–</value>%</span>
+  <span class="stat"><label>Drops</label><value id="s_drops">–</value></span>
+  <span class="stat"><label>Frames/s</label><value id="s_frames">–</value></span>
+  <span class="stat"><label>ACARS</label><value id="s_acars">–</value></span>
+ </div>
+ <p style="color:#8b949e;font-size:12px;margin-top:18px">
+  Updates every 2 seconds from C6's local 60-second ring of P4 status snapshots.
+ </p>
+</section>
+
+<section id="config">
+ <h3>Wi-Fi credentials</h3>
+ <p style="color:#8b949e;font-size:12px">
+  After saving, the C6 stores credentials to NVS. Reboot to apply (a future
+  release will hot-reconnect without reboot).
+ </p>
+ <form id="cfgform">
+  <label>SSID <input type="text" name="wifi_ssid" id="cf_ssid" autocomplete="off"/></label>
+  <label>Password <input type="password" name="wifi_psk" id="cf_psk" autocomplete="off"/></label>
+  <button type="submit">Save</button>
+  <span id="cfgmsg" style="color:#8b949e;margin-left:10px"></span>
+ </form>
+</section>
+
+</main>
+
+<script>
+let lastSeq = 0;
+
+async function fetchJSON(url, opts) {
+  const r = await fetch(url, opts || {});
+  if (!r.ok) throw new Error(r.statusText);
+  return r.json();
+}
+
+async function pollMessages() {
+  try {
+    const arr = await fetchJSON('/api/messages?since=' + lastSeq);
+    const tbody = document.getElementById('msgrows');
+    for (const m of arr) {
+      if (m.seq > lastSeq) lastSeq = m.seq;
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + m.seq + '</td>' +
+        '<td class="dir ' + m.dir + '">' + m.dir + '</td>' +
+        '<td>' + m.label + '</td>' +
+        '<td>' + m.flight + '</td>' +
+        '<td>' + m.msg_num + '</td>' +
+        '<td class="text">' + escapeHTML(m.text || '') + '</td>';
+      tbody.prepend(tr);
+      while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
+    }
+  } catch (e) { /* network errors — silently retry */ }
+}
+
+async function pollStats() {
+  try {
+    const j = await fetchJSON('/api/stats');
+    if (j.history && j.history.length) {
+      const h = j.history[0];
+      document.getElementById('s_rate').textContent   = h.rate_mb_s.toFixed(2);
+      document.getElementById('s_dsp').textContent    = h.dsp_cap.toFixed(0);
+      document.getElementById('s_wkr').textContent    = h.worker_cap.toFixed(0);
+      document.getElementById('s_drops').textContent  = h.drops;
+      document.getElementById('s_frames').textContent = h.frames;
+      document.getElementById('s_acars').textContent  = h.acars_decoded;
+    }
+  } catch (e) {}
+}
+
+async function pollStatus() {
+  try {
+    const j = await fetchJSON('/api/status');
+    document.getElementById('status').textContent =
+      j.wifi_mode + (j.wifi_mode === 'STA-connected' ? ' (' + j.wifi_rssi + ' dBm)' : '');
+    document.getElementById('m_total').textContent = j.acars_total;
+    document.getElementById('m_p4').textContent    = j.p4_ready ? 'ready' : 'waiting';
+    document.getElementById('m_wifi').textContent  = j.wifi_mode;
+  } catch (e) {
+    document.getElementById('status').textContent = 'disconnected';
+  }
+}
+
+async function loadConfig() {
+  try {
+    const j = await fetchJSON('/api/config');
+    document.getElementById('cf_ssid').value = j.wifi_ssid || '';
+  } catch (e) {}
+}
+
+document.getElementById('cfgform').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const ssid = document.getElementById('cf_ssid').value;
+  const psk  = document.getElementById('cf_psk').value;
+  const body = 'wifi_ssid=' + encodeURIComponent(ssid)
+             + '&wifi_psk=' + encodeURIComponent(psk);
+  try {
+    await fetchJSON('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: body
+    });
+    document.getElementById('cfgmsg').textContent = 'Saved (reboot to apply)';
+  } catch (e) {
+    document.getElementById('cfgmsg').textContent = 'Save failed';
+  }
+});
+
+function escapeHTML(s) {
+  const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+}
+
+document.querySelectorAll('.tab').forEach((a) => {
+  a.addEventListener('click', (e) => {
+    e.preventDefault();
+    document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
+    document.querySelectorAll('section').forEach((s) => s.classList.remove('active'));
+    a.classList.add('active');
+    document.getElementById(a.dataset.tab).classList.add('active');
+  });
+});
+
+loadConfig();
+pollStatus(); pollMessages(); pollStats();
+setInterval(pollStatus, 3000);
+setInterval(pollMessages, 5000);
+setInterval(pollStats, 2000);
+</script>
+</body>
+</html>

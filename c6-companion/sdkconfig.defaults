@@ -1,0 +1,29 @@
+# C6 companion firmware defaults.
+# Flash size — Waveshare ESP32-P4-NANO's C6-MINI-1 has 4 MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Custom partition table from partitions.csv.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# SPIFFS for the static web assets (index.html etc.).
+CONFIG_SPIFFS_USE_MAGIC=y
+
+# Wi-Fi: enable station + AP modes. AP mode used for captive
+# portal on first boot or BOOT-button-held reset.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+
+# HTTP server tuning. 4 KB stack, max 8 sockets is plenty for
+# a single-user web UI.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=128
+
+# We use main task stack of 4 KB and a separate UART/Wi-Fi task
+# at 4 KB each. Bump the IDLE stack to 1.5 KB just in case.
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1536
+
+# Logging compact for the C6 side.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
