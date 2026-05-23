@@ -55,25 +55,36 @@ and any other IDF Wi-Fi-aware component without a special API layer.
 
 ## 3. Inter-chip wiring
 
-Confirmed from the Waveshare ESP32-P4-NANO schematic (full pin extract in
-`docs/p4-nano-board-schematic-summary.md`). The **only** logical wires
-between the two SoCs are SDIO:
+Re-verified 2026-05-23 from the Waveshare ESP32-P4-NANO schematic
+(full pin extract in `docs/p4-nano-board-schematic-summary.md` §2).
+**Eight wires** total — six SDIO data/clock/command lines plus two
+control straps:
 
-| Signal | P4 GPIO | C6 GPIO |
-|---|---|---|
-| SDIO CLK | 18 | IO18 |
-| SDIO CMD | 19 | IO19 |
-| SDIO D0 | 14 | IO20 |
-| SDIO D1 | 15 | IO21 |
-| SDIO D2 | 16 | IO22 |
-| SDIO D3 | 17 | IO23 |
+| Signal | P4 GPIO | C6 pin / native | Notes |
+|---|---|---|---|
+| SDIO CMD       | 19 | 24 / IO18 | R21 = 1K series |
+| SDIO CLK       | 18 | 25 / IO19 | R20 = 1K series |
+| SDIO D0        | 14 | 26 / IO20 | |
+| SDIO D1        | 15 | 27 / IO21 | R19 = 1K |
+| SDIO D2        | 16 | 28 / IO22 | R18 = 1K |
+| SDIO D3        | 17 | 29 / IO23 | R16 = 1K |
+| C6 BOOT strap  |  6 |  5 / IO2  | R52 = 0Ω; drive low across reset edge → ROM bootloader |
+| C6 reset (EN)  | 54 |  8 / EN   | R54 = 0Ω; pulse low to reset C6 |
 
-The C6's UART0 (`U0TXD`/`U0RXD`), `CHIP_PU`, and IO9 (BOOT strap) all go
-**only** to the on-board USB-UART programmer chip — not to the P4. So the
-P4 cannot reset the C6, hold its BOOT pin during enumeration, or
-`esp-serial-flasher` it over UART. All inter-chip communication is SDIO.
+C6's UART0 (`U0TXD`/`U0RXD`) and IO9 (BOOT button on C6 itself) go
+**only** to the on-board USB-UART programmer chip and header P2 —
+not to the P4. So:
 
-This pinout reality killed the prior UART-based design — see *History*.
+- The P4 **can** reset the C6 (drive GPIO54 low) and force the C6's
+  ROM bootloader (drive GPIO6 low while pulsing reset).
+- The P4 **cannot** complete an `esp-serial-flasher` flow to the C6
+  (no UART data path). SDIO-side OTA or the PROG_C6 USB cable are
+  the only firmware-update paths.
+
+The lack of UART wires killed the prior UART-based companion design
+— see *History*. The BOOT + EN straps remain useful for hang
+recovery and (if SDIO-side OTA is ever implemented) for forcing
+the C6 into bootloader mode.
 
 ## 4. Internal-SRAM budget (the `esp_hosted` shrink)
 

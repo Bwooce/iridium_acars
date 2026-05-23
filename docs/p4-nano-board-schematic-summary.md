@@ -51,63 +51,71 @@ PHY/analog 3.3 V `PHY_3V3`/`A3V3` from U9 (RT9193-33PB LDO).
 
 ## 2. P4 ↔ C6 interconnect
 
-| Function | Signal on schematic | C6 pin | P4 GPIO | Series R | Notes |
-|---|---|---|---|---|---|
-| C6 reset (active-high enable) | `C6_CHIP_PU` | C6 pin 8 (EN) | **GPIO54** | R54 = 0R | P4 holds C6 in reset by driving GPIO54 low |
-| C6 boot strap (BOOT0 = IO2) | `C6_IO2` | C6 pin 5 (IO2) | **GPIO6** | R52 = 0R | P4 forces C6 ROM-bootloader by pulling GPIO6 low at C6 reset |
-| C6 UART0 TX → P4 | `C6_U0TXD` | C6 pin 31 (TXD0) | **GPIO17** | R15 = 1K | Also exposed on header P2 |
-| C6 UART0 RX ← P4 | `C6_U0RXD` | C6 pin 30 (RXD0) | **GPIO16** | R16 = 1K | Also exposed on header P2 |
-| SDIO line | C6 IO23 | C6 pin 29 | **GPIO15** | R18 = 1K | All four SDIO data/cmd lines have matching 1K series; bus lines also have 51K pull-up to `ESP_3V3` near the C6 module |
-| SDIO line | C6 IO22 | C6 pin 28 | **GPIO14** | R19 = 1K | |
-| SDIO line | C6 IO21 | C6 pin 27 | **GPIO18** | R20 = 1K | |
-| SDIO line | C6 IO20 | C6 pin 26 | **GPIO19** | R21 = 1K | |
-| SDIO line | C6 IO19 | C6 pin 25 | (routes off-sheet, label `GPIO19R` overlaps; see ambiguity below) | 1K + 51K pull-up to ESP_3V3 | Likely SDIO CLK |
-| Spare | `C6_IO9` | C6 IO9 | header P2 only | — | Wakeup / interrupt candidate; not wired to a fixed P4 GPIO |
-| Spare | `C6_IO8` | C6 IO8 | pull-up R25 10K to ESP_3V3 | — | |
-| Spare | `C6_IO12`, `C6_IO13` | C6 IO12/IO13 | header P2 | — | |
+Re-verified 2026-05-23 from the schematic PDF via `pdftohtml -xml` and
+spatial net-label alignment. There are **eight wires** between the
+P4 and the C6, and **no UART** wires between them.
 
-Mapping summary: this is the **standard Espressif ESP-Hosted-MCU C6 SDIO-slave
-topology** — P4 = host, C6 = SDIO slave at native voltage (3.3 V). The two
-0R strap resistors (R52/R54) let the P4 drive C6 boot pins entirely; the C6's
-own debug UART is also accessible on header P2 if direct C6 flashing is
-needed.
+| Function | Signal on schematic | C6 pin | C6 native | P4 GPIO | Series R | Notes |
+|---|---|---|---|---|---|---|
+| C6 reset (active-high enable) | `C6_CHIP_PU` | 8  | EN     | **GPIO54** | R54 = 0Ω | P4 holds C6 in reset by driving GPIO54 low. |
+| C6 boot strap | `C6_IO2`     | 5  | IO2    | **GPIO6**  | R52 = 0Ω | Drive low across a GPIO54 reset edge to force ROM bootloader. |
+| SDIO CMD | `GPIO19`         | 24 | IO18   | **GPIO19** | R21 = 1K | |
+| SDIO CLK | `GPIO18`         | 25 | IO19   | **GPIO18** | R20 = 1K | |
+| SDIO D0  | `GPIO14`         | 26 | IO20   | **GPIO14** | (1K)\*   | |
+| SDIO D1  | `GPIO15`         | 27 | IO21   | **GPIO15** | R19 = 1K | |
+| SDIO D2  | `GPIO16`         | 28 | IO22   | **GPIO16** | R18 = 1K | |
+| SDIO D3  | `GPIO17`         | 29 | IO23   | **GPIO17** | R16 = 1K | |
 
-**Boot/power sequencing.** The C6 starts only when:
+All six SDIO lines also have 51K pull-ups to `ESP_3V3` near the C6 module.
+
+\* GPIO14's series resistor designator isn't clearly readable in the
+PDF spatial dump; the 1K value matches the rest of the bus and the
+empirical link is stable.
+
+### NOT wired between P4 and C6
+
+| Signal | C6 pin | Goes to (NOT the P4) |
+|---|---|---|
+| `C6_U0TXD` | 31 (IO16) | Header P2 + on-board USB-UART bridge (PROG_C6 console). R15 = 1K is in series on the U0RXD line toward the bridge; an earlier read of this doc that placed R15 on a P4 GPIO was incorrect. |
+| `C6_U0RXD` | 30 (IO17) | Same path. |
+| `C6_IO9`   | —         | C6's own BOOT button + header P2 only — not connected to any P4 GPIO. |
+| `C6_IO8, IO12, IO13` | — | Header P2 only. |
+
+This matches `p4-usb-host/sdkconfig`:
+
+```
+CONFIG_ESP_HOSTED_SDIO_PIN_CMD=19
+CONFIG_ESP_HOSTED_SDIO_PIN_CLK=18
+CONFIG_ESP_HOSTED_SDIO_PIN_D0=14
+CONFIG_ESP_HOSTED_SDIO_PIN_D1=15
+CONFIG_ESP_HOSTED_SDIO_PIN_D2=16
+CONFIG_ESP_HOSTED_SDIO_PIN_D3=17
+```
+
+…and the empirically working `esp_hosted` + `esp_wifi_remote`
+transport on commit `bba7817` onwards.
+
+Mapping summary: this is the **standard Espressif ESP-Hosted-MCU C6
+SDIO-slave topology** — P4 = host, C6 = SDIO slave at native voltage
+(3.3 V). The two 0Ω strap resistors (R52/R54) let the P4 reset the
+C6 and force ROM bootloader entry, though without UART pins the P4
+**cannot** complete an `esp-serial-flasher` flow to the C6; SDIO-side
+slave OTA or the PROG_C6 USB cable are the only firmware-update
+paths.
+
+**Boot/power sequencing.** The C6 starts when:
 
 1. `VCC_5V` comes up → U3 produces `ESP_3V3`.
 2. P4 boots from internal/external flash and runs application code.
-3. Application releases `GPIO54` high → `C6_CHIP_PU` released → C6 boots from
-   its own internal flash.
+3. P4 application releases `GPIO54` high (or never drives it low) →
+   `C6_CHIP_PU` released → C6 boots from its own internal flash and
+   the factory `esp_hosted` slave runs.
 
-There is **no parallel hardware-reset path** on the C6 EN line — if the P4
-hangs with GPIO54 low, the C6 stays in reset. Conversely the P4's own
-CHIP_PU (`ESP_EN`) is driven only by the RESET button and the CH343P's
-RTS/DTR (USB-CDC reset glue, via the discrete U6 transistor on the USB-to-UART
-sheet); the C6 has no hardware path to reset the P4.
-
-> **Ambiguity (resolved 2026-05-23):** the PDF text dump shows six 1K series
-> resistors (R15, R16, R18-R21) for the C6↔P4 high-speed bus. The original
-> read of this doc labelled R15/R16 as UART (GPIO17/GPIO16 → C6
-> U0TXD/U0RXD) and R18-R21 as SDIO. **The empirical reality (D17 redo,
-> commit `bba7817`) is that the working transport uses all six lines as
-> SDIO**, mapping P4 GPIO 14-19 to C6 IO20/21/22/23 + IO18 + IO19:
->
-> | P4 | C6 | Role |
-> |---|---|---|
-> | GPIO14 | IO20 | SDIO D0 |
-> | GPIO15 | IO21 | SDIO D1 |
-> | GPIO16 | IO22 | SDIO D2 |
-> | GPIO17 | IO23 | SDIO D3 |
-> | GPIO18 | IO18 | SDIO CLK |
-> | GPIO19 | IO19 | SDIO CMD |
->
-> Whether the PDF's apparent "UART on R15/R16" net-label was a
-> mis-read or whether the board supports a UART-mode strap is not
-> known and not material — `esp_hosted` running over these pins
-> works end-to-end (Wi-Fi STA reaches the C6, RPC pings round-trip).
-> The previous c6-companion design's UART transport (commit
-> `20643e3`, reverted in `15c8205`) tried to drive these pins as
-> UART1 alongside SDIO and never reached the C6.
+If the P4 hangs with `GPIO54` low, the C6 stays in reset. Conversely
+the P4's own CHIP_PU (`ESP_EN`) is driven only by the RESET button
+and the CH343P's RTS/DTR (USB-CDC reset glue, via the discrete U6
+transistor on the USB-to-UART sheet); the C6 has no hardware path
+to reset the P4.
 
 ---
 
