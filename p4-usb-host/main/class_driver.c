@@ -230,6 +230,16 @@ void class_driver_task(void *arg)
     const int MAX_RECOVERY_ATTEMPTS = 3;
     const int64_t RECOVERY_INTERVAL_US = 6 * 1000000;
 
+    // Stream-stall watchdog (task #72): when a device IS enumerated but
+    // USB bytes_window stays effectively zero across several seconds,
+    // the controller / endpoint has wedged. Cycle the root port power
+    // to force re-attach (same recovery as the no-device path above).
+    int stall_seconds = 0;
+    const int STALL_TRIGGER_SECONDS    = 5;        // tolerate brief noise dips
+    const uint64_t STALL_BYTES_FLOOR   = 100*1024; // <100 KB/s is "stuck", not "quiet"
+    int stall_recoveries = 0;
+    const int MAX_STALL_RECOVERIES     = 3;
+
     while (1)
     {
         // Reset task watchdog. The loop runs hot (no vTaskDelay) because the
@@ -404,6 +414,40 @@ void class_driver_task(void *arg)
                 }
             }
 #endif // CONFIG_DIAG_TASK_DUMP
+
+            // Stream-stall watchdog (#72). Only relevant when a device
+            // is enumerated AND we're past initial warm-up (start_time
+            // + 3 s) so transient zero-byte windows during enumeration
+            // don't trigger.
+            if (s_driver_obj.dev_addr != 0 && (now - start_time) > 3 * 1000000) {
+                if (bytes_window < STALL_BYTES_FLOOR) {
+                    stall_seconds++;
+                    ESP_LOGW(TAG, "stream stall #%d/%d (%llu B in last 1s, threshold %llu)",
+                             stall_seconds, STALL_TRIGGER_SECONDS,
+                             (unsigned long long)bytes_window,
+                             (unsigned long long)STALL_BYTES_FLOOR);
+                } else {
+                    stall_seconds = 0;
+                }
+                if (stall_seconds >= STALL_TRIGGER_SECONDS &&
+                    stall_recoveries < MAX_STALL_RECOVERIES) {
+                    ESP_LOGE(TAG, "STREAM STALL: cycling root port power "
+                                  "(recovery %d/%d)",
+                             stall_recoveries + 1, MAX_STALL_RECOVERIES);
+                    esp_err_t r = usb_host_lib_set_root_port_power(false);
+                    ESP_LOGW(TAG, "  power(false) -> 0x%x (%s)", r, esp_err_to_name(r));
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    r = usb_host_lib_set_root_port_power(true);
+                    ESP_LOGW(TAG, "  power(true)  -> 0x%x (%s)", r, esp_err_to_name(r));
+                    stall_seconds = 0;
+                    stall_recoveries++;
+                }
+            } else {
+                stall_seconds   = 0;
+                // Re-arm the stall watchdog when a device re-enumerates
+                // — covers the "USB cable yanked and replugged" path.
+                if (s_driver_obj.dev_addr != 0) stall_recoveries = 0;
+            }
 
             last_report = now;
             bytes_window = 0;
