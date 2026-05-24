@@ -141,6 +141,20 @@ static void writer_task(void *arg)
     #define CONSEC_FAIL_LIMIT  64
     uint32_t consec_fail = 0;
 
+    // Per-write sector alignment — every fwrite size MUST be a
+    // multiple of 512 (SD sector size). Without this, FATFS detects
+    // a partial-sector tail, advances the user buf by `tail` bytes,
+    // and hands the SDMMC driver a misaligned pointer (e.g.
+    // buf+472). SDMMC's `is_aligned` check fails, it falls back to
+    // allocate_dma_buf which fails under DMA-INT pressure with
+    // ESP_ERR_NO_MEM. We saw this as deterministic 165032-byte (then
+    // 900 KB at 20 MHz) cliffs followed by every subsequent write
+    // returning EIO. Holding the unaligned tail in `stash` and
+    // prepending it to the next read keeps every fwrite aligned and
+    // every user-buf-offset aligned.
+    #define SECTOR_BYTES  512
+    size_t stash_len = 0;          // bytes held over from previous read
+
     while (1) {
         uint8_t *buf = s_writer_buf;
         if (!buf || s_state == CAP_STATE_IDLE || !s_stream) {
@@ -151,10 +165,18 @@ static void writer_task(void *arg)
             continue;
         }
 
-        // Drain whatever the producer queued. Short timeout so we
-        // notice STOPPING quickly even on a quiet capture.
-        size_t n = xStreamBufferReceive(s_stream, buf, WRITER_RECV_CHUNK,
+        // Drain whatever the producer queued, leaving room at the
+        // front of `buf` for the previous iteration's unaligned tail.
+        size_t n = xStreamBufferReceive(s_stream, buf + stash_len,
+                                         WRITER_RECV_CHUNK - stash_len,
                                          pdMS_TO_TICKS(100));
+        // Combine stash + new data, then round down to a sector
+        // multiple. The leftover bytes become the next iteration's
+        // stash.
+        size_t total = stash_len + n;
+        size_t aligned = total & ~(SECTOR_BYTES - 1);
+        size_t leftover = total - aligned;
+        n = aligned;
         if (n > 0 && s_fp) {
             // Single fwrite of the whole received chunk. We tried
             // chunking to 512 bytes with vTaskDelay(0) between
@@ -210,6 +232,13 @@ static void writer_task(void *arg)
                 }
             }
         }
+        // Move the unaligned tail to the front of buf for the next
+        // iteration's stash. Always do this after computing aligned/
+        // leftover so the rotation happens whether or not we wrote.
+        if (leftover > 0) {
+            memmove(buf, buf + aligned, leftover);
+        }
+        stash_len = leftover;
 
         // Periodic flush — limits crash-loss to ~1 s of capture.
         int64_t now = esp_timer_get_time();
@@ -224,19 +253,38 @@ static void writer_task(void *arg)
         if (s_state == CAP_STATE_STOPPING) {
             // Drain residual in non-blocking dequeues. Bounded so a
             // wedged SDMMC can't keep us looping on a 4 MB buffer.
+            // Same sector-alignment dance as the main loop: round
+            // each fwrite down to a 512-byte multiple, carry the
+            // leftover into the next iteration.
             int drain_iters = 512;
             for (; drain_iters > 0; drain_iters--) {
-                size_t rest = xStreamBufferReceive(s_stream, buf,
-                                                    WRITER_RECV_CHUNK, 0);
-                if (rest == 0) break;
-                if (s_fp) {
-                    size_t wr = fwrite(buf, 1, rest, s_fp);
-                    if (wr == rest) update_bytes_written(rest);
-                    else            update_write_error();
+                size_t rest = xStreamBufferReceive(s_stream, buf + stash_len,
+                                                    WRITER_RECV_CHUNK - stash_len, 0);
+                if (rest == 0 && stash_len == 0) break;
+                size_t total = stash_len + rest;
+                size_t aligned = total & ~(SECTOR_BYTES - 1);
+                size_t leftover = total - aligned;
+                if (aligned > 0 && s_fp) {
+                    size_t wr = fwrite(buf, 1, aligned, s_fp);
+                    if (wr == aligned) update_bytes_written(aligned);
+                    else               update_write_error();
                 }
+                if (leftover > 0) memmove(buf, buf + aligned, leftover);
+                stash_len = leftover;
+                if (rest == 0) break;   // nothing new and we just flushed
             }
             if (drain_iters == 0) {
                 ESP_LOGW(TAG, "drain hit iteration cap — discarding rest");
+            }
+            // Final partial-sector flush — fwrites the trailing
+            // `stash_len` (< 512) bytes. FATFS goes through its WIN
+            // cache for this single misaligned write; one such write
+            // is OK because the file is being closed immediately after.
+            if (stash_len > 0 && s_fp) {
+                size_t wr = fwrite(buf, 1, stash_len, s_fp);
+                if (wr == stash_len) update_bytes_written(stash_len);
+                else                 update_write_error();
+                stash_len = 0;
             }
             if (s_fp) {
                 fflush(s_fp);

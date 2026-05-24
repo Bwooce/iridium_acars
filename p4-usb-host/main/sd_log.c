@@ -252,6 +252,13 @@ static esp_err_t mount_sd(void)
                  SDMMC_PWR_LDO_CHANNEL, esp_err_to_name(pr));
     }
 
+    // Verbose SDMMC logs — diagnosing the deterministic ~165 KB
+    // EIO cliff in burst-mode capture. Reveals card status bits,
+    // CMD25/CMD12 errors, and wait_for_idle timeouts.
+    esp_log_level_set("sdmmc_cmd", ESP_LOG_DEBUG);
+    esp_log_level_set("sdmmc_common", ESP_LOG_DEBUG);
+    esp_log_level_set("sdmmc_io", ESP_LOG_DEBUG);
+
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     // 20 MHz (SDMMC_FREQ_DEFAULT). Tried 40 MHz (HIGHSPEED) first —
     // each burst's first multi-block write succeeded, then subsequent
@@ -471,9 +478,16 @@ esp_err_t sd_log_force_format(void)
     esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
         .timeout_ms = 5000, .idle_core_mask = 0, .trigger_panic = true });
 
-    // Recreate /sdcard/acars/ for the log + capture files.
+    // Recreate /sdcard/acars/ for the log + capture files, then
+    // re-open a fresh log file. esp_vfs_fat_sdcard_format leaves the
+    // VFS mount in place, so sd_log_force_mount would short-circuit on
+    // the stale s_log==NULL path and try to re-register the same mount
+    // point (which fails with INVALID_STATE). Re-opening the log here
+    // brings s_log back so subsequent /capture/start / sd_log_emit
+    // calls see a healthy logger.
     if (r == ESP_OK) {
         mkdir(MOUNT_POINT "/acars", 0775);
+        (void)open_log_file();
     }
     return r;
 }
