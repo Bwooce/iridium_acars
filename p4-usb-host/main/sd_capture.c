@@ -132,7 +132,7 @@ static void writer_task(void *arg)
 
         // Drain whatever the producer queued. Short timeout so we
         // notice STOPPING quickly even on a quiet capture.
-        size_t n = xStreamBufferReceive(s_stream, buf, sizeof(buf),
+        size_t n = xStreamBufferReceive(s_stream, buf, WRITER_RECV_CHUNK,
                                          pdMS_TO_TICKS(100));
         if (n > 0 && s_fp) {
             // Single fwrite of the whole received chunk. We tried
@@ -179,7 +179,7 @@ static void writer_task(void *arg)
             // Drain residual in non-blocking dequeues until empty.
             for (;;) {
                 size_t rest = xStreamBufferReceive(s_stream, buf,
-                                                    sizeof(buf), 0);
+                                                    WRITER_RECV_CHUNK, 0);
                 if (rest == 0) break;
                 if (s_fp) {
                     size_t wr = fwrite(buf, 1, rest, s_fp);
