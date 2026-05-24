@@ -11,14 +11,19 @@ set(_app_reqs
     usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash
     esp_wifi esp_netif esp_event esp_http_server esp_app_format
     esp_https_ota app_update lwip iridium_decoder
+    # SDMMC + FATFS always declared so idf_component_register sees them
+    # on first-pass CMake evaluation (CONFIG_* isn't readable until pass
+    # two, but PRIV_REQUIRES is consumed on pass one). The runtime cost
+    # comes from sd_log.c calling these APIs; that source file is what
+    # the CONFIG_ENABLE_SD_LOG gate actually excludes.
+    esp_driver_sdmmc fatfs esp_driver_gpio
 )
-# SD log subsystem (#63) is opt-in: linking SDMMC + FATFS pulls
-# ~50 KB of internal-SRAM reservations that compete with USB DMA
-# and break live-SDR throughput. Off by default; flip the
-# CONFIG_ENABLE_SD_LOG menuconfig option to include it.
+# SD log subsystem (#63): opt-in via CONFIG_ENABLE_SD_LOG. Off by
+# default. When off, sd_log.c isn't compiled and sd_log.h exposes
+# its API as inline no-ops, so no SDMMC / FATFS runtime allocations
+# happen even though the components are linked.
 if(CONFIG_ENABLE_SD_LOG)
     list(APPEND _app_srcs "sd_log.c")
-    list(APPEND _app_reqs esp_driver_sdmmc fatfs esp_driver_gpio)
 endif()
 
 idf_component_register(SRCS ${_app_srcs}

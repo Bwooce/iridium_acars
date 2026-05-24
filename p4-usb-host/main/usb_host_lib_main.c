@@ -22,6 +22,18 @@
 #include "acars_push.h"
 #include "ota_runner.h"
 #include "sd_log.h"
+#include "esp_heap_caps.h"
+
+// One-line snapshot of internal-DMA-capable heap (the pool the USB
+// transfer ring competes for). Temporary diagnostic for the SD-link
+// regression hunt.
+static void log_dma_int_heap(const char *tag)
+{
+    size_t f = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    size_t l = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    ESP_LOGW("HEAPDIAG", "%-30s DMA-INT free=%u largest=%u",
+             tag, (unsigned)f, (unsigned)l);
+}
 
 #if CONFIG_SMOKE_TEST_MODE
 #include "smoke_test.h"
@@ -151,6 +163,8 @@ void app_main(void)
         ESP_LOGW("BOOT", "reset reason: %s (%d)", name, (int)r);
     }
 
+    log_dma_int_heap("app_main entry");
+
     // Load runtime config from NVS (D18). Defaults are applied for any
     // missing keys — system stays operational with no NVS data.
     app_config_init();
@@ -158,6 +172,8 @@ void app_main(void)
 
     // D16 software AGC. Idle unless gain_mode==SOFTWARE_AGC.
     agc_init();
+
+    log_dma_int_heap("after app_config + agc");
 
     // D17 Wi-Fi via the C6 esp_hosted slave. STA if SSID in NVS, else
     // open SoftAP for first-time config. The smoke-mode build skips
@@ -175,8 +191,10 @@ void app_main(void)
     // ACARS UDP push (D17) — task is always created; emits only when
     // out_host/out_port are set in NVS.
     acars_push_init();
+    log_dma_int_heap("before sd_log_init");
     // SD card log (#63) — mounts the card if present; no-op if absent.
     sd_log_init();
+    log_dma_int_heap("after sd_log_init");
     // D19 OTA: if we got here without crashing, the current image is
     // healthy — cancel any pending rollback the bootloader was tracking.
     ota_runner_mark_valid();

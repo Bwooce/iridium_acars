@@ -28,7 +28,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/idf_additions.h"     // xQueueCreateWithCaps, xTaskCreatePinnedToCoreWithCaps
 
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 
 static const char *TAG = "SDLOG";
@@ -311,14 +313,24 @@ esp_err_t sd_log_init(void)
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
 
-    s_q = xQueueCreate(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t));
+    // Queue in PSRAM (NOT DMA-capable internal SRAM, the default for
+    // xQueueCreate). 32 × ~304-byte items = ~10 KB; if it lands in
+    // internal SRAM it steals from the USB transfer pool and kills
+    // live-SDR throughput. PSRAM is plenty fast for the per-message
+    // copy (~600 ns at 200 MHz).
+    s_q = xQueueCreateWithCaps(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t),
+                                MALLOC_CAP_SPIRAM);
     if (!s_q) return ESP_ERR_NO_MEM;
 
     // Writer task pinned to Core 0 — Core 1 is already heavily loaded
-    // by the DSP/worker/ingest pipeline.
-    BaseType_t ok = xTaskCreatePinnedToCore(writer_task, "sd_log",
-                                             WRITER_STACK, NULL, WRITER_PRIO,
-                                             NULL, 0);
+    // by the DSP/worker/ingest pipeline. Stack in PSRAM for the same
+    // reason as the queue (default xTaskCreate puts stacks in internal
+    // SRAM). 6 KB stack rate is fine on PSRAM — the writer task is at
+    // 1 Hz flush + ~few-Hz queue dequeue, latency-tolerant.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(writer_task, "sd_log",
+                                                     WRITER_STACK, NULL,
+                                                     WRITER_PRIO, NULL, 0,
+                                                     MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "writer task create failed");
         return ESP_ERR_NO_MEM;
@@ -327,8 +339,8 @@ esp_err_t sd_log_init(void)
     // the first time it receives an ACARS message. No internal SRAM is
     // consumed by the SD subsystem until then — important on no-card
     // boots and during the gap between boot and the first decode.
-    ESP_LOGI(TAG, "SD log writer ready on Core 0 (prio %d, queue %d) — "
-                  "lazy mount on first message",
+    ESP_LOGI(TAG, "SD log writer ready on Core 0 (prio %d, queue %d, "
+                  "queue+stack in PSRAM) — lazy mount on first message",
              WRITER_PRIO, EMIT_QUEUE_DEPTH);
     return ESP_OK;
 }
