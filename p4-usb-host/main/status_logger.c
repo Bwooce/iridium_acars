@@ -10,7 +10,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/idf_additions.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "status_logger.h"
 
 static const char *TAG = "CLASS";  // match the original tag for log continuity
@@ -197,7 +199,10 @@ static void logger_task(void *arg)
 
 esp_err_t status_logger_init(void)
 {
-    s_queue = xQueueCreate(2, sizeof(status_snapshot_t));
+    // Queue in PSRAM: 2 × sizeof(status_snapshot_t) (~600 B each = ~1.2 KB)
+    // — 1 Hz traffic, latency irrelevant, no reason to take DMA-INT.
+    s_queue = xQueueCreateWithCaps(2, sizeof(status_snapshot_t),
+                                    MALLOC_CAP_SPIRAM);
     if (!s_queue) return ESP_ERR_NO_MEM;
 
     // PSRAM stack — see feedback_task_stacks_in_psram memory note.

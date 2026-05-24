@@ -30,6 +30,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 
 #include "app_config.h"
 
@@ -170,7 +172,12 @@ esp_err_t ota_runner_start(void)
     xSemaphoreGive(s_status_mu);
     s_running = true;
 
-    BaseType_t ok = xTaskCreate(ota_task, "ota", 8192, NULL, 5, NULL);
+    // OTA stack in PSRAM — 8 KB stack would otherwise eat the USB
+    // DMA pool. esp_https_ota is HTTP+TCP-bound, latency-tolerant.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(ota_task, "ota", 8192,
+                                                     NULL, 5, NULL,
+                                                     tskNO_AFFINITY,
+                                                     MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         s_running = false;
         set_status_error("xTaskCreate failed");

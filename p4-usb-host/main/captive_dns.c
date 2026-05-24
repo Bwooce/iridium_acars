@@ -22,6 +22,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "DNS";
 static volatile bool s_running = false;
@@ -143,8 +145,13 @@ esp_err_t captive_dns_start(void)
     if (s_running) return ESP_OK;
     s_running = true;
 
-    BaseType_t ok = xTaskCreate(dns_task, "captive_dns",
-                                 3072, NULL, 3, NULL);
+    // DNS responder stack in PSRAM — UDP/53 handler is latency-tolerant
+    // (phone captive-portal probe, retries on timeout). Saves ~3 KB
+    // internal SRAM for USB DMA pool.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(dns_task, "captive_dns",
+                                                     3072, NULL, 3, NULL,
+                                                     tskNO_AFFINITY,
+                                                     MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "task create failed");
         s_running = false;

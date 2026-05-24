@@ -8,6 +8,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "AGC";
 
@@ -76,12 +78,17 @@ static void agc_task(void *arg)
 esp_err_t agc_init(void)
 {
     if (s_agc_task) return ESP_OK;
-    BaseType_t ok = xTaskCreatePinnedToCore(
+    // AGC task in PSRAM — 1 Hz tick, latency-tolerant, no reason to
+    // hold internal SRAM. ingest_core1 fills s_agc_peak_dev from
+    // Core 1, AGC reads it from PSRAM; the few-microsecond PSRAM
+    // latency is irrelevant at 1 Hz.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
         agc_task, "agc",
         /*stack=*/ 3072, NULL,
         /*prio=*/ 3,       // low priority; AGC is not time-critical
         &s_agc_task,
-        /*core=*/ 1);
+        /*core=*/ 1,
+        MALLOC_CAP_SPIRAM);
     return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
 }
 

@@ -20,6 +20,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "HTTP";
 static httpd_handle_t s_server = NULL;
@@ -318,7 +320,7 @@ static esp_err_t config_post(httpd_req_t *req)
 
     // 1-second deferred restart — let the TCP FIN out before tearing
     // down Wi-Fi.
-    xTaskCreate(deferred_reboot_task, "reboot", 2048, NULL, 5, NULL);
+    xTaskCreatePinnedToCoreWithCaps(deferred_reboot_task, "reboot", 2048, NULL, 5, NULL, tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
     return ESP_OK;
 }
 
@@ -511,7 +513,7 @@ static esp_err_t reset_post(httpd_req_t *req)
         "</body></html>";
     httpd_resp_send(req, ok, HTTPD_RESP_USE_STRLEN);
 
-    xTaskCreate(deferred_reboot_task, "reboot", 2048, NULL, 5, NULL);
+    xTaskCreatePinnedToCoreWithCaps(deferred_reboot_task, "reboot", 2048, NULL, 5, NULL, tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
     return ESP_OK;
 }
 
@@ -525,6 +527,11 @@ esp_err_t http_server_start(void)
     cfg.lru_purge_enable = true;
     cfg.stack_size     = 6144;
     cfg.task_priority  = 4;
+    // HTTP server task stack in PSRAM — default task_caps is
+    // MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT, which on P4 also satisfies
+    // MALLOC_CAP_DMA and steals from USB pool. esp_http_server is
+    // request/response over TCP, latency-tolerant; PSRAM stack is fine.
+    cfg.task_caps      = MALLOC_CAP_SPIRAM;
 
     esp_err_t r = httpd_start(&s_server, &cfg);
     if (r != ESP_OK) {

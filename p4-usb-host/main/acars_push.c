@@ -21,6 +21,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 
 #include "app_config.h"
 
@@ -172,12 +174,19 @@ static void push_task(void *arg)
 void acars_push_init(void)
 {
     if (s_active) return;
-    s_q = xQueueCreate(QUEUE_DEPTH, sizeof(acars_msg_t));
+    // Queue + task in PSRAM — UDP push is network-latency-tolerant
+    // (datagram emit, ~ms-scale), no reason to take internal SRAM
+    // away from USB DMA. See memory note feedback_usb_pool_size_not_throttle.
+    s_q = xQueueCreateWithCaps(QUEUE_DEPTH, sizeof(acars_msg_t),
+                                MALLOC_CAP_SPIRAM);
     if (!s_q) {
         ESP_LOGE(TAG, "queue create failed");
         return;
     }
-    BaseType_t ok = xTaskCreate(push_task, "acars_push", 4096, NULL, 3, NULL);
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(push_task, "acars_push",
+                                                     4096, NULL, 3, NULL,
+                                                     tskNO_AFFINITY,
+                                                     MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "task create failed");
         vQueueDelete(s_q);
