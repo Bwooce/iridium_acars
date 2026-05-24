@@ -265,12 +265,15 @@ static esp_err_t mount_sd(void)
     host.pwr_ctrl_handle = ldo_handle;
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    // 1-bit mode for max card compatibility — eliminates D1-D3 from
-    // the init handshake (some cards / slot-soldering combinations
-    // fail OCR at 4-bit). Throughput cap is ~6 MB/s on 1-bit at
-    // SDR25, comfortably above our ~4.5 MB/s SDR ingest rate, so
-    // the trade is free. Bump back to 4 only if a card needs more.
-    slot.width = 1;
+    // 4-bit mode. Board wires D0..D3 per schematic §1 (GPIO39..42).
+    // Was 1 briefly during LDO bring-up debugging (when card
+    // wasn't responding at all) — fallback no longer needed now
+    // that LDO #4 is properly enabled. 4-bit at SDMMC_FREQ_HIGHSPEED
+    // (40 MHz) = 20 MB/s peak, ~5-10 MB/s sustained on a decent
+    // card. Bench card was ~800 B/s under 1-bit so 4-bit should
+    // matter even more here (bus width is rarely THE bottleneck,
+    // but worth trying before blaming the card).
+    slot.width = 4;
     slot.clk = PIN_CLK;
     slot.cmd = PIN_CMD;
     slot.d0  = PIN_D0;
