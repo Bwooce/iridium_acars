@@ -30,19 +30,27 @@ static const char *TAG = "DSP_PROC";
 //   10  | gone   |  133   |   60    |   92%   ← host peak
 //   12  | gone   |   74   |   57    |   88%
 //   14  | gone   |   70   |   57    |   88%   ← firmware setting
-//   14  | fixed  |   70   |   56    |   86%
 //
-// Firmware uses 14 dB because per-burst processing went up with
-// 14 dB. This is TIGHTER than gri-equivalent (host uses 10 dB which
-// is the closest gri-aligned match given our tagger ENBW handling --
-// see fft_burst_tagger.c:131-141 and test_pipeline_wideband_albq.c).
-// We CANNOT match host's 10 dB here because the worker can't keep up:
-// tested 2026-05-21 -> dropped=57/147 (39% drop rate), recall regressed
-// 81.5% -> 49.2%, BCH-corrected frames 24 -> 15.
+// Firmware uses 14 dB. This is TIGHTER than gri-equivalent (host
+// uses 10 dB which is the closest gri-aligned match given our
+// tagger ENBW handling — see fft_burst_tagger.c:131-141 and
+// test_pipeline_wideband_albq.c). 10 dB is a perf workaround,
+// not a gri-aligned choice. Why we can't move to 10 yet:
 //
-// So this is a perf workaround, not a gri-aligned threshold. Documented
-// honestly. Task #58 / #74 cover the perf work needed before this can
-// move to 10 dB and match the host.
+//   * RAW_IRIDIUM smoke at 10 dB: matched 61 -> 63, recall 93.8%
+//     -> 96.9%, dropped=0/147. Looks like a win.
+//   * LIVE_SDR at 10 dB in a noisy / weak-signal bench environment:
+//     the tagger fires ~145 times/sec on noise spikes. The worker
+//     can't reject them fast enough; eventually a single burst's
+//     processing stalls past the 5 s task watchdog and the firmware
+//     reboots (worker_core1 reported running, IDLE0 starved).
+//     Tested 2026-05-24 — TASK_WDT fired at ~60 s uptime.
+//
+// What this means: smoke is bounded (16 s, 147 bursts) so it never
+// reveals the failure. Real-world reception with a properly placed
+// antenna may sit between the noise-only bench and the smoke
+// fixture — needs measurement before any move to 10 dB. Until
+// then, 14 dB stays as the safe default.
 #define FBT_THRESHOLD_DB    14.0f
 
 // Burst window padding in INPUT samples (at FS_DETECT_HZ). gri's
