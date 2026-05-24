@@ -27,11 +27,52 @@
 static const char *TAG = "HTTP";
 static httpd_handle_t s_server = NULL;
 
-static void deferred_reboot_task(void *arg)
+// NVS-write + reboot helper. MUST run with an internal-SRAM stack:
+// nvs_commit() takes spi_flash_disable_interrupts_caches_and_other_cpu(),
+// which makes PSRAM (cached) inaccessible. A task whose own stack
+// lives in PSRAM hits an assert and aborts the moment it dereferences
+// any local during the cache-disabled window. The httpd server task
+// is PSRAM-stacked (cfg.task_caps), so it cannot do NVS writes
+// itself — it must hand the work off to this task.
+typedef struct {
+    char     ssid[33];
+    char     psk[64];
+    char     out_host[64];
+    uint16_t out_port;
+    char     ota_url[128];
+    bool     bias_tee;
+    bool     clear_only;   // true = reset_post path (clear SSID+PSK, ignore other fields)
+} nvs_save_args_t;
+
+static void nvs_save_and_reboot_task(void *arg)
 {
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "rebooting to apply new Wi-Fi config");
+    nvs_save_args_t *a = (nvs_save_args_t *)arg;
+
+    esp_err_t r1, r2, r3 = ESP_OK, r4 = ESP_OK, r5 = ESP_OK, r6 = ESP_OK;
+    if (a->clear_only) {
+        r1 = app_config_set_wifi_ssid("");
+        r2 = app_config_set_wifi_psk("");
+    } else {
+        r1 = app_config_set_wifi_ssid(a->ssid);
+        r2 = app_config_set_wifi_psk(a->psk);
+        r3 = app_config_set_out_host(a->out_host);
+        r4 = app_config_set_out_port(a->out_port);
+        r5 = app_config_set_ota_url(a->ota_url);
+        r6 = app_config_set_bias_tee(a->bias_tee);
+    }
+    if (r1 || r2 || r3 || r4 || r5 || r6) {
+        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s bias=%s",
+                 esp_err_to_name(r1), esp_err_to_name(r2),
+                 esp_err_to_name(r3), esp_err_to_name(r4),
+                 esp_err_to_name(r5), esp_err_to_name(r6));
+    }
+
+    free(a);
+
+    // Brief grace period so the already-sent HTTP response + TCP FIN
+    // get out before Wi-Fi tears down.
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGI(TAG, "rebooting to apply new config");
     esp_restart();
 }
 
@@ -293,23 +334,25 @@ static esp_err_t config_post(httpd_req_t *req)
              out_host[0] ? out_host : "(none)", (unsigned)out_port,
              ota_url[0] ? ota_url : "(none)");
 
-    esp_err_t r1 = app_config_set_wifi_ssid(ssid);
-    esp_err_t r2 = app_config_set_wifi_psk(psk);
-    esp_err_t r3 = app_config_set_out_host(out_host);
-    esp_err_t r4 = app_config_set_out_port(out_port);
-    esp_err_t r5 = app_config_set_ota_url(ota_url);
-    esp_err_t r6 = app_config_set_bias_tee(bias_tee);
-    if (r1 || r2 || r3 || r4 || r5 || r6) {
-        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s bias=%s",
-                 esp_err_to_name(r1), esp_err_to_name(r2),
-                 esp_err_to_name(r3), esp_err_to_name(r4),
-                 esp_err_to_name(r5), esp_err_to_name(r6));
+    // Marshal form fields into a heap-allocated struct and hand off
+    // to an internal-SRAM-stacked worker that does the NVS writes
+    // and the reboot. See nvs_save_and_reboot_task comment.
+    nvs_save_args_t *args = calloc(1, sizeof(*args));
+    if (!args) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "nvs write failed\n", HTTPD_RESP_USE_STRLEN);
+        return httpd_resp_send(req, "alloc failed\n", HTTPD_RESP_USE_STRLEN);
     }
+    strlcpy(args->ssid,     ssid,     sizeof(args->ssid));
+    strlcpy(args->psk,      psk,      sizeof(args->psk));
+    strlcpy(args->out_host, out_host, sizeof(args->out_host));
+    args->out_port = out_port;
+    strlcpy(args->ota_url,  ota_url,  sizeof(args->ota_url));
+    args->bias_tee   = bias_tee;
+    args->clear_only = false;
 
-    // Tell the user, then reboot after a delay so the reply is fully
-    // flushed before the SDIO Wi-Fi tears down.
+    // Send the OK page BEFORE spawning the writer — once it runs,
+    // NVS commit disables flash cache, which could disrupt the
+    // socket send (esp_netif/lwip work on cached PSRAM too).
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     const char *ok =
         "<!doctype html><html><body style=\"font-family:system-ui;max-width:480px;margin:2em auto;padding:0 1em\">"
@@ -319,9 +362,12 @@ static esp_err_t config_post(httpd_req_t *req)
         "</body></html>";
     httpd_resp_send(req, ok, HTTPD_RESP_USE_STRLEN);
 
-    // 1-second deferred restart — let the TCP FIN out before tearing
-    // down Wi-Fi.
-    xTaskCreatePinnedToCoreWithCaps(deferred_reboot_task, "reboot", 2048, NULL, 5, NULL, tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
+    BaseType_t spawned = xTaskCreatePinnedToCore(nvs_save_and_reboot_task,
+        "nvs_save", 4096, args, 5, NULL, tskNO_AFFINITY);
+    if (spawned != pdPASS) {
+        ESP_LOGE(TAG, "nvs_save task spawn failed — NVS not written, no reboot");
+        free(args);
+    }
     return ESP_OK;
 }
 
@@ -590,14 +636,14 @@ static esp_err_t reset_post(httpd_req_t *req)
 {
     ESP_LOGW(TAG, "/reset POST: clearing Wi-Fi NVS + rebooting to AP mode");
 
-    esp_err_t r1 = app_config_set_wifi_ssid("");
-    esp_err_t r2 = app_config_set_wifi_psk("");
-    if (r1 != ESP_OK || r2 != ESP_OK) {
-        ESP_LOGE(TAG, "NVS clear failed: ssid=%s psk=%s",
-                 esp_err_to_name(r1), esp_err_to_name(r2));
+    // Same defer-to-internal-stack pattern as config_post — NVS
+    // commit can't run on this PSRAM-stacked httpd task.
+    nvs_save_args_t *args = calloc(1, sizeof(*args));
+    if (!args) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "nvs clear failed\n", HTTPD_RESP_USE_STRLEN);
+        return httpd_resp_send(req, "alloc failed\n", HTTPD_RESP_USE_STRLEN);
     }
+    args->clear_only = true;
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     const char *ok =
@@ -608,7 +654,12 @@ static esp_err_t reset_post(httpd_req_t *req)
         "</body></html>";
     httpd_resp_send(req, ok, HTTPD_RESP_USE_STRLEN);
 
-    xTaskCreatePinnedToCoreWithCaps(deferred_reboot_task, "reboot", 2048, NULL, 5, NULL, tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
+    BaseType_t spawned = xTaskCreatePinnedToCore(nvs_save_and_reboot_task,
+        "nvs_save", 4096, args, 5, NULL, tskNO_AFFINITY);
+    if (spawned != pdPASS) {
+        ESP_LOGE(TAG, "nvs_save task spawn failed — NVS not cleared, no reboot");
+        free(args);
+    }
     return ESP_OK;
 }
 

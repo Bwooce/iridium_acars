@@ -261,12 +261,20 @@ static esp_err_t mount_sd(void)
         // Power the card rail back off so a missing-card socket isn't
         // sitting with VDD asserted.
         gpio_set_level(PIN_PWR, 1);     // 1 = card power OFF
-        // NOTE: the SDMMC driver's slot state + FATFS context (~25 KB
-        // of internal DMA-capable SRAM) remain allocated even after
-        // a failed mount, which pushes the USB transfer pool short
-        // on the no-card boot path. A lazy mount path (e.g. only
-        // mount when /sd/mount is POST'd) would avoid the regression
-        // entirely. Tracked as a follow-up.
+        // Tear down what esp_vfs_fat_sdmmc_mount partially set up so
+        // a retry (after the user inserts a card and POSTs /sd/mount
+        // or /capture/start) can re-add the slot cleanly. Without
+        // this, the SDMMC driver returns "slot is not available"
+        // forever — even after the user fixes the underlying problem
+        // — and the only recovery is a hard reboot.
+        //
+        // The slot is what stays allocated after a failed mount;
+        // esp_vfs_fat_sdmmc_mount already cleans up its own VFS
+        // registration on failure. Errors from this teardown call
+        // are expected when init didn't reach slot allocation;
+        // ignored.
+        s_card = NULL;
+        (void)sdmmc_host_deinit_slot(SDMMC_HOST_SLOT_0);
         return r;
     }
 
