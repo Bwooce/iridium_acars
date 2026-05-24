@@ -28,14 +28,30 @@
 #define RS25_DECIM         128
 #define RS25_DELAY_SIZE    9
 
+// Caller-allocated batch_scratch capacity for _process_explicit.
+// 8 complex pairs = 32 bytes = half a cache line — enough to
+// amortise PSRAM write latency, small enough for any caller stack.
+#define RS25_BATCH_COMPLEX 8
+
 typedef struct {
     int16_t     coeffs[RS25_DELAY_SIZE * RS25_INTERP];   // legacy layout (used by firmr_s16 host comparison)
-    // Linear delay buffers (newest sample at index 0; manually shifted
-    // down on each input). 16 int16 wide so the active 9 are flanked
-    // by zero-padded tail slots for future PIE 128-bit loads.
-    int16_t     delay_i[16] __attribute__((aligned(16)));
-    int16_t     delay_q[16] __attribute__((aligned(16)));
+    // Circular delay buffers with double-mirror layout (task #58).
+    // The 16-slot logical ring is stored as 32 int16 — slots
+    // [0..15] are the live ring, slots [16..31] mirror the same
+    // data. wpos walks 0..15; each input writes the new sample at
+    // BOTH delay[wpos] and delay[wpos+16]. The MAC reads 16
+    // contiguous int16 starting at &delay[wpos] — first 9 are real
+    // taps, the rest are mirror data that gets multiplied by the
+    // coefficient zero-pad (slots [9..15] of every phase row) so
+    // it contributes 0 to the sum.
+    //
+    // This eliminates the per-input 9-element shift (was 18 stores
+    // per input, now 4) — see resample_256_to_250.c for the cycle
+    // accounting that justifies it.
+    int16_t     delay_i[32] __attribute__((aligned(16)));
+    int16_t     delay_q[32] __attribute__((aligned(16)));
     int         start_pos;     // phase counter (shared by I/Q)
+    int         wpos;          // circular write index in [0..15]
     firmr_s16_t fir_i;         // retained for host comparison build only
     firmr_s16_t fir_q;
 } resample_256_to_250_t;
@@ -65,22 +81,37 @@ int resample_256_to_250_process(resample_256_to_250_t *r,
                                  int16_t *out_iq);
 
 // Caller-managed-state variant of _process. The polyphase delay
-// line (delay_i[16], delay_q[16] — only [0..8] are live, [9..15] are
-// the PIE 128-bit-load zero-pad slots) and `start_pos` phase
-// counter are owned by the caller, not the resample_256_to_250_t
-// struct. Used by the split-ingest worker pool so two workers can
-// run concurrently on different output slices of the same chunk.
-// Returns number of complex outputs written, bounded by max_out.
+// line uses the double-mirror layout described in
+// resample_256_to_250_t — caller MUST provide delay_i[32] and
+// delay_q[32] (not [16]) and a wpos write index in [0..15].
+// `start_pos_io` is the phase counter as before. Used by the
+// split-ingest worker pool so two workers can run concurrently on
+// different output slices of the same chunk. Returns number of
+// complex outputs written, bounded by max_out.
+//
+// `batch_scratch` (optional, NULL = direct writes): caller-owned
+// 16-int16 (8 complex) buffer that MUST be aligned(16). If
+// non-NULL and points to internal SRAM, the PIE MAC writes each
+// emit into this scratch and the function memcpy-flushes 32-byte
+// chunks to `out_iq` (in PSRAM). This coalesces what would
+// otherwise be ~8000 scattered uncached 2-byte PSRAM stores into
+// ~1000 32-byte bursts. Pass NULL if the caller stack lives in
+// PSRAM (worker tasks) — batching to PSRAM scratch is a wash.
+// Measured PSRAM-write cost on the inline ingest_task path
+// (internal-SRAM stack) was ~525 µs of the ~3.7 ms resample cost
+// (2026-05-24 profile).
 int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *delay_q,
+                                          int *wpos_io,
                                           int *start_pos_io,
                                           const int16_t *in_iq, int n_in_complex,
-                                          int16_t *out_iq, int max_out);
+                                          int16_t *out_iq, int max_out,
+                                          int16_t *batch_scratch);
 
 // "Advance only" — process inputs but do NOT emit outputs. Used to
-// pre-position Worker B's (delay_line, start_pos) to the chunk's
-// midpoint before it starts its MAC slice. Same state evolution as
-// _process_explicit, just no per-output MAC work. ~30 ns/input
-// scalar, ~60 µs over 2048 inputs.
+// pre-position Worker B's (delay_line, wpos, start_pos) to the
+// chunk's midpoint before it starts its MAC slice. Same state
+// evolution as _process_explicit, just no per-output MAC work.
 void resample_256_to_250_advance(int16_t *delay_i, int16_t *delay_q,
+                                  int *wpos_io,
                                   int *start_pos_io,
                                   const int16_t *in_iq, int n_in_complex);

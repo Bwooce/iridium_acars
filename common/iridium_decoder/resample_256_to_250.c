@@ -60,10 +60,14 @@ extern void resample_125_128_mac_arp4(const int16_t *pc,
                                        const int16_t *dq,
                                        int16_t *out_i,
                                        int16_t *out_q);
+// Hoisted out of the per-emit MAC kernel — caller invokes once per
+// process_explicit call. See comment in resample_arp4.S.
+extern void resample_125_128_enable_pie_cfg(void);
 #define RS25_USE_PIE_ASM 1
 #else
 #define RS25_USE_PIE_ASM 0
 #endif
+
 
 // Modified Bessel I0, for Kaiser window. Copy of the same function in
 // direct_if_decim.c — could be deduped, but the two modules are
@@ -233,6 +237,7 @@ void resample_256_to_250_init(resample_256_to_250_t *r)
     memset(r->delay_i, 0, sizeof(r->delay_i));
     memset(r->delay_q, 0, sizeof(r->delay_q));
     r->start_pos = 0;
+    r->wpos      = 0;
     // firmr_s16 retained for host comparison / regression coverage;
     // the production path no longer routes through it.
     firmr_s16_init(&r->fir_i, r->coeffs, r->delay_i,
@@ -244,82 +249,146 @@ void resample_256_to_250_init(resample_256_to_250_t *r)
 }
 
 // Caller-managed-state core. Same Q15 math as the legacy entry below
-// (bit-exact, same 0x7fff rounding + >>15) but the (delay, phase)
+// (bit-exact, same 0x7fff rounding + >>15) but the (delay, wpos, phase)
 // live in caller-owned buffers. Used directly by the split-ingest
 // worker pool; the legacy resample_256_to_250_t wrapper delegates
 // here too.
+//
+// Layout (task #58): the delay buffer is 32 int16, but only 16 hold
+// unique data — slots [0..15] are the live ring and [16..31] mirror
+// the same values. Each input writes the new sample at BOTH
+// delay[wpos] and delay[wpos+16], then wpos walks backwards (wraps
+// at 0). The MAC reads 16 contiguous int16 starting at
+// &delay[wpos]; for any wpos in [0..15] that window fits inside the
+// [0..31] buffer, the first 9 entries are the true taps in
+// "newest..8-old" order, and entries [9..15] are mirror data that
+// gets multiplied by the per-phase coefficient zero-pad (slots
+// [9..15] are 0 by construction in make_resample_coeffs +
+// resample_256_to_250_init).
+//
+// This eliminates the per-input 9-element shift (was 18 stores per
+// input — 9 each for I and Q including the new sample; now 4
+// stores: newest + mirror, per channel). The MAC math is unchanged
+// — the same PIE asm reads the same 16-int16 window and produces a
+// bit-identical result.
+// Output batch size for the optional batch_scratch path: 8 complex
+// = 32 bytes = half a cache line. Big enough to amortise the cost
+// of an uncached PSRAM round-trip across multiple emits; small
+// enough that the scratch fits trivially on a caller's stack.
+#define RS25_BATCH_COMPLEX 8
+
 RS25_HOT int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *delay_q,
+                                          int *wpos_io,
                                           int *start_pos_io,
                                           const int16_t *in_iq, int n_in_complex,
-                                          int16_t *out_iq, int max_out)
+                                          int16_t *out_iq, int max_out,
+                                          int16_t *batch_scratch)
 {
     int16_t *__restrict di = delay_i;
     int16_t *__restrict dq = delay_q;
     const int16_t *__restrict coeffs_pp = s_coeffs_pp;
+    int wpos      = *wpos_io;
     int start_pos = *start_pos_io;
     int n_out = 0;
+    int batch_n = 0;     // 0..RS25_BATCH_COMPLEX (only used when batch_scratch != NULL)
     (void)s_coeffs_pp_ready;
 
+#if RS25_USE_PIE_ASM
+    // Enable unaligned 128-bit PIE vld once before the loop; the
+    // hot per-emit MAC kernel now assumes this is set.
+    resample_125_128_enable_pie_cfg();
+#endif
+
     for (int i = 0; i < n_in_complex; i++) {
-        // Shift delay line: 9 elements, newest at index 0.
-        // delay[9..15] are tail-pad slots for PIE 128-bit loads.
-        di[8] = di[7]; di[7] = di[6]; di[6] = di[5]; di[5] = di[4];
-        di[4] = di[3]; di[3] = di[2]; di[2] = di[1]; di[1] = di[0];
-        di[0] = in_iq[2 * i + 0];
-        dq[8] = dq[7]; dq[7] = dq[6]; dq[6] = dq[5]; dq[5] = dq[4];
-        dq[4] = dq[3]; dq[3] = dq[2]; dq[2] = dq[1]; dq[1] = dq[0];
-        dq[0] = in_iq[2 * i + 1];
+        // Circular write with mirror copy. wpos walks 0..15
+        // backwards (newest sample at delay[wpos]). The mirror at
+        // delay[wpos+16] keeps a contiguous 9-tap window readable
+        // at &delay[wpos] regardless of how wpos wraps.
+        wpos = (wpos + 15) & 15;
+        int16_t i_s = in_iq[2 * i + 0];
+        int16_t q_s = in_iq[2 * i + 1];
+        di[wpos] = i_s; di[wpos + 16] = i_s;
+        dq[wpos] = q_s; dq[wpos + 16] = q_s;
 
         if (start_pos < RS25_INTERP) {
             if (n_out < max_out) {
                 const int16_t *__restrict pc =
                     &coeffs_pp[start_pos * RS25_PADDED_TAPS];
+                // Pick the per-emit write destination. With
+                // batch_scratch, the MAC writes go to an aligned
+                // internal-SRAM scratch and we flush in 32-byte
+                // bursts; without, we write straight to out_iq in
+                // PSRAM as before.
+                int16_t *out_i = batch_scratch
+                    ? &batch_scratch[2 * batch_n + 0]
+                    : &out_iq[2 * n_out + 0];
+                int16_t *out_q = batch_scratch
+                    ? &batch_scratch[2 * batch_n + 1]
+                    : &out_iq[2 * n_out + 1];
 #if RS25_USE_PIE_ASM
-                resample_125_128_mac_arp4(pc, di, dq,
-                                           &out_iq[2 * n_out + 0],
-                                           &out_iq[2 * n_out + 1]);
+                resample_125_128_mac_arp4(pc, &di[wpos], &dq[wpos],
+                                           out_i, out_q);
 #else
                 int64_t acc_i = 0x7fff;
                 int64_t acc_q = 0x7fff;
                 for (int k = 0; k < RS25_DELAY_SIZE; k++) {
                     int32_t c = pc[k];
-                    acc_i += (int32_t)di[k] * c;
-                    acc_q += (int32_t)dq[k] * c;
+                    acc_i += (int32_t)di[wpos + k] * c;
+                    acc_q += (int32_t)dq[wpos + k] * c;
                 }
-                out_iq[2 * n_out + 0] = (int16_t)(acc_i >> 15);
-                out_iq[2 * n_out + 1] = (int16_t)(acc_q >> 15);
+                *out_i = (int16_t)(acc_i >> 15);
+                *out_q = (int16_t)(acc_q >> 15);
 #endif
                 n_out++;
+                if (batch_scratch) {
+                    batch_n++;
+                    if (batch_n == RS25_BATCH_COMPLEX) {
+                        // Flush full batch to PSRAM as one 32-byte memcpy.
+                        memcpy(&out_iq[2 * (n_out - RS25_BATCH_COMPLEX)],
+                               batch_scratch,
+                               RS25_BATCH_COMPLEX * 2 * sizeof(int16_t));
+                        batch_n = 0;
+                    }
+                }
             }
             start_pos += RS25_DECIM;
         }
         start_pos -= RS25_INTERP;
     }
 
+    // Final partial batch flush.
+    if (batch_scratch && batch_n > 0) {
+        memcpy(&out_iq[2 * (n_out - batch_n)],
+               batch_scratch,
+               batch_n * 2 * sizeof(int16_t));
+    }
+
+    *wpos_io      = wpos;
     *start_pos_io = start_pos;
     return n_out;
 }
 
 // State-advance only: walks delay + phase counter through the input
 // range without emitting outputs. Used by split-ingest's Worker B to
-// pre-position its (delay, start_pos) to the chunk midpoint while
-// Worker A processes the first half concurrently. ~30 ns/input
-// scalar — the loop body is just two delay-shifts + a phase update.
+// pre-position its (delay, wpos, start_pos) to the chunk midpoint
+// while Worker A processes the first half concurrently. Same write
+// pattern as _process_explicit so the resulting state is identical.
 void resample_256_to_250_advance(int16_t *delay_i, int16_t *delay_q,
+                                  int *wpos_io,
                                   int *start_pos_io,
                                   const int16_t *in_iq, int n_in_complex)
 {
     int16_t *__restrict di = delay_i;
     int16_t *__restrict dq = delay_q;
+    int wpos      = *wpos_io;
     int start_pos = *start_pos_io;
 
     for (int i = 0; i < n_in_complex; i++) {
-        di[8] = di[7]; di[7] = di[6]; di[6] = di[5]; di[5] = di[4];
-        di[4] = di[3]; di[3] = di[2]; di[2] = di[1]; di[1] = di[0];
-        di[0] = in_iq[2 * i + 0];
-        dq[8] = dq[7]; dq[7] = dq[6]; dq[6] = dq[5]; dq[5] = dq[4];
-        dq[4] = dq[3]; dq[3] = dq[2]; dq[2] = dq[1]; dq[1] = dq[0];
-        dq[0] = in_iq[2 * i + 1];
+        wpos = (wpos + 15) & 15;
+        int16_t i_s = in_iq[2 * i + 0];
+        int16_t q_s = in_iq[2 * i + 1];
+        di[wpos] = i_s; di[wpos + 16] = i_s;
+        dq[wpos] = q_s; dq[wpos + 16] = q_s;
 
         if (start_pos < RS25_INTERP) {
             start_pos += RS25_DECIM;
@@ -327,6 +396,7 @@ void resample_256_to_250_advance(int16_t *delay_i, int16_t *delay_q,
         start_pos -= RS25_INTERP;
     }
 
+    *wpos_io      = wpos;
     *start_pos_io = start_pos;
 }
 
@@ -338,7 +408,9 @@ int resample_256_to_250_process(resample_256_to_250_t *r,
     // n_in_complex is an upper bound on emitted outputs (the 125/128
     // ratio guarantees out_count <= in_count), so max_out = n_in.
     return resample_256_to_250_process_explicit(r->delay_i, r->delay_q,
+                                                 &r->wpos,
                                                  &r->start_pos,
                                                  in_iq, n_in_complex,
-                                                 out_iq, n_in_complex);
+                                                 out_iq, n_in_complex,
+                                                 /*batch_scratch=*/ NULL);
 }

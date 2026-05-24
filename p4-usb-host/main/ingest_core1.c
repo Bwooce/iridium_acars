@@ -21,17 +21,23 @@ static size_t   s_resamp_n_int16[INGEST_NUM_SLOTS];  // int16 element count in s
 
 // 125/128 polyphase rational resampler state. Caller-managed —
 // process_explicit() reads/updates these in place each dispatch.
-// Three separate file-scope statics instead of a single struct so
-// the resampler API doesn't tie us to the legacy resample_256_to_250_t
+// Separate file-scope statics instead of a single struct so the
+// resampler API doesn't tie us to the legacy resample_256_to_250_t
 // wrapper.
-static int16_t s_persist_delay_i[16] __attribute__((aligned(16)));
-static int16_t s_persist_delay_q[16] __attribute__((aligned(16)));
+//
+// delay buffers are 32 int16 — slots [0..15] are the live ring,
+// [16..31] mirror the same values to make the 9-tap MAC window
+// readable contiguously at any wpos. See resample_256_to_250.c for
+// the layout rationale (task #58 double-mirror).
+static int16_t s_persist_delay_i[32] __attribute__((aligned(16)));
+static int16_t s_persist_delay_q[32] __attribute__((aligned(16)));
 static int     s_persist_start_pos = 0;
+static int     s_persist_wpos      = 0;
 
 // Fraction (0–50%) of each dispatch's input handed to Worker A on
 // Core 0. 0 = single-thread inline path on Core 1 (default).
 // Tunable at runtime via ingest_core1_set_split_pct().
-static volatile uint8_t s_split_pct = 0;     /* default OFF — Worker A on Core 0 still slows FFT even with pipelined tagger (sweep 2026-05-23). See docs/split-resample-sweep-2026-05-22.md */
+static volatile uint8_t s_split_pct = 0;     /* default OFF — Worker A on Core 0 still slows FFT even with pipelined tagger (sweep 2026-05-23). See docs/split-resample-sweep-2026-05-22.md. Re-confirmed 2026-05-24 after task #58 wpos change: FFT 258→412 µs (+60%) at split=25; lighter wrapper doesn't change the L2 contention. */
 
 // 125/128 polyphase: number of outputs emitted by processing `k`
 // inputs starting from phase counter `S0`. Derivation: pre_(i+1) =
@@ -53,10 +59,14 @@ static inline int rs_n_emits(int S0, int k)
 
 // Resample worker scratch (used by the parallel split path; unused at
 // split=0 but the tasks exist at boot so we can ramp up dynamically).
+//
+// delay buffers carry the double-mirror layout — see s_persist_delay_*
+// comment above.
 typedef struct {
-    int16_t        delay_i[16] __attribute__((aligned(16)));
-    int16_t        delay_q[16] __attribute__((aligned(16)));
+    int16_t        delay_i[32] __attribute__((aligned(16)));
+    int16_t        delay_q[32] __attribute__((aligned(16)));
     int            start_pos;
+    int            wpos;
     const int16_t *in_iq;
     int            n_in_complex;
     int16_t       *out_iq;
@@ -111,10 +121,15 @@ static void resample_worker_task(void *arg)
         int16_t *out_target = w->out_iq;
         int      max_out_target = w->max_out;
 #endif
+        // Workers run on PSRAM-backed stacks, so a stack-local
+        // batch scratch would live in PSRAM and the memcpy from
+        // PSRAM→PSRAM would be net negative vs direct writes.
+        // Pass NULL to keep direct PSRAM writes for the worker path.
         w->n_out = resample_256_to_250_process_explicit(
-            w->delay_i, w->delay_q, &w->start_pos,
+            w->delay_i, w->delay_q, &w->wpos, &w->start_pos,
             w->in_iq, w->n_in_complex,
-            out_target, max_out_target);
+            out_target, max_out_target,
+            /*batch_scratch=*/ NULL);
         // Ensure output buffer writes are globally visible before
         // the coord (possibly on another core) reads them / kicks
         // signal_buffer_push (AXI-GDMA reading from PSRAM).
@@ -245,18 +260,29 @@ static void ingest_task(void *arg)
 
         if (mid == 0) {
             // Inline single-thread path on Core 1 (split=0 default).
+            // ingest_task's stack lives in internal SRAM (default
+            // xTaskCreatePinnedToCore), so the stack-local batch
+            // scratch lands in internal SRAM and the PIE MAC sh's
+            // are fast — the function then flushes 32-byte bursts
+            // into the PSRAM out buffer. See _process_explicit doc
+            // for the cost rationale.
+            int16_t batch_scratch[RS25_BATCH_COMPLEX * 2]
+                __attribute__((aligned(16)));
             n_out_complex = resample_256_to_250_process_explicit(
-                s_persist_delay_i, s_persist_delay_q, &s_persist_start_pos,
+                s_persist_delay_i, s_persist_delay_q,
+                &s_persist_wpos, &s_persist_start_pos,
                 dst, n_in_complex,
-                out, n_in_complex);
+                out, n_in_complex,
+                batch_scratch);
         } else {
             // Split path — Worker A on Core 0 takes the first `mid`
             // inputs; Worker B on Core 1 takes the rest. Both run
-            // concurrently. Worker B's initial (delay, start_pos)
-            // is computed from the closed-form polyphase walk so
-            // it can start immediately, no serial pre-pass.
+            // concurrently. Worker B's initial (delay, wpos,
+            // start_pos) is computed from the closed-form polyphase
+            // walk so it can start immediately, no serial pre-pass.
             memcpy(s_worker_a.delay_i, s_persist_delay_i, sizeof(s_persist_delay_i));
             memcpy(s_worker_a.delay_q, s_persist_delay_q, sizeof(s_persist_delay_q));
+            s_worker_a.wpos         = s_persist_wpos;
             s_worker_a.start_pos    = s_persist_start_pos;
             s_worker_a.in_iq        = dst;
             s_worker_a.n_in_complex = mid;
@@ -264,16 +290,28 @@ static void ingest_task(void *arg)
             s_worker_a.max_out      = mid;
             s_worker_a.coord_task   = xTaskGetCurrentTaskHandle();
 
+            // Seed Worker B's delay buffer with the 9 newest input
+            // samples (mid-1, mid-2, ..., mid-9) in newest-first
+            // order at delay[0..8], with mirror copies at
+            // delay[16..24] so the first MAC iteration sees them at
+            // delay[wpos+1..wpos+8] after the wpos decrement.
             int n_emits_a = rs_n_emits(s_persist_start_pos, mid);
             for (int k = 0; k < 9; k++) {
                 int src_idx = mid - 1 - k;
-                s_worker_b.delay_i[k] = dst[2 * src_idx + 0];
-                s_worker_b.delay_q[k] = dst[2 * src_idx + 1];
+                int16_t i_s = dst[2 * src_idx + 0];
+                int16_t q_s = dst[2 * src_idx + 1];
+                s_worker_b.delay_i[k]      = i_s;
+                s_worker_b.delay_i[k + 16] = i_s;
+                s_worker_b.delay_q[k]      = q_s;
+                s_worker_b.delay_q[k + 16] = q_s;
             }
             for (int k = 9; k < 16; k++) {
-                s_worker_b.delay_i[k] = 0;
-                s_worker_b.delay_q[k] = 0;
+                s_worker_b.delay_i[k]      = 0;
+                s_worker_b.delay_i[k + 16] = 0;
+                s_worker_b.delay_q[k]      = 0;
+                s_worker_b.delay_q[k + 16] = 0;
             }
+            s_worker_b.wpos         = 0;
             s_worker_b.start_pos    = s_persist_start_pos + 128 * n_emits_a - 125 * mid;
             s_worker_b.in_iq        = dst + 2 * mid;
             s_worker_b.n_in_complex = n_in_complex - mid;
@@ -294,6 +332,7 @@ static void ingest_task(void *arg)
             memcpy(s_persist_delay_i, s_worker_b.delay_i, sizeof(s_persist_delay_i));
             memcpy(s_persist_delay_q, s_worker_b.delay_q, sizeof(s_persist_delay_q));
             s_persist_start_pos = s_worker_b.start_pos;
+            s_persist_wpos      = s_worker_b.wpos;
         }
         int n_out_int16 = n_out_complex * 2;
         s_resamp_n_int16[msg.slot] = (size_t)n_out_int16;
@@ -380,6 +419,7 @@ esp_err_t ingest_core1_init(void)
     memset(s_persist_delay_i, 0, sizeof(s_persist_delay_i));
     memset(s_persist_delay_q, 0, sizeof(s_persist_delay_q));
     s_persist_start_pos = 0;
+    s_persist_wpos      = 0;
 #if WORKER_OUT_TO_INTERNAL_SCRATCH
     s_worker_out_scratch = heap_caps_aligned_alloc(64,
         WORKER_OUT_SCRATCH_INT16 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
