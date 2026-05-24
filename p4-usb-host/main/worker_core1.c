@@ -719,8 +719,20 @@ esp_err_t worker_core1_init(void)
     // pool and silently regress decode (verified empirically with
     // the resample worker tasks). Burst-decode runs ~5–10/s on real
     // RF with ~85 ms compute each → PSRAM stack overhead is < 0.1%.
+    // Priority: lower than frame_decoder (4) so a backlog of bursts
+    // never starves the WDT-watched decoder task. Worker is the
+    // slowest consumer (~85 ms/burst) and bursts queue with
+    // graceful drop-on-full at the tagger callback — back-pressure
+    // here is correct; CPU starvation of the decoder is not.
+    //
+    // History: was 5 (above frame_decoder). At task #77's 10 dB
+    // tagger threshold, the worker stayed runnable for >5 s
+    // straight under bench noise, starved frame_decoder, and the
+    // TASK_WDT aborted. Moving below frame_decoder lets the
+    // scheduler give the WDT-watched task its cycles even when
+    // worker has a backlog.
     xTaskCreatePinnedToCoreWithCaps(worker_task, "worker_core1", 16384, NULL,
-                                     5, NULL, 1, MALLOC_CAP_SPIRAM);
+                                     3, NULL, 1, MALLOC_CAP_SPIRAM);
     return ESP_OK;
 }
 

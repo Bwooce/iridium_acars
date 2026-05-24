@@ -207,8 +207,16 @@ esp_err_t status_logger_init(void)
 
     // PSRAM stack — see feedback_task_stacks_in_psram memory note.
     // 1 Hz periodic logging; PSRAM stack overhead is negligible.
+    //
+    // Priority 6 = above frame_decoder (4) and worker (3) on Core 1
+    // so the logger always gets its sub-millisecond formatting slot
+    // even when the worker has a sustained backlog of bursts. This
+    // 1 Hz spike can't starve the lower-prio tasks — it's ~200 µs
+    // of CPU per second. Without this, under heavy noise (10 dB
+    // tagger threshold, ~145 bursts/sec) the worker preempted the
+    // logger indefinitely and the STATUS line disappeared.
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(logger_task, "status_logger",
-                                                    6144, NULL, 1, NULL, 1,
+                                                    6144, NULL, 6, NULL, 1,
                                                     MALLOC_CAP_SPIRAM);
     return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
 }

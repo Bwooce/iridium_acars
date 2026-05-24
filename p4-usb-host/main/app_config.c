@@ -24,7 +24,7 @@ static const char *NVS_NS = "iridium";
 #define DEFAULT_GAIN_MODE            GAIN_MODE_TUNER_AGC
 #define DEFAULT_GAIN_DB_X10          350      // 35.0 dB (rec'd for live)
 #define DEFAULT_BIAS_TEE             false
-#define DEFAULT_TAGGER_THRESHOLD_DB  14.0f
+#define DEFAULT_TAGGER_THRESHOLD_DB  10.0f
 #define DEFAULT_STATION_ID           "p4-iridium-1"
 #define DEFAULT_WIFI_SSID            ""
 #define DEFAULT_WIFI_PSK             ""

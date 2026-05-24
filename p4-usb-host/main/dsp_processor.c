@@ -29,29 +29,27 @@ static const char *TAG = "DSP_PROC";
 //   10  | fixed  |  133   |   58    |   89%
 //   10  | gone   |  133   |   60    |   92%   ← host peak
 //   12  | gone   |   74   |   57    |   88%
-//   14  | gone   |   70   |   57    |   88%   ← firmware setting
+//   14  | gone   |   70   |   57    |   88%
 //
-// Firmware uses 14 dB. This is TIGHTER than gri-equivalent (host
-// uses 10 dB which is the closest gri-aligned match given our
-// tagger ENBW handling — see fft_burst_tagger.c:131-141 and
-// test_pipeline_wideband_albq.c). 10 dB is a perf workaround,
-// not a gri-aligned choice. Why we can't move to 10 yet:
+// 10 dB is the closest gri-aligned match given our tagger ENBW
+// handling (see fft_burst_tagger.c:131-141 and
+// test_pipeline_wideband_albq.c). Smoke at 10 dB: matched 61 -> 63,
+// recall 93.8% -> 96.9%, dropped=0/147.
 //
-//   * RAW_IRIDIUM smoke at 10 dB: matched 61 -> 63, recall 93.8%
-//     -> 96.9%, dropped=0/147. Looks like a win.
-//   * LIVE_SDR at 10 dB in a noisy / weak-signal bench environment:
-//     the tagger fires ~145 times/sec on noise spikes. The worker
-//     can't reject them fast enough; eventually a single burst's
-//     processing stalls past the 5 s task watchdog and the firmware
-//     reboots (worker_core1 reported running, IDLE0 starved).
-//     Tested 2026-05-24 — TASK_WDT fired at ~60 s uptime.
-//
-// What this means: smoke is bounded (16 s, 147 bursts) so it never
-// reveals the failure. Real-world reception with a properly placed
-// antenna may sit between the noise-only bench and the smoke
-// fixture — needs measurement before any move to 10 dB. Until
-// then, 14 dB stays as the safe default.
-#define FBT_THRESHOLD_DB    14.0f
+// History: 14 dB was a perf workaround through 2026-05-24 morning.
+// At 10 dB the worker couldn't keep up under bench-noise conditions
+// (tagger fires ~145/sec on noise spikes); the worker monopolised
+// Core 1 long enough to starve frame_decoder past the 5 s task
+// watchdog, and the firmware aborted. The fix wasn't perf — task
+// #58 had already cut Core 1 ingest cost ~10% which was plenty —
+// it was a priority inversion: worker (5) preempted frame_decoder
+// (4) and status_logger (1). Dropping worker to 3 (below decoder)
+// and bumping logger to 6 lets the scheduler keep the WDT-watched
+// task alive and the observability lines flowing even when the
+// worker has a backlog. With those in place, live USB rate at
+// 10 dB measured higher than at 14 dB (4.5 vs 4.0 MB/s) because
+// Core 1 spends less time worker-monopolised.
+#define FBT_THRESHOLD_DB    10.0f
 
 // Burst window padding in INPUT samples (at FS_DETECT_HZ). gri's
 // defaults: pre = 2*fft_size = 4096, post = sample_rate * 16e-3 =
