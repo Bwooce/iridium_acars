@@ -49,6 +49,31 @@ headroom (commit landing alongside this doc update). The old bars (wind
 25 µs, detect 50 µs, push 130 µs) reflected the pre-Wi-Fi code layout
 and no longer reflect a useful regression gate.
 
+### 2026-05-24 update — task #74 instrumented (verbose status logger)
+
+`CONFIG_STATUS_LOG_VERBOSE=y` exposed per-iteration cycle breakdown.
+At 3.7 MB/s sustained, the consumer loop in `class_driver_task` looks
+like:
+
+```
+Cycle (Core0): iter=239 (239/s)  handle_events=262 us/iter (6.2%)
+                                 take_converted=1599 us/feed (38%)
+Cycle (Core0 us avg): read=218  feed=2068
+```
+
+So per ~4.2 ms cycle: handle_events 6%, read 5%, take_converted 38%,
+feed (DSP) 49%. The previous-iteration ingest is what's keeping Core
+0 blocked in `take_converted`. Ingest cost per dispatch
+(`convert+resample+sbpush`) is **4.3 ms**, dominated by **resample
+at 3.8 ms** — exactly Optimization Opportunity #1 below. That sets
+the throughput ceiling at min(Core0_cycle, Core1_ingest) =
+16 KB / 4.3 ms = **3.72 MB/s**. Matches the measured 3.6.
+
+**Conclusion:** pool size + USB host stack are NOT the throttle.
+Resample is the throttle. Either rewrite it (opp #1 alt: PIE
+inner-MAC, bigger) or eliminate it by dropping SDR rate to 2.0 MSPS
+(opp #1 below, much smaller). Drop-to-2.0 is the next likely win.
+
 ---
 
 ## 1. Drop RTL-SDR rate from 2.56 → 2.0 MSPS (gri-aligned)
