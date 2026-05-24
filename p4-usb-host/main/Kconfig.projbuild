@@ -171,4 +171,23 @@ config SMOKE_TEST_LIVE_SDR
         stack without a fixture in the loop. Mutually exclusive with
         the fixture-driven smoke variants.
 
+config ENABLE_SD_LOG
+    bool "Log decoded ACARS messages to a microSD card (SDMMC slot 0)"
+    default n
+    help
+        When enabled, the firmware mounts the on-board microSD card on
+        first ACARS message and appends each decoded message as one
+        NDJSON line to /sdcard/acars/log-<bootts>.ndjson. Schema is
+        identical to GET /messages and the UDP push, so any consumer
+        can read the file directly.
+
+        Default OFF. Linking the SDMMC driver + FATFS pulls in fixed
+        internal-SRAM reservations (~50 KB) that compete with the USB
+        host's DMA transfer pool. With it enabled, the USB transfer
+        pool drops from 8 × 8 KB to 3 × 8 KB and signal_buffer's
+        GDMA descriptors fail to allocate, killing live-SDR
+        throughput. Until the SD subsystem can be made to coexist
+        without that pressure, builds without an SD card requirement
+        should leave this off.
+
 endmenu

@@ -2,9 +2,12 @@
 
 #include "esp_err.h"
 #include "msg_ring.h"
+#include "sdkconfig.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 // SD card log writer for decoded ACARS messages.
 //
@@ -17,10 +20,26 @@
 // schema as GET /messages and the UDP push, so any consumer can read
 // the file directly.
 //
-// Capacity is generous (a busy environment is ~few msg/sec × few
-// hundred bytes = a few KB/s, well under any SD card's sustained
-// write rate). One flush every ~1 s keeps data durable without
-// hammering the FATFS layer.
+// Compile-time gate: CONFIG_ENABLE_SD_LOG. When the flag is OFF
+// (default), the whole subsystem (SDMMC driver + FATFS + this
+// module) is excluded from the build and all public functions
+// become inline no-ops. Linking SDMMC + FATFS costs ~50 KB of
+// internal-SRAM static reservations that compete with USB host
+// DMA pool and break live-SDR throughput; opt-in only.
+
+// Snapshot stats for /status surfacing (struct always available so
+// callers compile in either build).
+typedef struct {
+    bool     mounted;
+    bool     log_open;
+    uint32_t messages_written;
+    uint32_t write_errors;
+    uint64_t bytes_written;
+    char     log_path[64];        // empty if no log open
+    char     mount_error[64];     // empty on success
+} sd_log_stats_t;
+
+#if CONFIG_ENABLE_SD_LOG
 
 // One-shot at boot: spawns the writer task + queue. Does NOT mount the
 // card. The first acars_msg_t through sd_log_emit() triggers a
@@ -38,15 +57,21 @@ void sd_log_emit(const acars_msg_t *m);
 // ESP_OK if already mounted.
 esp_err_t sd_log_force_mount(void);
 
-// Snapshot stats for /status surfacing.
-typedef struct {
-    bool     mounted;
-    bool     log_open;
-    uint32_t messages_written;
-    uint32_t write_errors;
-    uint64_t bytes_written;
-    char     log_path[64];        // empty if no log open
-    char     mount_error[64];     // empty on success
-} sd_log_stats_t;
-
 void sd_log_get_stats(sd_log_stats_t *out);
+
+#else  /* !CONFIG_ENABLE_SD_LOG — provide inline no-op stubs. */
+
+static inline esp_err_t sd_log_init(void) { return ESP_OK; }
+static inline void      sd_log_emit(const acars_msg_t *m) { (void)m; }
+static inline esp_err_t sd_log_force_mount(void) { return ESP_ERR_NOT_SUPPORTED; }
+static inline void      sd_log_get_stats(sd_log_stats_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    // "disabled-in-build" marker doubles as the /status hint that
+    // SDMMC isn't even linked into this firmware image.
+    snprintf(out->mount_error, sizeof(out->mount_error),
+             "disabled (CONFIG_ENABLE_SD_LOG=n)");
+}
+
+#endif  /* CONFIG_ENABLE_SD_LOG */
