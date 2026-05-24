@@ -253,16 +253,23 @@ static esp_err_t mount_sd(void)
     }
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    // 40 MHz is the SDIO 3.0 / UHS-I high-speed rate; the board wiring
-    // supports it. Fallback DS (default) is 20 MHz if a slower card
-    // is detected at probe time.
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    // 20 MHz (SDMMC_FREQ_DEFAULT). Tried 40 MHz (HIGHSPEED) first —
+    // each burst's first multi-block write succeeded, then subsequent
+    // writes returned EIO until the writer's circuit breaker tripped
+    // at 64 consecutive failures. Symptom matches an overclocked card
+    // wedging under sustained load. 20 MHz halves theoretical
+    // throughput but burst-mode peak (~0.8 MB/s) is well within reach.
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
     // Slot 0 (P4-NANO's SD slot per schematic, distinct from slot 1
     // which is C6 esp_hosted).
     host.slot = SDMMC_HOST_SLOT_0;
     host.init   = sdmmc_init_noop;
     host.deinit = sdmmc_deinit_noop;
     host.pwr_ctrl_handle = ldo_handle;
+    // (Tried SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF here to support PSRAM
+    // source buffers — that flag is documented as SDIO-only and
+    // produces ENOSPC on SD card writes. Producers must keep their
+    // fwrite source in DMA-capable internal SRAM. See sd_capture.c.)
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     // 4-bit mode. Board wires D0..D3 per schematic §1 (GPIO39..42).
@@ -425,6 +432,50 @@ esp_err_t sd_log_force_mount(void)
     // short-circuited by the writer task.
     s_mount_attempted = false;
     return try_mount_and_open();
+}
+
+esp_err_t sd_log_force_format(void)
+{
+    // Close the log file first so f_mkfs doesn't trip over an open
+    // handle. Subsequent acars writes will lazy-reopen the log.
+    if (s_log) {
+        fflush(s_log);
+        fclose(s_log);
+        s_log = NULL;
+        xSemaphoreTake(s_stats_mu, portMAX_DELAY);
+        s_stats.log_open = false;
+        s_stats.log_path[0] = '\0';
+        xSemaphoreGive(s_stats_mu);
+    }
+    // f_mkfs takes up to ~3 min on a 4 GB card; bump the WDT so the
+    // task that called us (httpd) doesn't trip during the format.
+    esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
+        .timeout_ms = 240000, .idle_core_mask = 0, .trigger_panic = true });
+
+    esp_err_t r = ESP_OK;
+    if (s_card) {
+        ESP_LOGW(TAG, "force_format: erasing card");
+        r = esp_vfs_fat_sdcard_format(MOUNT_POINT, s_card);
+        if (r != ESP_OK) {
+            ESP_LOGE(TAG, "esp_vfs_fat_sdcard_format failed: %s",
+                     esp_err_to_name(r));
+        } else {
+            ESP_LOGI(TAG, "force_format: complete — card reformatted FAT32");
+        }
+    } else {
+        ESP_LOGW(TAG, "force_format: no card mounted");
+        r = ESP_ERR_INVALID_STATE;
+    }
+
+    // Restore WDT to its normal value.
+    esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
+        .timeout_ms = 5000, .idle_core_mask = 0, .trigger_panic = true });
+
+    // Recreate /sdcard/acars/ for the log + capture files.
+    if (r == ESP_OK) {
+        mkdir(MOUNT_POINT "/acars", 0775);
+    }
+    return r;
 }
 
 void sd_log_emit(const acars_msg_t *m)

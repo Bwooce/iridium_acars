@@ -57,6 +57,13 @@ void sd_log_emit(const acars_msg_t *m);
 // ESP_OK if already mounted.
 esp_err_t sd_log_force_mount(void);
 
+// Unmount, wipe + reformat the card to FAT32, remount. Destroys all
+// data on the card. Used to recover from "ENOSPC even though the
+// card has space" after accumulated test captures fill the volume.
+// May take 30-180 s depending on card size — caller (HTTP handler)
+// should not hold any locks during the call.
+esp_err_t sd_log_force_format(void);
+
 void sd_log_get_stats(sd_log_stats_t *out);
 
 #else  /* !CONFIG_ENABLE_SD_LOG — provide inline no-op stubs. */
@@ -64,6 +71,7 @@ void sd_log_get_stats(sd_log_stats_t *out);
 static inline esp_err_t sd_log_init(void) { return ESP_OK; }
 static inline void      sd_log_emit(const acars_msg_t *m) { (void)m; }
 static inline esp_err_t sd_log_force_mount(void) { return ESP_ERR_NOT_SUPPORTED; }
+static inline esp_err_t sd_log_force_format(void) { return ESP_ERR_NOT_SUPPORTED; }
 static inline void      sd_log_get_stats(sd_log_stats_t *out)
 {
     if (!out) return;

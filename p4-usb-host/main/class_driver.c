@@ -23,6 +23,7 @@
 #include "resample_256_to_250.h"
 #include "fft_sc16_2048.h"
 #include "app_config.h"
+#include "sd_capture.h"
 #include "class_driver.h"
 #include "bch_decoder.h"
 #include "rtl-sdr.h"
@@ -148,6 +149,15 @@ static void action_start_stream(class_driver_t *driver_obj)
 
     ESP_LOGI(TAG, "Starting Async Stream...");
     esp_libusb_start_stream(driver_obj, 0x81);
+
+    // Grab the SD-capture writer's DMA-INT scratch AFTER tagger AND
+    // USB pool have taken their slices. Both are load-bearing for
+    // live decode, so they get first dibs. If this fails (heap too
+    // fragmented), SD capture refuses to start but everything else
+    // stays operational. esp_libusb_start_stream submits URBs and
+    // returns; URB recycling churn ramps up over the next seconds
+    // so allocating right here gives us the cleanest window.
+    sd_capture_alloc_writer_buf();
     
     driver_obj->actions &= ~ACTION_START_STREAM;
 }

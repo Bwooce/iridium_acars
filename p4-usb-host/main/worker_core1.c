@@ -29,6 +29,7 @@
 #include "dsp_processor.h"
 #include "qpsk_demod.h"
 #include "uw_correlator.h"
+#include "sd_capture.h"
 #include "burst_pipeline.h"
 #include "direct_if_decim.h"
 #include "rotate_to_dc.h"
@@ -568,6 +569,19 @@ void worker_task(void *arg)
 
             int64_t t_dec0 = esp_timer_get_time();
             direct_if_decim_reset_state(&s_decim);
+            // If burst-mode SD capture is active, emit one record
+            // per burst: header + raw 2.5 MSPS IQ samples (pre-
+            // rotate, pre-decim — the exact bytes the worker just
+            // read from signal_buffer). Chunked via the same
+            // signal_buffer_read_chunk loop the decode path uses.
+            // sd_capture_record_burst_* are no-ops when not in
+            // burst mode, so the hot-path cost is two predicted-
+            // false branches.
+            sd_capture_record_burst_begin((uint32_t)ext_len,
+                                           burst.rel_freq_hz,
+                                           burst.peak_snr_db,
+                                           burst.magnitude_db,
+                                           burst.noise_db);
             int n_250k = 0;
             for (int off = 0; off < (int)ext_len; off += DECIM_CHUNK_IN) {
                 int chunk = (int)ext_len - off;
@@ -580,6 +594,12 @@ void worker_task(void *arg)
                 // without a PSRAM intermediate.
                 signal_buffer_read_chunk(ext_start + (uint32_t)off,
                                           (uint32_t)chunk, s_chunk_iq);
+                // SD burst-capture tap. Writes the raw pre-rotate
+                // IQ chunk to the capture stream buffer; host
+                // pipeline replay sees exactly what the worker
+                // saw, so device-vs-host decode comparisons are
+                // apples-to-apples.
+                sd_capture_record_burst_chunk(s_chunk_iq, (size_t)chunk);
                 // Rotate the chunk in internal SRAM. sample_offset = off
                 // keeps the absolute-phase renorm aligned across the
                 // burst as if it were a single rotate call.
@@ -596,6 +616,7 @@ void worker_task(void *arg)
                                        s_decim_scr_out_i, s_decim_scr_out_q);
                 n_250k += n_chunk_out;
             }
+            sd_capture_record_burst_end();
             int64_t t_dec1 = esp_timer_get_time();
             s_t_decim_us += (uint64_t)(t_dec1 - t_dec0);
 

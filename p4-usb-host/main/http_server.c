@@ -593,12 +593,37 @@ static esp_err_t sd_mount_post(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// POST /sd/format — wipe + reformat the SD card. Destroys all data
+// on the card. Takes 30-180 s depending on card size; httpd timeout
+// gets bumped via the task WDT bump inside sd_log_force_format.
+static esp_err_t sd_format_post(httpd_req_t *req)
+{
+    // Refuse if a capture is currently writing — otherwise format
+    // would yank the file out from under the writer.
+    sd_capture_stats_t cs;
+    sd_capture_get_stats(&cs);
+    if (cs.active) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_send(req,
+            "capture is active — POST /capture/stop first\n",
+            HTTPD_RESP_USE_STRLEN);
+    }
+    esp_err_t r = sd_log_force_format();
+    char body[128];
+    int n = snprintf(body, sizeof(body),
+        "{\"result\":\"%s\"}", esp_err_to_name(r));
+    if (n < 0) n = 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "500 Internal Server Error");
+    return httpd_resp_send(req, body, n);
+}
+
 // POST /capture/start — body is optional JSON like {"target_bytes":N}
 // (default = unlimited). Returns the resulting file path + initial
 // stats. 503 if SD mount fails or capture is already active.
 static esp_err_t capture_start_post(httpd_req_t *req)
 {
-    char body[64] = {0};
+    char body[128] = {0};
     int len = req->content_len;
     if (len > 0 && len < (int)sizeof(body)) {
         int got = httpd_req_recv(req, body, len);
@@ -620,15 +645,26 @@ static esp_err_t capture_start_post(httpd_req_t *req)
         }
     }
 
-    esp_err_t r = sd_capture_start(target);
+    // Optional mode flag: {"mode":"bursts"} switches to per-burst
+    // IQ record capture (lossless on any SD card — tagged bursts
+    // only, ~40-160 KB per burst, ~0.5-10 bursts/sec real rate).
+    // Default is continuous (raw uint8 USB stream, needs fast card).
+    bool burst_mode = false;
+    if (strstr(body, "\"bursts\"") || strstr(body, "burst")) {
+        burst_mode = true;
+    }
+
+    esp_err_t r = burst_mode ? sd_capture_start_bursts()
+                              : sd_capture_start(target);
     sd_capture_stats_t s;
     sd_capture_get_stats(&s);
     char resp[256];
     int n = snprintf(resp, sizeof(resp),
-        "{\"result\":\"%s\",\"active\":%s,\"path\":\"%s\","
+        "{\"result\":\"%s\",\"active\":%s,\"mode\":\"%s\",\"path\":\"%s\","
         "\"target_bytes\":%llu}",
         esp_err_to_name(r),
         s.active ? "true" : "false",
+        burst_mode ? "bursts" : "continuous",
         s.path,
         (unsigned long long)s.bytes_target);
     if (n < 0) n = 0;
@@ -702,20 +738,27 @@ static esp_err_t capture_file_get(httpd_req_t *req)
     snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", name);
     httpd_resp_set_hdr(req, "Content-Disposition", disp);
 
-    uint8_t buf[8192];
+    // Heap-allocate the read buf — httpd task stack is in PSRAM and
+    // sized for small allocations, so an 8 KB stack array overflowed
+    // and crashed the system. PSRAM heap is fine for fread sources.
+    uint8_t *buf = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        fclose(fp);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "out of memory", HTTPD_RESP_USE_STRLEN);
+    }
     while (1) {
-        size_t n = fread(buf, 1, sizeof(buf), fp);
+        size_t n = fread(buf, 1, 8192, fp);
         if (n == 0) break;
         if (httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) {
             // client disconnected mid-stream; bail and clean up
             fclose(fp);
+            heap_caps_free(buf);
             return ESP_FAIL;
         }
-        // Yield between chunks so a long file transfer doesn't
-        // monopolise the httpd task (and through it, Core 0).
-        vTaskDelay(0);
     }
     fclose(fp);
+    heap_caps_free(buf);
     httpd_resp_send_chunk(req, NULL, 0);   // end of body
     return ESP_OK;
 }
@@ -810,6 +853,7 @@ esp_err_t http_server_start(void)
         { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,     .user_ctx = NULL },
         { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,       .user_ctx = NULL },
         { .uri = "/sd/mount",      .method = HTTP_POST, .handler = sd_mount_post,       .user_ctx = NULL },
+        { .uri = "/sd/format",     .method = HTTP_POST, .handler = sd_format_post,      .user_ctx = NULL },
         { .uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post,  .user_ctx = NULL },
         { .uri = "/capture/stop",  .method = HTTP_POST, .handler = capture_stop_post,   .user_ctx = NULL },
         { .uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get,  .user_ctx = NULL },

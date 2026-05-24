@@ -51,13 +51,19 @@ static const char *TAG = "SDCAP";
 #define WRITER_STACK            6144
 #define WRITER_PRIO             5
 
-// Per-receive scratch. Sized large so each fwrite is a single
-// multi-sector SD write — Class-4-class cards can sustain
-// 4 MB/s on 16+ KB sequential writes but degrade to <1 KB/s on
-// 4 KB random writes (each triggers a full erase-modify-write
-// cycle). 64 KB = 128 sectors, a typical SD erase-block boundary
-// on cheap SDHC, so writes align cleanly.
-#define WRITER_RECV_CHUNK       (64 * 1024)
+// Per-receive scratch. Must be DMA-capable internal SRAM (SDMMC
+// driver can't DMA from PSRAM; SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF
+// is SDIO-only). After tagger (66 KB) and USB pool (~56 KB
+// actually used — pool tries 64 KB but typically gets 7 of 8
+// transfers), only ~8-16 KB contiguous DMA-INT is left.
+// 8 KB is the largest that reliably fits AFTER USB pool init.
+//
+// 8 KB writes give ~300-500 KB/s on Class 4 cards. Burst-mode
+// peak rate is ~10 bursts/sec × 80 KB avg = 0.8 MB/s — close to
+// the limit but workable. If the producer outruns the writer,
+// stream-buffer back-pressure drops bytes (bytes_dropped ticks
+// up) rather than losing whole bursts.
+#define WRITER_RECV_CHUNK       (8 * 1024)
 
 // FATFS FILE buffer size: 64 KB. Each fwrite to a buffered FILE
 // just memcpy's into here; the actual SDMMC write happens when
@@ -76,6 +82,14 @@ static volatile cap_state_t s_state    = CAP_STATE_IDLE;
 static FILE                *s_fp       = NULL;
 static SemaphoreHandle_t    s_stats_mu = NULL;
 static sd_capture_stats_t   s_stats    = {0};
+
+// Capture mode: 0 = continuous (sd_capture_write tap in
+// class_driver), 1 = burst-only (sd_capture_record_burst_*
+// from worker_core1). The two modes share the writer task and
+// stream buffer; only one is producing at any time. Set by
+// sd_capture_start / sd_capture_start_bursts.
+static volatile bool s_burst_mode = false;
+static volatile uint32_t s_burst_seq = 0;
 
 static void update_bytes_written(size_t n)
 {
@@ -101,28 +115,35 @@ static void update_write_error(void)
     xSemaphoreGive(s_stats_mu);
 }
 
+static uint8_t *s_writer_buf = NULL;   // DMA-INT, alloc'd in action_start_stream
+
 static void writer_task(void *arg)
 {
     (void)arg;
-    // fwrite buffer MUST be in DMA-capable internal SRAM. SDMMC
-    // DMA reads from this on the way to the card; if it lives in
-    // PSRAM (which is the default for the writer's stack since we
-    // set MALLOC_CAP_SPIRAM for the task), the IDF DMA layer tries
-    // to allocate a "stash" copy in DMA-INT SRAM and fails with
-    // `no mem for stash buffer` when DMA-INT is already booked by
-    // the USB transfer pool. Outcome was fwrite returning EIO
-    // after ~76 KB of capture. Heap-alloc the buffer once here.
-    uint8_t *buf = heap_caps_aligned_alloc(64, WRITER_RECV_CHUNK,
-                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!buf) {
-        ESP_LOGE(TAG, "writer_task: DMA-INT buf alloc failed — capture disabled");
-        vTaskDelete(NULL);
-        return;
-    }
+    // fwrite buf is allocated via sd_capture_alloc_writer_buf() from
+    // action_start_stream() AFTER tagger init. Until then we idle —
+    // s_stream stays NULL anyway because sd_capture_start refuses if
+    // s_writer_buf hasn't landed yet.
     int64_t last_flush = 0;
 
+    // Throttle the fwrite-failure log spam — when SDMMC returns EIO
+    // continuously (card bus error / unrecoverable controller state),
+    // we don't want a wall of warnings. One line per WARN_THROTTLE_NS
+    // and one summary on transition back to success.
+    int64_t last_warn_us = 0;
+    uint32_t warn_skipped = 0;
+    #define WARN_THROTTLE_US  500000   // half a second between warn lines
+
+    // Hard cap on consecutive write failures — if SDMMC won't accept a
+    // write this many times in a row, the controller is wedged. Bail
+    // out of capture rather than burn CPU on a dead card. Operator can
+    // POST /sd/format + /capture/start to retry.
+    #define CONSEC_FAIL_LIMIT  64
+    uint32_t consec_fail = 0;
+
     while (1) {
-        if (s_state == CAP_STATE_IDLE || !s_stream) {
+        uint8_t *buf = s_writer_buf;
+        if (!buf || s_state == CAP_STATE_IDLE || !s_stream) {
             // No capture in flight — sleep until one starts. 200 ms
             // tick is fine; sd_capture_start is a low-frequency
             // operator action.
@@ -146,6 +167,13 @@ static void writer_task(void *arg)
             size_t total_wr = fwrite(buf, 1, n, s_fp);
             if (total_wr == n) {
                 update_bytes_written(n);
+                if (consec_fail > 0) {
+                    ESP_LOGI(TAG, "fwrite recovered after %u failures "
+                                  "(skipped %u warn lines)",
+                             (unsigned)consec_fail, (unsigned)warn_skipped);
+                    consec_fail = 0;
+                    warn_skipped = 0;
+                }
                 // Stop on target reached. Producer also gates on
                 // bytes_target so this is belt-and-suspenders.
                 uint64_t cap = 0, tgt = 0;
@@ -159,9 +187,27 @@ static void writer_task(void *arg)
                     s_state = CAP_STATE_STOPPING;
                 }
             } else {
-                ESP_LOGW(TAG, "fwrite short %u/%u (errno=%d)",
-                         (unsigned)total_wr, (unsigned)n, errno);
+                int64_t now = esp_timer_get_time();
+                if (now - last_warn_us >= WARN_THROTTLE_US) {
+                    ESP_LOGW(TAG, "fwrite short %u/%u (errno=%d) "
+                                  "consec_fail=%u (skipped %u since last)",
+                             (unsigned)total_wr, (unsigned)n, errno,
+                             (unsigned)consec_fail + 1, (unsigned)warn_skipped);
+                    last_warn_us = now;
+                    warn_skipped = 0;
+                } else {
+                    warn_skipped++;
+                }
                 update_write_error();
+                consec_fail++;
+                if (consec_fail >= CONSEC_FAIL_LIMIT) {
+                    ESP_LOGE(TAG, "fwrite failed %u consecutive times — "
+                                  "SDMMC controller likely wedged. Aborting "
+                                  "capture; POST /sd/format and try again.",
+                             (unsigned)consec_fail);
+                    s_state = CAP_STATE_STOPPING;
+                    consec_fail = 0;
+                }
             }
         }
 
@@ -176,8 +222,10 @@ static void writer_task(void *arg)
         // close. Producer is already gated by s_state != ACTIVE so
         // nothing new arrives.
         if (s_state == CAP_STATE_STOPPING) {
-            // Drain residual in non-blocking dequeues until empty.
-            for (;;) {
+            // Drain residual in non-blocking dequeues. Bounded so a
+            // wedged SDMMC can't keep us looping on a 4 MB buffer.
+            int drain_iters = 512;
+            for (; drain_iters > 0; drain_iters--) {
                 size_t rest = xStreamBufferReceive(s_stream, buf,
                                                     WRITER_RECV_CHUNK, 0);
                 if (rest == 0) break;
@@ -186,6 +234,9 @@ static void writer_task(void *arg)
                     if (wr == rest) update_bytes_written(rest);
                     else            update_write_error();
                 }
+            }
+            if (drain_iters == 0) {
+                ESP_LOGW(TAG, "drain hit iteration cap — discarding rest");
             }
             if (s_fp) {
                 fflush(s_fp);
@@ -210,29 +261,58 @@ esp_err_t sd_capture_init(void)
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
 
-    // Writer task on Core 1 — moved off Core 0 (where class_driver
-    // lives) because sustained SD writes were starving class_driver
-    // past its 5 s WDT. Stays at prio 2 so frame_decoder (4) and
-    // worker_core1 (3) and ingest_core1 (8) all preempt; the writer
-    // gets Core 1 cycles only when those are blocked. PSRAM stack
-    // is fine — fwrite is latency-tolerant.
+    // Eager-allocate the 8 KB DMA-INT fwrite scratch HERE, at the
+    // earliest possible moment (sd_capture_init runs in app_main
+    // before USB stack init). At this point DMA-INT has 139 KB
+    // largest contiguous; an 8 KB slice leaves 131 KB contiguous
+    // for tagger's later 66 KB allocation. Any later (after USB
+    // pool init) only ~2-3 KB largest is left — too small.
+    //
+    // SDMMC requires DMA-capable internal SRAM for the fwrite
+    // source. PSRAM source produces ENOSPC (the ALLOC_ALIGNED_BUF
+    // host flag is SDIO-only and does not help SD card writes).
+    s_writer_buf = heap_caps_aligned_alloc(64, WRITER_RECV_CHUNK,
+                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!s_writer_buf) {
+        ESP_LOGE(TAG, "writer-buf %u-byte DMA-INT alloc failed (largest=%u)",
+                 (unsigned)WRITER_RECV_CHUNK,
+                 (unsigned)heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        return ESP_ERR_NO_MEM;
+    }
+
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(writer_task, "sd_capture",
                                                      WRITER_STACK, NULL,
                                                      WRITER_PRIO, NULL, 1,
                                                      MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "writer task create failed");
+        heap_caps_free(s_writer_buf);
+        s_writer_buf = NULL;
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "SD capture writer ready on Core 1 (prio %d, stack in PSRAM) "
-                  "— lazy stream buffer on start", WRITER_PRIO);
+    ESP_LOGI(TAG, "SD capture ready on Core 1 (prio %d, stack PSRAM, "
+                  "%u-byte DMA-INT writer-buf)",
+             WRITER_PRIO, (unsigned)WRITER_RECV_CHUNK);
     return ESP_OK;
+}
+
+esp_err_t sd_capture_alloc_writer_buf(void)
+{
+    // Now a no-op — writer-buf is eager-allocated in sd_capture_init.
+    // Kept for ABI continuity with action_start_stream.
+    return s_writer_buf ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 esp_err_t sd_capture_start(uint64_t target_bytes)
 {
     if (!s_stats_mu) return ESP_ERR_INVALID_STATE;
     if (s_state != CAP_STATE_IDLE) return ESP_ERR_INVALID_STATE;
+    if (!s_writer_buf) {
+        ESP_LOGE(TAG, "writer-buf not allocated — sd_capture_alloc_writer_buf() "
+                      "never ran (USB device not enumerated?)");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // Ensure SD is mounted (shared with sd_log).
     esp_err_t r = sd_log_force_mount();
@@ -330,11 +410,14 @@ esp_err_t sd_capture_stop(void)
         vStreamBufferDeleteWithCaps(s_stream);
         s_stream = NULL;
     }
+    s_burst_mode = false;
     return ESP_OK;
 }
 
 void sd_capture_write(const uint8_t *data, size_t n)
 {
+    // Burst-mode mutually excludes the continuous tap.
+    if (s_burst_mode) return;
     if (s_state != CAP_STATE_ACTIVE || !s_stream || !data || n == 0) return;
 
     // Target gate — stop accepting bytes once we've queued past the
@@ -358,6 +441,64 @@ void sd_capture_write(const uint8_t *data, size_t n)
     if (sent < n) {
         update_bytes_dropped(n - sent);
     }
+}
+
+// ---- Burst-mode capture (per-burst IQ records) -------------------
+
+esp_err_t sd_capture_start_bursts(void)
+{
+    // Reuse the continuous start path for SD mount / file create /
+    // stream buffer setup; just flip the mode flag and reset seq.
+    s_burst_mode = false;        // sd_capture_start checks this is unset
+    esp_err_t r = sd_capture_start(0);
+    if (r != ESP_OK) return r;
+    s_burst_mode = true;
+    s_burst_seq = 0;
+    ESP_LOGI(TAG, "burst-mode capture armed");
+    return ESP_OK;
+}
+
+void sd_capture_record_burst_begin(uint32_t length_samples,
+                                    float rel_freq_hz,
+                                    float peak_snr_db,
+                                    float magnitude_db,
+                                    float noise_db)
+{
+    if (!s_burst_mode || s_state != CAP_STATE_ACTIVE || !s_stream) return;
+
+    sd_capture_burst_hdr_t hdr = {
+        .magic          = SD_CAPTURE_BURST_MAGIC,
+        .seq            = s_burst_seq++,
+        .t_us           = (uint64_t)esp_timer_get_time(),
+        .length_samples = length_samples,
+        .rel_freq_hz    = rel_freq_hz,
+        .peak_snr_db    = peak_snr_db,
+        .magnitude_db   = magnitude_db,
+        .noise_db       = noise_db,
+    };
+    size_t sent = xStreamBufferSend(s_stream, &hdr, sizeof(hdr), 0);
+    if (sent < sizeof(hdr)) {
+        update_bytes_dropped(sizeof(hdr) - sent);
+    }
+}
+
+void sd_capture_record_burst_chunk(const int16_t *iq, size_t n_complex)
+{
+    if (!s_burst_mode || s_state != CAP_STATE_ACTIVE || !s_stream) return;
+    if (!iq || n_complex == 0) return;
+
+    size_t n_bytes = n_complex * 2 * sizeof(int16_t);
+    size_t sent = xStreamBufferSend(s_stream, iq, n_bytes, 0);
+    if (sent < n_bytes) {
+        update_bytes_dropped(n_bytes - sent);
+    }
+}
+
+void sd_capture_record_burst_end(void)
+{
+    // No trailer in the current format — burst boundaries are
+    // implicit (parser reads length_samples * 4 bytes after each
+    // header). Reserved for future use (e.g. CRC of payload).
 }
 
 void sd_capture_get_stats(sd_capture_stats_t *out)
