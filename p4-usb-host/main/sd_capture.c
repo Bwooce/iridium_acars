@@ -51,10 +51,13 @@ static const char *TAG = "SDCAP";
 #define WRITER_STACK            6144
 #define WRITER_PRIO             5
 
-// Per-receive scratch — small enough to live on the writer task
-// stack, big enough for an efficient single fwrite. Tuned to match
-// the FILE-level setvbuf below; one FILE-buffer chunk per dequeue.
-#define WRITER_RECV_CHUNK       4096
+// Per-receive scratch. Sized large so each fwrite is a single
+// multi-sector SD write — Class-4-class cards can sustain
+// 4 MB/s on 16+ KB sequential writes but degrade to <1 KB/s on
+// 4 KB random writes (each triggers a full erase-modify-write
+// cycle). 64 KB = 128 sectors, a typical SD erase-block boundary
+// on cheap SDHC, so writes align cleanly.
+#define WRITER_RECV_CHUNK       (64 * 1024)
 
 // FATFS FILE buffer size: 64 KB. Each fwrite to a buffered FILE
 // just memcpy's into here; the actual SDMMC write happens when
@@ -263,7 +266,15 @@ esp_err_t sd_capture_start(uint64_t target_bytes)
         s_stream = NULL;
         return ESP_FAIL;
     }
-    setvbuf(fp, NULL, _IOFBF, FILE_BUFFER_BYTES);
+    // Disable libc buffering — the writer task already feeds us
+    // 64 KB chunks straight from the stream buffer, so any libc-
+    // layer buffering just adds memcpy overhead and obscures the
+    // SD write timing. _IONBF makes each fwrite go straight to
+    // FATFS f_write. Also verify the call succeeded so we don't
+    // silently fall back to the default 1024 B line buffer.
+    if (setvbuf(fp, NULL, _IONBF, 0) != 0) {
+        ESP_LOGW(TAG, "setvbuf(_IONBF) failed — proceeding with libc default");
+    }
 
     // Preallocate via ftruncate when a target is known — extends
     // the FAT cluster chain up front so mid-stream writes don't
