@@ -471,6 +471,24 @@ static esp_err_t ota_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+static esp_err_t sd_mount_post(httpd_req_t *req)
+{
+    esp_err_t r = sd_log_force_mount();
+    sd_log_stats_t s;
+    sd_log_get_stats(&s);
+    char body[256];
+    int n = snprintf(body, sizeof(body),
+        "{\"result\":\"%s\",\"mounted\":%s,\"log_path\":\"%s\",\"mount_error\":\"%s\"}",
+        esp_err_to_name(r),
+        s.mounted ? "true" : "false",
+        s.log_path,
+        s.mount_error);
+    if (n < 0) n = 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "503 Service Unavailable");
+    return httpd_resp_send(req, body, n);
+}
+
 static esp_err_t reset_post(httpd_req_t *req)
 {
     ESP_LOGW(TAG, "/reset POST: clearing Wi-Fi NVS + rebooting to AP mode");
@@ -520,14 +538,15 @@ esp_err_t http_server_start(void)
         { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
         { .uri = "/messages", .method = HTTP_GET,  .handler = messages_get, .user_ctx = NULL },
         { .uri = "/ota",      .method = HTTP_GET,  .handler = ota_get,      .user_ctx = NULL },
-        { .uri = "/config",   .method = HTTP_POST, .handler = config_post,  .user_ctx = NULL },
-        { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,   .user_ctx = NULL },
-        { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,     .user_ctx = NULL },
+        { .uri = "/config",   .method = HTTP_POST, .handler = config_post,    .user_ctx = NULL },
+        { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,     .user_ctx = NULL },
+        { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,       .user_ctx = NULL },
+        { .uri = "/sd/mount", .method = HTTP_POST, .handler = sd_mount_post,  .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
     }
 
-    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages, /ota; POST /config, /reset, /ota");
+    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages, /ota; POST /config, /reset, /ota, /sd/mount");
     return ESP_OK;
 }

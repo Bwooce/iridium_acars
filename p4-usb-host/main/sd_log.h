@@ -22,12 +22,21 @@
 // write rate). One flush every ~1 s keeps data durable without
 // hammering the FATFS layer.
 
+// One-shot at boot: spawns the writer task + queue. Does NOT mount the
+// card. The first acars_msg_t through sd_log_emit() triggers a
+// lazy mount in the writer task — saves ~25 KB internal SRAM on
+// no-card boots and on the gap between boot and the first decode.
 esp_err_t sd_log_init(void);
 
 // Append a decoded ACARS message to the open log file. Non-blocking
 // (writes through a small queue to a low-prio writer task). Safe to
 // call when SD is absent or unmounted — drops silently.
 void sd_log_emit(const acars_msg_t *m);
+
+// Force a mount attempt now (e.g. after the user inserts a card and
+// hits POST /sd/mount). Returns the mount result. Idempotent: returns
+// ESP_OK if already mounted.
+esp_err_t sd_log_force_mount(void);
 
 // Snapshot stats for /status surfacing.
 typedef struct {

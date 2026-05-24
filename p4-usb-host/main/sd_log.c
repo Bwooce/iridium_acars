@@ -54,6 +54,7 @@ static FILE           *s_log            = NULL;
 static QueueHandle_t   s_q              = NULL;
 static SemaphoreHandle_t s_stats_mu     = NULL;
 static sd_log_stats_t  s_stats          = {0};
+static volatile bool   s_mount_attempted = false;    // lazy-mount flag
 
 static void update_stats_ok(size_t bytes_added)
 {
@@ -127,6 +128,30 @@ static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
     return (size_t)n;
 }
 
+// Forward decls — lazy-mount triggers these.
+static esp_err_t mount_sd(void);
+static esp_err_t open_log_file(void);
+
+// Try to bring up SD + open the log file. Caller (the writer task) sets
+// s_mount_attempted so we only try once per "session". Returns ESP_OK on
+// success. On failure, leaves s_log NULL — subsequent messages get
+// dropped silently until force_mount() is called.
+static esp_err_t try_mount_and_open(void)
+{
+    s_mount_attempted = true;
+    esp_err_t r = mount_sd();
+    if (r != ESP_OK) {
+        ESP_LOGW(TAG, "SD mount failed (%s) — logging stays disabled",
+                 esp_err_to_name(r));
+        return r;
+    }
+    if (open_log_file() != ESP_OK) {
+        ESP_LOGW(TAG, "SD mounted but log file open failed");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 static void writer_task(void *arg)
 {
     (void)arg;
@@ -136,16 +161,25 @@ static void writer_task(void *arg)
 
     while (1) {
         BaseType_t got = xQueueReceive(s_q, &m, pdMS_TO_TICKS(1000));
-        if (got == pdTRUE && s_log) {
-            size_t len = format_msg_line(line, sizeof(line), &m);
-            if (len > 0) {
-                size_t wr = fwrite(line, 1, len, s_log);
-                if (wr == len) {
-                    update_stats_ok(len);
-                } else {
-                    ESP_LOGW(TAG, "fwrite short: %u/%u — disk full?",
-                             (unsigned)wr, (unsigned)len);
-                    update_stats_err();
+        if (got == pdTRUE) {
+            // Lazy mount: first message triggers the SDMMC + FATFS
+            // bring-up. Subsequent failures stay failed until the
+            // user POSTs /sd/mount.
+            if (!s_mount_attempted) {
+                ESP_LOGI(TAG, "first message — attempting lazy SD mount");
+                try_mount_and_open();
+            }
+            if (s_log) {
+                size_t len = format_msg_line(line, sizeof(line), &m);
+                if (len > 0) {
+                    size_t wr = fwrite(line, 1, len, s_log);
+                    if (wr == len) {
+                        update_stats_ok(len);
+                    } else {
+                        ESP_LOGW(TAG, "fwrite short: %u/%u — disk full?",
+                                 (unsigned)wr, (unsigned)len);
+                        update_stats_err();
+                    }
                 }
             }
         }
@@ -156,10 +190,6 @@ static void writer_task(void *arg)
         int64_t now = esp_timer_get_time();
         if (s_log && (now - last_flush) >= 1000000) {
             fflush(s_log);
-            // fsync would also walk the FAT — skip for now; fflush
-            // alone flushes the FILE buffer into FATFS's internal
-            // sector cache which is good enough for crash recovery
-            // to-the-second.
             last_flush = now;
         }
     }
@@ -281,25 +311,11 @@ esp_err_t sd_log_init(void)
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
 
-    esp_err_t r = mount_sd();
-    if (r != ESP_OK) {
-        ESP_LOGW(TAG, "SD mount failed (%s) — logging disabled",
-                 esp_err_to_name(r));
-        // Still create the queue so emit() can drop cleanly; just no writer.
-        s_q = xQueueCreate(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t));
-        return r;
-    }
-    if (open_log_file() != ESP_OK) {
-        ESP_LOGW(TAG, "SD mounted but log file open failed — logging disabled");
-        s_q = xQueueCreate(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t));
-        return ESP_FAIL;
-    }
-
     s_q = xQueueCreate(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t));
     if (!s_q) return ESP_ERR_NO_MEM;
 
-    // Pin writer to Core 0 — Core 1 is already heavily loaded by the
-    // DSP/worker/ingest pipeline.
+    // Writer task pinned to Core 0 — Core 1 is already heavily loaded
+    // by the DSP/worker/ingest pipeline.
     BaseType_t ok = xTaskCreatePinnedToCore(writer_task, "sd_log",
                                              WRITER_STACK, NULL, WRITER_PRIO,
                                              NULL, 0);
@@ -307,9 +323,23 @@ esp_err_t sd_log_init(void)
         ESP_LOGE(TAG, "writer task create failed");
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "SD log writer ready on Core 0 (prio %d, queue %d)",
+    // Lazy mount: the writer task will attempt the SDMMC + FATFS bring-up
+    // the first time it receives an ACARS message. No internal SRAM is
+    // consumed by the SD subsystem until then — important on no-card
+    // boots and during the gap between boot and the first decode.
+    ESP_LOGI(TAG, "SD log writer ready on Core 0 (prio %d, queue %d) — "
+                  "lazy mount on first message",
              WRITER_PRIO, EMIT_QUEUE_DEPTH);
     return ESP_OK;
+}
+
+esp_err_t sd_log_force_mount(void)
+{
+    if (s_log) return ESP_OK;             // already up
+    // Reset the latched "tried + failed" flag so the next attempt isn't
+    // short-circuited by the writer task.
+    s_mount_attempted = false;
+    return try_mount_and_open();
 }
 
 void sd_log_emit(const acars_msg_t *m)
