@@ -22,6 +22,7 @@
 #include "acars_push.h"
 #include "ota_runner.h"
 #include "sd_log.h"
+#include "sd_capture.h"
 #include "esp_heap_caps.h"
 
 // One-line snapshot of internal-DMA-capable heap (the pool the USB
@@ -194,6 +195,9 @@ void app_main(void)
     log_dma_int_heap("before sd_log_init");
     // SD card log (#63) — mounts the card if present; no-op if absent.
     sd_log_init();
+    // SD card raw IQ capture (#63) — spawns the writer task; stream
+    // buffer and SD mount happen lazily on POST /capture/start.
+    sd_capture_init();
     log_dma_int_heap("after sd_log_init");
     // D19 OTA: if we got here without crashing, the current image is
     // healthy — cancel any pending rollback the bootloader was tracking.

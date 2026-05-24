@@ -23,7 +23,7 @@ set(_app_reqs
 # its API as inline no-ops, so no SDMMC / FATFS runtime allocations
 # happen even though the components are linked.
 if(CONFIG_ENABLE_SD_LOG)
-    list(APPEND _app_srcs "sd_log.c")
+    list(APPEND _app_srcs "sd_log.c" "sd_capture.c")
 endif()
 
 idf_component_register(SRCS ${_app_srcs}

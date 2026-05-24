@@ -27,6 +27,7 @@
 #include "bch_decoder.h"
 #include "rtl-sdr.h"
 #include "status_logger.h"
+#include "sd_capture.h"
 
 #define CLIENT_NUM_EVENT_MSG 5
 
@@ -314,6 +315,13 @@ void class_driver_task(void *arg)
             cycle_read_us += (uint64_t)(t_read_end - t_read_start);
             total_bytes += n_read;
             bytes_window += n_read;
+
+            // Optional raw IQ capture (#63). Fast no-op when no
+            // capture is active; otherwise copies n_read bytes
+            // into a PSRAM stream buffer (non-blocking, drops on
+            // overflow). Tap is here — pre-dispatch — so we
+            // capture the exact uint8 payload before any conversion.
+            sd_capture_write(raw, n_read);
 
             // Hand the freshly-filled raw buffer to ingest on Core 1.
             // Convert + push happen there; we don't block on completion.

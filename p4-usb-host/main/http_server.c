@@ -17,6 +17,7 @@
 #include "frame_decoder.h"
 #include "ota_runner.h"
 #include "sd_log.h"
+#include "sd_capture.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -491,6 +492,100 @@ static esp_err_t sd_mount_post(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// POST /capture/start — body is optional JSON like {"target_bytes":N}
+// (default = unlimited). Returns the resulting file path + initial
+// stats. 503 if SD mount fails or capture is already active.
+static esp_err_t capture_start_post(httpd_req_t *req)
+{
+    char body[64] = {0};
+    int len = req->content_len;
+    if (len > 0 && len < (int)sizeof(body)) {
+        int got = httpd_req_recv(req, body, len);
+        if (got <= 0) body[0] = '\0';
+        else          body[got] = '\0';
+    }
+
+    uint64_t target = 0;
+    // Tiny "find a number after target_bytes" parse; full JSON is
+    // overkill for one field. Accepts "target_bytes":N or
+    // "target_bytes": N variants.
+    const char *p = strstr(body, "target_bytes");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p++;
+            while (*p == ' ') p++;
+            target = strtoull(p, NULL, 10);
+        }
+    }
+
+    esp_err_t r = sd_capture_start(target);
+    sd_capture_stats_t s;
+    sd_capture_get_stats(&s);
+    char resp[256];
+    int n = snprintf(resp, sizeof(resp),
+        "{\"result\":\"%s\",\"active\":%s,\"path\":\"%s\","
+        "\"target_bytes\":%llu}",
+        esp_err_to_name(r),
+        s.active ? "true" : "false",
+        s.path,
+        (unsigned long long)s.bytes_target);
+    if (n < 0) n = 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "503 Service Unavailable");
+    return httpd_resp_send(req, resp, n);
+}
+
+// POST /capture/stop — flushes and closes the current capture file.
+// Idempotent in spirit; returns 409 if no capture was active.
+static esp_err_t capture_stop_post(httpd_req_t *req)
+{
+    esp_err_t r = sd_capture_stop();
+    sd_capture_stats_t s;
+    sd_capture_get_stats(&s);
+    char resp[256];
+    int n = snprintf(resp, sizeof(resp),
+        "{\"result\":\"%s\",\"path\":\"%s\","
+        "\"bytes_captured\":%llu,\"bytes_dropped\":%lu,"
+        "\"write_errors\":%lu}",
+        esp_err_to_name(r),
+        s.path,
+        (unsigned long long)s.bytes_captured,
+        (unsigned long)s.bytes_dropped,
+        (unsigned long)s.write_errors);
+    if (n < 0) n = 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "409 Conflict");
+    return httpd_resp_send(req, resp, n);
+}
+
+// GET /capture/status — live snapshot, whether capture is active
+// or not. The path/bytes fields persist across stop so the operator
+// can see how much they captured after stopping.
+static esp_err_t capture_status_get(httpd_req_t *req)
+{
+    sd_capture_stats_t s;
+    sd_capture_get_stats(&s);
+    char resp[320];
+    int n = snprintf(resp, sizeof(resp),
+        "{\"active\":%s,\"file_open\":%s,\"path\":\"%s\","
+        "\"bytes_captured\":%llu,\"bytes_target\":%llu,"
+        "\"bytes_dropped\":%lu,\"write_errors\":%lu,"
+        "\"start_us\":%lld}",
+        s.active ? "true" : "false",
+        s.file_open ? "true" : "false",
+        s.path,
+        (unsigned long long)s.bytes_captured,
+        (unsigned long long)s.bytes_target,
+        (unsigned long)s.bytes_dropped,
+        (unsigned long)s.write_errors,
+        (long long)s.start_us);
+    if (n < 0) n = 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, resp, n);
+}
+
 static esp_err_t reset_post(httpd_req_t *req)
 {
     ESP_LOGW(TAG, "/reset POST: clearing Wi-Fi NVS + rebooting to AP mode");
@@ -523,7 +618,7 @@ esp_err_t http_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port    = 80;
-    cfg.max_uri_handlers = 8;
+    cfg.max_uri_handlers = 12;
     cfg.lru_purge_enable = true;
     cfg.stack_size     = 6144;
     cfg.task_priority  = 4;
@@ -548,12 +643,16 @@ esp_err_t http_server_start(void)
         { .uri = "/config",   .method = HTTP_POST, .handler = config_post,    .user_ctx = NULL },
         { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,     .user_ctx = NULL },
         { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,       .user_ctx = NULL },
-        { .uri = "/sd/mount", .method = HTTP_POST, .handler = sd_mount_post,  .user_ctx = NULL },
+        { .uri = "/sd/mount",      .method = HTTP_POST, .handler = sd_mount_post,       .user_ctx = NULL },
+        { .uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post,  .user_ctx = NULL },
+        { .uri = "/capture/stop",  .method = HTTP_POST, .handler = capture_stop_post,   .user_ctx = NULL },
+        { .uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get,  .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
     }
 
-    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages, /ota; POST /config, /reset, /ota, /sd/mount");
+    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages, /ota, /capture/status; "
+                  "POST /config, /reset, /ota, /sd/mount, /capture/start, /capture/stop");
     return ESP_OK;
 }
