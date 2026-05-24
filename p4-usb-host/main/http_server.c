@@ -660,6 +660,66 @@ static esp_err_t capture_stop_post(httpd_req_t *req)
     return httpd_resp_send(req, resp, n);
 }
 
+// GET /capture/file?name=iq-NNNN.u8 — stream a captured file back
+// to the client. The file lives under /sdcard/acars/ and we
+// validate that `name` is a bare filename (no traversal). 404 if
+// the file doesn't exist, 409 if the capture is still writing to
+// that file (we don't want to serve a partial / in-flight write).
+static esp_err_t capture_file_get(httpd_req_t *req)
+{
+    char query[96] = {0};
+    char name[64]  = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK ||
+        name[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req,
+            "?name=<filename> required (try /capture/status for the current path)\n",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    FILE *fp = sd_capture_open_for_read(name);
+    if (!fp) {
+        if (errno == EBUSY) {
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_set_type(req, "text/plain");
+            return httpd_resp_send(req,
+                "capture is still writing this file — stop first\n",
+                HTTPD_RESP_USE_STRLEN);
+        }
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "no such file\n", HTTPD_RESP_USE_STRLEN);
+    }
+
+    // Stream the file in chunks. Each fread+send_chunk yields to
+    // the scheduler between iterations so the SD read can't starve
+    // class_driver. 8 KB chunks balance: bigger reduces overhead,
+    // smaller reduces per-iteration latency.
+    httpd_resp_set_type(req, "application/octet-stream");
+    char disp[96];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", name);
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+
+    uint8_t buf[8192];
+    while (1) {
+        size_t n = fread(buf, 1, sizeof(buf), fp);
+        if (n == 0) break;
+        if (httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) {
+            // client disconnected mid-stream; bail and clean up
+            fclose(fp);
+            return ESP_FAIL;
+        }
+        // Yield between chunks so a long file transfer doesn't
+        // monopolise the httpd task (and through it, Core 0).
+        vTaskDelay(0);
+    }
+    fclose(fp);
+    httpd_resp_send_chunk(req, NULL, 0);   // end of body
+    return ESP_OK;
+}
+
 // GET /capture/status — live snapshot, whether capture is active
 // or not. The path/bytes fields persist across stop so the operator
 // can see how much they captured after stopping.
@@ -724,7 +784,7 @@ esp_err_t http_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port    = 80;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 13;
     cfg.lru_purge_enable = true;
     cfg.stack_size     = 6144;
     cfg.task_priority  = 4;
@@ -753,12 +813,13 @@ esp_err_t http_server_start(void)
         { .uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post,  .user_ctx = NULL },
         { .uri = "/capture/stop",  .method = HTTP_POST, .handler = capture_stop_post,   .user_ctx = NULL },
         { .uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get,  .user_ctx = NULL },
+        { .uri = "/capture/file",   .method = HTTP_GET, .handler = capture_file_get,    .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
     }
 
-    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages, /ota, /capture/status; "
+    ESP_LOGI(TAG, "HTTP server up on port 80 — GET /, /status, /messages, /ota, /capture/status, /capture/file; "
                   "POST /config, /reset, /ota, /sd/mount, /capture/start, /capture/stop");
     return ESP_OK;
 }

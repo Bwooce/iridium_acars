@@ -67,6 +67,13 @@ void sd_capture_write(const uint8_t *data, size_t n);
 
 void sd_capture_get_stats(sd_capture_stats_t *out);
 
+// Open a previously-captured file under /sdcard/acars/ for reading.
+// `name` is the bare filename (no path). Returns a FILE* the caller
+// must fclose, or NULL on error. Used by the HTTP /capture/file
+// download handler to stream the .u8 file back over the wire.
+// Forbids ".." anywhere in the name as a minimal traversal guard.
+FILE *sd_capture_open_for_read(const char *name);
+
 #else  /* !CONFIG_ENABLE_SD_LOG — provide inline no-op stubs. */
 
 static inline esp_err_t sd_capture_init(void) { return ESP_OK; }

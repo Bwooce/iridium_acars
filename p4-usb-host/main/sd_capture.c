@@ -21,22 +21,35 @@
 
 static const char *TAG = "SDCAP";
 
-// Stream buffer sizing: 128 KB of PSRAM holds ~32 ms of the current
-// 3.95 MB/s sustained USB rate. Comfortably covers any short SDMMC
-// stall (FAT update, card reordering write); larger isn't useful
-// since a sustained-overflow case would just delay the drop.
-#define STREAM_BUFFER_BYTES   (128 * 1024)
+// Stream buffer sizing: 4 MB of PSRAM holds ~900 ms of the current
+// ~4.5 MB/s sustained USB rate. Sized to absorb SDMMC block-erase
+// stalls (cards routinely pause 100-300 ms while reordering
+// writes; cheap SDHC can stall 500 ms+). PSRAM is plentiful
+// (32 MB on the P4-NANO), so spending 4 MB on this buffer is
+// cheap insurance against producer-side drops.
+//
+// Was 128 KB originally — only ~28 ms of buffering, which produced
+// worker_dropped tail noise in early capture runs.
+#define STREAM_BUFFER_BYTES   (4 * 1024 * 1024)
 
 // Trigger size on the stream buffer — the writer task wakes when at
 // least this many bytes are available. 4 KB = 8 SDMMC sectors,
 // matches typical FAT optimal write granularity.
 #define STREAM_BUFFER_TRIG     4096
 
-// Writer task params. Pinned to Core 0 (Core 1 is DSP-saturated).
-// Priority 2 = below HTTP server (5), below ingest (8), below worker
-// (5), above idle.
+// Writer task params. Pinned to Core 1 (see init below for the
+// why). Priority 5 = above worker_core1 (3) so the writer drains
+// the PSRAM stream buffer to SD even when the tagger is firing
+// 145 bursts/sec and worker is monopolising Core 1. Below ingest
+// (8) so USB ingest never stalls. Sharing the prio-5 slot with
+// http_server (also 5) is fine — both are mostly idle.
+//
+// Trade-off when capture is active: worker may drop bursts it
+// can't process in time. That's the right back-pressure direction
+// (lose some marginal burst decodes to keep the IQ recording
+// intact) since the WHOLE POINT of capture is offline analysis.
 #define WRITER_STACK            6144
-#define WRITER_PRIO             2
+#define WRITER_PRIO             5
 
 // Per-receive scratch — small enough to live on the writer task
 // stack, big enough for an efficient single fwrite. Tuned to match
@@ -88,7 +101,21 @@ static void update_write_error(void)
 static void writer_task(void *arg)
 {
     (void)arg;
-    uint8_t buf[WRITER_RECV_CHUNK];
+    // fwrite buffer MUST be in DMA-capable internal SRAM. SDMMC
+    // DMA reads from this on the way to the card; if it lives in
+    // PSRAM (which is the default for the writer's stack since we
+    // set MALLOC_CAP_SPIRAM for the task), the IDF DMA layer tries
+    // to allocate a "stash" copy in DMA-INT SRAM and fails with
+    // `no mem for stash buffer` when DMA-INT is already booked by
+    // the USB transfer pool. Outcome was fwrite returning EIO
+    // after ~76 KB of capture. Heap-alloc the buffer once here.
+    uint8_t *buf = heap_caps_aligned_alloc(64, WRITER_RECV_CHUNK,
+                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!buf) {
+        ESP_LOGE(TAG, "writer_task: DMA-INT buf alloc failed — capture disabled");
+        vTaskDelete(NULL);
+        return;
+    }
     int64_t last_flush = 0;
 
     while (1) {
@@ -105,8 +132,16 @@ static void writer_task(void *arg)
         size_t n = xStreamBufferReceive(s_stream, buf, sizeof(buf),
                                          pdMS_TO_TICKS(100));
         if (n > 0 && s_fp) {
-            size_t wr = fwrite(buf, 1, n, s_fp);
-            if (wr == n) {
+            // Single fwrite of the whole received chunk. We tried
+            // chunking to 512 bytes with vTaskDelay(0) between
+            // each — that round-robined to httpd (same prio 5)
+            // and cut effective throughput to ~700 B/s. Writer
+            // is now Core-1, prio 5: above worker (3) and below
+            // ingest (8), so it doesn't starve Core 0 (class_
+            // driver is on a different core) and doesn't need
+            // per-slice yields.
+            size_t total_wr = fwrite(buf, 1, n, s_fp);
+            if (total_wr == n) {
                 update_bytes_written(n);
                 // Stop on target reached. Producer also gates on
                 // bytes_target so this is belt-and-suspenders.
@@ -122,7 +157,7 @@ static void writer_task(void *arg)
                 }
             } else {
                 ESP_LOGW(TAG, "fwrite short %u/%u (errno=%d)",
-                         (unsigned)wr, (unsigned)n, errno);
+                         (unsigned)total_wr, (unsigned)n, errno);
                 update_write_error();
             }
         }
@@ -172,19 +207,21 @@ esp_err_t sd_capture_init(void)
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
 
-    // Writer task in PSRAM — latency-tolerant, no reason to consume
-    // internal SRAM. Stream buffer itself is allocated lazily on
-    // start (saves 128 KB PSRAM when no capture in flight, which is
-    // the common case).
+    // Writer task on Core 1 — moved off Core 0 (where class_driver
+    // lives) because sustained SD writes were starving class_driver
+    // past its 5 s WDT. Stays at prio 2 so frame_decoder (4) and
+    // worker_core1 (3) and ingest_core1 (8) all preempt; the writer
+    // gets Core 1 cycles only when those are blocked. PSRAM stack
+    // is fine — fwrite is latency-tolerant.
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(writer_task, "sd_capture",
                                                      WRITER_STACK, NULL,
-                                                     WRITER_PRIO, NULL, 0,
+                                                     WRITER_PRIO, NULL, 1,
                                                      MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "writer task create failed");
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "SD capture writer ready on Core 0 (prio %d, stack in PSRAM) "
+    ESP_LOGI(TAG, "SD capture writer ready on Core 1 (prio %d, stack in PSRAM) "
                   "— lazy stream buffer on start", WRITER_PRIO);
     return ESP_OK;
 }
@@ -322,4 +359,36 @@ void sd_capture_get_stats(sd_capture_stats_t *out)
     xSemaphoreTake(s_stats_mu, portMAX_DELAY);
     *out = s_stats;
     xSemaphoreGive(s_stats_mu);
+}
+
+FILE *sd_capture_open_for_read(const char *name)
+{
+    if (!name || !*name) return NULL;
+    // Reject anything with '/' or ".." to keep the request scoped
+    // to /sdcard/acars/. The basename-only contract is enough; full
+    // chroot is overkill on a per-device LAN-only firmware.
+    if (strchr(name, '/') || strstr(name, "..")) return NULL;
+
+    // Make sure the capture isn't still writing this file: if a
+    // capture is active and its current path ends with the
+    // requested name, refuse the open so the file's FATFS state is
+    // self-consistent. The caller (HTTP handler) can return 409.
+    if (s_stats_mu) {
+        bool busy = false;
+        xSemaphoreTake(s_stats_mu, portMAX_DELAY);
+        if (s_stats.active && s_stats.path[0]) {
+            const char *base = strrchr(s_stats.path, '/');
+            base = base ? base + 1 : s_stats.path;
+            if (strcmp(base, name) == 0) busy = true;
+        }
+        xSemaphoreGive(s_stats_mu);
+        if (busy) {
+            errno = EBUSY;
+            return NULL;
+        }
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "/sdcard/acars/%s", name);
+    return fopen(path, "rb");
 }
