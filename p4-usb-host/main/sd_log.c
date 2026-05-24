@@ -21,8 +21,10 @@
 
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
+#include "esp_task_wdt.h"
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
+#include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "driver/gpio.h"
 
 #include "freertos/FreeRTOS.h"
@@ -46,6 +48,14 @@ static const char *TAG = "SDLOG";
 #define PIN_D2   41
 #define PIN_D3   42
 #define PIN_PWR  45        // GPIO45 LOW = SD_VDD on (P-FET)
+
+// SD1_VDD on the Waveshare P4-NANO is sourced from ESP_LDO_VO4 (P4
+// internal LDO #4), gated by Q1 / GPIO45 (see
+// docs/p4-nano-board-schematic-summary.md §1). Without explicitly
+// turning on LDO #4, GPIO45 just gates a powerless rail — the card
+// never sees voltage and OCR (ACMD41) times out. Hours of "card
+// won't respond" on the bench traced back to this.
+#define SDMMC_PWR_LDO_CHANNEL  4
 
 #define EMIT_QUEUE_DEPTH    32
 #define WRITER_STACK        6144
@@ -209,8 +219,12 @@ static void enable_card_power(void)
     };
     gpio_config(&cfg);
     gpio_set_level(PIN_PWR, 0);     // 0 = card power ON
-    // Cards need ~1 ms to come up after power-on; give it more headroom.
-    vTaskDelay(pdMS_TO_TICKS(10));
+    // Cards need ~1 ms to come up after power-on; some 4 GB / older
+    // cards need much longer for their internal controller to be
+    // ready for OCR (CMD1/ACMD41) commands. 100 ms is the SD-spec
+    // "power-up to first command" upper bound and costs nothing on
+    // the mount path.
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 // esp_hosted owns the SDMMC host controller (single controller on P4,
@@ -227,6 +241,17 @@ static esp_err_t mount_sd(void)
 {
     enable_card_power();
 
+    // Enable LDO #4 so SD1_VDD actually has a voltage source. The
+    // P-FET on GPIO45 only gates this rail — without the LDO, the
+    // card power pin is floating regardless of GPIO45's state.
+    sd_pwr_ctrl_ldo_config_t ldo_cfg = { .ldo_chan_id = SDMMC_PWR_LDO_CHANNEL };
+    sd_pwr_ctrl_handle_t ldo_handle = NULL;
+    esp_err_t pr = sd_pwr_ctrl_new_on_chip_ldo(&ldo_cfg, &ldo_handle);
+    if (pr != ESP_OK) {
+        ESP_LOGW(TAG, "sd_pwr_ctrl_new_on_chip_ldo(ch=%d) failed: %s",
+                 SDMMC_PWR_LDO_CHANNEL, esp_err_to_name(pr));
+    }
+
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     // 40 MHz is the SDIO 3.0 / UHS-I high-speed rate; the board wiring
     // supports it. Fallback DS (default) is 20 MHz if a slower card
@@ -237,9 +262,15 @@ static esp_err_t mount_sd(void)
     host.slot = SDMMC_HOST_SLOT_0;
     host.init   = sdmmc_init_noop;
     host.deinit = sdmmc_deinit_noop;
+    host.pwr_ctrl_handle = ldo_handle;
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = 4;
+    // 1-bit mode for max card compatibility — eliminates D1-D3 from
+    // the init handshake (some cards / slot-soldering combinations
+    // fail OCR at 4-bit). Throughput cap is ~6 MB/s on 1-bit at
+    // SDR25, comfortably above our ~4.5 MB/s SDR ingest rate, so
+    // the trade is free. Bump back to 4 only if a card needs more.
+    slot.width = 1;
     slot.clk = PIN_CLK;
     slot.cmd = PIN_CMD;
     slot.d0  = PIN_D0;
@@ -249,12 +280,42 @@ static esp_err_t mount_sd(void)
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
     esp_vfs_fat_mount_config_t mount = {
-        .format_if_mount_failed = false,
+        // Format the card to FAT32 if it's blank or has a non-FAT
+        // filesystem. The card is exclusively for the device's own
+        // use (ACARS log + IQ capture) so destroying any pre-
+        // existing data is acceptable. The WDT bump below makes
+        // this safe — without it, f_mkfs on a 4 GB card runs
+        // synchronously long enough to starve frame_decoder past
+        // its 5 s watchdog.
+        .format_if_mount_failed = true,
         .max_files              = 4,
         .allocation_unit_size   = 16 * 1024,
     };
 
+    // Mount may trigger a synchronous f_mkfs (format) that takes
+    // tens of seconds on a multi-GB card and hammers the SDMMC bus.
+    // The watched class_driver / frame_decoder tasks can starve
+    // past their 5 s WDT timeout during this. Bump the global TWDT
+    // timeout to 60 s for the duration of the mount, restore after.
+    esp_task_wdt_config_t wdt_save = {
+        .timeout_ms     = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000U,
+        .idle_core_mask = 0,    // restore: leave as configured
+        .trigger_panic  = true,
+    };
+    // Format of a 4 GB card empirically took ~96 s in one bench
+    // run; 180 s gives margin for slower cards / fragmentation.
+    esp_task_wdt_config_t wdt_mount = {
+        .timeout_ms     = 180000,
+        .idle_core_mask = 0,
+        .trigger_panic  = true,
+    };
+    esp_err_t wdt_r = esp_task_wdt_reconfigure(&wdt_mount);
+    ESP_LOGI(TAG, "wdt reconfigure to %u ms -> %s",
+             (unsigned)wdt_mount.timeout_ms, esp_err_to_name(wdt_r));
+
     esp_err_t r = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot, &mount, &s_card);
+
+    (void)esp_task_wdt_reconfigure(&wdt_save);
     if (r != ESP_OK) {
         snprintf(s_stats.mount_error, sizeof(s_stats.mount_error),
                  "%s", esp_err_to_name(r));
@@ -275,6 +336,7 @@ static esp_err_t mount_sd(void)
         // ignored.
         s_card = NULL;
         (void)sdmmc_host_deinit_slot(SDMMC_HOST_SLOT_0);
+        if (ldo_handle) (void)sd_pwr_ctrl_del_on_chip_ldo(ldo_handle);
         return r;
     }
 

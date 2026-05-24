@@ -180,10 +180,33 @@ static esp_err_t status_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
-// Minimal HTML form for Wi-Fi credentials + optional UDP push target.
-// Self-contained, no JS, no external assets. Posts urlencoded form
-// data to /config.
-static const char s_index_html[] =
+// Escape src into dst for use inside an HTML attribute value
+// (covered chars: " & < >). Returns bytes written excluding NUL.
+// Truncates if dst is too small. Always NUL-terminates.
+static size_t html_attr_escape(char *dst, size_t cap, const char *src)
+{
+    size_t w = 0;
+    if (cap == 0) return 0;
+    for (const char *p = src; *p; p++) {
+        const char *rep = NULL;
+        size_t      rep_len = 0;
+        switch (*p) {
+        case '"': rep = "&quot;"; rep_len = 6; break;
+        case '&': rep = "&amp;";  rep_len = 5; break;
+        case '<': rep = "&lt;";   rep_len = 4; break;
+        case '>': rep = "&gt;";   rep_len = 4; break;
+        default:  rep = p;        rep_len = 1; break;
+        }
+        if (w + rep_len + 1 > cap) break;
+        memcpy(dst + w, rep, rep_len);
+        w += rep_len;
+    }
+    dst[w] = '\0';
+    return w;
+}
+
+// Static page head + style + intro — same for every render.
+static const char s_index_head[] =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>Iridium ACARS — config</title>"
@@ -197,26 +220,10 @@ static const char s_index_html[] =
     "</style></head><body>"
     "<h1>Iridium ACARS</h1>"
     "<p>Configure the device. Wi-Fi changes reboot the device on save; "
-    "UDP push fields take effect immediately.</p>"
-    "<form method=\"POST\" action=\"/config\">"
-    "<h2>Wi-Fi</h2>"
-    "<label>SSID</label>"
-    "<input type=\"text\" name=\"ssid\" required maxlength=\"32\">"
-    "<label>Password</label>"
-    "<input type=\"password\" name=\"psk\" maxlength=\"63\">"
-    "<h2>SDR</h2>"
-    "<label><input type=\"checkbox\" name=\"bias_tee\" value=\"1\"> "
-    "Enable RTL-SDR v4 bias tee (5 V on antenna line, for active antennas / LNAs)</label>"
-    "<h2>ACARS push (optional, UDP)</h2>"
-    "<label>Host (IP or hostname; leave empty to disable)</label>"
-    "<input type=\"text\" name=\"out_host\" maxlength=\"63\">"
-    "<label>Port</label>"
-    "<input type=\"number\" name=\"out_port\" min=\"0\" max=\"65535\" placeholder=\"e.g. 6700\">"
-    "<h2>OTA</h2>"
-    "<label>Firmware URL (http:// or https://)</label>"
-    "<input type=\"text\" name=\"ota_url\" maxlength=\"127\" placeholder=\"http://server/p4-usb-host.bin\">"
-    "<button type=\"submit\">Save &amp; reboot</button>"
-    "</form>"
+    "UDP push fields take effect immediately.</p>";
+
+// Static footer (after form / after optional reset block).
+static const char s_index_foot[] =
     "<p><small>Current status: <a href=\"/status\">/status</a> · "
     "Messages: <a href=\"/messages\">/messages</a> · "
     "OTA progress: <a href=\"/ota\">/ota</a></small></p>"
@@ -232,11 +239,59 @@ static const char s_index_reset_block[] =
 static esp_err_t index_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send_chunk(req, s_index_html, sizeof(s_index_html) - 1);
+    httpd_resp_send_chunk(req, s_index_head, sizeof(s_index_head) - 1);
+
+    // Build the form with the current config pre-filled so the user
+    // can see what's saved (SSID was missing from the rendered form
+    // before; clicking Save with the empty SSID field bounced the
+    // form because of `required` validation).
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+
+    char ssid_esc[2 * sizeof(cfg.wifi_ssid) + 8];
+    char psk_esc [2 * sizeof(cfg.wifi_psk)  + 8];
+    char host_esc[2 * sizeof(cfg.out_host)  + 8];
+    char ota_esc [2 * sizeof(cfg.ota_url)   + 8];
+    html_attr_escape(ssid_esc, sizeof(ssid_esc), cfg.wifi_ssid);
+    html_attr_escape(psk_esc,  sizeof(psk_esc),  cfg.wifi_psk);
+    html_attr_escape(host_esc, sizeof(host_esc), cfg.out_host);
+    html_attr_escape(ota_esc,  sizeof(ota_esc),  cfg.ota_url);
+
+    char form[2048];
+    int n = snprintf(form, sizeof(form),
+        "<form method=\"POST\" action=\"/config\">"
+        "<h2>Wi-Fi</h2>"
+        "<label>SSID</label>"
+        "<input type=\"text\" name=\"ssid\" required maxlength=\"32\" value=\"%s\">"
+        "<label>Password</label>"
+        "<input type=\"password\" name=\"psk\" maxlength=\"63\" value=\"%s\">"
+        "<h2>SDR</h2>"
+        "<label><input type=\"checkbox\" name=\"bias_tee\" value=\"1\"%s> "
+        "Enable RTL-SDR v4 bias tee (5 V on antenna line, for active antennas / LNAs)</label>"
+        "<h2>ACARS push (optional, UDP)</h2>"
+        "<label>Host (IP or hostname; leave empty to disable)</label>"
+        "<input type=\"text\" name=\"out_host\" maxlength=\"63\" value=\"%s\">"
+        "<label>Port</label>"
+        "<input type=\"number\" name=\"out_port\" min=\"0\" max=\"65535\" placeholder=\"e.g. 6700\" value=\"%u\">"
+        "<h2>OTA</h2>"
+        "<label>Firmware URL (http:// or https://)</label>"
+        "<input type=\"text\" name=\"ota_url\" maxlength=\"127\" placeholder=\"http://server/p4-usb-host.bin\" value=\"%s\">"
+        "<button type=\"submit\">Save &amp; reboot</button>"
+        "</form>",
+        ssid_esc, psk_esc,
+        cfg.bias_tee ? " checked" : "",
+        host_esc,
+        (unsigned)cfg.out_port,
+        ota_esc);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(form)) n = sizeof(form);
+    httpd_resp_send_chunk(req, form, n);
+
     if (!wifi_link_is_ap_mode()) {
         httpd_resp_send_chunk(req, s_index_reset_block,
                               sizeof(s_index_reset_block) - 1);
     }
+    httpd_resp_send_chunk(req, s_index_foot, sizeof(s_index_foot) - 1);
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 

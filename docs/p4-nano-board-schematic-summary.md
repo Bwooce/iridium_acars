@@ -281,3 +281,33 @@ the dump; confirm against the Waveshare board-support package's
    whenever the board is powered, with no proper charge control. Use a
    non-rechargeable coin cell, or fit a current-limit resistor in series
    with the battery holder.
+9. **µSD power needs *two* things, not just GPIO45.** `SD1_VDD` is sourced
+   from `ESP_LDO_VO4` (P4 internal LDO channel 4) and *then* gated by Q1
+   (AO3401 P-FET) on GPIO45. Driving GPIO45 alone gates a powerless rail —
+   the card never responds to OCR and `sdmmc_init_ocr` loops with
+   `send_op_cond (1) returned 0x107` → eventually `ESP_ERR_TIMEOUT`. Firmware
+   must explicitly allocate LDO channel 4 via the IDF on-chip LDO API and
+   hand the handle to the SDMMC host:
+
+   ```c
+   #include "sd_pwr_ctrl_by_on_chip_ldo.h"
+
+   #define SDMMC_PWR_LDO_CHANNEL  4
+   sd_pwr_ctrl_ldo_config_t ldo_cfg = { .ldo_chan_id = SDMMC_PWR_LDO_CHANNEL };
+   sd_pwr_ctrl_handle_t ldo_handle = NULL;
+   sd_pwr_ctrl_new_on_chip_ldo(&ldo_cfg, &ldo_handle);
+   // then in sdmmc_host_t:
+   host.pwr_ctrl_handle = ldo_handle;
+   ```
+
+   Notes:
+   - **GPIO45 polarity:** drive **LOW** to turn card power **ON** (Q1 is a
+     P-FET, so the GPIO inverts). Allow ~100 ms after asserting power before
+     issuing the first command; some 4 GB and older cards need that long to
+     come up.
+   - **Start at 1-bit width.** `slot.width = 1` is markedly more forgiving
+     than `slot.width = 4` during init — if you see TIMEOUT at 4-bit, drop
+     to 1-bit to validate the card + LDO setup, then bump back to 4 once
+     enumeration is reliable.
+   - **Reference code:** working setup in
+     `p4-usb-host/main/sd_log.c::mount_sd()`.
