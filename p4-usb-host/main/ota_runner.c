@@ -172,12 +172,18 @@ esp_err_t ota_runner_start(void)
     xSemaphoreGive(s_status_mu);
     s_running = true;
 
-    // OTA stack in PSRAM — 8 KB stack would otherwise eat the USB
-    // DMA pool. esp_https_ota is HTTP+TCP-bound, latency-tolerant.
-    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(ota_task, "ota", 8192,
-                                                     NULL, 5, NULL,
-                                                     tskNO_AFFINITY,
-                                                     MALLOC_CAP_SPIRAM);
+    // OTA task MUST have an internal-SRAM stack. esp_https_ota_perform
+    // and esp_https_ota_finish do flash writes via spi_flash_disable_
+    // interrupts_caches_and_other_cpu(), which makes PSRAM (cached)
+    // inaccessible. A PSRAM-stacked task hits an assert and aborts the
+    // moment it dereferences any local during that cache-disabled
+    // window — same bug as the /config save crash (commit a23b6b8).
+    // 8 KB of internal SRAM is fine here because the task is only
+    // spawned on user-triggered OTA (not boot), so it can't fragment
+    // tagger init the way a boot-time internal stack would.
+    BaseType_t ok = xTaskCreatePinnedToCore(ota_task, "ota", 8192,
+                                             NULL, 5, NULL,
+                                             tskNO_AFFINITY);
     if (ok != pdPASS) {
         s_running = false;
         set_status_error("xTaskCreate failed");
