@@ -18,6 +18,7 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <unistd.h>          // fsync()
 
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
@@ -149,24 +150,24 @@ static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
 static esp_err_t mount_sd(void);
 static esp_err_t open_log_file(void);
 
-// Try to bring up SD + open the log file. Caller (the writer task) sets
-// s_mount_attempted so we only try once per "session". Returns ESP_OK on
-// success. On failure, leaves s_log NULL — subsequent messages get
-// dropped silently until force_mount() is called.
-static esp_err_t try_mount_and_open(void)
+// Bring up the SD card (shared by sd_log + sd_capture). Sets
+// s_mount_attempted so the writer only retries once per "session".
+// Returns ESP_OK on success; on failure mount_sd() tears the slot down
+// so a later force_mount() can retry cleanly (see #93).
+//
+// This does NOT open the decode log file. Opening is deferred to the
+// first actual ACARS message (see writer_task) so a mount triggered by
+// capture or POST /sd/mount on a decode-less run doesn't litter the card
+// with empty log-*.ndjson files (#102).
+static esp_err_t try_mount(void)
 {
     s_mount_attempted = true;
     esp_err_t r = mount_sd();
     if (r != ESP_OK) {
         ESP_LOGW(TAG, "SD mount failed (%s) — logging stays disabled",
                  esp_err_to_name(r));
-        return r;
     }
-    if (open_log_file() != ESP_OK) {
-        ESP_LOGW(TAG, "SD mounted but log file open failed");
-        return ESP_FAIL;
-    }
-    return ESP_OK;
+    return r;
 }
 
 static void writer_task(void *arg)
@@ -179,12 +180,19 @@ static void writer_task(void *arg)
     while (1) {
         BaseType_t got = xQueueReceive(s_q, &m, pdMS_TO_TICKS(1000));
         if (got == pdTRUE) {
-            // Lazy mount: first message triggers the SDMMC + FATFS
-            // bring-up. Subsequent failures stay failed until the
-            // user POSTs /sd/mount.
-            if (!s_mount_attempted) {
-                ESP_LOGI(TAG, "first message — attempting lazy SD mount");
-                try_mount_and_open();
+            // Lazy open: the first real message triggers the SDMMC mount
+            // (if capture hasn't already done it) AND opens the decode
+            // log file. Opening here — rather than at mount time — means
+            // decode-less runs leave no empty log file (#102). A mount
+            // that already failed stays failed until POST /sd/mount.
+            if (!s_log) {
+                if (!s_card && !s_mount_attempted) {
+                    ESP_LOGI(TAG, "first message — attempting lazy SD mount");
+                    try_mount();
+                }
+                if (s_card) {
+                    open_log_file();
+                }
             }
             if (s_log) {
                 size_t len = format_msg_line(line, sizeof(line), &m);
@@ -192,6 +200,15 @@ static void writer_task(void *arg)
                     size_t wr = fwrite(line, 1, len, s_log);
                     if (wr == len) {
                         update_stats_ok(len);
+                        // Commit immediately. Decodes are rare and
+                        // precious; on FATFS fflush() alone only pushes
+                        // the stdio buffer into the sector cache — the
+                        // data and the directory size aren't committed
+                        // until f_sync, so a crash/power-loss would lose
+                        // the line and it wouldn't even appear in
+                        // /sd/list. fsync() forces FATFS f_sync (#102).
+                        fflush(s_log);
+                        fsync(fileno(s_log));
                     } else {
                         ESP_LOGW(TAG, "fwrite short: %u/%u — disk full?",
                                  (unsigned)wr, (unsigned)len);
@@ -466,11 +483,14 @@ esp_err_t sd_log_init(void)
 
 esp_err_t sd_log_force_mount(void)
 {
-    if (s_log) return ESP_OK;             // already up
+    if (s_card) return ESP_OK;            // card already mounted
     // Reset the latched "tried + failed" flag so the next attempt isn't
     // short-circuited by the writer task.
     s_mount_attempted = false;
-    return try_mount_and_open();
+    // Mount the card only. The decode log file opens lazily on the first
+    // ACARS message (writer_task), so callers that just need the card
+    // mounted (capture, POST /sd/mount) don't create empty logs (#102).
+    return try_mount();
 }
 
 esp_err_t sd_log_force_format(void)
