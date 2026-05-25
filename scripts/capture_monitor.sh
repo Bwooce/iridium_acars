@@ -261,13 +261,32 @@ while true; do
         fi
     fi
 
-    # SD getting full?
+    # SD getting full? FIFO-evict the oldest iq-*.u8 file per tick.
+    # Reformatting yanks the active file and freezes the device for
+    # ~95 s; deleting the single oldest .u8 is microseconds and lets
+    # the worker keep producing bursts.
     if [ "$sd_used" -gt "$SD_FULL_BYTES" ]; then
-        log "SD used ${sd_used} > ${SD_FULL_BYTES} — reformatting"
-        stop_capture
-        curl_p -X POST "$DEVICE/sd/format" >/dev/null
-        ensure_mounted
-        start_capture
+        # Pick the oldest iq-*.u8 by mtime that isn't the active file.
+        active_path=$(capture_status_path 2>/dev/null)
+        active_name="${active_path##*/}"
+        oldest=$(curl_q "$DEVICE/sd/list" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+iq = [f for f in d if f.get('name','').startswith('iq-') and f['name'].endswith('.u8') and f.get('mtime',0) > 0]
+iq = [f for f in iq if f['name'] != '$active_name']
+if not iq: sys.exit(0)
+iq.sort(key=lambda f: f['mtime'])
+print(iq[0]['name'])
+")
+        if [ -n "$oldest" ]; then
+            log "SD used ${sd_used} > ${SD_FULL_BYTES} — FIFO-evicting $oldest"
+            curl_p -X POST "$DEVICE/sd/delete?name=$oldest" >/dev/null
+        else
+            log "SD used ${sd_used} > ${SD_FULL_BYTES} but no evictable iq file found"
+        fi
     fi
 
     sleep "$POLL_INTERVAL"

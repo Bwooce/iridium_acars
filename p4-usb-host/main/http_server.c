@@ -674,10 +674,12 @@ static esp_err_t sd_list_get(httpd_req_t *req)
         char path[320];
         snprintf(path, sizeof(path), "/sdcard/acars/%s", e->d_name);
         struct stat st;
-        long long sz = (stat(path, &st) == 0) ? (long long)st.st_size : -1;
+        bool ok = (stat(path, &st) == 0);
+        long long sz = ok ? (long long)st.st_size : -1;
+        long long mt = ok ? (long long)st.st_mtime : 0;
         int n = snprintf(line, sizeof(line),
-            "%s{\"name\":\"%s\",\"size\":%lld}",
-            first ? "" : ",", e->d_name, sz);
+            "%s{\"name\":\"%s\",\"size\":%lld,\"mtime\":%lld}",
+            first ? "" : ",", e->d_name, sz, mt);
         if (n > 0) httpd_resp_send_chunk(req, line, n);
         first = false;
     }
@@ -709,6 +711,58 @@ static esp_err_t sd_format_post(httpd_req_t *req)
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "500 Internal Server Error");
+    return httpd_resp_send(req, body, n);
+}
+
+// POST /sd/delete?name=<filename> — unlink one file under
+// /sdcard/acars/. FIFO eviction policy is driven by the host-side
+// monitor (uses /sd/list to pick the oldest). Refuses to delete the
+// active capture file, refuses path traversal.
+static esp_err_t sd_delete_post(httpd_req_t *req)
+{
+    char query[96] = {0};
+    char name[64]  = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK ||
+        name[0] == '\0' ||
+        strstr(name, "..") || strchr(name, '/')) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req,
+            "?name=<bare-filename> required (no slashes, no ..)\n",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    char path[96];
+    int wrote = snprintf(path, sizeof(path), "/sdcard/acars/%s", name);
+    if (wrote <= 0 || wrote >= (int)sizeof(path)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "name too long\n", HTTPD_RESP_USE_STRLEN);
+    }
+
+    sd_capture_stats_t cs;
+    sd_capture_get_stats(&cs);
+    if (cs.active && cs.file_open && strcmp(path, cs.path) == 0) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req,
+            "refusing to delete the active capture file — stop first\n",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    int r = unlink(path);
+    if (r != 0) {
+        httpd_resp_set_status(req, (errno == ENOENT) ? "404 Not Found" : "500 Internal Server Error");
+        httpd_resp_set_type(req, "text/plain");
+        char msg[96];
+        int mn = snprintf(msg, sizeof(msg), "unlink failed: %s\n", strerror(errno));
+        return httpd_resp_send(req, msg, mn);
+    }
+    char body[128];
+    int n = snprintf(body, sizeof(body),
+        "{\"result\":\"ESP_OK\",\"deleted\":\"%s\"}", name);
+    if (n < 0) n = 0;
+    httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, n);
 }
 
@@ -982,6 +1036,7 @@ esp_err_t http_server_start(void)
         { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,       .user_ctx = NULL },
         { .uri = "/sd/mount",      .method = HTTP_POST, .handler = sd_mount_post,       .user_ctx = NULL },
         { .uri = "/sd/format",     .method = HTTP_POST, .handler = sd_format_post,      .user_ctx = NULL },
+        { .uri = "/sd/delete",     .method = HTTP_POST, .handler = sd_delete_post,      .user_ctx = NULL },
         { .uri = "/sd/list",       .method = HTTP_GET,  .handler = sd_list_get,         .user_ctx = NULL },
         { .uri = "/tasks",         .method = HTTP_GET,  .handler = tasks_get,           .user_ctx = NULL },
         { .uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post,  .user_ctx = NULL },
