@@ -152,16 +152,17 @@ download_and_decode() {
     # Extract summary numbers from the txt.
     local bursts ok_pct frames ms tl bc lw ra unk dl ul
     bursts=$(awk -F': *' '/^  bursts /{print $2; exit}' "$out_txt")
-    ok_pct=$(awk -F'[() %]+' '/^  decode ok/{for(i=1;i<=NF;i++)if($i~/^[0-9.]+$/&&$(i+1)~/%/){print $i; exit}}' "$out_txt")
+    ok_pct=$(awk -F'[()%]' '/decode ok/{print $2; exit}' "$out_txt")
     frames=$(awk -F': *' '/^  frames /{print $2; exit}' "$out_txt")
-    ms=$(awk -F'[/ ]+' '/MS\/TL\/BC\/LW\/RA/{print $5}' "$out_txt")
-    tl=$(awk -F'[/ ]+' '/MS\/TL\/BC\/LW\/RA/{print $6}' "$out_txt")
-    bc=$(awk -F'[/ ]+' '/MS\/TL\/BC\/LW\/RA/{print $7}' "$out_txt")
-    lw=$(awk -F'[/ ]+' '/MS\/TL\/BC\/LW\/RA/{print $8}' "$out_txt")
-    ra=$(awk -F'[/ ]+' '/MS\/TL\/BC\/LW\/RA/{print $9}' "$out_txt")
-    unk=$(awk -F'unknown: *' '/unknown:/{print $2; exit}' "$out_txt")
-    dl=$(awk -F'[/ ]+' '/DL\/UL/{print $4}' "$out_txt")
-    ul=$(awk -F'[/ ]+' '/DL\/UL/{print $5}' "$out_txt")
+    # Decoder prints (note leading spaces, ':' and '/' both act as separators):
+    #     MS/TL/BC/LW/RA : 0/0/0/0/0  unknown: 1
+    #     DL/UL          : 0/1
+    # With FS=[: /]+ the leading space makes $1 empty, so on the MS line
+    # $2..$6 are the labels and $7..$11 are the five counts; on the DL/UL
+    # line $4/$5 are the two counts.
+    read -r ms tl bc lw ra <<< "$(awk -F'[: /]+' '/MS\/TL\/BC\/LW\/RA/{print $7,$8,$9,$10,$11; exit}' "$out_txt")"
+    unk=$(awk -F'unknown: *' '/unknown:/{print $2+0; exit}' "$out_txt")
+    read -r dl ul <<< "$(awk -F'[: /]+' '/DL\/UL/{print $4,$5; exit}' "$out_txt")"
 
     local up; up=$(device_uptime)
     # DEV_DELTA exported by the caller (main loop) from snapshot_diff —
