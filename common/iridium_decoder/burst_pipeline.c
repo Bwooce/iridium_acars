@@ -265,6 +265,23 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     if (dump) dump_iq_cf32("08_decim_2sps", src, n_post_cplx);
     PROFILE_LOG(TDF_DECIM);
 
+    // Apply post-UW CFO refinement. omega_per_sym from uw_correlator_find
+    // is the residual frequency offset measured with a correctly-anchored
+    // CFO window (preamble+UW, not adj_burst[0..255]); the pre-RRC blind
+    // omega_coarse can be wrong on low-CFO bursts where the squared tone
+    // lands near DC and the noise-dominated input window biases the peak.
+    // Without this, the first-order PLL (alpha=0.2, beta=0) has to chase
+    // the residual within 12 UW symbols and fails the diffs<=2 check on
+    // borderline cases (gri_id=0 in the ALBQ corpus -- task #78).
+    // src is at sps=2 after the POST_CORR_DECIM step, so phase_step =
+    // omega_per_sym / 2.
+    if (tmp.omega_per_sym != 0.0f) {
+        rotate_to_dc_q15_simd_at(src, n_post_cplx,
+                                  (double)tmp.omega_per_sym * 0.5,
+                                  0);
+    }
+    if (dump) dump_iq_cf32("08b_post_uwcfo_2sps", src, n_post_cplx);
+
     bool ok = qpsk_demod_process(src, n_post_cplx * 2, &result->frame);
     PROFILE_LOG(TDF_QPSK);
     if (ok) {
