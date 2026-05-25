@@ -199,14 +199,18 @@ void class_driver_task(void *arg)
     };
     ESP_ERROR_CHECK(usb_host_client_register(&client_config, &s_driver_obj.client_hdl));
 
-    // Subscribe this task to the task watchdog. The class_driver loop is
-    // intentionally hot — the ringbuffer is constantly draining and we don't
-    // want to add an arbitrary vTaskDelay just to keep IDLE0 alive. Reset
-    // the watchdog explicitly each iteration instead.
-    esp_err_t wdt_rc = esp_task_wdt_add(NULL);
-    if (wdt_rc != ESP_OK && wdt_rc != ESP_ERR_INVALID_ARG) {
-        ESP_LOGW(TAG, "esp_task_wdt_add returned %d (%s)", wdt_rc, esp_err_to_name(wdt_rc));
-    }
+    // class_driver does NOT subscribe to TASK_WDT. We tried it
+    // (added then removed) — when no USB device enumerates within
+    // the 60 s WDT window, OR when ingest blocks unbounded waiting
+    // for the device to start producing, class trips the WDT and
+    // reboots. The interesting failure is the device hardware (a
+    // wedged controller, a missing dongle); a panic-reboot doesn't
+    // fix that and just hides the diagnostic.
+    //
+    // Real safety: the daemon's own root-port-power cycling
+    // (action_open_dev / Recovery) handles a wedged USB controller,
+    // and the in-loop "stream-stall watchdog" below catches the
+    // post-enumeration case where bytes_window stalls to zero.
 
     uint32_t out_block_size = 16 * 1024;
     // The raw + converted buffers are owned by ingest_core1 (ping-pong on
@@ -256,7 +260,7 @@ void class_driver_task(void *arg)
         // Reset task watchdog. The loop runs hot (no vTaskDelay) because the
         // ringbuffer is constantly draining; without this reset the IDLE0
         // task would never get to run and TWDT would trigger every 5 s.
-        esp_task_wdt_reset();
+        // (No esp_task_wdt_reset — class isn't WDT-subscribed; see init.)
 
         int64_t t_he0 = esp_timer_get_time();
         usb_host_client_handle_events(s_driver_obj.client_hdl, 10);

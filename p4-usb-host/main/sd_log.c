@@ -422,30 +422,15 @@ esp_err_t sd_log_init(void)
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
 
-    // Pre-allocate the SDMMC stash buffer here, BEFORE USB pool +
-    // tagger fragment DMA-INT. Mount happens later (lazy on first
-    // log message OR explicit POST /sd/mount) and would otherwise
-    // find DMA-INT too tight for a contiguous block. Without the
-    // stash, every PSRAM-sourced SDMMC op (sd_log writes;
-    // /capture/file reads into PSRAM dst) returns EIO under load.
-    //
-    // Sized to SDMMC's actual per-chunk cap: the host descriptor's
-    // unaligned_multi_block_rw_max_chunk_size is 16 sectors = 8 KB.
-    // 16 KB = 2x margin. Was 64 KB initially, which left only 47 KB
-    // largest DMA-INT contiguous after USB pool init — too small
-    // for the 66 KB tagger struct → fft_burst_tagger_init failed and
-    // the device sat at 0 bursts/sec forever.
-    s_sdmmc_stash = heap_caps_aligned_alloc(64, 16 * 1024,
-                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (s_sdmmc_stash) {
-        ESP_LOGI(TAG, "pre-allocated 16 KB SDMMC stash @ %p (DMA-INT largest now %u)",
-                 s_sdmmc_stash,
-                 (unsigned)heap_caps_get_largest_free_block(
-                     MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-    } else {
-        ESP_LOGW(TAG, "SDMMC stash early-alloc failed — PSRAM-sourced "
-                      "ops will allocate per-transaction (may fail)");
-    }
+    // (NO eager SDMMC stash here — that path was tried with 64 KB
+    // and 16 KB and both starved the USB transfer pool by 28-48 KB
+    // DMA-INT, dropping the pool from 7 → 3 transfers and stalling
+    // the dongle stream entirely. SDMMC's per-transaction
+    // allocate_dma_buf path works fine when DMA-INT is healthy and
+    // only fails under sustained load — and the right reaction to
+    // SDMMC EIO under load is the writer's circuit breaker, not
+    // pre-reserving the budget.)
+    s_sdmmc_stash = NULL;
 
     // Queue in PSRAM (NOT DMA-capable internal SRAM, the default for
     // xQueueCreate). 32 × ~304-byte items = ~10 KB; if it lands in
