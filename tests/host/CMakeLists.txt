@@ -282,6 +282,32 @@ target_include_directories(test_pipeline_wideband_albq PRIVATE
 )
 target_link_libraries(test_pipeline_wideband_albq PRIVATE m)
 
+# Generate /tmp/host_direct_if/fixture_albq_raw_2500k.cf32 — the
+# scipy-resampled 2.5 MSPS input that test_pipeline_wideband_albq and
+# test_pipeline_direct_if_albq read. Output stamped so cmake/ninja
+# only re-runs the script when its inputs change. Requires
+# `iridium-extractor` on PATH (tests/scripts/direct_if_dump.py also
+# generates per-burst dumps + manifest.csv along the way).
+set(ALBQ_25K_CF32 /tmp/host_direct_if/fixture_albq_raw_2500k.cf32)
+add_custom_command(
+    OUTPUT  ${ALBQ_25K_CF32}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/direct_if_dump.py
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/direct_if_dump.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/fixture_albq_raw.h
+    COMMENT "Generating ALBQ 2.5 MSPS cf32 fixture via direct_if_dump.py (needs iridium-extractor)"
+    VERBATIM)
+add_custom_target(albq_25k_cf32_fixture DEPENDS ${ALBQ_25K_CF32})
+
+# Wire the fixture as a build-time dep so `cmake --build ... --target
+# test_pipeline_wideband_albq` produces a runnable test. If
+# iridium-extractor isn't installed the script will fail; users can
+# either install it (apt: gr-iridium) or run the wideband_resampled
+# variant which is fixture-self-contained.
+add_dependencies(test_pipeline_wideband_albq albq_25k_cf32_fixture)
+# Note: test_pipeline_direct_if_albq's add_dependencies lives next to
+# its add_executable below — it's defined after this point so we can't
+# forward-reference it here.
+
 # (test_polyphase_int16, test_channelizer_detector, test_polyphase_channelizer,
 # test_snr_gap_measurement, and test_worker_pipeline_albq removed —
 # the polyphase channelizer that fed them was deprecated when the
@@ -439,6 +465,7 @@ target_include_directories(test_pipeline_direct_if_albq PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
 )
 target_link_libraries(test_pipeline_direct_if_albq PRIVATE m)
+add_dependencies(test_pipeline_direct_if_albq albq_25k_cf32_fixture)
 
 # (test_snr_gap_measurement removed with the channelizer — was a
 # diagnostic instrument for the channelizer-vs-gri SNR gap that
