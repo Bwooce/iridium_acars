@@ -1,6 +1,7 @@
 #include "usb/usb_host.h"
 #include "esp_log.h"
 #include "esp_libusb.h"
+#include "esp_timer.h"
 
 static class_adsb_dev *adsbdev;
 
@@ -19,6 +20,17 @@ static volatile uint8_t  s_xfer_last_error = 0;
 // consumed by status_logger every second (read-and-reset); these
 // parallel counters let /status JSON expose lifetime totals so an
 // external monitor can compute deltas across capture cycles.
+//
+// Startup grace period: USB streaming has a settling transient
+// (pool transfer churn, DMA-INT competition, EMA priming on tagger
+// side) that produces ~5000 rb_full_drops in the first few seconds
+// of every boot. The per-second stats above still record it (useful
+// for diagnosing startup regressions), but the lifetime totals below
+// only start incrementing AFTER the grace window so external
+// monitors don't get a misleading 0.86% lifetime drop rate driven
+// entirely by boot transients.
+#define STREAM_STATS_GRACE_US (5 * 1000 * 1000)
+static volatile int64_t  s_stream_start_us       = 0;
 static volatile uint64_t s_total_completed       = 0;
 static volatile uint64_t s_total_rb_full_drops   = 0;
 static volatile uint64_t s_total_status_errors   = 0;
@@ -169,14 +181,19 @@ void stream_transfer_cb(usb_transfer_t *transfer)
         return;
     }
 
+    // Lifetime totals only count post-grace. Per-second stats still
+    // capture the boot transient so status_logger can show it.
+    bool post_grace = (s_stream_start_us != 0) &&
+                      (esp_timer_get_time() - s_stream_start_us >= STREAM_STATS_GRACE_US);
+
     if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_xfer_completed++;
-        s_total_completed++;
+        if (post_grace) s_total_completed++;
         s_xfer_actual_bytes    += (uint32_t)transfer->actual_num_bytes;
         s_xfer_requested_bytes += (uint32_t)transfer->num_bytes;
         if (transfer->actual_num_bytes < transfer->num_bytes) {
             s_xfer_short++;
-            s_total_short_xfers++;
+            if (post_grace) s_total_short_xfers++;
         }
         if (transfer->actual_num_bytes > 0) {
             // Sample fill BEFORE the send. vRingbufferGetInfo's last arg is
@@ -192,13 +209,13 @@ void stream_transfer_cb(usb_transfer_t *transfer)
                                             transfer->actual_num_bytes, 0);
             if (ok != pdTRUE) {
                 s_xfer_rb_full_drops++;
-                s_total_rb_full_drops++;
+                if (post_grace) s_total_rb_full_drops++;
                 s_producer_rb_used_at_drop = used_bytes;
             }
         }
     } else {
         s_xfer_status_errors++;
-        s_total_status_errors++;
+        if (post_grace) s_total_status_errors++;
         s_xfer_last_error = (uint8_t)transfer->status;
     }
 
@@ -282,6 +299,10 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
     }
 
     dev->streaming = true;
+    // Mark when streaming began so the transfer callback can decide
+    // whether the lifetime counters should accumulate yet. See the
+    // STREAM_STATS_GRACE_US block above.
+    s_stream_start_us = esp_timer_get_time();
     // Diagnostic for the DMA-pool exhaustion symptom that previously
     // showed up as "Failed to alloc async transfer 0" with no further
     // detail. usb_host_transfer_alloc requires DMA-capable internal
