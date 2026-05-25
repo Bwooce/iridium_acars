@@ -74,9 +74,39 @@ Resample is the throttle. Either rewrite it (opp #1 alt: PIE
 inner-MAC, bigger) or eliminate it by dropping SDR rate to 2.0 MSPS
 (opp #1 below, much smaller). Drop-to-2.0 is the next likely win.
 
+### 2026-05-25 status sweep — verdicts on each opportunity below
+
+A round of attempts since this doc was written has produced
+concrete verdicts. Each item below is annotated inline with one of
+LANDED / REJECTED / STILL OPEN and a short reason. Detail
+preserved as history; do not delete.
+
+Headline: USB drops are now near zero (commits `aa1e85d`,
+`3d85779`, `209b2d5`), so the urgency on opportunity #1 has
+dropped — typical-traffic operation no longer demands the
+structural rate change. The remaining levers are decode-time wins
+inside the worker, and #4's verdict has flipped to REJECTED for
+policy reasons (quality must not be compromised).
+
+The session that landed those USB-drop fixes also disabled
+`fbt_pipe` (the Core 0 ‖ Core 1 tagger pipeline helper). It was at
+prio 9 on Core 1 and was starving `worker_core1`; bursts stopped
+reaching the decoder. The implicit "tagger pipelining" inside this
+doc (called out under #2 below) is therefore REJECTED for now —
+re-enabling it requires moving ingest off Core 1 or speeding the
+worker enough that the helper can coexist. See memory note
+`project_core1_cpu_budget_scheduling.md`.
+
 ---
 
 ## 1. Drop RTL-SDR rate from 2.56 → 2.0 MSPS (gri-aligned)
+
+**Status (2026-05-25): STILL OPEN, urgency reduced.** USB drops
+are now near zero after the pool-stash trim + DMA-INT pre-alloc
+removal + `fbt_pipe` disable (commits `aa1e85d`, `3d85779`,
+`209b2d5`). Worth keeping as a last-resort structural change if
+typical-traffic operation later reveals 4.48 MB/s isn't enough,
+but no longer the obvious next win.
 
 **What:** Change `FS_IN_HZ` in `dsp_processor.h:20` from `2560000` to
 `2000000`. gr-iridium ships `sample_rate=2000000`; librtlsdr
@@ -95,6 +125,15 @@ dropping at the source. Ringbuf drops should evaporate.
 smoke (fixture stays at 2.5 MSPS; live-rate change is orthogonal).
 
 ## 2. PIE-accelerate the burst-tagger EMA + magnitude loops
+
+**Status (2026-05-25): STILL OPEN.** The sibling approach of
+*pipelining* the tagger across cores (`fbt_pipe`) was tried and
+DISABLED (commit `209b2d5`) — at prio 9 on Core 1 it starved
+`worker_core1`. PIE-accelerating the inline loops stays on Core 0
+and doesn't touch the Core 1 budget, so the verdict here is
+unchanged: worth doing, just hand-rolled PIE work. See related
+`docs/split-resample-sweep-2026-05-22.md` for the broader Core 0
+contention story.
 
 **What:** `compute_magnitude_shifted()` and `update_baseline_ema()` in
 `fft_burst_tagger.c:197/380` are the per-step hotspots after the FFT.
@@ -139,6 +178,11 @@ pattern as the worker-stack bug). Blocked behind finding/
 relocating that victim allocation.
 
 ## 4. Conditional multi-frame iteration
+
+**Status (2026-05-25): REJECTED.** Tried; saved ~40 ms/burst but
+cost matched 61 → 56 and BCH 29 → 25 (quality regression). User
+policy: quality must not be compromised. See "Forward plan §4" in
+`iridium-acars-implementation-plan.md`.
 
 **What:** `burst_pipeline.c:457` always iterates until window
 exhausted, regardless of frame 1 outcome. Retry loop is ~3.3× per
@@ -198,6 +242,8 @@ the FFT cost.)
 
 ## 7. Q15 absolute-phase phasor table for rotate-to-DC
 
+**Status (2026-05-25): STILL OPEN.** No attempt landed.
+
 **What:** Per memory `feedback_q15_incremental_phasor_decays.md`, you
 switched to per-sample float `cosf/sinf` to avoid Q15 incremental
 decay. But that's a scalar float trig call per sample × ~40 K
@@ -216,6 +262,12 @@ mul).
 coherence harness.
 
 ## 8. SNR-gate + tagger threshold relaxation (after #1-#3)
+
+**Status (2026-05-25): LANDED (threshold drop).** Tagger threshold
+dropped 14 → 10 dB in commit `aa8e6c7` (task #77) alongside the
+Core 1 priority fix; the 2026-05-24 live soak confirmed
+production stability at 10 dB. SNR-gate component of this item is
+deferred.
 
 **What:** Tagger is at 14 dB threshold because the worker can't keep
 up. After #1-#3 land, lower to 10 dB to recover the missing 4 BCH

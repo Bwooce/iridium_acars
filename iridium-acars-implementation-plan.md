@@ -3,11 +3,13 @@
 Tracks the concrete implementation steps for the
 [Iridium ACARS Decoding Stack Design](./iridium-acars-decoding-stack-design.md).
 
-## Current status (2026-05-22)
+## Current status (2026-05-25)
 
 **Bit-correctness is solved; the wideband C decoder produces clean
 frames on both host and P4.** Focus has moved to performance —
-specifically, closing the gap to real-time on a single ESP32-P4.
+specifically, closing the gap to real-time on a single ESP32-P4 —
+and to operational concerns: USB pool stability, on-device SD raw-IQ
+capture, and bench-side burst harvesting.
 
 Smoke run against the ALBQ fixture (72 tagged bursts) — current numbers:
 
@@ -20,6 +22,67 @@ Smoke run against the ALBQ fixture (72 tagged bursts) — current numbers:
 | Raw BER over matched bursts | 0% | **1.91%** |
 
 Host bch/qpsk/burst-pipeline regression suite: **20/20 ctest pass**.
+
+### Since 2026-05-22
+
+USB stability and operational tooling have moved a long way; the
+bit-correctness story above is unchanged.
+
+- **USB drops effectively closed** (commits `aa1e85d`, `3d85779`,
+  `209b2d5`). Three changes together: shrunk the SDMMC stash
+  64 → 16 → 0 KB, removed eager DMA-INT pre-allocs that were
+  starving the USB transfer pool, and disabled the Core 1 tagger
+  pipe helper (`fbt_pipe`). `rb_full_drops` went from ~7.5%
+  cumulative on the 2026-05-24 live soak to ~0% per cycle on the
+  follow-up runs. Task #91 substantially resolved.
+- **`fbt_pipe` helper DISABLED** (commit `209b2d5`). The
+  Core 0 ‖ Core 1 split for the burst tagger (window + FFT on
+  Core 0, magnitude / detect / EMA on Core 1) was starving
+  `worker_core1` at prio 9 on Core 1 — bursts stopped reaching the
+  decoder. Tagger now runs sequentially again (mag + det + EMA
+  inline on Core 0). Restoring the helper requires either moving
+  ingest off Core 1 or speeding the worker enough to absorb the
+  helper's prio. Listed as task #85 (disabled) / #87 (follow-up).
+- **Class driver unsubscribed from TASK_WDT** (commit `3d85779`).
+  Stuck-USB conditions were rebooting the device every 60 s. Root
+  cause is structural (consumer task blocked on `take_converted`
+  when ingest stalls), and a panic-reboot was the wrong response.
+  Recovery now relies on the stream-stall watchdog + root-port
+  power cycling. Memory note
+  `feedback_task_wdt_subscription_pitfalls.md`.
+- **SD raw-IQ capture shipped** (commit `d6b864f` + follow-ups
+  `08d8899` / `3ff7c0b` / `f8dee32` / `fd74cd5` / `a9be68f` /
+  `329a9cc`; tasks #63, #94). New endpoints on the HTTP server:
+  - `POST /capture/start` (continuous + burst modes),
+    `POST /capture/stop`, `GET /capture/status`,
+    `GET /capture/file?name=...` (download).
+  - `POST /sd/format`, `GET /sd/list` (returns name + size +
+    mtime), `POST /sd/delete`, `GET /tasks`.
+  - Writer lives on Core 1 prio 5 with sector-aligned fwrite (see
+    memory note `project_sd_fwrite_sector_alignment.md`); EIO
+    circuit breaker on top.
+- **Burst-mode arm race fixed**. `sd_capture_start_bursts` was
+  setting `s_burst_mode=true` AFTER `state=ACTIVE` inside
+  `sd_capture_start`; the brief window let raw USB IQ bytes leak
+  into the new burst file. Observed live as `iq-4188149994.u8`
+  starting with 4992 bytes of junk before the first `BRST`
+  header. Arm ordering tightened so burst mode is committed before
+  the writer flips to ACTIVE.
+- **Capture monitor → FIFO eviction** (`scripts/capture_monitor.sh`,
+  with `scripts/capture_housekeeper.sh` companion, commit
+  `fa16898`). Previous behaviour reformatted the whole card at
+  `SD_FULL_BYTES` threshold — a 95 s freeze that lost the active
+  capture. Now the monitor per-tick FIFO-evicts the oldest
+  `iq-*.u8` by mtime via `POST /sd/delete`. The reformat path is
+  retained for manual recovery.
+- **30-minute live stability** (2026-05-24, on the
+  `c9e75a4 + d6b864f + 51a6bd0 + aa8e6c7` build that immediately
+  preceded the USB-pool fixes above): 0 crashes / 4.48 MB/s
+  sustained / 14 real bursts at 12–13 dB SNR / 7% rb_full_drops
+  blocking decode. Reception is the limit, not the firmware.
+  Memory note `project_30min_live_stability_2026_05_24.md`. The
+  rb_full_drops figure is what the post-fix builds have now
+  brought to ~0%.
 
 Bit-correctness milestones landed in May 2026:
 
@@ -91,12 +154,14 @@ regression at any commit.
 
 ### What's NOT yet real-time
 
-USB throughput (task #74) is closed — we're at 4.57 MB/s sustained
-(was 0.85 MB/s). That's 89% of the 5.12 MB/s target. The remaining
-gap is structural: ~85 ms/burst worker time vs ~11 ms target for
-single-channel real-time. The dominant remaining cost is the
-matched-filter + multi-frame retry loop on Core 1
-(~63 ms/burst, intrinsically serial within one burst).
+USB throughput (task #74) is closed — we're at ~4.48 MB/s sustained
+on the 2026-05-24 live soak, with `rb_full_drops` now near zero
+after the USB-pool fixes that followed (tasks #91 / `aa1e85d` /
+`3d85779` / `209b2d5`). That's 87% of the 5.12 MB/s target. The
+remaining gap is structural: ~85 ms/burst worker time vs ~11 ms
+target for single-channel real-time. The dominant remaining cost is
+the matched-filter + multi-frame retry loop on Core 1 (~63 ms/burst,
+intrinsically serial within one burst).
 
 Approaches considered for the worker gap, with current verdicts
 (updated 2026-05-23):
@@ -108,7 +173,7 @@ Approaches considered for the worker gap, with current verdicts
 | Chunked RRC PIE FIR | failed twice | Static-BSS variant broke boot (PSRAM DMA pool reserve), heap-alloc variant produced corrupt output (streaming FIR semantics quirk in arp4). Worth another look. |
 | Two-worker burst pool | blocked (memory) | Each instance needs ~34 KB internal SRAM. Largest contiguous block after init = 31 KB. Doesn't fit without further freeing. |
 | Two-worker parallel resample | architecture built, blocked (L2 contention) | Within-chunk split implemented and validated bit-exact (commit `aad9735`). At split>0, FFT cost on Core 0 jumps 263→443 µs. Default split_pct=0 ships. See `docs/split-resample-sweep-2026-05-22.md`. |
-| Pipelined tagger (FFT step N+1 ‖ post-FFT step N) | attempted, exposed silicon bug | Refactor surfaced a latent P4 v1.3 PIE position-dependent corruption bug (matched 61→44 on heap shift). Workaround landed (`resample_256_to_250_alloc_coeffs` early in boot, commit `cfd2739`). Pipelining itself parked. Memory note `project_heap_position_decode_bug.md`. |
+| Pipelined tagger (FFT step N+1 ‖ post-FFT step N) | attempted, DISABLED 2026-05-25 | First pass surfaced a latent P4 v1.3 PIE position-dependent corruption bug (matched 61→44 on heap shift); workaround landed (`resample_256_to_250_alloc_coeffs` early in boot, commit `cfd2739`). A second implementation (the Core 0 ‖ Core 1 `fbt_pipe` helper) shipped briefly and was then disabled in commit `209b2d5`: at prio 9 on Core 1 it starved `worker_core1` and bursts stopped reaching the decoder. Tagger now runs sequentially. Restoring it requires moving ingest off Core 1 or speeding the worker. Tasks #85 (disabled) / #87. Memory notes `project_heap_position_decode_bug.md`, `project_core1_cpu_budget_scheduling.md`. |
 | Conditional multi-frame iteration | tried, reverted | Saved ~40 ms/burst but cost matched 61→56 and BCH 29→25 — quality regression. Quality-must-not-be-compromised policy. |
 | Drop input to 2.0 MSPS (task #1 in opt doc) | available, deferred | Deletes the resampler entirely, closes the 11% USB gap. Trade-off: ~22% less spectrum captured. Worth it only if real-RF reveals the gap is binding. |
 
@@ -118,13 +183,16 @@ See `Forward plan` below for the concrete next steps.
 
 ## Forward plan
 
-Bit-correctness is done. USB ingest is now at **4.57 MB/s** on
-LIVE_SDR (was 0.85 MB/s — task #74 closed via the resample +
-coeffs-internal + PSRAM-stacks work). The remaining gap is **~11%
-short of true realtime** (5.12 MB/s at 2.56 MSPS) and the existing
-~85 ms/burst decode budget. The plan is sequenced so each step is
-testable in isolation and the next one is informed by what the
-previous one measured.
+Bit-correctness is done. USB ingest is now at **~4.48 MB/s** on
+LIVE_SDR with `rb_full_drops` near zero (was 0.85 MB/s — task #74
+closed via the resample + coeffs-internal + PSRAM-stacks work;
+task #91 closed via the USB-pool stash trim + DMA-INT pre-alloc
+removal + `fbt_pipe` disable, commits `aa1e85d`, `3d85779`,
+`209b2d5`). The remaining gap is **~13% short of true realtime**
+(5.12 MB/s at 2.56 MSPS) and the existing ~85 ms/burst decode
+budget. The plan is sequenced so each step is testable in
+isolation and the next one is informed by what the previous one
+measured.
 
 ### 1. ~~Grow the PSRAM ring buffer~~ — DONE
 
@@ -132,12 +200,17 @@ Burst queue is now 1024 entries × 28 B in PSRAM. Plenty of slack
 for transient overloads; `qmax` stays low even at peak fixture
 rate.
 
-### 2. ~~Restore USB SDR throughput~~ — DONE (LIVE_SDR ≈ 4.57 MB/s)
+### 2. ~~Restore USB SDR throughput~~ — DONE (LIVE_SDR ≈ 4.48 MB/s, drops ≈ 0)
 
 Resample-and-related work brought the consumer-side pipeline from
-~0.85 MB/s to 4.57 MB/s, well within the "above 4.5 MB/s no drops"
-acceptance criterion. The 11% gap to true 5.12 MB/s is from the
-remaining ~2.7 ms resample on Core 1.
+~0.85 MB/s to 4.57 MB/s. Follow-up USB-pool work (commits
+`aa1e85d`, `3d85779`, `209b2d5`; tasks #91 / #85) brought
+`rb_full_drops` from ~7% sustained on 2026-05-24 down to near
+zero, with the 30-min live soak settling at 4.48 MB/s mean. The
+remaining ~13% gap to true 5.12 MB/s is the resample cost on
+Core 1 plus the inherent fbt-helper-disabled headroom; closing it
+needs either the structural rate drop (Section 9) or a way to
+re-enable the tagger pipe helper without starving the worker.
 
 ### 3. Live RF validation (Phase 4)
 
@@ -232,7 +305,7 @@ stuck-enumeration state that LIVE_SDR currently hits on re-flash.
 
 ### 9. Drop input rate to 2.0 MSPS (task #1 in opt doc)
 
-Last-resort structural change if Phase 4 reveals 4.57 MB/s isn't
+Last-resort structural change if Phase 4 reveals 4.48 MB/s isn't
 enough for typical-traffic operation. Eliminates the resampler
 entirely, deletes the 2.7 ms/dispatch Core 1 cost. gr-iridium
 ships at 2.0 MSPS by default so we'd be standards-aligned.
@@ -301,6 +374,17 @@ messages; this section only states what works today.
 - **Frame layer**: IDA decode (de-interleave + BCH), CRC-16-CCITT
   validation, SBD reassembler, libacars (vendored) for ACARS parsing
   with multi-segment reassembly via `la_acars_parse_and_reassemble`.
+- **On-device SD raw-IQ capture** (`sd_capture.c`, tasks #63 / #94).
+  HTTP endpoints: `POST /capture/start` (continuous + burst modes),
+  `POST /capture/stop`, `GET /capture/status`,
+  `GET /capture/file?name=...`, `POST /sd/format`, `GET /sd/list`,
+  `POST /sd/delete`, `GET /tasks`. Sector-aligned fwrite to avoid
+  the SDMMC EIO cliff (memory note
+  `project_sd_fwrite_sector_alignment.md`); EIO circuit breaker;
+  Core 1 writer task at prio 5. Companion host scripts:
+  `scripts/capture_monitor.sh` (FIFO eviction of oldest IQ files,
+  no card reformat) and `scripts/capture_housekeeper.sh` (log
+  rotation + IQ prune).
 - **Comparison tooling**: `tests/scripts/dsp_compare.py` (single CLI,
   three modes, manifest-aware alignment, NPZ regression vectors).
   Per-stage NMSE / phase coherence dumps for any matched burst.

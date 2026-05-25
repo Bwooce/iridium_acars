@@ -9,12 +9,14 @@ ESP32-P4-Nano or P4-Pico board.
 
 | Aspect | State |
 |---|---|
-| **Throughput** | **4.88 MB/s** at 2.56 MSPS (= **100.5%** of real-time target) |
-| **Packet drops** | **0** in steady state |
-| End-to-end DSP | Detect → extract → freq-shift → decimate → resample → DQPSK → BCH all working |
-| USB host stack | Recovers stuck-device states without physical unplug |
-| Functional regression tests | 6 layers, all green (incl. real-RF Albuquerque corpus) |
-| **Blocker** | **Antenna + LNA hardware** (Scan Iridium GO! QFH + Nooelec SAWbird+ IR + lightning protection). Until installed, only RFI is in the air. |
+| **USB throughput** | **~4.48 MB/s** sustained at 2.56 MSPS (= ~87% of the 5.12 MB/s real-time target). `rb_full_drops` ~0 after the 2026-05-25 USB-pool fixes. |
+| **Bit-correctness** | Wideband path matches gr-iridium: **1.91% raw BER** on the P4 ALBQ smoke corpus, **1.33%** on host. 29 BCH-corrected frames / 61 matched / 93.8% recall. |
+| **Decode budget** | ~85 ms/burst on Core 1 vs ~11 ms target for single-channel real-time (~8× too slow). Reception is the practical limit today, not the worker. |
+| End-to-end DSP | Detect → extract → freq-shift → decimate → resample → DQPSK → BCH → IDA → libacars all working. |
+| On-device capture | SD raw-IQ capture (continuous + burst modes) over HTTP, with download / list / delete / FIFO-evict tooling. |
+| USB host stack | Recovers stuck-device states without physical unplug; class driver no longer subscribed to TASK_WDT (was reboot-storming on stalls). |
+| Functional regression tests | 20 host ctests green + on-target smoke (synthetic + real-IQ + LIVE_SDR). |
+| **Blocker** | **Antenna + LNA hardware** (Scan Iridium GO! QFH + Nooelec SAWbird+ IR + lightning protection). Until installed, only RFI is in the air; 30-min bench soak (2026-05-24) saw 14 real bursts at 12-13 dB SNR — below the host's reliable decode threshold. |
 
 ## Quick start
 
@@ -143,7 +145,7 @@ while tuning throughput; off by default to keep long unattended
 captures readable.
 
 Healthy operational signs:
-- `rate=4.88 MB/s` stable (= the device's actual streaming rate)
+- `rate=` ~4.4-4.6 MB/s stable (= the device's actual streaming rate; RTL emits 5.12 MB/s at 2.56 MSPS)
 - `drops=0`, no `STATUS-ERR:` line
 - `processed > 0` lines appear once real Iridium bursts are detected
 
@@ -166,8 +168,9 @@ keep the log small over long captures.
 
 ## How the optimization arc went
 
-The throughput journey from 25% to 100.5% in 11 numbered steps is
-documented in
+The throughput journey (25% baseline → peak ~100% on the early
+synthetic load → today's ~87% sustained on live SDR, after the
+wideband bit-correct decode path landed) is documented in
 [`iridium-acars-implementation-plan.md`](./iridium-acars-implementation-plan.md).
 Some highlights worth keeping front of mind:
 
