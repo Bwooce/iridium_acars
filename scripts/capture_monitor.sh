@@ -213,10 +213,14 @@ while true; do
 
     up=$(device_uptime)
     if [ "$up" -lt "$last_reboot_up" ]; then
-        log "device REBOOTED (uptime ${last_reboot_up} -> $up)"
+        log "device REBOOTED (uptime ${last_reboot_up} -> $up) — re-baselining counters"
         ensure_mounted
         sleep 2
         start_capture
+        # Counters reset on reboot, so the next cycle's delta MUST
+        # baseline against the post-reboot counters or it goes
+        # negative. Update dev_snap_before NOW, not after start.
+        dev_snap_before=$(device_decode_snapshot)
         last_reboot_up=$up
         sleep "$POLL_INTERVAL"
         continue
