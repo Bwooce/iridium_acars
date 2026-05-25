@@ -752,8 +752,20 @@ esp_err_t worker_core1_init(void)
     // TASK_WDT aborted. Moving below frame_decoder lets the
     // scheduler give the WDT-watched task its cycles even when
     // worker has a backlog.
+    // Prio 4 = same as frame_decoder. Empirically (Mon 2026-05-25)
+    // prio 3 was getting <1% Core 1 under noise-heavy bench load
+    // (tagger emitting 140 bursts/sec); the queue filled within a
+    // second and stayed full, worker_dropped=130/s indefinitely.
+    // Round-tripping with frame_decoder (same prio, both not
+    // WDT-fatal-blocking) shares cycles equitably. Prio is BELOW
+    // sd_capture writer (5) so SD writes don't compete with worker
+    // for the few cycles ingest/fbt_pipe leave behind.
+    //
+    // History: was 5 → starved frame_decoder past WDT → moved to 3
+    // → starved by ingest (8) + fbt_pipe (9) under load. Prio 4 is
+    // the goldilocks slot.
     xTaskCreatePinnedToCoreWithCaps(worker_task, "worker_core1", 16384, NULL,
-                                     3, NULL, 1, MALLOC_CAP_SPIRAM);
+                                     4, NULL, 1, MALLOC_CAP_SPIRAM);
     return ESP_OK;
 }
 

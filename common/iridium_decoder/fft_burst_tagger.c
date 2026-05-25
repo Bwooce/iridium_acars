@@ -302,18 +302,20 @@ fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
     t->staged_max_new        = FBT_MAX_BURSTS;
     t->staged_max_gone       = FBT_MAX_BURSTS;
 
-    if (s_pipe_helper_task == NULL && t->fft_buf_alt) {
-        BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
-            fbt_pipe_helper_task, "fbt_pipe", 4096, NULL,
-            /*prio=*/ 9, &s_pipe_helper_task,
-            /*core=*/ 1, MALLOC_CAP_SPIRAM);
-        if (ok != pdPASS) {
-            ESP_LOGW("FBT_INIT", "pipe helper spawn failed; sequential fallback");
-            s_pipe_helper_task = NULL;
-        } else {
-            ESP_LOGI("FBT_INIT", "pipe helper on Core 1 (window+FFT ‖ mag+detect+EMA)");
-        }
-    }
+    // (Mon 2026-05-25) Pipeline helper DISABLED. Was prio 9 on Core 1
+    // and ate 24% of Core 1 CPU under noise-heavy bench load (tagger
+    // emitting 140 bursts/sec). ingest_core1 already takes 62% on the
+    // same core; together they starve worker_core1 to <1% and the
+    // worker can't process bursts. The sequential fallback (mag+
+    // detect+EMA inline on Core 0 with the FFT) is slower per FFT
+    // step but frees Core 1 entirely for worker.
+    //
+    // History: enabled in task #85 when worker was fast enough that
+    // the extra Core 1 contention didn't matter. Re-evaluate when
+    // we measure worker throughput improvements that change the
+    // budget arithmetic.
+    s_pipe_helper_task = NULL;
+    ESP_LOGI("FBT_INIT", "pipe helper DISABLED — sequential fallback (Core 1 freed for worker)");
 #endif
     return t;
 }

@@ -617,6 +617,40 @@ static esp_err_t sd_mount_post(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// GET /tasks — text dump of FreeRTOS task list (vTaskList). Tells us
+// which tasks are Ready/Running/Blocked/Suspended and which CPU
+// they're on. Essential for diagnosing "the X task isn't running"
+// cases where ESP_LOGI silence alone isn't a positive signal.
+//
+// Output format (vTaskList):
+//   Name State Prio StackHighWater Number CPU
+// State letters: R running, B blocked, S suspended, X deleted.
+static esp_err_t tasks_get(httpd_req_t *req)
+{
+    // vTaskList output is ~40-80 bytes per task. Allocate generously
+    // in PSRAM. Header line + ~15 tasks ≈ 1.5 KB worst case.
+    char *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "oom", HTTPD_RESP_USE_STRLEN);
+    }
+    // Header so the output's columns are obvious to a human reader.
+    int n = snprintf(buf, 4096,
+        "Name             State Prio Stack Num CPU\n"
+        "-------------------------------------------\n");
+    vTaskList(buf + n);
+    size_t off = strlen(buf);
+    off += snprintf(buf + off, 4096 - off,
+        "\n=== CPU runtime stats (since boot) ===\n"
+        "Name             Time%%\n"
+        "----------------------\n");
+    vTaskGetRunTimeStats(buf + off);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    heap_caps_free(buf);
+    return ESP_OK;
+}
+
 // GET /sd/list — JSON array of files under /sdcard/acars/ with their
 // on-disk sizes. Lets the operator confirm a capture file actually
 // landed on the card before attempting a download (and lets external
@@ -949,6 +983,7 @@ esp_err_t http_server_start(void)
         { .uri = "/sd/mount",      .method = HTTP_POST, .handler = sd_mount_post,       .user_ctx = NULL },
         { .uri = "/sd/format",     .method = HTTP_POST, .handler = sd_format_post,      .user_ctx = NULL },
         { .uri = "/sd/list",       .method = HTTP_GET,  .handler = sd_list_get,         .user_ctx = NULL },
+        { .uri = "/tasks",         .method = HTTP_GET,  .handler = tasks_get,           .user_ctx = NULL },
         { .uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post,  .user_ctx = NULL },
         { .uri = "/capture/stop",  .method = HTTP_POST, .handler = capture_stop_post,   .user_ctx = NULL },
         { .uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get,  .user_ctx = NULL },
