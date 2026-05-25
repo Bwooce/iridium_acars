@@ -19,6 +19,9 @@
 #include "sd_log.h"
 #include "sd_capture.h"
 
+#include <dirent.h>
+#include <sys/stat.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
@@ -593,6 +596,42 @@ static esp_err_t sd_mount_post(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// GET /sd/list — JSON array of files under /sdcard/acars/ with their
+// on-disk sizes. Lets the operator confirm a capture file actually
+// landed on the card before attempting a download (and lets external
+// monitors decide when to pull or prune).
+static esp_err_t sd_list_get(httpd_req_t *req)
+{
+    DIR *d = opendir("/sdcard/acars");
+    if (!d) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, "{\"error\":\"opendir failed\"}",
+                                HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send_chunk(req, "[", 1);
+    struct dirent *e;
+    bool first = true;
+    char line[160];
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char path[320];
+        snprintf(path, sizeof(path), "/sdcard/acars/%s", e->d_name);
+        struct stat st;
+        long long sz = (stat(path, &st) == 0) ? (long long)st.st_size : -1;
+        int n = snprintf(line, sizeof(line),
+            "%s{\"name\":\"%s\",\"size\":%lld}",
+            first ? "" : ",", e->d_name, sz);
+        if (n > 0) httpd_resp_send_chunk(req, line, n);
+        first = false;
+    }
+    closedir(d);
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 // POST /sd/format — wipe + reformat the SD card. Destroys all data
 // on the card. Takes 30-180 s depending on card size; httpd timeout
 // gets bumped via the task WDT bump inside sd_log_force_format.
@@ -729,6 +768,17 @@ static esp_err_t capture_file_get(httpd_req_t *req)
         return httpd_resp_send(req, "no such file\n", HTTPD_RESP_USE_STRLEN);
     }
 
+    // Log the size we'll actually deliver, for download-debug. fseek
+    // to end + ftell is the FATFS-blessed way to learn the size of an
+    // open file; struct stat through /sdcard might lag behind the
+    // dir-entry update.
+    long size_seek = -1;
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        size_seek = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+    }
+    ESP_LOGI(TAG, "/capture/file: serving %s (size=%ld bytes)", name, size_seek);
+
     // Stream the file in chunks. Each fread+send_chunk yields to
     // the scheduler between iterations so the SD read can't starve
     // class_driver. 8 KB chunks balance: bigger reduces overhead,
@@ -827,7 +877,7 @@ esp_err_t http_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port    = 80;
-    cfg.max_uri_handlers = 13;
+    cfg.max_uri_handlers = 16;
     cfg.lru_purge_enable = true;
     cfg.stack_size     = 6144;
     cfg.task_priority  = 4;
@@ -854,6 +904,7 @@ esp_err_t http_server_start(void)
         { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,       .user_ctx = NULL },
         { .uri = "/sd/mount",      .method = HTTP_POST, .handler = sd_mount_post,       .user_ctx = NULL },
         { .uri = "/sd/format",     .method = HTTP_POST, .handler = sd_format_post,      .user_ctx = NULL },
+        { .uri = "/sd/list",       .method = HTTP_GET,  .handler = sd_list_get,         .user_ctx = NULL },
         { .uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post,  .user_ctx = NULL },
         { .uri = "/capture/stop",  .method = HTTP_POST, .handler = capture_stop_post,   .user_ctx = NULL },
         { .uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get,  .user_ctx = NULL },

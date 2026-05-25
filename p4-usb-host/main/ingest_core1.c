@@ -503,11 +503,24 @@ esp_err_t ingest_core1_init(void)
 uint8_t *ingest_core1_acquire_raw(int *out_slot)
 {
     int slot = s_next_acquire_slot;
-    // The slot must be free before the consumer overwrites the raw buffer.
-    // In steady state this is immediate (ingest typically runs faster than
-    // DSP feed). Time the wait so we can see contention if it shows up.
+    // 4 s timeout (not portMAX_DELAY) so the caller — class_driver,
+    // which is subscribed to the TASK_WDT — can return to its loop
+    // and feed the watchdog even if the downstream pipeline has
+    // wedged. A NULL return signals the caller to drop this read
+    // and try again. The 60 s class WDT then never trips: class
+    // reaches its esp_task_wdt_reset() every loop iteration.
+    //
+    // Before this change, sustained SD captures would block worker
+    // → ring buffer fills → ingest's push blocks → ingest never
+    // releases s_free → class blocked here forever → TASK_WDT
+    // reboot at the 60 s mark.
     int64_t t_wait = esp_timer_get_time();
-    xSemaphoreTake(s_free[slot], portMAX_DELAY);
+    if (xSemaphoreTake(s_free[slot], pdMS_TO_TICKS(4000)) != pdTRUE) {
+        ESP_LOGW(TAG, "acquire_raw slot %d timed out — pipeline backpressured",
+                 slot);
+        *out_slot = -1;
+        return NULL;
+    }
     uint32_t waited = (uint32_t)(esp_timer_get_time() - t_wait);
     if (waited > 100) {  // skip noise; only count meaningful waits
         s_acc_slot_wait_us += waited;
@@ -528,9 +541,15 @@ void ingest_core1_dispatch(int slot, size_t bytes_filled)
 
 int16_t *ingest_core1_take_converted(int slot, size_t *out_n_int16)
 {
-    xSemaphoreTake(s_ready[slot], portMAX_DELAY);
-    // Returns the RESAMPLED buffer (2.5 MSPS) and its int16 count —
-    // post-Phase 3.6.M cutover this is what downstream DSP wants.
+    // 4 s timeout (matches acquire_raw) so the calling task —
+    // class_driver, on the WDT-watched hot loop — can return to
+    // feed the TWDT if the ingest worker is stuck. NULL return
+    // signals "no data this cycle, try again" without deadlocking.
+    if (xSemaphoreTake(s_ready[slot], pdMS_TO_TICKS(4000)) != pdTRUE) {
+        ESP_LOGW(TAG, "take_converted slot %d timed out — ingest stuck", slot);
+        if (out_n_int16) *out_n_int16 = 0;
+        return NULL;
+    }
     if (out_n_int16) *out_n_int16 = s_resamp_n_int16[slot];
     return s_resamp[slot];
 }

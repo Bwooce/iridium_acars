@@ -360,6 +360,31 @@ static esp_err_t mount_sd(void)
     s_stats.mounted = true;
     s_stats.mount_error[0] = '\0';
     sdmmc_card_print_info(stdout, s_card);
+
+    // Pre-allocate the SDMMC driver's per-transaction stash buffer
+    // once, BEFORE USB + capture have fragmented DMA-INT. Without
+    // this, sdmmc_write_sectors calls allocate_dma_buf for every
+    // PSRAM-sourced write (the sd_log writer pulls from a PSRAM
+    // queue), which fails with ESP_ERR_NO_MEM during sustained
+    // captures, returns EIO to FATFS, and cascades into a
+    // class_driver TASK_WDT 60 s later when SDMMC retries pile up.
+    // 64 KB covers the largest single sdmmc transaction the driver
+    // does (chunk_size, capped at ~64 sectors); SDMMC sees
+    // host.dma_aligned_buffer != NULL and reuses it.
+    if (!s_card->host.dma_aligned_buffer) {
+        void *aligned = heap_caps_aligned_alloc(64, 64 * 1024,
+                                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (aligned) {
+            s_card->host.dma_aligned_buffer = aligned;
+            ESP_LOGI(TAG, "pre-allocated 64 KB SDMMC stash @ %p (DMA-INT now %u)",
+                     aligned,
+                     (unsigned)heap_caps_get_largest_free_block(
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        } else {
+            ESP_LOGW(TAG, "SDMMC stash alloc failed — SDMMC will allocate "
+                          "per-transaction (may fail under DMA-INT pressure)");
+        }
+    }
     return ESP_OK;
 }
 

@@ -37,17 +37,13 @@ static const char *TAG = "SDCAP";
 // matches typical FAT optimal write granularity.
 #define STREAM_BUFFER_TRIG     4096
 
-// Writer task params. Pinned to Core 1 (see init below for the
-// why). Priority 5 = above worker_core1 (3) so the writer drains
-// the PSRAM stream buffer to SD even when the tagger is firing
-// 145 bursts/sec and worker is monopolising Core 1. Below ingest
-// (8) so USB ingest never stalls. Sharing the prio-5 slot with
-// http_server (also 5) is fine — both are mostly idle.
-//
-// Trade-off when capture is active: worker may drop bursts it
-// can't process in time. That's the right back-pressure direction
-// (lose some marginal burst decodes to keep the IQ recording
-// intact) since the WHOLE POINT of capture is offline analysis.
+// Writer task params. Pinned to Core 1. Priority 5 = above
+// worker_core1 (3) so the writer can drain the PSRAM stream
+// buffer even while the tagger fires bursts continuously. The
+// blocking-in-fwrite case is harmless: SDMMC waits on an interrupt
+// semaphore, so the writer task is suspended and worker / ingest
+// keep running on their own. Below ingest (8) so USB ingest itself
+// is never preempted.
 #define WRITER_STACK            6144
 #define WRITER_PRIO             5
 
@@ -329,6 +325,23 @@ esp_err_t sd_capture_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    // Allocate the PSRAM stream buffer ONCE at boot; never free it.
+    // Previously we created/destroyed it per capture session, which
+    // raced with the writer task: vStreamBufferDeleteWithCaps would
+    // run while xStreamBufferReceive was still holding the handle,
+    // tripping a tlsf double-free assert during sd_capture_stop.
+    // 4 MB of PSRAM is rounding error on a 32 MB device.
+    s_stream = xStreamBufferCreateWithCaps(STREAM_BUFFER_BYTES,
+                                            STREAM_BUFFER_TRIG,
+                                            MALLOC_CAP_SPIRAM);
+    if (!s_stream) {
+        ESP_LOGE(TAG, "stream buffer alloc failed (need %u B PSRAM)",
+                 (unsigned)STREAM_BUFFER_BYTES);
+        heap_caps_free(s_writer_buf);
+        s_writer_buf = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(writer_task, "sd_capture",
                                                      WRITER_STACK, NULL,
                                                      WRITER_PRIO, NULL, 1,
@@ -370,16 +383,11 @@ esp_err_t sd_capture_start(uint64_t target_bytes)
         return r;
     }
 
-    // Lazy-allocate the stream buffer in PSRAM. Recreating on every
-    // start is fine; the cost is one PSRAM alloc (~µs) and the
-    // delete-on-stop matches.
-    s_stream = xStreamBufferCreateWithCaps(STREAM_BUFFER_BYTES,
-                                            STREAM_BUFFER_TRIG,
-                                            MALLOC_CAP_SPIRAM);
-    if (!s_stream) {
-        ESP_LOGE(TAG, "stream buffer alloc failed");
-        return ESP_ERR_NO_MEM;
-    }
+    // Reset any leftover content from a prior capture. Stream buffer
+    // itself is permanent (allocated in sd_capture_init) — see
+    // double-free note there.
+    if (!s_stream) return ESP_ERR_INVALID_STATE;
+    xStreamBufferReset(s_stream);
 
     // One file per capture session; same /sdcard/acars/ dir as the
     // ACARS log uses. .u8 extension hints at the raw uint8 IQ format.
@@ -390,8 +398,8 @@ esp_err_t sd_capture_start(uint64_t target_bytes)
     FILE *fp = fopen(path, "wb");
     if (!fp) {
         ESP_LOGE(TAG, "fopen(%s) failed errno=%d", path, errno);
-        vStreamBufferDeleteWithCaps(s_stream);
-        s_stream = NULL;
+        // Don't free s_stream — it's permanent now. Just leave the
+        // capture state at IDLE so a retry can re-arm.
         return ESP_FAIL;
     }
     // Disable libc buffering — the writer task already feeds us
@@ -445,19 +453,24 @@ esp_err_t sd_capture_stop(void)
     // its own and we tear down the stream buffer there.
     s_state = CAP_STATE_STOPPING;
 
-    // Wait briefly (up to ~1 s) for the writer to reach IDLE. Stop
-    // is a low-frequency action, so the busy-wait poll is fine.
-    for (int i = 0; i < 50; i++) {
+    // Wait for the writer to reach IDLE. A 5 MB stream buffer at
+    // ~500 KB/s takes ~10 s to drain; an old 1 s timeout was racing
+    // the writer to vStreamBufferDeleteWithCaps and (a) truncating
+    // the file (FATFS' fclose never ran) and (b) tripping the
+    // writer's xStreamBufferReceive against a freed buffer →
+    // reboot. 60 s is generous for any reasonable capture; the
+    // drain loop itself has a 512-iter safety cap so it can't
+    // hang here indefinitely.
+    for (int i = 0; i < 3000; i++) {        // 60 s @ 20 ms tick
         if (s_state == CAP_STATE_IDLE) break;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
-
-    // Release stream buffer regardless of whether the writer fully
-    // drained — anything still in there got dropped by the timeout.
-    if (s_stream) {
-        vStreamBufferDeleteWithCaps(s_stream);
-        s_stream = NULL;
+    if (s_state != CAP_STATE_IDLE) {
+        ESP_LOGW(TAG, "writer didn't reach IDLE in 60s — forcing teardown");
     }
+
+    // Stream buffer is permanent (allocated once in sd_capture_init)
+    // so we don't free it here. It gets reset on the next start.
     s_burst_mode = false;
     return ESP_OK;
 }

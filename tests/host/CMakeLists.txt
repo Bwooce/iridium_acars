@@ -402,6 +402,29 @@ target_link_libraries(test_uw_correlator_albq_ul PRIVATE m)
 # same burst_pipeline_process_250khz that runs on P4. Isolates whether
 # the host-vs-gr-iridium decode gap is the front end or the downstream
 # pipeline. Always passes; the body is a measurement we read by eye.
+# decode_burst_capture: not a test — a host-side replay tool. Reads a
+# device-captured .u8 burst file, runs the same per-burst pipeline the
+# firmware runs, and emits CSV + summary. Used by the long-running
+# capture monitor to compute decode-quality over many bursts offline,
+# decoupled from the firmware's own decode metric.
+add_executable(decode_burst_capture
+    decode_burst_capture.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+)
+target_include_directories(decode_burst_capture PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}    # esp_log.h stub
+)
+target_link_libraries(decode_burst_capture PRIVATE m)
+
 add_executable(test_pipeline_direct_if_albq
     test_pipeline_direct_if_albq.c
     ${COMMON_DIR}/burst_pipeline.c
