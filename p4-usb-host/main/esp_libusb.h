@@ -99,4 +99,17 @@ typedef struct {
 } usb_stream_stats_t;
 
 void esp_libusb_get_stream_stats(usb_stream_stats_t *out);
+
+// Lifetime totals — never reset. Parallel counters maintained
+// alongside the per-second stats above. Lets external monitors
+// compute deltas across an arbitrary window without racing
+// status_logger's reset-on-read.
+typedef struct {
+    uint64_t completed;          // total successful transfers since boot
+    uint64_t rb_full_drops;      // total transfers dropped at ringbuf-send
+    uint64_t status_errors;      // total transfers with non-COMPLETED status
+    uint64_t short_xfers;        // total transfers where actual_bytes < requested
+} usb_stream_totals_t;
+
+void esp_libusb_get_stream_totals(usb_stream_totals_t *out);
 #endif // ESP_LIBUSB_H

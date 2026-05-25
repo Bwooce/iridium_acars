@@ -15,6 +15,14 @@ static volatile uint32_t s_xfer_short = 0;
 static volatile uint64_t s_xfer_actual_bytes = 0;
 static volatile uint64_t s_xfer_requested_bytes = 0;
 static volatile uint8_t  s_xfer_last_error = 0;
+// Cumulative-since-boot counters that never reset. The above are
+// consumed by status_logger every second (read-and-reset); these
+// parallel counters let /status JSON expose lifetime totals so an
+// external monitor can compute deltas across capture cycles.
+static volatile uint64_t s_total_completed       = 0;
+static volatile uint64_t s_total_rb_full_drops   = 0;
+static volatile uint64_t s_total_status_errors   = 0;
+static volatile uint64_t s_total_short_xfers     = 0;
 // Producer-side ringbuffer fill tracking. The class_driver consumer measures
 // HWM after each read which biases towards 0; these are sampled in the USB
 // callback (the producer) so we capture the actual peak fills.
@@ -163,10 +171,12 @@ void stream_transfer_cb(usb_transfer_t *transfer)
 
     if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_xfer_completed++;
+        s_total_completed++;
         s_xfer_actual_bytes    += (uint32_t)transfer->actual_num_bytes;
         s_xfer_requested_bytes += (uint32_t)transfer->num_bytes;
         if (transfer->actual_num_bytes < transfer->num_bytes) {
             s_xfer_short++;
+            s_total_short_xfers++;
         }
         if (transfer->actual_num_bytes > 0) {
             // Sample fill BEFORE the send. vRingbufferGetInfo's last arg is
@@ -182,11 +192,13 @@ void stream_transfer_cb(usb_transfer_t *transfer)
                                             transfer->actual_num_bytes, 0);
             if (ok != pdTRUE) {
                 s_xfer_rb_full_drops++;
+                s_total_rb_full_drops++;
                 s_producer_rb_used_at_drop = used_bytes;
             }
         }
     } else {
         s_xfer_status_errors++;
+        s_total_status_errors++;
         s_xfer_last_error = (uint8_t)transfer->status;
     }
 
@@ -219,6 +231,15 @@ void esp_libusb_get_stream_stats(usb_stream_stats_t *out)
     s_producer_rb_max_used = 0;
     s_producer_rb_used_at_drop = 0;
     s_producer_samples = 0;
+}
+
+void esp_libusb_get_stream_totals(usb_stream_totals_t *out)
+{
+    if (!out) return;
+    out->completed     = s_total_completed;
+    out->rb_full_drops = s_total_rb_full_drops;
+    out->status_errors = s_total_status_errors;
+    out->short_xfers   = s_total_short_xfers;
 }
 
 void esp_libusb_set_dev_hdl(usb_device_handle_t hdl)

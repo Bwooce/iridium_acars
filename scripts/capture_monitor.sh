@@ -40,7 +40,14 @@ MAX_RUNTIME_S="${MAX_RUNTIME_S:-14400}"         # 4 h total cap
 mkdir -p "$WORKDIR"
 SUMMARY="$WORKDIR/summary.tsv"
 if [ ! -s "$SUMMARY" ]; then
-    printf 'ts\tup_s\tfile\tsize_bytes\tbursts\tdecode_ok_pct\tframes\tms\ttl\tbc\tlw\tra\tunk\tdl\tul\tnote\n' > "$SUMMARY"
+    # dev_*  = delta of the device's own per-frame classifier counters
+    #          across this cycle (status_at_stop − status_at_arm)
+    # h_*    = host re-run of decode_burst_capture on the downloaded
+    #          .u8 file. Same burst_pipeline code, so totals should
+    #          match closely; a divergence is the interesting signal.
+    # usb_*  = delta of USB transfer counters; drops/completed ratio
+    #          tells us if missing samples are corrupting decode.
+    printf 'ts\tup_s\tfile\tsize_bytes\tbursts\th_dec_pct\th_frames\th_ms\th_tl\th_bc\th_lw\th_ra\th_unk\th_dl\th_ul\tdev_frames\tdev_ms\tdev_tl\tdev_bc\tdev_lw_da\tdev_lw_other\tdev_unk\tdev_acars\tdev_sbd\tusb_completed\tusb_drops\tdrop_pct\tnote\n' > "$SUMMARY"
 fi
 
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -71,6 +78,37 @@ capture_status_path() {
 sd_list_size_total() {
     curl_q "$DEVICE/sd/list" | python3 -c \
         'import json,sys;d=json.load(sys.stdin);print(sum(f["size"] for f in d if f["size"]>0))' 2>/dev/null || echo 0
+}
+
+# Snapshot the device counters that matter for delta-vs-host
+# comparison + USB-drop correlation. Output is a single space-
+# separated line for snapshot_diff to consume:
+#   ms tl bc lw_da lw_other unknown acars sbd usb_completed usb_drops
+# (usb_completed/drops only present on firmware that exposes
+# /status.usb.*; older builds report 0.)
+device_decode_snapshot() {
+    curl_q "$DEVICE/status" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+dec = d.get("decode", {})
+f = dec.get("frames", {})
+usb = d.get("usb", {})
+print(f.get("ms",0), f.get("tl",0), f.get("bc",0),
+      f.get("lw_da",0), f.get("lw_other",0), f.get("unknown",0),
+      dec.get("acars_decoded",0), dec.get("sbd_complete",0),
+      usb.get("completed",0), usb.get("rb_full_drops",0))
+' 2>/dev/null || echo "0 0 0 0 0 0 0 0 0 0"
+}
+
+# Subtract two snapshot lines and emit the per-field delta on stdout.
+snapshot_diff() {
+    local a="$1" b="$2"
+    python3 -c "
+a = '$a'.split(); b = '$b'.split()
+while len(a) < 10: a.append('0')
+while len(b) < 10: b.append('0')
+print(*[int(b[i])-int(a[i]) for i in range(10)])
+" 2>/dev/null || echo "0 0 0 0 0 0 0 0 0 0"
 }
 
 ensure_mounted() {
@@ -126,13 +164,29 @@ download_and_decode() {
     ul=$(awk -F'[/ ]+' '/DL\/UL/{print $5}' "$out_txt")
 
     local up; up=$(device_uptime)
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    # DEV_DELTA exported by the caller (main loop) from snapshot_diff —
+    # 10 fields: ms tl bc lw_da lw_other unknown acars sbd usb_completed usb_drops
+    read -r d_ms d_tl d_bc d_lwda d_lwoth d_unk d_acars d_sbd d_usb_cmp d_usb_drp \
+        <<< "${DEV_DELTA:-0 0 0 0 0 0 0 0 0 0}"
+    # Host's "lw" lumps DA + other; combine for the comparison column.
+    local d_lw_total=$((d_lwda + d_lwoth))
+    local drop_pct="0.00"
+    if [ "$d_usb_cmp" -gt 0 ] 2>/dev/null; then
+        drop_pct=$(python3 -c "print(f'{100.0*$d_usb_drp/($d_usb_drp+$d_usb_cmp):.2f}')")
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$(date -u +%FT%TZ)" "$up" "$fn" "$size" \
         "${bursts:-0}" "${ok_pct:-0}" "${frames:-0}" \
         "${ms:-0}" "${tl:-0}" "${bc:-0}" "${lw:-0}" "${ra:-0}" "${unk:-0}" \
-        "${dl:-0}" "${ul:-0}" "ok" \
+        "${dl:-0}" "${ul:-0}" \
+        "$((d_ms + d_tl + d_bc + d_lw_total + d_unk))" \
+        "$d_ms" "$d_tl" "$d_bc" "$d_lwda" "$d_lwoth" "$d_unk" "$d_acars" "$d_sbd" \
+        "$d_usb_cmp" "$d_usb_drp" "$drop_pct" \
+        "ok" \
         >> "$SUMMARY"
-    log "decode summary: bursts=${bursts:-0} frames=${frames:-0} MS=${ms:-0} TL=${tl:-0} LW=${lw:-0}"
+    log "host: bursts=${bursts:-0} frames=${frames:-0} MS=${ms:-0} TL=${tl:-0} LW=${lw:-0} UNK=${unk:-0}"
+    log "dev:  delta MS=$d_ms TL=$d_tl BC=$d_bc LW(da+oth)=$d_lwda+$d_lwoth UNK=$d_unk  ACARS=$d_acars SBD=$d_sbd"
+    log "usb:  completed=$d_usb_cmp drops=$d_usb_drp (${drop_pct}%)"
 }
 
 # ---- main loop --------------------------------------------------------
@@ -146,6 +200,8 @@ log "poll=${POLL_INTERVAL}s download=${DOWNLOAD_INTERVAL}s max=${MAX_RUNTIME_S}s
 
 ensure_mounted
 start_capture
+# Baseline device counters for the first cycle's delta.
+dev_snap_before=$(device_decode_snapshot)
 
 while true; do
     now=$(date +%s)
@@ -184,12 +240,20 @@ while true; do
         fn=$(capture_status_path)
         if [ -n "$fn" ]; then
             log "download cycle: stopping to flush $fn"
+            # Snapshot device decode counters BEFORE we stop so the
+            # delta over this cycle matches what the device decoded
+            # from the bursts that landed in this exact .u8 file.
+            dev_snap_after=$(device_decode_snapshot)
             stop_capture
             sleep 5
+            export DEV_DELTA="$(snapshot_diff "${dev_snap_before:-0 0 0 0 0 0 0 0}" "$dev_snap_after")"
             download_and_decode "$fn"
             last_download=$now
             log "re-arming"
             start_capture
+            # New baseline for the next cycle. Read AFTER re-arm so any
+            # in-flight bursts from the gap aren't counted twice.
+            dev_snap_before=$(device_decode_snapshot)
         fi
     fi
 

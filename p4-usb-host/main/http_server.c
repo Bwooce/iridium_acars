@@ -18,6 +18,7 @@
 #include "ota_runner.h"
 #include "sd_log.h"
 #include "sd_capture.h"
+#include "esp_libusb.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -120,8 +121,10 @@ static esp_err_t status_get(httpd_req_t *req)
     uint64_t msgs_total  = msg_ring_total();
     sd_log_stats_t sd = {0};
     sd_log_get_stats(&sd);
+    usb_stream_totals_t usbt = {0};
+    esp_libusb_get_stream_totals(&usbt);
 
-    char body[1280];
+    char body[1536];
     int n = snprintf(body, sizeof(body),
         "{"
             "\"build\":\"%s\","
@@ -137,6 +140,10 @@ static esp_err_t status_get(httpd_req_t *req)
             "\"bias_tee\":%s,"
             "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
             "\"ota_url\":\"%s\","
+            "\"usb\":{"
+                "\"completed\":%llu,\"rb_full_drops\":%llu,"
+                "\"status_errors\":%llu,\"short_xfers\":%llu"
+            "},"
             "\"decode\":{"
                 "\"messages_total\":%llu,"
                 "\"acars_decoded\":%llu,"
@@ -168,6 +175,10 @@ static esp_err_t status_get(httpd_req_t *req)
         (unsigned)cfg.out_port,
         (cfg.out_host[0] && cfg.out_port) ? "true" : "false",
         cfg.ota_url,
+        (unsigned long long)usbt.completed,
+        (unsigned long long)usbt.rb_full_drops,
+        (unsigned long long)usbt.status_errors,
+        (unsigned long long)usbt.short_xfers,
         (unsigned long long)msgs_total,
         (unsigned long long)acars_total,
         (unsigned long long)sbd_total,
