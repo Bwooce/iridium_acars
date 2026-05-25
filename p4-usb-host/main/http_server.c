@@ -18,6 +18,7 @@
 #include "ota_runner.h"
 #include "sd_log.h"
 #include "sd_capture.h"
+#include "acars_push.h"
 #include "esp_libusb.h"
 
 #include <dirent.h>
@@ -599,6 +600,37 @@ static esp_err_t ota_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// POST /debug/inject — synthesise one ACARS message and push it through
+// the exact same fan-out the real decode path uses (frame_decoder.c):
+// RAM ring, UDP push, and the SD NDJSON log. This proves the decode ->
+// persistence path end-to-end on the live device, which otherwise never
+// runs at bench SNR (no real decodes). Internal-LAN debug aid (task #102).
+static esp_err_t debug_inject_post(httpd_req_t *req)
+{
+    acars_msg_t m = {0};
+    m.timestamp_us = (uint64_t)esp_timer_get_time();
+    m.uplink       = false;
+    m.mode         = 'A';
+    m.label[0]     = 'Q'; m.label[1] = '0'; m.label[2] = '\0';
+    m.block_id     = '1';
+    strlcpy(m.msg_num,   "T001", sizeof(m.msg_num));
+    strlcpy(m.flight_id, "TEST01", sizeof(m.flight_id));
+    m.crc_ok       = true;
+    m.peak_bin     = -1;
+    m.snr_db       = 0.0f;
+    strlcpy(m.txt, "debug/inject write-path proof", sizeof(m.txt));
+
+    msg_ring_push(&m);
+    acars_push_emit(&m);
+    sd_log_emit(&m);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req,
+        "{\"result\":\"injected\",\"sinks\":[\"msg_ring\",\"udp\",\"sd_log\"]}",
+        HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t sd_mount_post(httpd_req_t *req)
 {
     esp_err_t r = sd_log_force_mount();
@@ -909,6 +941,12 @@ static esp_err_t capture_file_get(httpd_req_t *req)
                                 HTTPD_RESP_USE_STRLEN);
     }
 
+    // No cooperative yield here: the USB consumer (class task) runs at a
+    // higher priority than httpd (see CLASS_TASK_PRIORITY) and is
+    // event-driven, so it preempts this download loop whenever USB data
+    // arrives and keeps the ringbuffer drained. A vTaskDelay() yield was
+    // tried and didn't help — httpd outranked the consumer at the time,
+    // so the tick just bounced straight back to httpd. See task #91.
     size_t total_sent = 0;
     int read_errors = 0;
     while (1) {
@@ -1009,10 +1047,21 @@ esp_err_t http_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port    = 80;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 20;
     cfg.lru_purge_enable = true;
     cfg.stack_size     = 6144;
-    cfg.task_priority  = 4;
+    // Pin to Core 0: Core 1 is ~98% saturated (ingest + worker), so a
+    // no-affinity httpd task can get parked there and barely run. Core 0
+    // has ~23% idle headroom. Prio 5 cleanly outranks class_driver (3)
+    // on Core 0. recv/send timeouts cut to 2 s (default 5 s): under the
+    // esp_hosted SDIO TX throttle a blocking send() can wedge this single
+    // serve task, making the WHOLE server unreachable; a short timeout
+    // bounds that worst case so one stalled connection can't hold off
+    // accept() for everyone. See task #101.
+    cfg.task_priority  = 5;
+    cfg.core_id        = 0;
+    cfg.recv_wait_timeout = 2;
+    cfg.send_wait_timeout = 2;
     // HTTP server task stack in PSRAM — default task_caps is
     // MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT, which on P4 also satisfies
     // MALLOC_CAP_DMA and steals from USB pool. esp_http_server is
@@ -1034,6 +1083,7 @@ esp_err_t http_server_start(void)
         { .uri = "/config",   .method = HTTP_POST, .handler = config_post,    .user_ctx = NULL },
         { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,     .user_ctx = NULL },
         { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,       .user_ctx = NULL },
+        { .uri = "/debug/inject",  .method = HTTP_POST, .handler = debug_inject_post,    .user_ctx = NULL },
         { .uri = "/sd/mount",      .method = HTTP_POST, .handler = sd_mount_post,       .user_ctx = NULL },
         { .uri = "/sd/format",     .method = HTTP_POST, .handler = sd_format_post,      .user_ctx = NULL },
         { .uri = "/sd/delete",     .method = HTTP_POST, .handler = sd_delete_post,      .user_ctx = NULL },

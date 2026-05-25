@@ -41,7 +41,15 @@ static void log_dma_int_heap(const char *tag)
 #endif
 
 #define DAEMON_TASK_PRIORITY 4
-#define CLASS_TASK_PRIORITY 3
+// The class task both drains USB transfers into the ringbuffer and
+// consumes them (read_stream -> dsp_processor_feed). It MUST outrank the
+// httpd task (prio 5) so a multi-MB /capture/file download can't starve
+// the consumer and overflow the ringbuffer (rb_full_drops). It's
+// effectively event-driven (xRingbufferReceiveUpTo with timeout 0 + a
+// 10 ms usb_host_client_handle_events cap), so it yields Core 0 naturally
+// every ~3-4 ms when data drains — raising its priority does not starve
+// httpd. See task #91 / #101.
+#define CLASS_TASK_PRIORITY 6
 
 extern void class_driver_task(void *arg);
 
