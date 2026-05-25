@@ -293,6 +293,12 @@ static void writer_task(void *arg)
             s_stats.file_open = false;
             xSemaphoreGive(s_stats_mu);
             ESP_LOGI(TAG, "capture closed");
+            // Clear burst mode here so any path that reaches STOPPING
+            // (target-hit, fwrite circuit-breaker) leaves us with a
+            // clean default for the next /capture/start. sd_capture_stop
+            // also clears this, but writer-initiated stops don't go
+            // through it.
+            s_burst_mode = false;
             s_state = CAP_STATE_IDLE;
         }
     }
@@ -508,13 +514,20 @@ void sd_capture_write(const uint8_t *data, size_t n)
 
 esp_err_t sd_capture_start_bursts(void)
 {
-    // Reuse the continuous start path for SD mount / file create /
-    // stream buffer setup; just flip the mode flag and reset seq.
-    s_burst_mode = false;        // sd_capture_start checks this is unset
-    esp_err_t r = sd_capture_start(0);
-    if (r != ESP_OK) return r;
+    // Pre-arm burst mode BEFORE sd_capture_start transitions s_state
+    // to ACTIVE. sd_capture_write gates on (state == ACTIVE && !burst_mode);
+    // if we set the flag AFTER state goes ACTIVE the brief window lets
+    // raw USB bytes leak into the new file. At 4.5 MB/s a ~1 ms context
+    // switch produces a 4-5 KB junk prefix that shifts every BRST header
+    // off byte 0 and breaks naive decoders. Observed live 2026-05-25 in
+    // iq-4188149994.u8 (first BRST at offset 4992).
     s_burst_mode = true;
-    s_burst_seq = 0;
+    s_burst_seq  = 0;
+    esp_err_t r = sd_capture_start(0);
+    if (r != ESP_OK) {
+        s_burst_mode = false;       // back out so a continuous /capture/start can succeed
+        return r;
+    }
     ESP_LOGI(TAG, "burst-mode capture armed");
     return ESP_OK;
 }
