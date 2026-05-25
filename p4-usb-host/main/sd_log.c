@@ -64,6 +64,11 @@ static const char *TAG = "SDLOG";
 static sdmmc_card_t   *s_card           = NULL;
 static FILE           *s_log            = NULL;
 static QueueHandle_t   s_q              = NULL;
+// 64 KB DMA-INT buffer the SDMMC driver uses for read/write to
+// PSRAM-resident user buffers. Allocated eagerly in sd_log_init
+// (early in app_main, before USB + tagger fragment DMA-INT) and
+// attached to s_card->host.dma_aligned_buffer at mount time.
+static void           *s_sdmmc_stash    = NULL;
 static SemaphoreHandle_t s_stats_mu     = NULL;
 static sd_log_stats_t  s_stats          = {0};
 static volatile bool   s_mount_attempted = false;    // lazy-mount flag
@@ -361,29 +366,21 @@ static esp_err_t mount_sd(void)
     s_stats.mount_error[0] = '\0';
     sdmmc_card_print_info(stdout, s_card);
 
-    // Pre-allocate the SDMMC driver's per-transaction stash buffer
-    // once, BEFORE USB + capture have fragmented DMA-INT. Without
-    // this, sdmmc_write_sectors calls allocate_dma_buf for every
-    // PSRAM-sourced write (the sd_log writer pulls from a PSRAM
-    // queue), which fails with ESP_ERR_NO_MEM during sustained
-    // captures, returns EIO to FATFS, and cascades into a
-    // class_driver TASK_WDT 60 s later when SDMMC retries pile up.
-    // 64 KB covers the largest single sdmmc transaction the driver
-    // does (chunk_size, capped at ~64 sectors); SDMMC sees
-    // host.dma_aligned_buffer != NULL and reuses it.
-    if (!s_card->host.dma_aligned_buffer) {
-        void *aligned = heap_caps_aligned_alloc(64, 64 * 1024,
-                                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-        if (aligned) {
-            s_card->host.dma_aligned_buffer = aligned;
-            ESP_LOGI(TAG, "pre-allocated 64 KB SDMMC stash @ %p (DMA-INT now %u)",
-                     aligned,
-                     (unsigned)heap_caps_get_largest_free_block(
-                         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-        } else {
-            ESP_LOGW(TAG, "SDMMC stash alloc failed — SDMMC will allocate "
-                          "per-transaction (may fail under DMA-INT pressure)");
-        }
+    // Attach the SDMMC stash buffer that sd_log_init pre-allocated.
+    // SDMMC reuses host.dma_aligned_buffer for every PSRAM-sourced
+    // transaction (reads AND writes) instead of calling
+    // allocate_dma_buf per-call. Allocating it here (mount-time) is
+    // too late — DMA-INT is fragmented after USB pool + tagger + the
+    // sd_capture writer take their slices. Allocating in
+    // sd_log_init (app_main pre-USB) catches DMA-INT with 139 KB
+    // largest contiguous free.
+    if (!s_card->host.dma_aligned_buffer && s_sdmmc_stash) {
+        s_card->host.dma_aligned_buffer = s_sdmmc_stash;
+        ESP_LOGI(TAG, "attached pre-allocated SDMMC stash @ %p", s_sdmmc_stash);
+    } else if (!s_sdmmc_stash) {
+        ESP_LOGW(TAG, "no SDMMC stash — PSRAM-sourced SDMMC ops will "
+                      "allocate per-transaction and may fail under "
+                      "DMA-INT pressure");
     }
     return ESP_OK;
 }
@@ -424,6 +421,24 @@ esp_err_t sd_log_init(void)
 
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
+
+    // Pre-allocate the SDMMC stash buffer here, BEFORE USB pool +
+    // tagger fragment DMA-INT. Mount happens later (lazy on first
+    // log message OR explicit POST /sd/mount) and would otherwise
+    // find DMA-INT too tight for a 64 KB contiguous block. Without
+    // the stash, every PSRAM-sourced SDMMC op (sd_log writes;
+    // /capture/file reads into PSRAM dst) returns EIO under load.
+    s_sdmmc_stash = heap_caps_aligned_alloc(64, 64 * 1024,
+                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (s_sdmmc_stash) {
+        ESP_LOGI(TAG, "pre-allocated 64 KB SDMMC stash @ %p (DMA-INT largest now %u)",
+                 s_sdmmc_stash,
+                 (unsigned)heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    } else {
+        ESP_LOGW(TAG, "SDMMC stash early-alloc failed — PSRAM-sourced "
+                      "ops will allocate per-transaction (may fail)");
+    }
 
     // Queue in PSRAM (NOT DMA-capable internal SRAM, the default for
     // xQueueCreate). 32 × ~304-byte items = ~10 KB; if it lands in

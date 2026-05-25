@@ -21,6 +21,8 @@
 
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,6 +31,14 @@
 
 static const char *TAG = "HTTP";
 static httpd_handle_t s_server = NULL;
+
+// Pre-allocated DMA-INT read buffer for /capture/file. Allocated at
+// http_server_start (early in app_main) so it survives DMA-INT
+// fragmentation from USB pool + tagger. Without this, the download
+// handler's lazy 4 KB DMA-INT alloc fails, falls back to PSRAM, and
+// the SDMMC read into PSRAM hits the stash path which is also tight.
+static uint8_t *s_download_buf = NULL;
+#define DOWNLOAD_BUF_BYTES   4096
 
 // NVS-write + reboot helper. MUST run with an internal-SRAM stack:
 // nvs_commit() takes spi_flash_disable_interrupts_caches_and_other_cpu(),
@@ -754,6 +764,13 @@ static esp_err_t capture_file_get(httpd_req_t *req)
             HTTPD_RESP_USE_STRLEN);
     }
 
+    // Validate same-path checks via sd_capture_open_for_read, but
+    // immediately drop down to the POSIX fd. fread/fopen-style IO
+    // was returning 0 bytes on otherwise-valid multi-MB files after
+    // the device had been running ~10 min — the libc FILE buffering
+    // path (or its interaction with FATFS' sector cache) goes stale
+    // somehow under sustained-capture pressure. The raw fd path
+    // doesn't go through that buffering and stays reliable.
     FILE *fp = sd_capture_open_for_read(name);
     if (!fp) {
         if (errno == EBUSY) {
@@ -767,49 +784,53 @@ static esp_err_t capture_file_get(httpd_req_t *req)
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req, "no such file\n", HTTPD_RESP_USE_STRLEN);
     }
+    int fd = fileno(fp);
 
-    // Log the size we'll actually deliver, for download-debug. fseek
-    // to end + ftell is the FATFS-blessed way to learn the size of an
-    // open file; struct stat through /sdcard might lag behind the
-    // dir-entry update.
-    long size_seek = -1;
-    if (fseek(fp, 0, SEEK_END) == 0) {
-        size_seek = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-    }
-    ESP_LOGI(TAG, "/capture/file: serving %s (size=%ld bytes)", name, size_seek);
+    // Size for the log line — fstat() goes through the same VFS
+    // layer as the fd; consistent with what we'll actually read.
+    struct stat st;
+    long long size_stat = (fstat(fd, &st) == 0) ? (long long)st.st_size : -1;
+    ESP_LOGI(TAG, "/capture/file: serving %s (size=%lld bytes, fd=%d)",
+             name, size_stat, fd);
 
-    // Stream the file in chunks. Each fread+send_chunk yields to
-    // the scheduler between iterations so the SD read can't starve
-    // class_driver. 8 KB chunks balance: bigger reduces overhead,
-    // smaller reduces per-iteration latency.
     httpd_resp_set_type(req, "application/octet-stream");
     char disp[96];
     snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", name);
     httpd_resp_set_hdr(req, "Content-Disposition", disp);
 
-    // Heap-allocate the read buf — httpd task stack is in PSRAM and
-    // sized for small allocations, so an 8 KB stack array overflowed
-    // and crashed the system. PSRAM heap is fine for fread sources.
-    uint8_t *buf = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
-    if (!buf) {
+    // Use the pre-allocated DMA-INT read buffer (s_download_buf,
+    // allocated once in http_server_start while DMA-INT still had
+    // 139 KB largest contiguous). The buf lives at a known address
+    // so SDMMC can DMA straight into it without going through its
+    // stash buffer.
+    if (!s_download_buf) {
         fclose(fp);
         httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_send(req, "out of memory", HTTPD_RESP_USE_STRLEN);
+        return httpd_resp_send(req, "download buf unavailable",
+                                HTTPD_RESP_USE_STRLEN);
     }
+
+    size_t total_sent = 0;
+    int read_errors = 0;
     while (1) {
-        size_t n = fread(buf, 1, 8192, fp);
-        if (n == 0) break;
-        if (httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) {
-            // client disconnected mid-stream; bail and clean up
+        ssize_t n = read(fd, s_download_buf, DOWNLOAD_BUF_BYTES);
+        if (n < 0) {
+            ESP_LOGW(TAG, "/capture/file: read() err=%d after %zu bytes",
+                     errno, total_sent);
+            if (++read_errors > 3) break;
+            continue;
+        }
+        if (n == 0) break;       // EOF
+        if (httpd_resp_send_chunk(req, (const char *)s_download_buf, n) != ESP_OK) {
             fclose(fp);
-            heap_caps_free(buf);
             return ESP_FAIL;
         }
+        total_sent += (size_t)n;
     }
+    ESP_LOGI(TAG, "/capture/file: sent %zu bytes", total_sent);
+
     fclose(fp);
-    heap_caps_free(buf);
-    httpd_resp_send_chunk(req, NULL, 0);   // end of body
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -874,6 +895,18 @@ static esp_err_t reset_post(httpd_req_t *req)
 esp_err_t http_server_start(void)
 {
     if (s_server) return ESP_OK;
+
+    // Pre-allocate the download buffer here, BEFORE the USB pool
+    // and tagger have a chance to fragment DMA-INT. See
+    // s_download_buf decl for the why.
+    s_download_buf = heap_caps_aligned_alloc(64, DOWNLOAD_BUF_BYTES,
+                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (s_download_buf) {
+        ESP_LOGI(TAG, "pre-allocated %d-byte DMA-INT download buf @ %p",
+                 DOWNLOAD_BUF_BYTES, s_download_buf);
+    } else {
+        ESP_LOGW(TAG, "download buf alloc failed — /capture/file will 500");
+    }
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port    = 80;

@@ -46,7 +46,7 @@ fi
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
 curl_q() { curl -s --connect-timeout 3 --max-time 30 "$@"; }
-curl_p() { curl -s --connect-timeout 3 --max-time 300 "$@"; }   # long ops (format/download)
+curl_p() { curl -s --connect-timeout 3 --max-time 600 "$@"; }   # long ops (format/download)
 
 device_uptime() {
     curl_q "$DEVICE/status" | python3 -c \
