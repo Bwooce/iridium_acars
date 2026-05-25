@@ -315,12 +315,6 @@ void class_driver_task(void *arg)
         // from "read + convert + push + feed" to "read + feed".
         int slot_for_read;
         uint8_t *raw = ingest_core1_acquire_raw(&slot_for_read);
-        if (!raw) {
-            // Pipeline backpressured (sustained SD capture, large fwrite).
-            // Skip this cycle; the next loop iteration will feed the WDT,
-            // poll USB events again, and retry the acquire.
-            continue;
-        }
 
         size_t n_read = 0;
         int64_t t_read_start = esp_timer_get_time();
@@ -352,19 +346,16 @@ void class_driver_task(void *arg)
                 int64_t t_tc0 = esp_timer_get_time();
                 int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
                 cycle_take_converted_us += (uint64_t)(esp_timer_get_time() - t_tc0);
-                if (converted) {
-                    int64_t t_pre_feed = esp_timer_get_time();
-                    dsp_processor_feed(converted, n_int16 / 2);
-                    int64_t t_post_feed = esp_timer_get_time();
-                    dsp_total_time_us += (uint64_t)(t_post_feed - t_pre_feed);
-                    dsp_frame_count += (n_int16 / 2) / 2048;
-                    feed_calls_window++;
-                    ingest_core1_release(prev_dsp_slot);
-                }
-                // If converted == NULL (4 s timeout), the slot is still
-                // owned by ingest and will signal s_ready[slot] when its
-                // push completes — we just drop this cycle's feed. The
-                // next cycle's take_converted picks it up.
+                int64_t t_pre_feed = esp_timer_get_time();
+
+                dsp_processor_feed(converted, n_int16 / 2);
+                int64_t t_post_feed = esp_timer_get_time();
+                dsp_total_time_us += (uint64_t)(t_post_feed - t_pre_feed);
+                dsp_frame_count += (n_int16 / 2) / 2048;
+                feed_calls_window++;
+
+                // Mark the slot free so ingest can reuse it next cycle.
+                ingest_core1_release(prev_dsp_slot);
             }
 
             prev_dsp_slot = slot_for_read;

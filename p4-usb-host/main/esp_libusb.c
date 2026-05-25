@@ -261,7 +261,21 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
         return -1;
     }
 
-    dev->ringbuf = xRingbufferCreateWithCaps(512 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    // 4 MB PSRAM ringbuffer ≈ 900 ms of buffering at 4.5 MB/s
+    // sustained USB ingest. Sized to absorb the worst consumer-side
+    // stalls we see:
+    //  - sd_capture writer fwrite blocking 100-300 ms during SDMMC
+    //    multi-sector writes
+    //  - SD card block-erase pauses up to 500 ms+ on cheap SDHC
+    //  - tagger spikes when bursts arrive in clusters (back-to-back
+    //    sub-frames within a single satellite pass)
+    // Previously 512 KB (~110 ms); we measured rb_full_drops of
+    // 40-50/sec during sustained capture, ≈ 700 KB/s of dropped
+    // samples corrupting downstream burst data. 4 MB is well within
+    // the 32 MB PSRAM budget and turns the consumer-stall window
+    // into a true elastic queue.
+    dev->ringbuf = xRingbufferCreateWithCaps(4 * 1024 * 1024,
+                                              RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     if (dev->ringbuf == NULL) {
         ESP_LOGE("LIBUSB", "Failed to create stream ringbuffer in PSRAM");
         return -1;
