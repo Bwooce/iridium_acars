@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_system.h"      // esp_restart() — stream-stall last-resort recovery (#103)
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
@@ -463,6 +464,25 @@ void class_driver_task(void *arg)
                     ESP_LOGW(TAG, "  power(true)  -> 0x%x (%s)", r, esp_err_to_name(r));
                     stall_seconds = 0;
                     stall_recoveries++;
+                } else if (stall_seconds >= STALL_TRIGGER_SECONDS &&
+                           stall_recoveries >= MAX_STALL_RECOVERIES &&
+                           total_bytes > 10ULL * 1024 * 1024) {
+                    // Root-port cycling exhausted on a stream that HAD been
+                    // working (>10 MB before the stall). This is a silent
+                    // mid-stream wedge root-port power can't clear — e.g. the
+                    // dongle halted after USB transfer servicing was starved
+                    // during a long /capture/file download (#103: the finite
+                    // transfer pool drained because handle_events lapsed).
+                    // Reboot to re-enumerate (esp_restart re-runs usb_host
+                    // install with root_port_unpowered=true, which clears it).
+                    // Gated on total_bytes so an absent/broken dongle at boot
+                    // can't turn this into a reboot loop.
+                    ESP_LOGE(TAG, "STREAM STALL unrecoverable after %d root-port "
+                                  "cycles (%llu bytes before stall) — esp_restart()",
+                             MAX_STALL_RECOVERIES, (unsigned long long)total_bytes);
+                    fflush(stdout);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    esp_restart();
                 }
             } else {
                 stall_seconds   = 0;
