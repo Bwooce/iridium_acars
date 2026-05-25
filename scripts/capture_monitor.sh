@@ -2,6 +2,10 @@
 # capture_monitor.sh — long-running burst-mode capture watchdog +
 # offline-decode summariser. Runs against the live P4-NANO firmware.
 #
+# Pair with capture_housekeeper.sh to keep /tmp from filling up:
+#   scripts/capture_monitor.sh     > /tmp/capture_monitor.log     2>&1 &
+#   scripts/capture_housekeeper.sh > /tmp/capture_housekeeper.log 2>&1 &
+#
 # Loop:
 #   1. Ensure capture is armed on the device
 #   2. Wait POLL_INTERVAL seconds
