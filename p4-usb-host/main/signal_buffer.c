@@ -45,6 +45,17 @@ static async_memcpy_handle_t s_dma = NULL;
 // transfer carries the give-back callback.
 static SemaphoreHandle_t s_dma_done = NULL;
 
+// Deadlock-guard diagnostics (#106). dma_submit_errors: esp_async_memcpy
+// returned non-OK (its completion callback then never fires). dma_timeouts:
+// the s_dma_done wait timed out (a previous DMA's give never came). Either,
+// untreated, would hang signal_buffer_push forever -> ingest never signals
+// s_ready -> class deadlocks in take_converted.
+static volatile uint32_t s_dma_submit_errors = 0;
+static volatile uint32_t s_dma_timeouts      = 0;
+
+uint32_t signal_buffer_dma_submit_errors(void) { return s_dma_submit_errors; }
+uint32_t signal_buffer_dma_timeouts(void)      { return s_dma_timeouts; }
+
 static IRAM_ATTR bool dma_done_cb(async_memcpy_handle_t mcp,
                                   async_memcpy_event_t *evt, void *arg)
 {
@@ -90,25 +101,50 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
     // Wait for the previous DMA to finish before reusing circular_buf at
     // the (potentially old) head pointer or before the caller's `samples`
     // gets overwritten by the next class_driver loop iteration.
-    xSemaphoreTake(s_dma_done, portMAX_DELAY);
+    //
+    // TIMEOUT, not portMAX_DELAY: if a previous DMA's completion callback
+    // never fired (a failed/lost async_memcpy submit, or a driver wedge), the
+    // semaphore would never be returned and this take would hang FOREVER —
+    // ingest then never signals s_ready and class deadlocks in
+    // ingest_core1_take_converted (#106). A real DMA completes in ~microsec-
+    // onds, so a 250 ms wait means the previous DMA is dead; proceed (this
+    // push's own callback re-arms the semaphore on the next cycle).
+    if (xSemaphoreTake(s_dma_done, pdMS_TO_TICKS(250)) != pdTRUE) {
+        s_dma_timeouts++;
+    }
 
     size_t bytes = n_samples * 4;
     uint8_t *dst_base = (uint8_t *)circular_buf;
     uint32_t head_bytes = head * 4;
     size_t bytes_to_end = (uint32_t)SIGNAL_BUF_SIZE - head_bytes;
 
+    esp_err_t r;
     if (bytes <= bytes_to_end) {
         // Common path: single contiguous write.
-        esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples, bytes,
-                         dma_done_cb, NULL);
+        r = esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples, bytes,
+                             dma_done_cb, NULL);
     } else {
         // Wrap: two writes. Only the second carries the completion callback
         // so the semaphore is given exactly once.
-        esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples,
-                         bytes_to_end, NULL, NULL);
+        (void)esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples,
+                               bytes_to_end, NULL, NULL);
         size_t remainder = bytes - bytes_to_end;
-        esp_async_memcpy(s_dma, dst_base, (uint8_t *)samples + bytes_to_end,
-                         remainder, dma_done_cb, NULL);
+        r = esp_async_memcpy(s_dma, dst_base, (uint8_t *)samples + bytes_to_end,
+                             remainder, dma_done_cb, NULL);
+    }
+    if (r != ESP_OK) {
+        // The callback-carrying submit failed → dma_done_cb will never fire →
+        // s_dma_done would never be returned and the NEXT push would deadlock
+        // (#106). Give it back ourselves so the pipeline keeps moving; this
+        // chunk is dropped (head not advanced). Log it — this is the failure
+        // message that was previously swallowed by the unchecked return.
+        s_dma_submit_errors++;
+        if ((s_dma_submit_errors & 0x3f) == 1) {   // rate-limit to ~1/64
+            ESP_LOGW(TAG, "esp_async_memcpy submit failed: %s (n=%u) — chunk dropped, sem restored",
+                     esp_err_to_name(r), (unsigned)n_samples);
+        }
+        xSemaphoreGive(s_dma_done);
+        return;   // do not advance head: this chunk was not (fully) written
     }
 
     head = (head + (uint32_t)n_samples) % total_cap;

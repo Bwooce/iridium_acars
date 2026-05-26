@@ -30,6 +30,12 @@ void signal_buffer_read_chunk(uint32_t start_idx, uint32_t length, int16_t *dest
 // window gets overwritten.
 uint32_t signal_buffer_head(void);
 
+// Deadlock-guard diagnostics (#106): count of failed esp_async_memcpy submits
+// and of s_dma_done wait-timeouts in signal_buffer_push. Both should stay 0;
+// nonzero means the DMA path hiccuped (recovered, not deadlocked).
+uint32_t signal_buffer_dma_submit_errors(void);
+uint32_t signal_buffer_dma_timeouts(void);
+
 // True iff [start_idx, start_idx + length) of the circular buffer still
 // holds the original-pushed data — i.e. the producer hasn't yet lapped
 // onto the burst window. Returns false when the burst is stale and
