@@ -79,7 +79,19 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 static void start_sta(const app_config_t *cfg)
 {
     strlcpy(s_ssid, cfg->wifi_ssid, sizeof(s_ssid));
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta = esp_netif_create_default_wifi_sta();
+
+    // Advertise station_id as the DHCP hostname so the device appears by
+    // name (e.g. "p4-iridium-1") in the router's client list and can be
+    // reached without hardcoding its IP. Set before connect so it's sent
+    // in the first DHCP request. station_id is kept DHCP-safe by config.
+    if (sta && cfg->station_id[0]) {
+        esp_err_t hr = esp_netif_set_hostname(sta, cfg->station_id);
+        if (hr != ESP_OK) {
+            ESP_LOGW(TAG, "set_hostname('%s') -> %s",
+                     cfg->station_id, esp_err_to_name(hr));
+        }
+    }
 
     wifi_config_t wc = {0};
     strlcpy((char *)wc.sta.ssid,     cfg->wifi_ssid, sizeof(wc.sta.ssid));
