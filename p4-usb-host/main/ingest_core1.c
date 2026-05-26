@@ -523,12 +523,25 @@ uint8_t *ingest_core1_acquire_raw(int *out_slot)
     return s_raw[slot];
 }
 
+static volatile uint32_t s_dispatch_drops = 0;
+uint32_t ingest_core1_dispatch_drops(void) { return s_dispatch_drops; }
+
 void ingest_core1_dispatch(int slot, size_t bytes_filled)
 {
     dispatch_msg_t msg = { .slot = slot, .bytes = bytes_filled };
     // Non-blocking send. The queue depth (4) exceeds the slot count (2),
-    // so a successful acquire always implies space available here.
-    xQueueSend(s_dispatch, &msg, 0);
+    // so a successful acquire always implies space — this should never fail.
+    // But if it ever did, ingest would never process this slot and never give
+    // s_ready[slot], so the next ingest_core1_take_converted(slot) would hang
+    // FOREVER → class deadlocks (same class as #106). Recover: mark the slot
+    // zero-length and signal it ready, so take_converted returns immediately
+    // (dsp_feed gets 0 samples) and the slot recycles instead of stranding.
+    if (xQueueSend(s_dispatch, &msg, 0) != pdTRUE) {
+        s_dispatch_drops++;
+        ESP_LOGW(TAG, "dispatch queue full — slot %d dropped (recovered, no deadlock)", slot);
+        s_resamp_n_int16[slot] = 0;
+        xSemaphoreGive(s_ready[slot]);
+    }
 }
 
 int16_t *ingest_core1_take_converted(int slot, size_t *out_n_int16)

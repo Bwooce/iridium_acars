@@ -764,8 +764,18 @@ esp_err_t worker_core1_init(void)
     // History: was 5 → starved frame_decoder past WDT → moved to 3
     // → starved by ingest (8) + fbt_pipe (9) under load. Prio 4 is
     // the goldilocks slot.
-    xTaskCreatePinnedToCoreWithCaps(worker_task, "worker_core1", 16384, NULL,
-                                     4, NULL, 1, MALLOC_CAP_SPIRAM);
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(worker_task, "worker_core1",
+                                     16384, NULL, 4, NULL, 1, MALLOC_CAP_SPIRAM);
+    if (ok != pdPASS) {
+        // Don't report a healthy init with no worker: burst_queue would still
+        // exist, so push_burst would enqueue bursts that nothing ever drains —
+        // the queue fills and every burst is silently dropped. Tear down so
+        // the caller sees the failure.
+        ESP_LOGE(TAG, "worker_core1 task create failed — tearing down");
+        vQueueDelete(burst_queue);
+        burst_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }
 

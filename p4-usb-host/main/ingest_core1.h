@@ -34,6 +34,10 @@ uint8_t *ingest_core1_acquire_raw(int *out_slot);
 //   3. Mark the slot ready-for-DSP via a semaphore
 void ingest_core1_dispatch(int slot, size_t bytes_filled);
 
+// Count of dispatches dropped because the queue was unexpectedly full
+// (should always be 0; nonzero = the slot was recovered, not deadlocked). #106
+uint32_t ingest_core1_dispatch_drops(void);
+
 // Wait for the named slot's converted int16 data to be ready. Returns a
 // pointer to the int16 buffer the DSP can read. Sets *out_n_int16 to the
 // number of int16 elements available (= bytes_filled).

@@ -219,7 +219,13 @@ void stream_transfer_cb(usb_transfer_t *transfer)
         s_xfer_last_error = (uint8_t)transfer->status;
     }
 
-    if (usb_host_transfer_submit(transfer) != ESP_OK) {
+    // Resubmit this URB to keep it in the in-flight ring. A failure drops it
+    // permanently from the ring (one fewer of ASYNC_TRANSFER_COUNT); if they
+    // accumulate, the ring empties → no more completions → the stream stalls
+    // (eventually caught by the stall watchdog). Retry a bounded few times to
+    // ride out transient submit failures rather than leaking the URB.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (usb_host_transfer_submit(transfer) == ESP_OK) break;
         s_xfer_resubmit_errors++;
     }
 }
