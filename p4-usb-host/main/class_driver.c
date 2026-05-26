@@ -45,6 +45,60 @@ static const char *TAG = "CLASS";
 static rtlsdr_dev_t *rtldev = NULL;
 static volatile int s_last_gain_dbx10 = -1;
 
+// Stall-forensics breadcrumb: the consumer loop sets this to its current
+// stage; the health watchdog dumps it (class_driver_dump_stall_diag) right
+// before rebooting a wedged stream, so we can see WHICH call the loop was
+// stuck on (#105 root-cause). Stages are ordered by loop position.
+enum { CS_TOP=0, CS_HANDLE_EVENTS, CS_ACQUIRE, CS_READ, CS_DISPATCH,
+       CS_TAKE_CONVERTED, CS_FEED, CS_RELEASE, CS_REPORT };
+static const char *const k_class_stage_name[] = {
+    "top", "handle_events", "acquire_raw", "read_stream", "dispatch",
+    "take_converted", "dsp_feed", "release", "report" };
+static volatile uint8_t  s_class_stage      = CS_TOP;
+static volatile uint64_t s_class_iter       = 0;     // loop iterations
+static volatile int64_t  s_class_stage_us   = 0;     // when the stage was entered
+
+static inline void class_stage(uint8_t s)
+{
+    s_class_stage    = s;
+    s_class_stage_us = esp_timer_get_time();
+}
+
+// Forensic dump for a wedged USB stream — called by the health watchdog
+// (wifi_link.c) just before it esp_restart()s, so every auto-recovery leaves
+// a trace on serial. Shows which loop stage `class` is stuck on (and for how
+// long), the USB transfer totals, and every task's state + stack high-water.
+// Safe to call from any task (reads counters, mallocs, logs — no flash ops).
+void class_driver_dump_stall_diag(void)
+{
+    unsigned st = s_class_stage;
+    if (st >= sizeof(k_class_stage_name) / sizeof(k_class_stage_name[0])) st = 0;
+    int64_t stuck_ms = (esp_timer_get_time() - s_class_stage_us) / 1000;
+
+    usb_stream_totals_t ut = {0};
+    esp_libusb_get_stream_totals(&ut);
+    ESP_LOGW(TAG, "STALL DIAG: class stage=%s for %lld ms, iter=%llu | "
+                  "USB completed=%llu status_err=%llu short=%llu rb_drops=%llu",
+             k_class_stage_name[st], (long long)stuck_ms,
+             (unsigned long long)s_class_iter,
+             (unsigned long long)ut.completed, (unsigned long long)ut.status_errors,
+             (unsigned long long)ut.short_xfers, (unsigned long long)ut.rb_full_drops);
+
+    UBaseType_t n = uxTaskGetNumberOfTasks();
+    TaskStatus_t *ts = malloc(n * sizeof(TaskStatus_t));
+    if (ts) {
+        n = uxTaskGetSystemState(ts, n, NULL);
+        for (UBaseType_t i = 0; i < n; i++) {
+            // eCurrentState: 0=Running 1=Ready 2=Blocked 3=Suspended 4=Deleted
+            ESP_LOGW(TAG, "  task %-16s state=%d pri=%u stack_hwm=%lu",
+                     ts[i].pcTaskName, (int)ts[i].eCurrentState,
+                     (unsigned)ts[i].uxCurrentPriority,
+                     (unsigned long)ts[i].usStackHighWaterMark);
+        }
+        free(ts);
+    }
+}
+
 bool class_driver_set_tuner_gain_dbx10(int gain_dbx10)
 {
     if (!rtldev) return false;
@@ -262,10 +316,12 @@ void class_driver_task(void *arg)
         // task would never get to run and TWDT would trigger every 5 s.
         // (No esp_task_wdt_reset — class isn't WDT-subscribed; see init.)
 
+        class_stage(CS_HANDLE_EVENTS);
         int64_t t_he0 = esp_timer_get_time();
         usb_host_client_handle_events(s_driver_obj.client_hdl, 10);
         cycle_handle_events_us += (uint64_t)(esp_timer_get_time() - t_he0);
         cycle_iterations++;
+        s_class_iter++;
 
         // Periodic status / recovery watchdog while no device is open.
         if (s_driver_obj.dev_addr == 0) {
@@ -318,10 +374,12 @@ void class_driver_task(void *arg)
         // feed) overlap, which collapses the per-cycle wall time on Core 0
         // from "read + convert + push + feed" to "read + feed".
         int slot_for_read;
+        class_stage(CS_ACQUIRE);
         uint8_t *raw = ingest_core1_acquire_raw(&slot_for_read);
 
         size_t n_read = 0;
         int64_t t_read_start = esp_timer_get_time();
+        class_stage(CS_READ);
         int read_ok = esp_libusb_read_stream(raw, out_block_size, &n_read, 0);
         int64_t t_read_end = esp_timer_get_time();
 
@@ -348,10 +406,12 @@ void class_driver_task(void *arg)
             if (prev_dsp_slot >= 0) {
                 size_t n_int16 = 0;
                 int64_t t_tc0 = esp_timer_get_time();
+                class_stage(CS_TAKE_CONVERTED);
                 int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
                 cycle_take_converted_us += (uint64_t)(esp_timer_get_time() - t_tc0);
                 int64_t t_pre_feed = esp_timer_get_time();
 
+                class_stage(CS_FEED);
                 dsp_processor_feed(converted, n_int16 / 2);
                 int64_t t_post_feed = esp_timer_get_time();
                 dsp_total_time_us += (uint64_t)(t_post_feed - t_pre_feed);

@@ -19,6 +19,7 @@
 
 #include "app_config.h"
 #include "esp_libusb.h"               // usb.completed liveness for the health wdt
+#include "class_driver.h"             // class_driver_dump_stall_diag()
 
 static const char *TAG = "WIFI";
 
@@ -187,8 +188,9 @@ static void health_wdt_task(void *arg)
             ESP_LOGW(TAG, "health-wdt: USB stream frozen at %llu (%d/%d)",
                      (unsigned long long)ut.completed, s_stream_stalls, STREAM_STALL_LIMIT);
             if (s_stream_stalls >= STREAM_STALL_LIMIT) {
-                ESP_LOGE(TAG, "health-wdt: USB stream frozen %d cycles — esp_restart() [#105]",
+                ESP_LOGE(TAG, "health-wdt: USB stream frozen %d cycles — dumping diag then esp_restart() [#105]",
                          s_stream_stalls);
+                class_driver_dump_stall_diag();   // forensics → serial before reboot
                 fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
