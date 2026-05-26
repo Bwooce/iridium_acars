@@ -125,9 +125,11 @@ static esp_err_t status_get(httpd_req_t *req)
     usb_stream_totals_t usbt = {0};
     esp_libusb_get_stream_totals(&usbt);
 
-    // Link-loss watchdog (#104) state.
+    // Health watchdog (#104 gateway + #105 USB stream) state.
     uint32_t wdt_gw = 0; bool wdt_armed = false; int wdt_fails = 0;
-    wifi_link_wdt_status(&wdt_gw, &wdt_armed, &wdt_fails);
+    bool wdt_stream_live = false; int wdt_stream_stalls = 0;
+    wifi_link_wdt_status(&wdt_gw, &wdt_armed, &wdt_fails,
+                         &wdt_stream_live, &wdt_stream_stalls);
 
     char body[1600];
     int n = snprintf(body, sizeof(body),
@@ -158,7 +160,8 @@ static esp_err_t status_get(httpd_req_t *req)
                     "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu"
                 "}"
             "},"
-            "\"link_wdt\":{\"gw\":\"%u.%u.%u.%u\",\"armed\":%s,\"fails\":%d},"
+            "\"health_wdt\":{\"gw\":\"%u.%u.%u.%u\",\"gw_armed\":%s,\"gw_fails\":%d,"
+                "\"stream_live\":%s,\"stream_stalls\":%d},"
             "\"sd\":{"
                 "\"mounted\":%s,\"log_open\":%s,"
                 "\"messages_written\":%u,\"bytes_written\":%llu,"
@@ -194,6 +197,7 @@ static esp_err_t status_get(httpd_req_t *req)
         (unsigned)(wdt_gw & 0xff), (unsigned)((wdt_gw >> 8) & 0xff),
         (unsigned)((wdt_gw >> 16) & 0xff), (unsigned)((wdt_gw >> 24) & 0xff),
         wdt_armed ? "true" : "false", wdt_fails,
+        wdt_stream_live ? "true" : "false", wdt_stream_stalls,
         sd.mounted  ? "true" : "false",
         sd.log_open ? "true" : "false",
         (unsigned)sd.messages_written,

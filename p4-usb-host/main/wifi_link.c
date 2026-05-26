@@ -18,6 +18,7 @@
 #include "freertos/semphr.h"
 
 #include "app_config.h"
+#include "esp_libusb.h"               // usb.completed liveness for the health wdt
 
 static const char *TAG = "WIFI";
 
@@ -38,7 +39,10 @@ static volatile bool        s_ever_got_ip  = false; // gate: don't reboot pre-fi
 static volatile bool        s_ping_ever_ok = false; // gate: gateway answered ICMP once
 static SemaphoreHandle_t    s_ping_done    = NULL;
 static volatile uint32_t    s_ping_replies = 0;
-static volatile int         s_wdt_fails    = 0;     // consecutive failed ping cycles
+static volatile int         s_wdt_fails    = 0;     // consecutive failed gw-ping cycles
+// USB stream liveness (folded into the same health watchdog, #105).
+static volatile bool        s_stream_live   = false; // usb.completed advanced at least once
+static volatile int         s_stream_stalls = 0;     // consecutive frozen cycles
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -142,32 +146,71 @@ static bool ping_gateway_once(void)
     return ok;
 }
 
-static void wifi_wdt_task(void *arg)
+// One independent health watchdog (runs OUTSIDE the class_driver/DSP loops,
+// so a wedged pipeline can't stop it). Each cycle it checks two liveness
+// signals and esp_restart()s on either: the USB stream (usb.completed
+// advancing, #105) and WiFi reachability (gateway ping, #104). It replaces
+// the in-loop stream-stall esp_restart that couldn't fire when that loop
+// blocked.
+static void health_wdt_task(void *arg)
 {
     (void)arg;
-    const int        FAIL_LIMIT = 6;                    // ~3 min of failures
-    const TickType_t CYCLE      = pdMS_TO_TICKS(30000);
+    const int        GW_FAIL_LIMIT      = 6;   // ~3 min gateway unreachable
+    const int        STREAM_STALL_LIMIT = 3;   // ~90 s USB stream frozen
+    const TickType_t CYCLE              = pdMS_TO_TICKS(30000);
+    uint64_t last_completed = 0;
     for (;;) {
         vTaskDelay(CYCLE);
-        // Only in STA mode and only after we've actually held an IP, so a
-        // never-associating boot or AP config mode can't reboot-loop.
-        if (s_mode != LINK_STA || !s_ever_got_ip) { s_wdt_fails = 0; continue; }
+        // Only in STA mode and only after we've held an IP, so a never-
+        // associating boot or AP config mode can't reboot-loop.
+        if (s_mode != LINK_STA || !s_ever_got_ip) {
+            s_wdt_fails = 0;
+            s_stream_stalls = 0;
+            continue;
+        }
 
+        // --- USB stream liveness (#105) ---------------------------------
+        // usb.completed advancing = the RTL-SDR stream is feeding the
+        // pipeline. If it freezes, the stream wedged (dongle silent halt
+        // and/or the class loop blocked on the Core-1 handoff) — the in-loop
+        // #103 watchdog can't fire then, so reboot from out here. Only after
+        // it has advanced once (s_stream_live), so a non-streaming dongle at
+        // boot can't reboot-loop.
+        usb_stream_totals_t ut = {0};
+        esp_libusb_get_stream_totals(&ut);
+        if (ut.completed > last_completed) {
+            last_completed  = ut.completed;
+            s_stream_live   = true;
+            s_stream_stalls = 0;
+        } else if (s_stream_live) {
+            s_stream_stalls++;
+            ESP_LOGW(TAG, "health-wdt: USB stream frozen at %llu (%d/%d)",
+                     (unsigned long long)ut.completed, s_stream_stalls, STREAM_STALL_LIMIT);
+            if (s_stream_stalls >= STREAM_STALL_LIMIT) {
+                ESP_LOGE(TAG, "health-wdt: USB stream frozen %d cycles — esp_restart() [#105]",
+                         s_stream_stalls);
+                fflush(stdout);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            }
+        }
+
+        // --- WiFi/gateway reachability (#104) ---------------------------
+        // Reboot only if the gateway has answered before (proves ICMP works
+        // here) — guards against a non-pingable gateway looping the device.
         if (ping_gateway_once()) {
             s_ping_ever_ok = true;
             s_wdt_fails = 0;
-            continue;
-        }
-        s_wdt_fails++;
-        ESP_LOGW(TAG, "link-wdt: gateway unreachable (%d/%d)", s_wdt_fails, FAIL_LIMIT);
-        // Reboot only if the gateway has answered before (proves ICMP works
-        // here) — guards against a non-pingable gateway looping the device.
-        if (s_ping_ever_ok && s_wdt_fails >= FAIL_LIMIT) {
-            ESP_LOGE(TAG, "link-wdt: gateway unreachable %d cycles — esp_restart() [#104]",
-                     s_wdt_fails);
-            fflush(stdout);
-            vTaskDelay(pdMS_TO_TICKS(200));
-            esp_restart();
+        } else {
+            s_wdt_fails++;
+            ESP_LOGW(TAG, "health-wdt: gateway unreachable (%d/%d)", s_wdt_fails, GW_FAIL_LIMIT);
+            if (s_ping_ever_ok && s_wdt_fails >= GW_FAIL_LIMIT) {
+                ESP_LOGE(TAG, "health-wdt: gateway unreachable %d cycles — esp_restart() [#104]",
+                         s_wdt_fails);
+                fflush(stdout);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            }
         }
     }
 }
@@ -175,11 +218,14 @@ static void wifi_wdt_task(void *arg)
 // Link-watchdog state for /status: gateway IPv4 (network order, 0 if none),
 // armed = a gateway ping has succeeded at least once (so the wdt can fire),
 // fails = current consecutive failed cycles. See #104.
-void wifi_link_wdt_status(uint32_t *gw_addr, bool *armed, int *fails)
+void wifi_link_wdt_status(uint32_t *gw_addr, bool *gw_armed, int *gw_fails,
+                          bool *stream_live, int *stream_stalls)
 {
-    if (gw_addr) *gw_addr = s_gw_addr;
-    if (armed)   *armed   = s_ping_ever_ok;
-    if (fails)   *fails   = s_wdt_fails;
+    if (gw_addr)       *gw_addr       = s_gw_addr;
+    if (gw_armed)      *gw_armed      = s_ping_ever_ok;
+    if (gw_fails)      *gw_fails      = s_wdt_fails;
+    if (stream_live)   *stream_live   = s_stream_live;
+    if (stream_stalls) *stream_stalls = s_stream_stalls;
 }
 
 static void start_sta(const app_config_t *cfg)
@@ -267,16 +313,16 @@ esp_err_t wifi_link_start(void)
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Link-loss watchdog (#104). Stack in PSRAM — it's latency-tolerant and
-    // internal/DMA SRAM is reserved for the USB transfer pool. Self-gates to
-    // STA mode, so harmless in AP config mode.
+    // Independent health watchdog (#104 gateway + #105 USB stream). Stack in
+    // PSRAM — latency-tolerant, and internal/DMA SRAM is reserved for the USB
+    // transfer pool. Runs outside all work loops; self-gates to STA mode.
     s_ping_done = xSemaphoreCreateBinary();
     if (s_ping_done) {
-        xTaskCreatePinnedToCoreWithCaps(wifi_wdt_task, "wifi_wdt", 4096, NULL,
+        xTaskCreatePinnedToCoreWithCaps(health_wdt_task, "health_wdt", 4096, NULL,
                                         2, NULL, tskNO_AFFINITY,
                                         MALLOC_CAP_SPIRAM);
     } else {
-        ESP_LOGW(TAG, "link-wdt: semaphore alloc failed — watchdog disabled");
+        ESP_LOGW(TAG, "health-wdt: semaphore alloc failed — watchdog disabled");
     }
     return ESP_OK;
 }

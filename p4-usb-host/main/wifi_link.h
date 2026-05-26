@@ -31,7 +31,11 @@ const char *wifi_link_ssid(void);
 // STA-mode IP (network order). Zero in AP mode (use 192.168.4.1).
 uint32_t wifi_link_ip_u32(void);
 
-// Link-loss watchdog (#104) state for diagnostics. gw_addr: STA gateway
-// IPv4 (network order, 0 if none). armed: a gateway ping has succeeded at
-// least once (watchdog can fire). fails: current consecutive failed cycles.
-void wifi_link_wdt_status(uint32_t *gw_addr, bool *armed, int *fails);
+// Health watchdog (#104 gateway + #105 USB stream) state for diagnostics.
+// gw_addr: STA gateway IPv4 (network order, 0 if none). gw_armed: a gateway
+// ping has succeeded once (gw side can fire). gw_fails: consecutive failed
+// ping cycles. stream_live: usb.completed has advanced once (stream side can
+// fire). stream_stalls: consecutive frozen-stream cycles. Any pointer may be
+// NULL.
+void wifi_link_wdt_status(uint32_t *gw_addr, bool *gw_armed, int *gw_fails,
+                          bool *stream_live, int *stream_stalls);
