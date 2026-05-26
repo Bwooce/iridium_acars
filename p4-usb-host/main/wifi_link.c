@@ -38,6 +38,7 @@ static volatile bool        s_ever_got_ip  = false; // gate: don't reboot pre-fi
 static volatile bool        s_ping_ever_ok = false; // gate: gateway answered ICMP once
 static SemaphoreHandle_t    s_ping_done    = NULL;
 static volatile uint32_t    s_ping_replies = 0;
+static volatile int         s_wdt_fails    = 0;     // consecutive failed ping cycles
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -146,30 +147,39 @@ static void wifi_wdt_task(void *arg)
     (void)arg;
     const int        FAIL_LIMIT = 6;                    // ~3 min of failures
     const TickType_t CYCLE      = pdMS_TO_TICKS(30000);
-    int fails = 0;
     for (;;) {
         vTaskDelay(CYCLE);
         // Only in STA mode and only after we've actually held an IP, so a
         // never-associating boot or AP config mode can't reboot-loop.
-        if (s_mode != LINK_STA || !s_ever_got_ip) { fails = 0; continue; }
+        if (s_mode != LINK_STA || !s_ever_got_ip) { s_wdt_fails = 0; continue; }
 
         if (ping_gateway_once()) {
             s_ping_ever_ok = true;
-            fails = 0;
+            s_wdt_fails = 0;
             continue;
         }
-        fails++;
-        ESP_LOGW(TAG, "link-wdt: gateway unreachable (%d/%d)", fails, FAIL_LIMIT);
+        s_wdt_fails++;
+        ESP_LOGW(TAG, "link-wdt: gateway unreachable (%d/%d)", s_wdt_fails, FAIL_LIMIT);
         // Reboot only if the gateway has answered before (proves ICMP works
         // here) — guards against a non-pingable gateway looping the device.
-        if (s_ping_ever_ok && fails >= FAIL_LIMIT) {
+        if (s_ping_ever_ok && s_wdt_fails >= FAIL_LIMIT) {
             ESP_LOGE(TAG, "link-wdt: gateway unreachable %d cycles — esp_restart() [#104]",
-                     fails);
+                     s_wdt_fails);
             fflush(stdout);
             vTaskDelay(pdMS_TO_TICKS(200));
             esp_restart();
         }
     }
+}
+
+// Link-watchdog state for /status: gateway IPv4 (network order, 0 if none),
+// armed = a gateway ping has succeeded at least once (so the wdt can fire),
+// fails = current consecutive failed cycles. See #104.
+void wifi_link_wdt_status(uint32_t *gw_addr, bool *armed, int *fails)
+{
+    if (gw_addr) *gw_addr = s_gw_addr;
+    if (armed)   *armed   = s_ping_ever_ok;
+    if (fails)   *fails   = s_wdt_fails;
 }
 
 static void start_sta(const app_config_t *cfg)

@@ -125,7 +125,11 @@ static esp_err_t status_get(httpd_req_t *req)
     usb_stream_totals_t usbt = {0};
     esp_libusb_get_stream_totals(&usbt);
 
-    char body[1536];
+    // Link-loss watchdog (#104) state.
+    uint32_t wdt_gw = 0; bool wdt_armed = false; int wdt_fails = 0;
+    wifi_link_wdt_status(&wdt_gw, &wdt_armed, &wdt_fails);
+
+    char body[1600];
     int n = snprintf(body, sizeof(body),
         "{"
             "\"build\":\"%s\","
@@ -154,6 +158,7 @@ static esp_err_t status_get(httpd_req_t *req)
                     "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu"
                 "}"
             "},"
+            "\"link_wdt\":{\"gw\":\"%u.%u.%u.%u\",\"armed\":%s,\"fails\":%d},"
             "\"sd\":{"
                 "\"mounted\":%s,\"log_open\":%s,"
                 "\"messages_written\":%u,\"bytes_written\":%llu,"
@@ -186,6 +191,9 @@ static esp_err_t status_get(httpd_req_t *req)
         (unsigned long long)cc.ms,    (unsigned long long)cc.tl,
         (unsigned long long)cc.bc,    (unsigned long long)cc.lw_da,
         (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown,
+        (unsigned)(wdt_gw & 0xff), (unsigned)((wdt_gw >> 8) & 0xff),
+        (unsigned)((wdt_gw >> 16) & 0xff), (unsigned)((wdt_gw >> 24) & 0xff),
+        wdt_armed ? "true" : "false", wdt_fails,
         sd.mounted  ? "true" : "false",
         sd.log_open ? "true" : "false",
         (unsigned)sd.messages_written,

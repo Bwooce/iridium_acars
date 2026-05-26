@@ -30,3 +30,8 @@ const char *wifi_link_ssid(void);
 
 // STA-mode IP (network order). Zero in AP mode (use 192.168.4.1).
 uint32_t wifi_link_ip_u32(void);
+
+// Link-loss watchdog (#104) state for diagnostics. gw_addr: STA gateway
+// IPv4 (network order, 0 if none). armed: a gateway ping has succeeded at
+// least once (watchdog can fire). fails: current consecutive failed cycles.
+void wifi_link_wdt_status(uint32_t *gw_addr, bool *armed, int *fails);
