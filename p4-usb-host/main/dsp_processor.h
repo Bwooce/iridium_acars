@@ -19,8 +19,17 @@
 // the SDR's nominal rate (status logger, etc.).
 #define FS_IN_HZ                2560000u
 #define FS_DETECT_HZ            2500000u    // wideband path rate
-#define IRIDIUM_CENTER_FREQ_HZ  1626000000u // SDR tuned LO (mid-band of
-                                            // Iridium downlink 1616-1626)
+// SDR tuned LO. NOTE: 1626 MHz is NOT mid-band — it's the boundary between
+// the duplex band (1616.0-1626.0 MHz, 240 user channels @ 41.667 kHz, where
+// SBD / aircraft ACARS traffic lives) and the simplex band (1626.0-1626.5
+// MHz: Ring Alert @ 1626.2708, IBC broadcast, paging). With FS_IN_HZ this
+// LO covers ~1624.72-1627.28 MHz: ALL of simplex + only the top ~1.3 MHz of
+// duplex. So this tuning targets Iridium SYSTEM frames (RA/IBC/TL — 24/7,
+// no aircraft needed); most duplex USER channels are out of window. To favor
+// user/ACARS traffic, move the LO lower (gr-iridium suggests ~1622 MHz),
+// trading away the simplex/ring-alert band. Runtime-settable via /config
+// (app_config_set_lo_freq_hz, NVS-persisted).
+#define IRIDIUM_CENTER_FREQ_HZ  1626000000u
 #define IRIDIUM_CHANNEL_HZ      41666.67f   // Iridium channel grid spacing
 
 // One detected burst, as emitted by the wideband fft_burst_tagger
