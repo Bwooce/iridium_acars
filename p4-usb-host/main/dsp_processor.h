@@ -27,8 +27,8 @@
 // duplex. So this tuning targets Iridium SYSTEM frames (RA/IBC/TL — 24/7,
 // no aircraft needed); most duplex USER channels are out of window. To favor
 // user/ACARS traffic, move the LO lower (gr-iridium suggests ~1622 MHz),
-// trading away the simplex/ring-alert band. Runtime-settable via /config
-// (app_config_set_lo_freq_hz, NVS-persisted).
+// trading away the simplex/ring-alert band. Runtime-settable via POST
+// /tune?hz=<lo_freq_hz> (NVS-persisted, reboots to apply).
 #define IRIDIUM_CENTER_FREQ_HZ  1626000000u
 #define IRIDIUM_CHANNEL_HZ      41666.67f   // Iridium channel grid spacing
 

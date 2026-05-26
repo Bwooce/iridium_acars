@@ -91,6 +91,22 @@ static void nvs_save_and_reboot_task(void *arg)
     esp_restart();
 }
 
+// /tune apply task. The NVS write (app_config_set_lo_freq_hz → nvs_commit)
+// does a flash op that disables the cache, so it MUST run on a task with an
+// internal-SRAM stack — NOT the httpd task, whose stack is in PSRAM (a PSRAM
+// stack faults the moment the cache is disabled; same footgun as #92 / the
+// /config-save crash). Plain xTaskCreate gives an internal stack. The LO is
+// programmed at stream start, so reboot to apply.
+static void tune_apply_reboot_task(void *arg)
+{
+    uint32_t hz = (uint32_t)(uintptr_t)arg;
+    esp_err_t r = app_config_set_lo_freq_hz(hz);
+    ESP_LOGI(TAG, "/tune: set lo_freq_hz=%u (%s) — rebooting to apply",
+             (unsigned)hz, esp_err_to_name(r));
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
 static esp_err_t status_get(httpd_req_t *req)
 {
     app_config_t cfg;
@@ -643,6 +659,53 @@ static esp_err_t debug_inject_post(httpd_req_t *req)
         HTTPD_RESP_USE_STRLEN);
 }
 
+// POST /tune?hz=<lo_freq_hz> — set the SDR centre frequency dynamically and
+// reboot to apply (the LO is programmed at stream start, class_driver.c).
+// Touches ONLY lo_freq_hz; WiFi and all other config are preserved (unlike
+// /config, which rewrites everything). Lets us retune across the Iridium band
+// without reflashing — e.g. 1626 MHz (simplex/system frames) vs ~1622 MHz
+// (duplex/user channels where SBD/ACARS rides).
+static esp_err_t tune_post(httpd_req_t *req)
+{
+    char query[64] = {0};
+    char hz_s[24]  = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "hz", hz_s, sizeof(hz_s)) != ESP_OK ||
+        hz_s[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req,
+            "usage: POST /tune?hz=<lo_freq_hz>  (e.g. 1622000000)\n",
+            HTTPD_RESP_USE_STRLEN);
+    }
+    uint32_t hz = (uint32_t)strtoul(hz_s, NULL, 10);
+    // Iridium L-band downlink is 1616.0-1626.5 MHz; allow a little slack so
+    // the 2.56 MHz window can be centred near either edge.
+    if (hz < 1615000000u || hz > 1628000000u) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        char m[112];
+        int mn = snprintf(m, sizeof(m),
+            "hz=%u out of Iridium band [1615000000, 1628000000]\n", (unsigned)hz);
+        return httpd_resp_send(req, m, mn);
+    }
+    // Reply first, then do the NVS write + reboot on an internal-stack task
+    // (the write can't run on this PSRAM-stacked httpd task — see
+    // tune_apply_reboot_task). 4096 B internal stack covers nvs_commit +
+    // esp_restart.
+    char body[96];
+    int n = snprintf(body, sizeof(body),
+        "{\"result\":\"ok\",\"lo_freq_hz\":%u,\"reboot\":true}", (unsigned)hz);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, body, n);
+    if (xTaskCreate(tune_apply_reboot_task, "tune_apply", 4096,
+                    (void *)(uintptr_t)hz, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "/tune: failed to spawn apply task");
+    }
+    return ESP_OK;
+}
+
 static esp_err_t sd_mount_post(httpd_req_t *req)
 {
     esp_err_t r = sd_log_force_mount();
@@ -1096,6 +1159,7 @@ esp_err_t http_server_start(void)
         { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,     .user_ctx = NULL },
         { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,       .user_ctx = NULL },
         { .uri = "/debug/inject",  .method = HTTP_POST, .handler = debug_inject_post,    .user_ctx = NULL },
+        { .uri = "/tune",          .method = HTTP_POST, .handler = tune_post,            .user_ctx = NULL },
         { .uri = "/sd/mount",      .method = HTTP_POST, .handler = sd_mount_post,       .user_ctx = NULL },
         { .uri = "/sd/format",     .method = HTTP_POST, .handler = sd_format_post,      .user_ctx = NULL },
         { .uri = "/sd/delete",     .method = HTTP_POST, .handler = sd_delete_post,      .user_ctx = NULL },
