@@ -9,8 +9,13 @@
 #include "esp_event.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
+#include "esp_system.h"           // esp_restart() — link-loss watchdog (#104)
+#include "ping/ping_sock.h"       // gateway-ping reachability watchdog
+#include "lwip/ip_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"   // xTaskCreatePinnedToCoreWithCaps
+#include "freertos/semphr.h"
 
 #include "app_config.h"
 
@@ -26,6 +31,13 @@ static volatile link_mode_t s_mode = LINK_OFF;
 static volatile bool        s_up   = false;     // STA: got IP; AP: started
 static char                 s_ssid[33];         // active SSID (STA target, or AP self-SSID)
 static esp_ip4_addr_t       s_ip   = {0};
+
+// WiFi link-loss watchdog (#104) state.
+static volatile uint32_t    s_gw_addr      = 0;     // STA gateway IPv4 (ping target)
+static volatile bool        s_ever_got_ip  = false; // gate: don't reboot pre-first-IP
+static volatile bool        s_ping_ever_ok = false; // gate: gateway answered ICMP once
+static SemaphoreHandle_t    s_ping_done    = NULL;
+static volatile uint32_t    s_ping_replies = 0;
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -73,6 +85,90 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         ESP_LOGI(TAG, "STA_GOT_IP " IPSTR " gw=" IPSTR,
                  IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
         s_up = true;
+        s_gw_addr = e->ip_info.gw.addr;   // ping target for the link-wdt
+        s_ever_got_ip = true;
+    }
+}
+
+// --- WiFi link-loss watchdog (#104) --------------------------------------
+// The WiFi/C6 (esp_hosted-over-SDIO) link can drop — or the RPC link wedge —
+// leaving the P4 alive and decoding but unreachable over IP, with no event
+// or auto-recovery (observed: ~4 h stranded). This watchdog pings the
+// gateway; after sustained unreachability it esp_restart()s to re-enumerate
+// the link. It only arms after a gateway ping has succeeded once, so a
+// network whose gateway ignores ICMP can never trigger a reboot loop.
+static void ping_end_cb(esp_ping_handle_t hdl, void *args)
+{
+    (void)args;
+    uint32_t recv = 0;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &recv, sizeof(recv));
+    s_ping_replies = recv;
+    if (s_ping_done) xSemaphoreGive(s_ping_done);
+}
+
+static bool ping_gateway_once(void)
+{
+    uint32_t gw = s_gw_addr;
+    if (gw == 0 || !s_ping_done) return false;
+
+    ip_addr_t target = {0};
+    target.type = IPADDR_TYPE_V4;
+    target.u_addr.ip4.addr = gw;
+
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.target_addr = target;
+    cfg.count       = 3;
+    cfg.interval_ms = 500;
+    cfg.timeout_ms  = 1000;
+
+    esp_ping_callbacks_t cbs = {0};
+    cbs.on_ping_end = ping_end_cb;
+
+    esp_ping_handle_t h = NULL;
+    if (esp_ping_new_session(&cfg, &cbs, &h) != ESP_OK || !h) return false;
+
+    s_ping_replies = 0;
+    xSemaphoreTake(s_ping_done, 0);          // drain any stale signal
+    bool ok = false;
+    if (esp_ping_start(h) == ESP_OK) {
+        // 3 × (500 ms interval + ≤1000 ms timeout) ≈ 4.5 s worst case.
+        if (xSemaphoreTake(s_ping_done, pdMS_TO_TICKS(8000)) == pdTRUE) {
+            ok = (s_ping_replies > 0);
+        }
+        esp_ping_stop(h);
+    }
+    esp_ping_delete_session(h);
+    return ok;
+}
+
+static void wifi_wdt_task(void *arg)
+{
+    (void)arg;
+    const int        FAIL_LIMIT = 6;                    // ~3 min of failures
+    const TickType_t CYCLE      = pdMS_TO_TICKS(30000);
+    int fails = 0;
+    for (;;) {
+        vTaskDelay(CYCLE);
+        // Only in STA mode and only after we've actually held an IP, so a
+        // never-associating boot or AP config mode can't reboot-loop.
+        if (s_mode != LINK_STA || !s_ever_got_ip) { fails = 0; continue; }
+
+        if (ping_gateway_once()) {
+            s_ping_ever_ok = true;
+            fails = 0;
+            continue;
+        }
+        fails++;
+        ESP_LOGW(TAG, "link-wdt: gateway unreachable (%d/%d)", fails, FAIL_LIMIT);
+        // Reboot only if the gateway has answered before (proves ICMP works
+        // here) — guards against a non-pingable gateway looping the device.
+        if (s_ping_ever_ok && fails >= FAIL_LIMIT) {
+            ESP_LOGE(TAG, "link-wdt: gateway unreachable %d cycles — esp_restart() [#104]",
+                     fails);
+            fflush(stdout);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        }
     }
 }
 
@@ -160,6 +256,18 @@ esp_err_t wifi_link_start(void)
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Link-loss watchdog (#104). Stack in PSRAM — it's latency-tolerant and
+    // internal/DMA SRAM is reserved for the USB transfer pool. Self-gates to
+    // STA mode, so harmless in AP config mode.
+    s_ping_done = xSemaphoreCreateBinary();
+    if (s_ping_done) {
+        xTaskCreatePinnedToCoreWithCaps(wifi_wdt_task, "wifi_wdt", 4096, NULL,
+                                        2, NULL, tskNO_AFFINITY,
+                                        MALLOC_CAP_SPIRAM);
+    } else {
+        ESP_LOGW(TAG, "link-wdt: semaphore alloc failed — watchdog disabled");
+    }
     return ESP_OK;
 }
 
