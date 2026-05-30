@@ -20,6 +20,7 @@
 #include "sd_capture.h"
 #include "acars_push.h"
 #include "esp_libusb.h"
+#include "worker_core1.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -228,6 +229,40 @@ static esp_err_t status_get(httpd_req_t *req)
         body[n] = '\0';
     }
 
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, n);
+}
+
+// /diag/histograms (#116). Cumulative-since-boot SNR + BCH histograms
+// for operator diagnostics. Closes the "/status can't tell antenna-
+// empty from demod-broken" gap. UW Hamming histogram is deferred —
+// requires decoded_frame_t API change to plumb dl_diffs back.
+static esp_err_t diag_histograms_get(httpd_req_t *req)
+{
+    worker_histograms_t h = {0};
+    worker_core1_get_histograms(&h);
+
+    char body[1024];
+    int n = 0;
+    n += snprintf(body + n, sizeof(body) - n,
+                  "{\"snr_total\":%u,\"bch_total\":%u,"
+                  "\"snr_bin_dB_width\":1,\"snr\":[",
+                  (unsigned)h.snr_total, (unsigned)h.bch_total);
+    for (int i = 0; i < 32; i++) {
+        n += snprintf(body + n, sizeof(body) - n,
+                      "%s%u", i ? "," : "", (unsigned)h.snr[i]);
+    }
+    // bch layout: bch[(e1+1)*4 + (e2+1)] for e in {-1=fail, 0,1,2=corrected}.
+    n += snprintf(body + n, sizeof(body) - n,
+                  "],\"bch_index\":\"(e1+1)*4+(e2+1), e in {-1=fail,0,1,2}\","
+                  "\"bch\":[");
+    for (int i = 0; i < 16; i++) {
+        n += snprintf(body + n, sizeof(body) - n,
+                      "%s%u", i ? "," : "", (unsigned)h.bch[i]);
+    }
+    n += snprintf(body + n, sizeof(body) - n, "]}\n");
+    if (n < 0 || n >= (int)sizeof(body)) n = sizeof(body) - 1;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, body, n);
@@ -1153,6 +1188,7 @@ esp_err_t http_server_start(void)
     httpd_uri_t routes[] = {
         { .uri = "/",         .method = HTTP_GET,  .handler = index_get,    .user_ctx = NULL },
         { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
+        { .uri = "/diag/histograms", .method = HTTP_GET, .handler = diag_histograms_get, .user_ctx = NULL },
         { .uri = "/messages", .method = HTTP_GET,  .handler = messages_get, .user_ctx = NULL },
         { .uri = "/ota",      .method = HTTP_GET,  .handler = ota_get,      .user_ctx = NULL },
         { .uri = "/config",   .method = HTTP_POST, .handler = config_post,    .user_ctx = NULL },

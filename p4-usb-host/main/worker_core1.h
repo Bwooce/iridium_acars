@@ -32,6 +32,21 @@ typedef struct {
 
 void worker_core1_get_stats(worker_stats_t *out);
 
+// Diagnostic histograms (#116). Cumulative since boot; clients compute
+// deltas if they want a rate. Closes the design-review gap that /status
+// alone can't distinguish "antenna empty" from "demod broken in a new way."
+//   snr[32]  bin i = bursts with floor(SNR_dB) == i
+//   bch[16]  bin ((e1+1)*4 + (e2+1)) for e in {-1=fail, 0,1,2=corrected}.
+// snr_total = sum(snr); bch_total = sum(bch). UW Hamming histogram is
+// deliberately deferred (requires decoded_frame_t API change to plumb).
+typedef struct {
+    uint32_t snr[32];
+    uint32_t bch[16];
+    uint32_t snr_total;
+    uint32_t bch_total;
+} worker_histograms_t;
+void worker_core1_get_histograms(worker_histograms_t *out);
+
 // Smoke-only: dumps per-burst golden-bits comparison summary at the
 // end of the smoke run. Compiled to a no-op outside the
 // CONFIG_SMOKE_TEST_RAW_IRIDIUM build.

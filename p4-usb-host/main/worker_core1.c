@@ -63,6 +63,31 @@ static volatile uint32_t s_bursts_bch_unknown = 0;  // BCH OK but iridium_frame_
 static volatile uint32_t s_bursts_bch_failed  = 0;  // BCH itself uncorrectable
 static volatile uint32_t s_bursts_bch_chase_recovered = 0;  // Chase-2 soft decoder rescued a hard-decision BCH failure (#112)
 
+// Diagnostic histograms (#116). Cumulative since boot — no decay /
+// rolling window; clients compute deltas if they want a rate.
+// Closes the design-review gap "can't tell antenna-empty from
+// demod-broken from /status alone." SNR bins are 1 dB wide [0..32);
+// BCH bins are a 4×4 joint of e1 × e2 codes (-1 = failed, 0..2 = corrected).
+#define HIST_SNR_BINS  32
+static volatile uint32_t s_hist_snr[HIST_SNR_BINS];   // bin i = bursts with floor(SNR_dB) == i
+#define HIST_BCH_BINS  16                              // (e1+1)*4 + (e2+1), e ∈ {-1..2}
+static volatile uint32_t s_hist_bch[HIST_BCH_BINS];
+
+static inline void hist_snr_record(float snr_db)
+{
+    int bin = (int)snr_db;
+    if (bin < 0) bin = 0;
+    if (bin >= HIST_SNR_BINS) bin = HIST_SNR_BINS - 1;
+    s_hist_snr[bin]++;
+}
+static inline void hist_bch_record(int e1, int e2)
+{
+    // Clamp to {-1, 0, 1, 2} then offset to {0..3}
+    int a = (e1 < -1) ? -1 : (e1 > 2 ? 2 : e1);
+    int b = (e2 < -1) ? -1 : (e2 > 2 ? 2 : e2);
+    s_hist_bch[(a + 1) * 4 + (b + 1)]++;
+}
+
 // Per-stage timing accumulators, summed over processed bursts only.
 static volatile uint64_t s_t_extract_us = 0;
 static volatile uint64_t s_t_rotate_us  = 0;
@@ -432,6 +457,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
         iridium_deinterleave(payload, block1, block2);
         e1_bch = bch_decode_block(block1, data1);
         e2_bch = bch_decode_block(block2, data2);
+        hist_bch_record(e1_bch, e2_bch);   // #116 — records pre-Chase outcome
 
         // Chase-2 soft decoder rescue path (#112). On hard-BCH failure
         // for either block, retry with K=3 (8 trials) soft Chase-2 using
@@ -510,6 +536,7 @@ void worker_task(void *arg)
                      (unsigned long)burst.length_samples,
                      (double)burst.rel_freq_hz,
                      (double)burst.peak_snr_db);
+            hist_snr_record(burst.peak_snr_db);   // #116
 
             // Length guard. Tagger emits stop - start as length, which
             // can range from ~30 ms (single frame) to ~250 ms
@@ -864,6 +891,22 @@ void worker_core1_push_burst(const detected_burst_t *burst)
             s_bursts_dropped++;
         }
     }
+}
+
+void worker_core1_get_histograms(worker_histograms_t *out)
+{
+    if (!out) return;
+    uint32_t total_snr = 0, total_bch = 0;
+    for (int i = 0; i < HIST_SNR_BINS; i++) {
+        out->snr[i] = s_hist_snr[i];
+        total_snr += s_hist_snr[i];
+    }
+    for (int i = 0; i < HIST_BCH_BINS; i++) {
+        out->bch[i] = s_hist_bch[i];
+        total_bch += s_hist_bch[i];
+    }
+    out->snr_total = total_snr;
+    out->bch_total = total_bch;
 }
 
 void worker_core1_get_stats(worker_stats_t *out)
