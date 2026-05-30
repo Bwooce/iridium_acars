@@ -64,6 +64,14 @@ static const char *TAG = "SDLOG";
 
 static sdmmc_card_t   *s_card           = NULL;
 static FILE           *s_log            = NULL;
+// s_log_mu protects s_log itself — every read/write of the FILE* and
+// every fwrite/fflush/fsync/fclose/fopen-via-open_log_file must hold it
+// (#108). Without this, sd_log_force_format (httpd task) could fclose
+// s_log while writer_task (Core 0, prio 3) is mid-fwrite; concurrent
+// fwrite+fclose on the same FILE* is UB inside FATFS/libc buffers and
+// will crash or corrupt under load. s_stats_mu only protects s_stats,
+// not s_log.
+static SemaphoreHandle_t s_log_mu        = NULL;
 static QueueHandle_t   s_q              = NULL;
 // 64 KB DMA-INT buffer the SDMMC driver uses for read/write to
 // PSRAM-resident user buffers. Allocated eagerly in sd_log_init
@@ -185,6 +193,12 @@ static void writer_task(void *arg)
             // log file. Opening here — rather than at mount time — means
             // decode-less runs leave no empty log file (#102). A mount
             // that already failed stays failed until POST /sd/mount.
+            //
+            // s_log_mu (#108) is held for the whole open + write + flush
+            // block so sd_log_force_format can't fclose under us. format
+            // is rare admin; holding the mutex through fsync (which can
+            // be ms under DMA pressure) is fine.
+            xSemaphoreTake(s_log_mu, portMAX_DELAY);
             if (!s_log) {
                 if (!s_card && !s_mount_attempted) {
                     ESP_LOGI(TAG, "first message — attempting lazy SD mount");
@@ -216,14 +230,17 @@ static void writer_task(void *arg)
                     }
                 }
             }
+            xSemaphoreGive(s_log_mu);
         }
 
         // Flush at least every 1 s so an abrupt power loss doesn't lose
         // more than a second of decodes. FATFS fsync is fairly cheap
-        // when the SDMMC DMA isn't backed up.
+        // when the SDMMC DMA isn't backed up. s_log_mu again (#108).
         int64_t now = esp_timer_get_time();
-        if (s_log && (now - last_flush) >= 1000000) {
-            fflush(s_log);
+        if ((now - last_flush) >= 1000000) {
+            xSemaphoreTake(s_log_mu, portMAX_DELAY);
+            if (s_log) fflush(s_log);
+            xSemaphoreGive(s_log_mu);
             last_flush = now;
         }
     }
@@ -438,6 +455,8 @@ esp_err_t sd_log_init(void)
 
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
+    s_log_mu = xSemaphoreCreateMutex();
+    if (!s_log_mu) return ESP_ERR_NO_MEM;
 
     // (NO eager SDMMC stash here — that path was tried with 64 KB
     // and 16 KB and both starved the USB transfer pool by 28-48 KB
@@ -497,6 +516,10 @@ esp_err_t sd_log_force_format(void)
 {
     // Close the log file first so f_mkfs doesn't trip over an open
     // handle. Subsequent acars writes will lazy-reopen the log.
+    // s_log_mu serializes us against writer_task's fwrite/fflush/fsync
+    // path (#108) — without this, concurrent fwrite + fclose on the
+    // same FILE* is UB inside FATFS buffering.
+    if (s_log_mu) xSemaphoreTake(s_log_mu, portMAX_DELAY);
     if (s_log) {
         fflush(s_log);
         fclose(s_log);
@@ -506,6 +529,7 @@ esp_err_t sd_log_force_format(void)
         s_stats.log_path[0] = '\0';
         xSemaphoreGive(s_stats_mu);
     }
+    if (s_log_mu) xSemaphoreGive(s_log_mu);
     // f_mkfs takes up to ~3 min on a 4 GB card; bump the WDT so the
     // task that called us (httpd) doesn't trip during the format.
     esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
@@ -536,10 +560,13 @@ esp_err_t sd_log_force_format(void)
     // the stale s_log==NULL path and try to re-register the same mount
     // point (which fails with INVALID_STATE). Re-opening the log here
     // brings s_log back so subsequent /capture/start / sd_log_emit
-    // calls see a healthy logger.
+    // calls see a healthy logger. Hold s_log_mu so writer_task can't
+    // open its own log between our close above and our open here (#108).
     if (r == ESP_OK) {
         mkdir(MOUNT_POINT "/acars", 0775);
+        if (s_log_mu) xSemaphoreTake(s_log_mu, portMAX_DELAY);
         (void)open_log_file();
+        if (s_log_mu) xSemaphoreGive(s_log_mu);
     }
     return r;
 }
