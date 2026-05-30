@@ -124,13 +124,26 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
         r = esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples, bytes,
                              dma_done_cb, NULL);
     } else {
-        // Wrap: two writes. Only the second carries the completion callback
-        // so the semaphore is given exactly once.
-        (void)esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples,
-                               bytes_to_end, NULL, NULL);
-        size_t remainder = bytes - bytes_to_end;
-        r = esp_async_memcpy(s_dma, dst_base, (uint8_t *)samples + bytes_to_end,
-                             remainder, dma_done_cb, NULL);
+        // Wrap: two writes. The first carries no callback (the second's
+        // callback gives the semaphore once); but its return MUST be
+        // checked too (#107). If the first submit fails and we silently
+        // proceed to the second, the second succeeds + fires the callback
+        // + advances head by the FULL n_samples — yet only the second
+        // segment actually landed in PSRAM. The first segment is left as
+        // whatever was there from the prior wrap cycle, and the worker
+        // decodes garbage with no indicator. Same class as #106.
+        r = esp_async_memcpy(s_dma, dst_base + head_bytes, (void *)samples,
+                             bytes_to_end, NULL, NULL);
+        if (r == ESP_OK) {
+            size_t remainder = bytes - bytes_to_end;
+            r = esp_async_memcpy(s_dma, dst_base,
+                                 (uint8_t *)samples + bytes_to_end,
+                                 remainder, dma_done_cb, NULL);
+        }
+        // If the first wrap submit failed, we fall through to the shared
+        // failure handler below without ever submitting the second — the
+        // semaphore was already taken at line 112, so the handler restores
+        // it. head is not advanced; the chunk is dropped.
     }
     if (r != ESP_OK) {
         // The callback-carrying submit failed → dma_done_cb will never fire →
