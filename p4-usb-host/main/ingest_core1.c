@@ -526,6 +526,14 @@ uint8_t *ingest_core1_acquire_raw(int *out_slot)
 static volatile uint32_t s_dispatch_drops = 0;
 uint32_t ingest_core1_dispatch_drops(void) { return s_dispatch_drops; }
 
+// Count of take_converted iterations that exceeded one 500 ms tick
+// without s_ready being given — i.e. ingest_task hasn't yet processed
+// the dispatch corresponding to this slot. A handful per hour is FINE
+// (just a slow ingest cycle); a sustained climb means ingest is
+// wedged and health_wdt will reboot once class can't progress (#110).
+static volatile uint32_t s_take_converted_slow_waits = 0;
+uint32_t ingest_core1_take_converted_slow_waits(void) { return s_take_converted_slow_waits; }
+
 void ingest_core1_dispatch(int slot, size_t bytes_filled)
 {
     dispatch_msg_t msg = { .slot = slot, .bytes = bytes_filled };
@@ -546,7 +554,29 @@ void ingest_core1_dispatch(int slot, size_t bytes_filled)
 
 int16_t *ingest_core1_take_converted(int slot, size_t *out_n_int16)
 {
-    xSemaphoreTake(s_ready[slot], portMAX_DELAY);
+    // Diagnostic poll loop (#110 — #106-class deadlock sibling). The wait
+    // remains unbounded in effect (we keep retrying until s_ready is
+    // given) — a bounded timeout with local recovery was tried for the
+    // analogous s_free take at line 506 and caused subtle data loss
+    // when the timeout fired without proper slot-ownership handoff.
+    // External recovery: if ingest_task is truly wedged, take_converted
+    // never returns, class can't advance usb.completed, and health_wdt's
+    // stream-stall watchdog reboots in ~30-90 s (wifi_link.c).
+    //
+    // What this loop ADDS over a plain portMAX_DELAY: visibility. A
+    // ~ms-scale wait is normal; anything beyond 500 ms is suspicious
+    // and worth logging before the watchdog acts. We log the first
+    // slow wait and then every ~10 s while still waiting.
+    int waited_ms = 0;
+    while (xSemaphoreTake(s_ready[slot], pdMS_TO_TICKS(500)) != pdTRUE) {
+        waited_ms += 500;
+        s_take_converted_slow_waits++;
+        if (waited_ms == 500 || (waited_ms % 10000) == 0) {
+            ESP_LOGW(TAG, "take_converted slot=%d waited %dms — ingest "
+                          "may be wedged; health_wdt will reboot if class "
+                          "stops progressing", slot, waited_ms);
+        }
+    }
     if (out_n_int16) *out_n_int16 = s_resamp_n_int16[slot];
     return s_resamp[slot];
 }

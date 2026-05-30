@@ -38,6 +38,11 @@ void ingest_core1_dispatch(int slot, size_t bytes_filled);
 // (should always be 0; nonzero = the slot was recovered, not deadlocked). #106
 uint32_t ingest_core1_dispatch_drops(void);
 
+// Count of 500 ms ticks take_converted waited without s_ready being given.
+// A handful per hour is fine (slow ingest cycle); a sustained climb means
+// ingest is wedged and health_wdt will reboot once class can't progress (#110).
+uint32_t ingest_core1_take_converted_slow_waits(void);
+
 // Wait for the named slot's converted int16 data to be ready. Returns a
 // pointer to the int16 buffer the DSP can read. Sets *out_n_int16 to the
 // number of int16 elements available (= bytes_filled).
