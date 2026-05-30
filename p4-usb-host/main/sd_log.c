@@ -532,6 +532,16 @@ esp_err_t sd_log_force_format(void)
     if (s_log_mu) xSemaphoreGive(s_log_mu);
     // f_mkfs takes up to ~3 min on a 4 GB card; bump the WDT so the
     // task that called us (httpd) doesn't trip during the format.
+    // Save the current TWDT config so the restore below puts it back
+    // exactly as configured rather than assuming a hardcoded 5 s.
+    // mount_sd() (above) already follows this pattern; this branch had
+    // an unconditional 5000 ms restore that would clobber a non-default
+    // CONFIG_ESP_TASK_WDT_TIMEOUT_S (#124).
+    esp_task_wdt_config_t wdt_save = {
+        .timeout_ms     = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000U,
+        .idle_core_mask = 0,
+        .trigger_panic  = true,
+    };
     esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
         .timeout_ms = 240000, .idle_core_mask = 0, .trigger_panic = true });
 
@@ -550,9 +560,8 @@ esp_err_t sd_log_force_format(void)
         r = ESP_ERR_INVALID_STATE;
     }
 
-    // Restore WDT to its normal value.
-    esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
-        .timeout_ms = 5000, .idle_core_mask = 0, .trigger_panic = true });
+    // Restore WDT to the saved (configured) value, not a hardcoded 5 s.
+    (void)esp_task_wdt_reconfigure(&wdt_save);
 
     // Recreate /sdcard/acars/ for the log + capture files, then
     // re-open a fresh log file. esp_vfs_fat_sdcard_format leaves the

@@ -61,6 +61,12 @@ void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out);
 uint64_t frame_decoder_acars_decoded_total(void);
 uint64_t frame_decoder_sbd_complete_total(void);
 
+// Rolling decode-rate counters (#117). Sum of classified-as-known-type
+// frames over the last 1 h and 24 h, snapped on a 1-minute esp_timer
+// tick. A WARN log fires automatically when 24h>10 && 1h==0 ("we
+// used to work, we no longer do") — catches silent DSP wedge.
+void frame_decoder_get_rolling_rates(uint32_t *out_1h, uint32_t *out_24h);
+
 #ifdef __cplusplus
 }
 #endif

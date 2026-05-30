@@ -11,6 +11,7 @@ static class_adsb_dev *adsbdev;
 static volatile uint32_t s_xfer_completed = 0;
 static volatile uint32_t s_xfer_status_errors = 0;
 static volatile uint32_t s_xfer_resubmit_errors = 0;
+static volatile uint32_t s_xfer_pool_lost = 0;  // URBs whose 3-attempt resubmit retry exhausted; pool size shrinks (#124)
 static volatile uint32_t s_xfer_rb_full_drops = 0;
 static volatile uint32_t s_xfer_short = 0;
 static volatile uint64_t s_xfer_actual_bytes = 0;
@@ -224,9 +225,23 @@ void stream_transfer_cb(usb_transfer_t *transfer)
     // accumulate, the ring empties → no more completions → the stream stalls
     // (eventually caught by the stall watchdog). Retry a bounded few times to
     // ride out transient submit failures rather than leaking the URB.
+    bool submitted = false;
+    esp_err_t last_err = ESP_OK;
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (usb_host_transfer_submit(transfer) == ESP_OK) break;
+        last_err = usb_host_transfer_submit(transfer);
+        if (last_err == ESP_OK) { submitted = true; break; }
         s_xfer_resubmit_errors++;
+    }
+    if (!submitted) {
+        // All 3 attempts exhausted — this URB is permanently retired from
+        // the in-flight pool. Pool shrinks 8 → 7 → … silently until stream
+        // throttle is caught by health_wdt (~30-90 s). Make it loud so a
+        // post-mortem doesn't have to infer the cause from a downstream
+        // STATUS-ERR line (#124). Rate-limited; with ASYNC_TRANSFER_COUNT=8
+        // even 8 occurrences here means the entire pool is gone.
+        s_xfer_pool_lost++;
+        ESP_LOGE("LIBUSB", "URB resubmit exhausted 3 attempts: %s — pool shrunk (lost=%u)",
+                 esp_err_to_name(last_err), (unsigned)s_xfer_pool_lost);
     }
 }
 
@@ -385,7 +400,10 @@ void esp_libusb_get_ringbuffer_info(size_t *used, size_t *capacity)
         UBaseType_t items_waiting = 0;
         vRingbufferGetInfo(adsbdev->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
         *used = (size_t)items_waiting;
-        *capacity = 512 * 1024;
+        // Capacity must track the actual ringbuf allocation above
+        // (was hardcoded 512 KB after the 512 KB → 4 MB upgrade —
+        // every /status utilisation metric was 8× under-reported). #109
+        *capacity = 4 * 1024 * 1024;
     } else {
         *used = 0;
         *capacity = 0;

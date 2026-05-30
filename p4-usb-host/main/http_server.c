@@ -137,6 +137,8 @@ static esp_err_t status_get(httpd_req_t *req)
     uint64_t acars_total = frame_decoder_acars_decoded_total();
     uint64_t sbd_total   = frame_decoder_sbd_complete_total();
     uint64_t msgs_total  = msg_ring_total();
+    uint32_t rate_1h = 0, rate_24h = 0;
+    frame_decoder_get_rolling_rates(&rate_1h, &rate_24h);   // #117
     sd_log_stats_t sd = {0};
     sd_log_get_stats(&sd);
     usb_stream_totals_t usbt = {0};
@@ -172,6 +174,7 @@ static esp_err_t status_get(httpd_req_t *req)
                 "\"messages_total\":%llu,"
                 "\"acars_decoded\":%llu,"
                 "\"sbd_complete\":%llu,"
+                "\"rate_1h\":%u,\"rate_24h\":%u,"
                 "\"frames\":{"
                     "\"ms\":%llu,\"tl\":%llu,\"bc\":%llu,"
                     "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu"
@@ -208,6 +211,7 @@ static esp_err_t status_get(httpd_req_t *req)
         (unsigned long long)msgs_total,
         (unsigned long long)acars_total,
         (unsigned long long)sbd_total,
+        (unsigned)rate_1h, (unsigned)rate_24h,
         (unsigned long long)cc.ms,    (unsigned long long)cc.tl,
         (unsigned long long)cc.bc,    (unsigned long long)cc.lw_da,
         (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown,

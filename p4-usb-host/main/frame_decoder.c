@@ -61,6 +61,76 @@ static _Atomic uint64_t  s_acars_fragments = 0;  // ACARS fragments awaiting rea
 // decoder init.
 static la_reasm_ctx *s_reasm_ctx = NULL;
 
+// Rolling decode-rate counters (#117). Closes the "silent DSP wedge"
+// gap: today health_wdt watches USB liveness + gateway, neither of
+// which catches "USB flowing, /status happy, but no classified frames
+// for hours." 60-minute and 24-hour rolling counts of classified-as-
+// known-type frames (anything other than UNKNOWN), rolled by a 1-min
+// esp_timer. Warn-on-decline fires when 24h > 10 && 1h == 0 = "we
+// used to work, we no longer do" (an OTA regression / antenna change).
+#define DRATE_MIN_BUCKETS  60   // per-minute, 1 h coverage
+#define DRATE_HR_BUCKETS   24   // per-hour, 24 h coverage
+static volatile uint32_t s_drate_min[DRATE_MIN_BUCKETS];
+static volatile uint32_t s_drate_hr [DRATE_HR_BUCKETS];
+static volatile uint64_t s_drate_classified_at_last_roll = 0;   // s_class_*-sum snapshot
+static volatile uint8_t  s_drate_min_head = 0;
+static volatile uint8_t  s_drate_hr_head  = 0;
+static volatile uint8_t  s_drate_min_in_hr = 0;                 // 0..59
+static esp_timer_handle_t s_drate_timer = NULL;
+
+static uint64_t drate_classified_sum(void)
+{
+    return atomic_load_explicit(&s_class_ms,       memory_order_relaxed)
+         + atomic_load_explicit(&s_class_tl,       memory_order_relaxed)
+         + atomic_load_explicit(&s_class_bc,       memory_order_relaxed)
+         + atomic_load_explicit(&s_class_lw_da,    memory_order_relaxed)
+         + atomic_load_explicit(&s_class_lw_other, memory_order_relaxed);
+}
+
+static void drate_tick(void *arg)
+{
+    (void)arg;
+    uint64_t now_total = drate_classified_sum();
+    uint32_t delta = (uint32_t)(now_total - s_drate_classified_at_last_roll);
+    s_drate_classified_at_last_roll = now_total;
+
+    // Advance the minute bucket; write the delta into the new head.
+    s_drate_min_head = (s_drate_min_head + 1) % DRATE_MIN_BUCKETS;
+    s_drate_min[s_drate_min_head] = delta;
+
+    // Every 60 ticks, roll a fresh hour: write the hour's sum, advance.
+    s_drate_min_in_hr++;
+    if (s_drate_min_in_hr >= 60) {
+        s_drate_min_in_hr = 0;
+        uint32_t hr_sum = 0;
+        for (int i = 0; i < DRATE_MIN_BUCKETS; i++) hr_sum += s_drate_min[i];
+        s_drate_hr_head = (s_drate_hr_head + 1) % DRATE_HR_BUCKETS;
+        s_drate_hr[s_drate_hr_head] = hr_sum;
+
+        // Warn-on-decline: 1h is the buckets above; 24h is the hours.
+        uint32_t sum_1h = hr_sum;
+        uint32_t sum_24h = 0;
+        for (int i = 0; i < DRATE_HR_BUCKETS; i++) sum_24h += s_drate_hr[i];
+        if (sum_24h > 10 && sum_1h == 0) {
+            ESP_LOGW(TAG, "decode-rate decline: 24h=%u classified frames "
+                          "but last 1h=0 — possible DSP regression / "
+                          "antenna change / OTA broke decode", sum_24h);
+        }
+    }
+}
+
+void frame_decoder_get_rolling_rates(uint32_t *out_1h, uint32_t *out_24h)
+{
+    uint32_t sum_1h = 0, sum_24h = 0;
+    for (int i = 0; i < DRATE_MIN_BUCKETS; i++) sum_1h  += s_drate_min[i];
+    for (int i = 0; i < DRATE_HR_BUCKETS;  i++) sum_24h += s_drate_hr[i];
+    // 24h totals don't include the in-progress hour — include the 1h
+    // buckets to give the caller the actual last-24h coverage.
+    sum_24h += sum_1h;
+    if (out_1h)  *out_1h  = sum_1h;
+    if (out_24h) *out_24h = sum_24h;
+}
+
 // Walk a la_proto_node tree to find the la_acars_msg payload.
 extern la_type_descriptor const la_DEF_acars_message;
 static la_acars_msg *find_acars_msg(la_proto_node *node)
@@ -378,6 +448,19 @@ esp_err_t frame_decoder_init(void)
         frame_queue_destroy(s_queue);
         s_queue = NULL;
         return ESP_FAIL;
+    }
+
+    // Rolling decode-rate timer (#117): 1-minute tick.
+    const esp_timer_create_args_t drate_args = {
+        .callback        = drate_tick,
+        .arg             = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "decode_rate",
+    };
+    if (esp_timer_create(&drate_args, &s_drate_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_drate_timer, 60ULL * 1000000ULL);
+    } else {
+        ESP_LOGW(TAG, "decode-rate timer create failed; rolling counters unavailable");
     }
 
     s_initialised = true;
