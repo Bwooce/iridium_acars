@@ -133,11 +133,13 @@ static void emit(const status_snapshot_t *s)
     // processed=58 typically resolves to bch_decoded=19 + bch_failed=27
     // + bch_skipped(short)=12.
     ESP_LOGI(TAG, "Worker: queued=%u dropped=%u processed=%u "
-                  "bch_decoded=%u bch_unknown=%u bch_failed=%u skipped=%u "
+                  "bch_decoded=%u bch_unknown=%u bch_failed=%u "
+                  "bch_chase=%u skipped=%u "
                   "qmax=%u avg_burst=%.0f us cap=%.1f%%",
              s->ws.bursts_queued, s->ws.bursts_dropped, s->ws.bursts_processed,
              s->ws.bursts_bch_decoded, s->ws.bursts_bch_unknown,
-             s->ws.bursts_bch_failed, s->ws.bursts_skipped,
+             s->ws.bursts_bch_failed, s->ws.bursts_bch_chase_recovered,
+             s->ws.bursts_skipped,
              s->ws.queue_high_water, s->ws.avg_burst_us, worker_pct);
 
     ESP_LOGI(TAG, "Worker-stages (us): extract=%.0f freq=%.0f fir=%.0f "

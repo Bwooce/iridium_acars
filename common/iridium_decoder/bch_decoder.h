@@ -24,4 +24,10 @@ int bch_decode_block_soft(const int16_t *soft_in31, uint8_t *out_data, int K);
 
 void iridium_deinterleave(const uint8_t *in, uint8_t *out1, uint8_t *out2);
 
+// Identical permutation as iridium_deinterleave but on int16 soft metrics.
+// Used to route per-bit soft values from qpsk_demod through the same
+// bit-reordering that the hard path uses, so the resulting 31-element
+// soft blocks line up bit-for-bit with the BCH codewords (#112).
+void iridium_deinterleave_int16(const int16_t *in, int16_t *out1, int16_t *out2);
+
 #endif

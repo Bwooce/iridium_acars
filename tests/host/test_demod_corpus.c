@@ -134,6 +134,7 @@ int main(void)
             }
         }
         free(frame.bits);
+        free(frame.soft_bits);   // #112
     }
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);

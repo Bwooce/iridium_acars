@@ -261,16 +261,46 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         return 0;
     }
 
-    // 4. DQPSK Decode
+    // 4. DQPSK Decode + per-bit soft metric for Chase-2 BCH (#112).
+    //
+    // QPSK confidence per symbol = |pll_out[i]| (the distance from
+    // origin in the constellation plane). At low SNR the constellation
+    // points are pulled toward origin, reducing |pll_out|; at high SNR
+    // they sit near the canonical (±1, ±1)/√2 points. The same
+    // confidence is assigned to both bits derived from a symbol — a
+    // conservative simplification (real per-axis soft would split |re|
+    // for one bit and |im| for the other, but DQPSK couples the two
+    // axes nonlinearly so the symbol-magnitude is the safe approximation).
+    //
+    // Scale: max_mag2 (from step 3) bounds |pll_out|² across the burst;
+    // we normalise so the brightest symbol sits near INT16 mid-scale,
+    // giving Chase-2 plenty of soft headroom without overflow.
+    float mag_scale = 0.0f;
+    if (max_mag2 > 0.0f) {
+        mag_scale = 16384.0f / sqrtf(max_mag2);   // brightest symbol → ~16k
+    }
     int old_sym = 0;
     out->bits = malloc(n_symbols * 2);
+    out->soft_bits = malloc(n_symbols * 2 * sizeof(int16_t));
     out->n_bits = n_symbols * 2;
     for (int i = 0; i < n_symbols; i++) {
         int diff = (hard_decisions[i] - old_sym + 4) % 4;
         old_sym = hard_decisions[i];
         int decoded = DQPSK_MAP[diff];
-        out->bits[2 * i + 0] = (decoded >> 1) & 1;
-        out->bits[2 * i + 1] = decoded & 1;
+        uint8_t b0 = (decoded >> 1) & 1;
+        uint8_t b1 = decoded & 1;
+        out->bits[2 * i + 0] = b0;
+        out->bits[2 * i + 1] = b1;
+        if (out->soft_bits) {
+            float re = crealf(pll_out[i]);
+            float im = cimagf(pll_out[i]);
+            float mag = sqrtf(re * re + im * im) * mag_scale;
+            if (mag > 32000.0f) mag = 32000.0f;
+            int16_t conf = (int16_t)mag;
+            // Sign convention: bit=0 → positive soft, bit=1 → negative.
+            out->soft_bits[2 * i + 0] = b0 ? (int16_t)-conf : conf;
+            out->soft_bits[2 * i + 1] = b1 ? (int16_t)-conf : conf;
+        }
     }
 
     ESP_LOGI(TAG, "Successfully demodulated %s frame, %d bits",

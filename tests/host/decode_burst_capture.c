@@ -80,6 +80,7 @@ static void on_frame(burst_pipeline_result_t *res, void *ctx)
     else                          bs->frames_dl++;
 
     free(res->frame.bits);
+    free(res->frame.soft_bits);   // #112
 }
 
 int main(int argc, char **argv)

@@ -191,6 +191,7 @@ int main(int argc, char **argv) {
                    res.uw_res.snr_estimate_db, res.omega_coarse,
                    dir, res.frame.n_bits);
             free(res.frame.bits);
+            free(res.frame.soft_bits);   // #112
         } else {
             const char *why = !ok ? "TOO-SHORT"
                               : (!have_uw ? "no-UW" : "no-demod");

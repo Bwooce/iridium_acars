@@ -17,6 +17,7 @@ typedef struct {
     uint32_t bursts_bch_decoded;  // subset whose frame passed BCH AND classified as a known type (real decodes)
     uint32_t bursts_bch_unknown;  // subset that passed BCH but iridium_frame_classify returned UNKNOWN (BCH false positives)
     uint32_t bursts_bch_failed;   // subset that demod'd but BCH was uncorrectable (qpsk_demod false positives)
+    uint32_t bursts_bch_chase_recovered;  // subset where hard-BCH failed but Chase-2 soft decoder rescued it (#112; subset of bursts_bch_decoded + bursts_bch_unknown)
     uint32_t queue_high_water;    // peak observed queue depth
     float    avg_burst_us;        // mean wall-clock per processed burst
 

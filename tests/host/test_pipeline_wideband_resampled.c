@@ -157,6 +157,7 @@ int main(void) {
         if (res.demod_ok) {
             decoded++;
             free(res.frame.bits);
+            free(res.frame.soft_bits);   // #112
         }
     }
 

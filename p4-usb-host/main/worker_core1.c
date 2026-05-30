@@ -61,6 +61,7 @@ static volatile uint64_t s_burst_total_us = 0;
 static volatile uint32_t s_bursts_bch_decoded = 0;  // BCH OK AND classify returned a known type
 static volatile uint32_t s_bursts_bch_unknown = 0;  // BCH OK but iridium_frame_classify => IR_FRAME_UNKNOWN (BCH false-positive — task #111)
 static volatile uint32_t s_bursts_bch_failed  = 0;  // BCH itself uncorrectable
+static volatile uint32_t s_bursts_bch_chase_recovered = 0;  // Chase-2 soft decoder rescued a hard-decision BCH failure (#112)
 
 // Per-stage timing accumulators, summed over processed bursts only.
 static volatile uint64_t s_t_extract_us = 0;
@@ -411,6 +412,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
         // Failed sub-frames still fire the callback for diagnostic
         // logging; just free the bits and return.
         free(bres->frame.bits);
+        free(bres->frame.soft_bits);   // #112
         wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);
         return;
     }
@@ -421,6 +423,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
              frame.n_bits);
 
     int e1_bch = -1, e2_bch = -1;
+    bool chase_used = false;
     if (frame.n_bits >= 24 + 64) {
         const uint8_t *payload = frame.bits + 24;
         uint8_t block1[32], block2[32];
@@ -430,7 +433,26 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
         e1_bch = bch_decode_block(block1, data1);
         e2_bch = bch_decode_block(block2, data2);
 
+        // Chase-2 soft decoder rescue path (#112). On hard-BCH failure
+        // for either block, retry with K=3 (8 trials) soft Chase-2 using
+        // the per-bit soft metrics qpsk_demod populated. Typical gain
+        // 1.0-1.5 dB at the BCH stage on Iridium; sub-100 µs of compute
+        // per frame on P4 (8 hard decodes × 31-bit poly division).
+        if ((e1_bch < 0 || e2_bch < 0) && frame.soft_bits != NULL) {
+            int16_t soft1[32], soft2[32];
+            iridium_deinterleave_int16(frame.soft_bits + 24, soft1, soft2);
+            if (e1_bch < 0) {
+                int e = bch_decode_block_soft(soft1, data1, 3);
+                if (e >= 0) { e1_bch = e; chase_used = true; }
+            }
+            if (e2_bch < 0) {
+                int e = bch_decode_block_soft(soft2, data2, 3);
+                if (e >= 0) { e2_bch = e; chase_used = true; }
+            }
+        }
+
         if (e1_bch >= 0 && e2_bch >= 0) {
+            if (chase_used) s_bursts_bch_chase_recovered++;
             // BCH passed — but at marginal SNR (~12-13 dB) BCH(31,21)
             // can correct random noise into a "valid" 31-bit codeword
             // that has no Iridium frame structure. Classify before
@@ -471,6 +493,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
                        frame.direction, 0u,
                        wctx->burst->peak_bin, wctx->burst->peak_snr_db);
     free(frame.bits);
+    free(frame.soft_bits);   // #112
     wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);
 }
 
@@ -823,6 +846,7 @@ void worker_core1_get_stats(worker_stats_t *out)
     out->bursts_bch_decoded = s_bursts_bch_decoded;
     out->bursts_bch_unknown = s_bursts_bch_unknown;
     out->bursts_bch_failed  = s_bursts_bch_failed;
+    out->bursts_bch_chase_recovered = s_bursts_bch_chase_recovered;
     out->queue_high_water   = s_queue_high_water;
     if (n > 0) {
         float fn = (float)n;
@@ -845,6 +869,7 @@ void worker_core1_get_stats(worker_stats_t *out)
     s_bursts_bch_decoded = 0;
     s_bursts_bch_unknown = 0;
     s_bursts_bch_failed = 0;
+    s_bursts_bch_chase_recovered = 0;
     s_queue_high_water = 0;
     s_burst_total_us = 0;
     s_t_extract_us = s_t_rotate_us = s_t_decim_us = s_t_pipeline_us

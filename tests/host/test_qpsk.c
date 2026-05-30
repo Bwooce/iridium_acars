@@ -86,14 +86,17 @@ static int test_direction(const int *uw, const char *name, ir_direction_t expect
         printf("  %s: FAIL — direction=%d, expected=%d\n",
                name, (int)frame.direction, (int)expected);
         free(frame.bits);
+        free(frame.soft_bits);   // #112
         return 0;
     }
     if (frame.n_bits != 32 * 2) {
         printf("  %s: FAIL — n_bits=%d, expected=64\n", name, frame.n_bits);
         free(frame.bits);
+        free(frame.soft_bits);   // #112
         return 0;
     }
     free(frame.bits);
+    free(frame.soft_bits);   // #112
     return 1;
 }
 
@@ -116,6 +119,7 @@ static int test_unknown_direction(void)
     if (rc != 0) {
         printf("  unknown-UW: FAIL — demod returned %d (expected 0)\n", rc);
         free(frame.bits);
+        free(frame.soft_bits);   // #112
         return 0;
     }
     return 1;
@@ -132,6 +136,7 @@ static int test_too_short(void)
     if (rc != 0) {
         printf("  too-short: FAIL — demod returned %d (expected 0)\n", rc);
         free(frame.bits);
+        free(frame.soft_bits);   // #112
         return 0;
     }
     return 1;

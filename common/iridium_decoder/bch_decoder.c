@@ -202,3 +202,17 @@ void iridium_deinterleave(const uint8_t *in, uint8_t *out1, uint8_t *out2)
         out2[p++] = in[2 * s + 1];
     }
 }
+
+void iridium_deinterleave_int16(const int16_t *in, int16_t *out1, int16_t *out2)
+{
+    int p = 0;
+    for (int s = 31; s >= 1; s -= 2) {
+        out1[p++] = in[2 * s];
+        out1[p++] = in[2 * s + 1];
+    }
+    p = 0;
+    for (int s = 30; s >= 0; s -= 2) {
+        out2[p++] = in[2 * s];
+        out2[p++] = in[2 * s + 1];
+    }
+}

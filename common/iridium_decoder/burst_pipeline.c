@@ -317,6 +317,7 @@ static void legacy_first_frame_cb(burst_pipeline_result_t *res, void *ctx)
     } else {
         // Extra frames -- caller of legacy API doesn't take them.
         free(res->frame.bits);
+        free(res->frame.soft_bits);   // #112
     }
     lc->n_seen++;
 }
