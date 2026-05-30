@@ -378,15 +378,17 @@ static void smoke_test_run_live_sdr(void)
     uint32_t d_queued   = s1.bursts_queued    - s0.bursts_queued;
     uint32_t d_proc     = s1.bursts_processed - s0.bursts_processed;
     uint32_t d_bch_ok   = s1.bursts_bch_decoded - s0.bursts_bch_decoded;
+    uint32_t d_bch_unk  = s1.bursts_bch_unknown - s0.bursts_bch_unknown;
     uint32_t d_bch_fail = s1.bursts_bch_failed  - s0.bursts_bch_failed;
     uint32_t d_drop     = s1.bursts_dropped   - s0.bursts_dropped;
     uint32_t d_skip     = s1.bursts_skipped   - s0.bursts_skipped;
 
     ESP_LOGI(TAG, "Live-SDR window done after %.1f s", window_s);
     ESP_LOGI(TAG, "  Worker delta: queued=%u processed=%u "
-                   "bch_decoded=%u bch_failed=%u dropped=%u skipped=%u",
+                   "bch_decoded=%u bch_unknown=%u bch_failed=%u "
+                   "dropped=%u skipped=%u",
              (unsigned)d_queued, (unsigned)d_proc,
-             (unsigned)d_bch_ok, (unsigned)d_bch_fail,
+             (unsigned)d_bch_ok, (unsigned)d_bch_unk, (unsigned)d_bch_fail,
              (unsigned)d_drop, (unsigned)d_skip);
     ESP_LOGI(TAG, "  Heap: PSRAM free=%u KB  internal free=%u KB",
              (unsigned)(psram_free / 1024),

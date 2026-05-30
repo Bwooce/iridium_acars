@@ -35,6 +35,7 @@
 #include "rotate_to_dc.h"
 #include "bch_decoder.h"
 #include "frame_decoder.h"
+#include "iridium_frame.h"
 #include "sdkconfig.h"
 
 #if CONFIG_SMOKE_TEST_RAW_IRIDIUM
@@ -57,8 +58,9 @@ static volatile uint64_t s_burst_total_us = 0;
 // passed BCH — the real decode rate. bch_failed counts qpsk-demod
 // successes that produced an uncorrectable frame (false-positive
 // decodes from the application's perspective).
-static volatile uint32_t s_bursts_bch_decoded = 0;
-static volatile uint32_t s_bursts_bch_failed = 0;
+static volatile uint32_t s_bursts_bch_decoded = 0;  // BCH OK AND classify returned a known type
+static volatile uint32_t s_bursts_bch_unknown = 0;  // BCH OK but iridium_frame_classify => IR_FRAME_UNKNOWN (BCH false-positive — task #111)
+static volatile uint32_t s_bursts_bch_failed  = 0;  // BCH itself uncorrectable
 
 // Per-stage timing accumulators, summed over processed bursts only.
 static volatile uint64_t s_t_extract_us = 0;
@@ -429,12 +431,32 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
         e2_bch = bch_decode_block(block2, data2);
 
         if (e1_bch >= 0 && e2_bch >= 0) {
-            // Per-frame BCH outcomes demoted to LOGD: the GOLDEN summary
-            // aggregates counts (clean/corrected/failed/skipped) so the
-            // per-frame logs are just diagnostic noise during runs.
-            ESP_LOGD(TAG, "BCH PASS: errors=%d/%d (real decode)",
-                     e1_bch, e2_bch);
-            s_bursts_bch_decoded++;
+            // BCH passed — but at marginal SNR (~12-13 dB) BCH(31,21)
+            // can correct random noise into a "valid" 31-bit codeword
+            // that has no Iridium frame structure. Classify before
+            // calling this a real decode (task #111): only count
+            // bch_decoded when iridium_frame_classify returns a known
+            // frame type. The downstream frame_decoder re-classifies
+            // independently and feeds the /status frames.{ms,tl,bc,lw,ra}
+            // counters; this is the worker-side "real frame" signal.
+            iridium_frame_t classified = { 0 };
+            ir_frame_direction_t fdir = (frame.direction == DIR_DOWNLINK)
+                                        ? IR_FRM_DIR_DOWNLINK
+                                        : IR_FRM_DIR_UPLINK;
+            int crc = iridium_frame_classify(frame.bits, frame.n_bits,
+                                             fdir, &classified);
+            if (crc == 0 && classified.type != IR_FRAME_UNKNOWN) {
+                ESP_LOGD(TAG, "BCH PASS: errors=%d/%d type=%s (real decode)",
+                         e1_bch, e2_bch,
+                         iridium_frame_type_name(classified.type));
+                s_bursts_bch_decoded++;
+            } else {
+                ESP_LOGD(TAG, "BCH PASS but UNKNOWN: errors=%d/%d "
+                              "(BCH false-positive — noise corrected into "
+                              "a valid codeword with no frame structure)",
+                         e1_bch, e2_bch);
+                s_bursts_bch_unknown++;
+            }
         } else {
             ESP_LOGD(TAG, "BCH FAIL: e1=%d e2=%d (false-positive "
                            "qpsk_demod success — bits unusable)",
@@ -799,6 +821,7 @@ void worker_core1_get_stats(worker_stats_t *out)
     out->bursts_processed   = n;
     out->bursts_skipped     = s_bursts_skipped;
     out->bursts_bch_decoded = s_bursts_bch_decoded;
+    out->bursts_bch_unknown = s_bursts_bch_unknown;
     out->bursts_bch_failed  = s_bursts_bch_failed;
     out->queue_high_water   = s_queue_high_water;
     if (n > 0) {
@@ -820,6 +843,7 @@ void worker_core1_get_stats(worker_stats_t *out)
     s_bursts_processed = 0;
     s_bursts_skipped = 0;
     s_bursts_bch_decoded = 0;
+    s_bursts_bch_unknown = 0;
     s_bursts_bch_failed = 0;
     s_queue_high_water = 0;
     s_burst_total_us = 0;

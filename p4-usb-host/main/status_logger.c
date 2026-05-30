@@ -125,18 +125,20 @@ static void emit(const status_snapshot_t *s)
              s->dsp.wind_us, s->dsp.fft_us, s->dsp.mag_us,
              s->dsp.detect_us, s->dsp.baseline_us);
 
-    // bch_decoded is the REAL decode rate (qpsk_demod + BCH passed);
-    // processed includes false positives where qpsk_demod found UW
-    // but the frame's BCH-protected payload was uncorrectable.
-    // On the ALBQ raw fixture: processed=58 typically resolves to
-    // bch_decoded=19 + bch_failed=27 + bch_skipped(short)=12.
+    // bch_decoded is the REAL decode rate (BCH passed AND classify
+    // returned a known frame type — task #111). bch_unknown is BCH
+    // passed but iridium_frame_classify => UNKNOWN, i.e. BCH random-
+    // noise false-positives. processed includes both plus qpsk_demod
+    // successes that fail BCH outright. On the ALBQ raw fixture:
+    // processed=58 typically resolves to bch_decoded=19 + bch_failed=27
+    // + bch_skipped(short)=12.
     ESP_LOGI(TAG, "Worker: queued=%u dropped=%u processed=%u "
-                  "bch_decoded=%u bch_failed=%u skipped=%u "
+                  "bch_decoded=%u bch_unknown=%u bch_failed=%u skipped=%u "
                   "qmax=%u avg_burst=%.0f us cap=%.1f%%",
              s->ws.bursts_queued, s->ws.bursts_dropped, s->ws.bursts_processed,
-             s->ws.bursts_bch_decoded, s->ws.bursts_bch_failed,
-             s->ws.bursts_skipped, s->ws.queue_high_water, s->ws.avg_burst_us,
-             worker_pct);
+             s->ws.bursts_bch_decoded, s->ws.bursts_bch_unknown,
+             s->ws.bursts_bch_failed, s->ws.bursts_skipped,
+             s->ws.queue_high_water, s->ws.avg_burst_us, worker_pct);
 
     ESP_LOGI(TAG, "Worker-stages (us): extract=%.0f freq=%.0f fir=%.0f "
                   "resamp=%.0f demod=%.0f bch=%.0f",
@@ -159,14 +161,16 @@ static void emit(const status_snapshot_t *s)
                               * (double)s->ws.avg_burst_us
                               / (double)s->window_us;
 
-    // bch_decoded = real Iridium frame decodes (qpsk_demod + BCH pass).
-    // processed is the qpsk_demod success count (includes BCH false-
-    // positives). They diverge when borderline-SNR bursts pass UW
-    // correlation but fail BCH.
+    // bch_decoded = real Iridium frame decodes (BCH pass AND classify
+    // known type — task #111). bch_unknown = BCH false positives (random
+    // noise corrected into valid codeword with no frame structure);
+    // expect this to dominate over bch_decoded under marginal RF.
     ESP_LOGI(TAG, "STATUS: rate=%.2f MB/s frames=%u processed=%u "
-                  "bch_decoded=%u drops=%u dsp_cap=%.0f%% worker_cap=%.0f%%",
+                  "bch_decoded=%u bch_unknown=%u drops=%u "
+                  "dsp_cap=%.0f%% worker_cap=%.0f%%",
              rate_inst, s->dsp_frame_count,
              s->ws.bursts_processed, s->ws.bursts_bch_decoded,
+             s->ws.bursts_bch_unknown,
              s->us.rb_full_drops, dsp_pct, worker_pct);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
