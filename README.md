@@ -156,13 +156,19 @@ When something's wrong:
 
 ## Capturing real bursts (when the antenna is hooked up)
 
-Background-log the serial port to `/tmp/`:
+Background-log the serial port with `serial_logger.sh` — auto-detects the
+P4 port by USB vendor:product, auto-reconnects across reflashes / USB
+re-enumeration, optionally rotates the log:
 
 ```sh
-nohup ./scripts/monitor.sh 999999 /dev/ttyACM0 > /tmp/p4_iridium_capture.full.log 2>&1 &
+./scripts/serial_logger.sh &                  # default log: /tmp/p4_serial.log
+./scripts/serial_logger.sh status             # is it alive?
+./scripts/serial_logger.sh stop               # kill the instance
 ```
 
-Or use a filtering wrapper that only writes interesting events
+For one-shot N-second captures use `./scripts/monitor.sh <seconds>` instead.
+
+Or pipe through a filtering wrapper that only writes interesting events
 (`BURST DETECTED`, `Worker: ... processed=N`, USB errors, panics) to
 keep the log small over long captures.
 

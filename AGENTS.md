@@ -33,8 +33,18 @@ common workflow:
 ./scripts/flash.sh /dev/ttyACM0   # explicit
 
 # Non-interactive serial monitor — reads N seconds of output to stdout
-# (grep/awk-pipeable). Use this from automation; idf.py monitor is for humans.
+# (grep/awk-pipeable). Use this for one-shot capture from automation;
+# idf.py monitor is for humans.
 ./scripts/monitor.sh <seconds> [/dev/ttyACM0]
+
+# Long-running serial capture with auto-reconnect across reflashes /
+# USB re-enumeration. Single-instance via PID file; writes to
+# /tmp/p4_serial.log by default. Use this for bench soaks (replaces
+# the ad-hoc `nohup cat /dev/ttyACM0` pattern that died on every
+# flash reset).
+./scripts/serial_logger.sh        # start (foreground; & or nohup to bg)
+./scripts/serial_logger.sh status # is it alive? log path + size
+./scripts/serial_logger.sh stop   # kill the instance + orphan cats
 ```
 
 Build and flash are intentionally split into separate scripts so each can
@@ -268,7 +278,8 @@ iridium_acars/                   # repo root
   scripts/                       # repo-level dev-loop tools
     build.sh                     # ninja-direct, idf.py fallback
     flash.sh                     # idf.py flash with port auto-detect
-    monitor.sh                   # non-interactive serial monitor
+    monitor.sh                   # one-shot N-second serial read (for grep/awk)
+    serial_logger.sh             # long-running serial capture, auto-reconnects
   common/                        # shared IDF components (cross-board)
     iridium_decoder/             # BCH + DQPSK demod
       bch_decoder.{c,h}
