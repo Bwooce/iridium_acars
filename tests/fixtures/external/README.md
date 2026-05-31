@@ -47,6 +47,18 @@ Optional / deferred (alphabetical):
 | **Oxford SatIQ — Watch This Space** ([Zenodo 8220494](https://zenodo.org/record/8220494)) | 135 GB compressed → 67 TB uncompressed. 1.7 M IRA messages as numpy .npy files, **25 MS/s** per-burst | Highest-rate per-burst dataset publicly available; ideal for fingerprinting research. Code at [ssloxford/SatIQ](https://github.com/ssloxford/SatIQ) | Massive — far exceeds what's needed for pipeline regression testing. Per-burst layer (same as Mendeley). |
 | **Oxford SatIQ — 3 locations** ([UK](https://doi.org/10.7910/DVN/P5FUAW), [Germany](https://doi.org/10.7910/DVN/RXWV1M), [Switzerland](https://doi.org/10.7910/DVN/OSSJ68) on Harvard Dataverse) | Three geographic captures, full size each unknown but on the order of the Watch This Space set | Geographic diversity (channel statistics vary with antenna location); useful if we ever want to debug a propagation-channel-related issue | Same per-burst layer; storage cost > usefulness for our regression goals. |
 
+### Layer B sources not yet public (but worth asking)
+
+A June 2026 survey of all major repositories (Zenodo, figshare, Harvard Dataverse, SigMF/IQEngine, sigidwiki, GitHub, Kaggle, Internet Archive, Reddit r/RTLSDR, GNU Radio Discourse) found **no publicly downloadable wideband (≥4 MHz) Iridium L-band IQ captures** other than our own ALBQ recording.
+
+One promising lead:
+
+| Source | Format | Why interesting | Status |
+|---|---|---|---|
+| **alphafox02/iridium-sniffer benchmark recording** ([github.com/alphafox02/iridium-sniffer](https://github.com/alphafox02/iridium-sniffer)) | cf32, 10 MHz BW, 1622 MHz centre, USRP B210, 60 s | Exactly the format and bandwidth we need; referenced in the README but not published | Not released. Contact author (@cemaxecuter on X / GitHub issue) to request it. |
+
+Suggested request text for a GitHub issue: *"We're building a wideband Iridium ACARS/SBD decoder (ESP32-P4, open-source) and are looking for a second wideband test fixture to complement our ALBQ USRP B210 capture. Would you be willing to share the 60-second cf32/10 MHz/1622 MHz B210 recording you reference in the README?"*
+
 ### Layer B — wideband fixtures
 
 Raw SDR output at the radio sample rate (typically 2.4–12 MSPS),
