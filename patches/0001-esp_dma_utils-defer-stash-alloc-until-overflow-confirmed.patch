@@ -1,55 +1,22 @@
-diff --git a/components/esp_driver_dma/src/esp_dma_utils.c b/components/esp_driver_dma/src/esp_dma_utils.c
-index 9836f7670a..baeebf1adb 100644
---- a/components/esp_driver_dma/src/esp_dma_utils.c
-+++ b/components/esp_driver_dma/src/esp_dma_utils.c
-@@ -47,11 +47,28 @@ esp_err_t esp_dma_split_rx_buffer_to_cache_aligned(void *rx_buffer, size_t buffe
-     bool align_required = split_line_size > 0;
-     ESP_EARLY_LOGV(TAG, "split_line_size:%zu", split_line_size);
- 
-+    // Calculate overflow lengths up front so we know whether a stash buffer is
-+    // actually needed before touching the DMA-INT heap.
-+    size_t head_overflow_len = 0;
-+    size_t tail_overflow_len = 0;
-+    bool is_small_buf = false;
-+    if (align_required) {
-+        head_overflow_len = (uintptr_t)rx_buffer % split_line_size;
-+        head_overflow_len = head_overflow_len ? split_line_size - head_overflow_len : 0;
-+        tail_overflow_len = ((uintptr_t)rx_buffer + buffer_len) % split_line_size;
-+        is_small_buf = head_overflow_len >= buffer_len || tail_overflow_len >= buffer_len;
-+    }
-+    bool need_stash = head_overflow_len || tail_overflow_len || is_small_buf;
-+
-     if (*ret_stash_buffer == NULL) {
--        // If the stash buffer is not offered by the caller, allocate the stash buffer from internal RAM
--        // Note, the split_line_size can be 0, in this case, the stash_buffer is also NULL, which is fine
--        stash_buffer = heap_caps_calloc(2, split_line_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
--        ESP_RETURN_ON_FALSE_ISR(!(split_line_size && !stash_buffer), ESP_ERR_NO_MEM, TAG, "no mem for stash buffer");
-+        // Only allocate from DMA-INT heap when the buffer is actually unaligned.
-+        // Allocating unconditionally causes the tiny DMA-INT heap to fragment
-+        // over time on high-throughput paths where buffers are already aligned.
-+        if (need_stash && split_line_size > 0) {
-+            stash_buffer = heap_caps_calloc(2, split_line_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-+            ESP_RETURN_ON_FALSE_ISR(stash_buffer, ESP_ERR_NO_MEM, TAG, "no mem for stash buffer");
-+        }
-+        // else: stash_buffer stays NULL — aligned buffer, no stash needed
-     } else {
-         // If the stash buffer is offered by the caller, check if it is aligned
-         ESP_RETURN_ON_FALSE_ISR(split_line_size == 0 || (uintptr_t)(*ret_stash_buffer) % split_line_size == 0,
-@@ -66,16 +83,11 @@ esp_err_t esp_dma_split_rx_buffer_to_cache_aligned(void *rx_buffer, size_t buffe
- 
-     // if align_required, split the buffer into head, body and tail
-     if (align_required) {
--        // calculate head_overflow_len
--        size_t head_overflow_len = (uintptr_t)rx_buffer % split_line_size;
--        head_overflow_len = head_overflow_len ? split_line_size - head_overflow_len : 0;
-         ESP_EARLY_LOGV(TAG, "head_addr:%p head_overflow_len:%zu", rx_buffer, head_overflow_len);
--        // calculate tail_overflow_len
--        size_t tail_overflow_len = ((uintptr_t)rx_buffer + buffer_len) % split_line_size;
-         ESP_EARLY_LOGV(TAG, "tail_addr:%p tail_overflow_len:%zu", rx_buffer + buffer_len - tail_overflow_len, tail_overflow_len);
- 
-         // special handling when input_buffer length is no more than buffer alignment
--        bool is_small_buf = head_overflow_len >= buffer_len || tail_overflow_len >= buffer_len;
-+        // (is_small_buf already computed above)
-         uint8_t extra_buf_count = 0;
-         uint8_t* input_buffer = (uint8_t*)rx_buffer;
-         if (head_overflow_len || is_small_buf) {
+diff --git a/components/esp_driver_dma/src/async_memcpy_gdma.c b/components/esp_driver_dma/src/async_memcpy_gdma.c
+index ae0fc8ea77..0f53a855e0 100644
+--- a/components/esp_driver_dma/src/async_memcpy_gdma.c
++++ b/components/esp_driver_dma/src/async_memcpy_gdma.c
+@@ -369,7 +369,7 @@ static esp_err_t mcp_gdma_memcpy(async_memcpy_context_t *ctx, void *dst, void *s
+         .num_items = num_dma_nodes,
+         .flags = {
+             .check_owner = true,
+-            .items_in_ext_mem = false, // TODO: if the memcopy size is too large, we may need to allocate the link list items from external memory
++            .items_in_ext_mem = true, // P4 AXI-GDMA can fetch descriptors from PSRAM; avoids fragmenting the tiny DMA-INT heap
+         },
+     };
+     ESP_GOTO_ON_ERROR(gdma_new_link_list(&tx_link_cfg, &trans->tx_link_list), err, TAG, "failed to create TX link list");
+@@ -402,7 +402,7 @@ static esp_err_t mcp_gdma_memcpy(async_memcpy_context_t *ctx, void *dst, void *s
+         .num_items = num_dma_nodes + 3, // add 3 extra items for the cache aligned buffers
+         .flags = {
+             .check_owner = true,
+-            .items_in_ext_mem = false, // TODO: if the memcopy size is too large, we may need to allocate the link list items from external memory
++            .items_in_ext_mem = true, // P4 AXI-GDMA can fetch descriptors from PSRAM; avoids fragmenting the tiny DMA-INT heap
+         },
+     };
+     ESP_GOTO_ON_ERROR(gdma_new_link_list(&rx_link_cfg, &trans->rx_link_list), err, TAG, "failed to create RX link list");
