@@ -261,6 +261,33 @@ target_include_directories(test_pipeline_wideband_resampled PRIVATE
 )
 target_link_libraries(test_pipeline_wideband_resampled PRIVATE m)
 
+# Drift + AWGN parameter-sweep regression (#121). Same wideband pipeline
+# as test_pipeline_wideband_resampled, but each cell applies a synthetic
+# LO drift (±5/10/15 kHz) and added AWGN (sigma 0..400 int16 LSB), then
+# counts demod_ok + bch_ok. Quantifies the sensitivity gain from
+# #112/#113/#115 and catches future regressions.
+add_executable(test_pipeline_drift_snr
+    test_pipeline_drift_snr.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+    ${COMMON_DIR}/bch_decoder.c
+)
+target_include_directories(test_pipeline_drift_snr PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_pipeline_drift_snr PRIVATE m)
+
 # Per-layer gri-equivalence check at the TAGGER level. Counts at
 # the end of the pipeline (decode count) have been misleading before
 # (gri's "65 decoded" was frames; our "138 tagged" wasn't comparable);
@@ -515,6 +542,7 @@ add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 # tests/scripts/direct_if_dump.py to have run first.
 add_test(NAME rotate_to_dc          COMMAND test_rotate_to_dc)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
+add_test(NAME pipeline_drift_snr   COMMAND test_pipeline_drift_snr)
 # uw_correlator_cfo NOT auto-registered: its synthetic-burst
 # expectations predate the gr-iridium-alignment work in
 # uw_correlator.c (5 alignment commits since the test was written —
