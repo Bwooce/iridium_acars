@@ -699,35 +699,12 @@ void worker_task(void *arg)
                 continue;
             }
 
-            // 3.5 Per-burst DC removal at 250 ksps (#113). The RTL-SDR
-            //    R820T tuner doesn't auto-calibrate DC; the byte-128
-            //    bias correction at ingest_core1.c subtracts the nominal
-            //    centre only, leaving residual DC that varies with
-            //    temperature and gain setting. After downmix above the
-            //    DC lands at the channel centre as a coherent tone —
-            //    biases the squared-FFT CFO estimator (uw_correlator)
-            //    and distorts the matched-filter peak. Subtract the
-            //    burst's mean in place. Two PSRAM passes (~1.6 ms at
-            //    16k samples ≈ 3% of typical burst budget). Cross-
-            //    validation safe: fixture corpora pass through gri's
-            //    GNU Radio flowgraph which has a DC blocker by
-            //    convention, so the fixtures already have ~zero DC and
-            //    this is a no-op there. Net gain ~0.3-0.5 dB at the
-            //    channel boundary.
-            {
-                int32_t sum_re = 0, sum_im = 0;
-                for (int i = 0; i < n_250k; i++) {
-                    sum_re += s_decim_buf[i * 2 + 0];
-                    sum_im += s_decim_buf[i * 2 + 1];
-                }
-                // Max sum bound: ±32768 × 24k ≈ ±800M, well within int32.
-                int16_t dc_re = (int16_t)(sum_re / n_250k);
-                int16_t dc_im = (int16_t)(sum_im / n_250k);
-                for (int i = 0; i < n_250k; i++) {
-                    s_decim_buf[i * 2 + 0] -= dc_re;
-                    s_decim_buf[i * 2 + 1] -= dc_im;
-                }
-            }
+            // 3.5 Per-burst DC removal moved INSIDE burst_pipeline_process_burst
+            //     as step 0 (2026-05-31, #128). Was at this site originally
+            //     (#113) but the host pipeline tests didn't replicate it,
+            //     which gave the host suite a different pre-CFO statistic
+            //     than the device worker — the gap that hid the #115
+            //     regression. Now in one place.
 
             // 4. Per-burst pipeline at 250 ksps. Multi-frame callback
             //    fires once per decoded sub-frame so multi-frame bursts

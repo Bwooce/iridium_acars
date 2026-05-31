@@ -339,6 +339,38 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
 {
     PROFILE_T0();
 
+    // 0. Per-burst DC removal (#113, moved here from worker_core1.c
+    //    2026-05-31 as part of #128 host-harness parity work). The RTL-
+    //    SDR R820T tuner doesn't auto-calibrate DC; the byte-128 bias
+    //    correction at ingest_core1 subtracts only the nominal centre,
+    //    leaving residual DC that varies with temperature and gain.
+    //    Inside the per-burst window the DC lands at the channel centre
+    //    as a coherent tone — biases the squared-FFT CFO estimator
+    //    (uw_correlator below) and distorts the matched-filter peak.
+    //    Subtract the burst's mean in place. Two passes (~1.6 ms at 16k
+    //    samples ≈ 3% of typical burst budget on P4). Cross-validation
+    //    safe: gri fixtures pass through a DC blocker by convention so
+    //    they already have ~zero DC and this is a no-op there.
+    //
+    //    By living here, host pipeline tests (test_pipeline_drift_snr,
+    //    test_pipeline_wideband_albq, test_pipeline_direct_if_albq,
+    //    test_pipeline_wideband_resampled) all get the same pre-CFO
+    //    statistic as the device worker — closing the gap that hid the
+    //    #115 regression where host PASS didn't predict device PASS.
+    if (n_complex > 0) {
+        int32_t sum_re = 0, sum_im = 0;
+        for (int i = 0; i < n_complex; i++) {
+            sum_re += iq250[i * 2 + 0];
+            sum_im += iq250[i * 2 + 1];
+        }
+        int16_t dc_re = (int16_t)(sum_re / n_complex);
+        int16_t dc_im = (int16_t)(sum_im / n_complex);
+        for (int i = 0; i < n_complex; i++) {
+            iq250[i * 2 + 0] -= dc_re;
+            iq250[i * 2 + 1] -= dc_im;
+        }
+    }
+
     // 1. D13 envelope start_finder. Search depth matches gr-iridium's
     //    burst_downmix exactly: 0.007 × burst_sample_rate = 1750
     //    samples at 250 ksps (= ~7 ms). With our 17.6 ms padded
