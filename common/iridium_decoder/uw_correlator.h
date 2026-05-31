@@ -95,6 +95,10 @@ void uw_correlator_find(const int16_t *burst, int n_complex,
 //              56 = 16 preamble + 12 UW × 2 sps; clamped to 24-56)
 float uw_correlator_estimate_cfo(const int16_t *burst, int n_complex);
 
+// #115: how often cfo_fine_estimate rejected its own peak as low-confidence
+// (peak/second-peak ratio < 6 dB). Cumulative since boot.
+uint32_t uw_correlator_get_cfo_low_confidence_count(void);
+
 // Apply the root-raised-cosine matched filter to a 2-sps interleaved
 // int16 IQ burst, in-place equivalent (in and out may be the same
 // buffer). gr-iridium's burst_downmix_impl.cc applies RRC to the
