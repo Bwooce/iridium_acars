@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# pre-push: any commit being pushed that touches the DSP path must have
+# a Smoke-verified: or Smoke-skip: trailer. Catches the failure mode
+# that bit us 2026-05-31 with #115 — host suite green, device smoke
+# regression invisible until manual run.
+#
+# Enable per-clone with:
+#   git config core.hooksPath .githooks
+#
+# Bypass for a single push with `git push --no-verify` ONLY when you
+# accept the risk.
+
+set -e
+
+DSP_PATHS='common/iridium_decoder/|p4-usb-host/main/(worker_core1|burst_pipeline|signal_buffer|dsp_processor|ingest_core1|qpsk_demod|uw_correlator|frame_decoder|smoke_test)'
+
+zero="0000000000000000000000000000000000000000"
+fail=0
+
+while read local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue  # branch deletion
+
+    if [ "$remote_sha" = "$zero" ]; then
+        # New branch — check all commits not on any other branch.
+        range=$(git rev-list --not --branches="*" --exclude="$local_ref" "$local_sha" 2>/dev/null || echo "$local_sha")
+    else
+        range="${remote_sha}..${local_sha}"
+    fi
+
+    commits=$(git rev-list "$range" 2>/dev/null || true)
+    [ -z "$commits" ] && continue
+
+    for c in $commits; do
+        # Does this commit touch DSP files?
+        if ! git diff-tree --no-commit-id --name-only -r "$c" 2>/dev/null | grep -qE "$DSP_PATHS"; then
+            continue
+        fi
+
+        # Is it a pure revert? Reverts inherit their validation from the
+        # original commit's mistake (we know what they undo).
+        if git log -1 --format=%s "$c" | grep -qE '^Revert '; then
+            continue
+        fi
+
+        msg=$(git log -1 --format=%B "$c")
+        if echo "$msg" | grep -qE '^(Smoke-verified|Smoke-skip):'; then
+            continue
+        fi
+
+        if [ "$fail" -eq 0 ]; then
+            echo
+            echo "================================================================"
+            echo "  pre-push BLOCKED: DSP-touching commits missing smoke trailer"
+            echo "================================================================"
+            fail=1
+        fi
+        echo "  $(git log -1 --format='%h %s' "$c")"
+        echo "    files touched (DSP only):"
+        git diff-tree --no-commit-id --name-only -r "$c" | grep -E "$DSP_PATHS" | sed 's/^/      /'
+        echo
+    done
+done
+
+if [ "$fail" -eq 1 ]; then
+    cat <<'EOF'
+These commits touch DSP code. Run all 4 smoke variants on hardware
+before pushing:
+
+  /tmp/run_smoke_variant.sh RAW_IRIDIUM
+  /tmp/run_smoke_variant.sh REAL_IRIDIUM
+  /tmp/run_smoke_variant.sh CORPUS
+  /tmp/run_smoke_variant.sh FRAME_DECODER
+
+Then add a trailer to each affected commit (git commit --amend or
+git rebase -i):
+
+  Smoke-verified: RAW=Nframes REAL=Nframes CORPUS=PASS FRAME=PASS
+
+Where Nframes is the per-class real-frame count from "Frame-decoder
+counts:" — UNKNOWN does NOT count. If a smoke variant times out or
+reports zero real frames, the commit is regressing decode and must NOT
+be pushed.
+
+If smoke is genuinely not relevant (comment-only edit, deleted dead
+code, doc shuffling that happens to land in a DSP file), use:
+
+  Smoke-skip: <one-line reason>
+
+Bypass for a single push with `git push --no-verify` only when you
+accept the risk and have a written reason.
+EOF
+    exit 1
+fi
