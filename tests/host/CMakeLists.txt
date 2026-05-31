@@ -543,6 +543,31 @@ add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 add_test(NAME rotate_to_dc          COMMAND test_rotate_to_dc)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
 add_test(NAME pipeline_drift_snr   COMMAND test_pipeline_drift_snr)
+
+# Mendeley Iridium dataset burst-pipeline coverage (task #130). Only
+# built+registered if the generated fixture is present. Run
+#   python3 tests/scripts/fetch_mendeley_iridium.py
+#   python3 tests/scripts/build_mendeley_fixture.py
+# to populate it (4.67 GB download). Test skips cleanly otherwise.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/external/fixture_mendeley_burst_sample.h")
+    add_executable(test_burst_pipeline_mendeley
+        test_burst_pipeline_mendeley.c
+        ${COMMON_DIR}/burst_pipeline.c
+        ${COMMON_DIR}/uw_correlator.c
+        ${COMMON_DIR}/uw_correlator_tables.c
+        ${COMMON_DIR}/qpsk_demod.c
+        ${COMMON_DIR}/sym_timing.c
+        ${COMMON_DIR}/bch_decoder.c
+        ${COMMON_DIR}/fft_sc16_2048.c
+    )
+    target_include_directories(test_burst_pipeline_mendeley PRIVATE
+        ${COMMON_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/external
+    )
+    target_link_libraries(test_burst_pipeline_mendeley PRIVATE m)
+    add_test(NAME burst_pipeline_mendeley COMMAND test_burst_pipeline_mendeley)
+endif()
 # uw_correlator_cfo NOT auto-registered: its synthetic-burst
 # expectations predate the gr-iridium-alignment work in
 # uw_correlator.c (5 alignment commits since the test was written —
