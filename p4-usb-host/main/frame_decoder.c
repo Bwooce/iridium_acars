@@ -34,8 +34,22 @@ static const char *TAG = "FRMDEC";
 
 #define FRAME_QUEUE_SLOTS  64        // 64 × 432 B ≈ 27 KB in PSRAM
 #define DECODER_STACK      6144
-#define DECODER_PRIO       4         // < worker (5), < ingest (8), > logger (1)
-#define DECODER_CORE       1
+#define DECODER_PRIO       4         // Core 0: < class_driver (6), < httpd (5),
+                                     // > sd_log (2), > logger (1)
+                                     // Decoder is bursty (only wakes when a
+                                     // frame arrives, ms-scale compute) so
+                                     // its CPU cost doesn't displace the
+                                     // USB consumer or httpd in practice.
+#define DECODER_CORE       0         // Moved from Core 1 → Core 0 (#123,
+                                     // 2026-05-31). Core 1's worker (prio
+                                     // 5) was being preempted by anything
+                                     // else at ≥4; relocating the per-
+                                     // frame decode work to Core 0 (which
+                                     // is bursty too — only class_driver
+                                     // is steady-state heavy) dissolves
+                                     // the Core-1 priority equilibrium
+                                     // documented in
+                                     // project_core1_cpu_budget_scheduling.
 
 static frame_queue_t  *s_queue       = NULL;
 static TaskHandle_t    s_task        = NULL;
