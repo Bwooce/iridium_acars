@@ -1280,7 +1280,7 @@ esp_err_t http_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port    = 80;
-    cfg.max_uri_handlers = 20;
+    cfg.max_uri_handlers = 32;   // route count = 21; headroom for growth
     cfg.lru_purge_enable = true;
     cfg.stack_size     = 6144;
     // Pin to Core 0: Core 1 is ~98% saturated (ingest + worker), so a
