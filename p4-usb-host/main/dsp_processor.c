@@ -106,6 +106,13 @@ static volatile uint32_t s_acc_input_samples = 0;
 static volatile uint32_t s_acc_new_bursts    = 0;
 static volatile uint32_t s_acc_gone_bursts   = 0;
 
+// Non-resetting cumulative counter for callers that compute their own
+// deltas (e.g. /diag/dsp_health's 2-second window — #127). The pair
+// (s_acc_input_samples) is reset by dsp_processor_get_stage_stats() once
+// per second by status_logger, racing any other reader. This counter
+// only ever increments; readers snapshot it at t0/t1 and subtract.
+static volatile uint64_t s_total_input_samples = 0;
+
 // Push one gone burst out to the user callback. Converts fbt_burst_t
 // (FFT bin space, uint64 sample idx) into detected_burst_t (signed
 // rel_freq_hz, uint32 sample idx for signal_buffer).
@@ -247,6 +254,7 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
     if (!s_tagger) return;
 
     s_acc_input_samples += (uint32_t)n_samples;
+    s_total_input_samples += (uint64_t)n_samples;   // #127, never reset
 
     size_t off = 0;
     while (off < n_samples) {
@@ -306,4 +314,14 @@ void dsp_processor_get_stage_stats(dsp_stage_stats_t *out)
     s_acc_input_samples = 0;
     s_acc_new_bursts    = 0;
     s_acc_gone_bursts   = 0;
+}
+
+// #127: race-free cumulative FFT-frames count. Callers that compute
+// their own delta over a wall-clock window (e.g. /diag/dsp_health)
+// must use this instead of dsp_processor_get_stage_stats — the latter
+// resets its accumulator on every call, so any second reader (e.g.
+// status_logger at 1 Hz) destroys the snapshot.
+uint64_t dsp_processor_get_total_fft_frames(void)
+{
+    return s_total_input_samples / FBT_FFT_SIZE;
 }

@@ -72,4 +72,11 @@ typedef struct {
 
 void dsp_processor_get_stage_stats(dsp_stage_stats_t *out);
 
+// #127: race-free cumulative FFT-frames count. Use this from any path
+// that wants a delta over a wall-clock window (it is NEVER reset).
+// dsp_processor_get_stage_stats resets its accumulator on every call,
+// so /diag/dsp_health's 2 s window races status_logger's 1 Hz reset
+// and reports phantom dsp_ok=false; this getter avoids the race.
+uint64_t dsp_processor_get_total_fft_frames(void);
+
 #endif

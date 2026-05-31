@@ -686,10 +686,14 @@ static esp_err_t ota_get(httpd_req_t *req)
 // from a cron / monitor.
 static esp_err_t diag_dsp_health_get(httpd_req_t *req)
 {
-    // Snapshot 1: read+reset the per-window tagger counters; also read
-    // the cumulative usb.completed.
-    dsp_stage_stats_t dsp0 = {0};
-    dsp_processor_get_stage_stats(&dsp0);   // reset only — value ignored
+    // Snapshot 1: use the race-free cumulative counter (#127). The
+    // previous implementation called dsp_processor_get_stage_stats which
+    // RESETS its per-window counter — status_logger calls the same API
+    // once per second, so a 2 s window heartbeat lost 50-100% of its
+    // frames whenever status_logger fired between snapshots and reported
+    // a phantom dsp_ok=false. dsp_processor_get_total_fft_frames is
+    // monotonic; subtracting two snapshots gives an exact count.
+    uint64_t dsp_frames0 = dsp_processor_get_total_fft_frames();
     usb_stream_totals_t usb0 = {0};
     esp_libusb_get_stream_totals(&usb0);
     uint64_t acars0 = frame_decoder_acars_decoded_total();
@@ -699,15 +703,14 @@ static esp_err_t diag_dsp_health_get(httpd_req_t *req)
     // (~1900 at 2.56 MSPS with FBT_FFT_SIZE=2048).
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    dsp_stage_stats_t dsp1 = {0};
-    dsp_processor_get_stage_stats(&dsp1);
+    uint64_t dsp_frames1 = dsp_processor_get_total_fft_frames();
     usb_stream_totals_t usb1 = {0};
     esp_libusb_get_stream_totals(&usb1);
     uint64_t acars1 = frame_decoder_acars_decoded_total();
     int64_t t1 = esp_timer_get_time();
 
     uint64_t usb_delta   = usb1.completed - usb0.completed;
-    uint32_t dsp_frames  = dsp1.frames;    // second call's value = window count
+    uint64_t dsp_frames  = dsp_frames1 - dsp_frames0;
     uint64_t acars_delta = acars1 - acars0;
     int64_t  window_us   = t1 - t0;
 
