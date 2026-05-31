@@ -13,6 +13,13 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
 # CMakeLists.txt for the DSP hot files.)
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set
+
+# LOG_VERSION_2 enables dynamic suppression of ESP_DRAM_LOGE — needed
+# to silence IDF's dma_utils:no-mem-for-stash-buffer spam fired ~100/min
+# under DMA-INT pressure. Under v1 those errors went straight to
+# esp_rom_printf which esp_log_level_set cannot reach. See
+# signal_buffer.c's esp_log_level_set call.
+CONFIG_LOG_VERSION_2=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_TYPE_OCTAL=y
 CONFIG_SPIRAM_SPEED_200M=y
