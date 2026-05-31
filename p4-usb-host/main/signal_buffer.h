@@ -35,6 +35,10 @@ uint32_t signal_buffer_head(void);
 // nonzero means the DMA path hiccuped (recovered, not deadlocked).
 uint32_t signal_buffer_dma_submit_errors(void);
 uint32_t signal_buffer_dma_timeouts(void);
+// #126E: count of CPU memcpy fallbacks (simple-path submit errors that
+// were recovered, NOT dropped). Audio-dropped count is
+// signal_buffer_dma_submit_errors() - signal_buffer_dma_cpu_fallbacks().
+uint32_t signal_buffer_dma_cpu_fallbacks(void);
 
 // True iff [start_idx, start_idx + length) of the circular buffer still
 // holds the original-pushed data — i.e. the producer hasn't yet lapped

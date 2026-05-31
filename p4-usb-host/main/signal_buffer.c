@@ -82,9 +82,15 @@ static SemaphoreHandle_t s_dma_done = NULL;
 // s_ready -> class deadlocks in take_converted.
 static volatile uint32_t s_dma_submit_errors = 0;
 static volatile uint32_t s_dma_timeouts      = 0;
+// #126E: count of CPU memcpy fallbacks (simple-path submit errors that
+// did NOT drop audio). s_dma_submit_errors covers both the fallback
+// case AND the wrap-path drop case; the difference (s_dma_submit_errors
+// - s_dma_cpu_fallbacks) is the audio-dropped count.
+static volatile uint32_t s_dma_cpu_fallbacks = 0;
 
 uint32_t signal_buffer_dma_submit_errors(void) { return s_dma_submit_errors; }
 uint32_t signal_buffer_dma_timeouts(void)      { return s_dma_timeouts; }
+uint32_t signal_buffer_dma_cpu_fallbacks(void) { return s_dma_cpu_fallbacks; }
 
 static IRAM_ATTR bool dma_done_cb(async_memcpy_handle_t mcp,
                                   async_memcpy_event_t *evt, void *arg)
@@ -208,7 +214,8 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
     size_t bytes_to_end = (uint32_t)SIGNAL_BUF_SIZE - head_bytes;
 
     esp_err_t r;
-    if (aligned_bytes <= bytes_to_end) {
+    bool wrap = (aligned_bytes > bytes_to_end);
+    if (!wrap) {
         // Common path: single contiguous write. All three (src, dst, len)
         // are 64-aligned, so no cache-split-RX path triggered.
         r = esp_async_memcpy(s_dma, dst_base + head_bytes, s_align_scratch,
@@ -228,18 +235,40 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
         }
     }
     if (r != ESP_OK) {
-        // The callback-carrying submit failed → dma_done_cb will never fire →
-        // s_dma_done would never be returned and the NEXT push would deadlock
-        // (#106). Give it back ourselves so the pipeline keeps moving; this
-        // chunk is dropped (head not advanced) — the carry is also preserved
-        // unchanged so no sample is lost on retry.
+        // Submit failed — dma_done_cb won't fire and s_dma_done would
+        // never be returned (#106 deadlock class). Behaviour depends on
+        // wrap state:
+        //
+        //   Simple path (no wrap, #126E): CPU memcpy fallback. Nothing
+        //   was enqueued. Both src+dst are 64-aligned (#125) so it's a
+        //   plain block copy; ~50 us per 16 KB on Core 0. No audio
+        //   dropped; head advances normally.
+        //
+        //   Wrap path: keep the existing drop behaviour. If the FIRST
+        //   submit succeeded and the SECOND failed, the first GDMA is
+        //   in flight reading s_align_scratch. We'd need to wait for it
+        //   to complete before letting the next push overwrite scratch
+        //   — and GDMA's first transaction had a NULL callback, so we
+        //   have no signal for that. Wrap-path failures are extremely
+        //   rare with #125's alignment (the wrap itself is only at the
+        //   end of the 32 MB ring, and even then the per-transaction
+        //   alloc usually succeeds); not worth the complexity.
         s_dma_submit_errors++;
         if ((s_dma_submit_errors & 0x3f) == 1) {   // rate-limit to ~1/64
-            ESP_LOGW(TAG, "esp_async_memcpy submit failed: %s (n=%u) — chunk dropped, sem restored",
-                     esp_err_to_name(r), (unsigned)aligned_count);
+            ESP_LOGW(TAG, "esp_async_memcpy submit failed: %s (n=%u, wrap=%d) — %s",
+                     esp_err_to_name(r), (unsigned)aligned_count, (int)wrap,
+                     wrap ? "chunk dropped, sem restored" : "CPU memcpy fallback");
         }
-        xSemaphoreGive(s_dma_done);
-        return;   // do not advance head: this chunk was not (fully) written
+        if (!wrap) {
+            memcpy(dst_base + head_bytes, s_align_scratch, aligned_bytes);
+            s_dma_cpu_fallbacks++;
+            xSemaphoreGive(s_dma_done);
+            // fall through to head + carry update — data IS in ring
+        } else {
+            // Wrap fail: drop, do not advance head, preserve carry.
+            xSemaphoreGive(s_dma_done);
+            return;
+        }
     }
 
     head = (head + (uint32_t)aligned_count) % total_cap;
