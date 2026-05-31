@@ -24,9 +24,9 @@ Usage:
 import argparse
 import hashlib
 import os
+import subprocess
 import sys
 import time
-import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -94,7 +94,9 @@ def verify_zip(path: Path) -> bool:
 
 
 def download_zip() -> None:
-    """Resume-capable download. Streams in 1 MB chunks with progress."""
+    """Resume-capable download via curl (Python urllib hits 403 on the
+    Mendeley → S3 redirect chain because the presigned URL won't accept
+    urllib's default headers; curl -L works cleanly)."""
     zp = zip_path()
     zp.parent.mkdir(parents=True, exist_ok=True)
     if zp.exists() and zp.stat().st_size == ZIP_SIZE:
@@ -105,26 +107,23 @@ def download_zip() -> None:
         print("  cached zip is larger than expected — re-downloading")
         zp.unlink()
         start = 0
-    headers = {"Range": f"bytes={start}-"} if start else {}
     print(f"  GET {ZIP_URL}")
     print(f"  resume from {fmt_bytes(start)} / {fmt_bytes(ZIP_SIZE)}")
-    req = urllib.request.Request(ZIP_URL, headers=headers)
+    cmd = [
+        "curl", "-sL",            # silent, follow redirects
+        "--fail",                 # error on HTTP error
+        "--continue-at", str(start),
+        "-o", str(zp),
+        ZIP_URL,
+    ]
     t0 = time.time()
-    written = start
-    with urllib.request.urlopen(req, timeout=60) as resp, \
-            open(zp, "ab" if start else "wb") as out:
-        while True:
-            chunk = resp.read(1 << 20)
-            if not chunk:
-                break
-            out.write(chunk)
-            written += len(chunk)
-            dt = max(time.time() - t0, 0.001)
-            rate_mbps = (written - start) * 8 / 1e6 / dt
-            print(f"\r  {fmt_bytes(written)} / {fmt_bytes(ZIP_SIZE)}"
-                  f"  ({100.0 * written / ZIP_SIZE:.1f}%, {rate_mbps:.1f} Mbps)",
-                  end="", flush=True)
-    print()
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        raise RuntimeError(f"curl exited {r.returncode}")
+    dt = time.time() - t0
+    written = zp.stat().st_size
+    rate_mbps = (written - start) * 8 / 1e6 / max(dt, 0.001)
+    print(f"  done in {dt:.1f} s ({rate_mbps:.1f} Mbps avg)")
 
 
 def extract_zip() -> None:

@@ -30,15 +30,26 @@ void signal_buffer_read_chunk(uint32_t start_idx, uint32_t length, int16_t *dest
 // window gets overwritten.
 uint32_t signal_buffer_head(void);
 
-// Deadlock-guard diagnostics (#106): count of failed esp_async_memcpy submits
-// and of s_dma_done wait-timeouts in signal_buffer_push. Both should stay 0;
-// nonzero means the DMA path hiccuped (recovered, not deadlocked).
-uint32_t signal_buffer_dma_submit_errors(void);
+// Recovery-counter accessors (surfaced in /diag/recovery_counters and
+// in the STATUS-ERR log line when nonzero).
+//
+//   stash_alloc_fails      — IDF dma_utils "no mem for stash buffer"
+//                            events. esp_async_memcpy returns
+//                            ESP_ERR_NO_MEM; we count + try to
+//                            recover. This is the same event the
+//                            LOG_VERSION_2 silencing kept out of the
+//                            UART log; the counter is the visible
+//                            replacement for the lost log lines.
+//   stash_alloc_recoveries — simple-path failures that recovered via
+//                            CPU memcpy (#126E). Audio-dropped =
+//                            stash_alloc_fails - stash_alloc_recoveries
+//                            (wrap-path failures fall through to drop).
+//   dma_timeouts           — s_dma_done wait timeout (a previous DMA's
+//                            give never came). Indicates upstream
+//                            wedge; has never fired in production.
+uint32_t signal_buffer_stash_alloc_fails(void);
+uint32_t signal_buffer_stash_alloc_recoveries(void);
 uint32_t signal_buffer_dma_timeouts(void);
-// #126E: count of CPU memcpy fallbacks (simple-path submit errors that
-// were recovered, NOT dropped). Audio-dropped count is
-// signal_buffer_dma_submit_errors() - signal_buffer_dma_cpu_fallbacks().
-uint32_t signal_buffer_dma_cpu_fallbacks(void);
 
 // True iff [start_idx, start_idx + length) of the circular buffer still
 // holds the original-pushed data — i.e. the producer hasn't yet lapped

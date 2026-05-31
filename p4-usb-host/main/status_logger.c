@@ -14,6 +14,9 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "status_logger.h"
+#include "signal_buffer.h"
+#include "ingest_core1.h"
+#include "esp_libusb.h"
 
 static const char *TAG = "CLASS";  // match the original tag for log continuity
 
@@ -176,18 +179,35 @@ static void emit(const status_snapshot_t *s)
              s->us.rb_full_drops, dsp_pct, worker_pct);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
-    // any drop counter ticks — operator gets the heads-up before the
-    // queue overflows.
+    // any drop / recovery counter ticks. Field names match
+    // /diag/recovery_counters exactly — same names in log and endpoint.
+    // Component prefixes (usb./sb./ing.) so grepping for one
+    // component's counters is straightforward.
+    uint32_t sb_fails      = signal_buffer_stash_alloc_fails();
+    uint32_t sb_recoveries = signal_buffer_stash_alloc_recoveries();
+    uint32_t sb_dma_to     = signal_buffer_dma_timeouts();
+    uint32_t ic_disp_drops = ingest_core1_dispatch_drops();
+    uint32_t ic_slow_waits = ingest_core1_take_converted_slow_waits();
+    uint32_t lu_pool_lost  = esp_libusb_xfer_pool_lost();
+    uint32_t sb_audio_drop = (sb_fails > sb_recoveries) ? (sb_fails - sb_recoveries) : 0;
+
     bool over_capacity = (dsp_pct > 80.0) || (worker_pct > 80.0);
+    bool any_recovery  = sb_fails || sb_dma_to || ic_disp_drops ||
+                         ic_slow_waits || lu_pool_lost;
     if (over_capacity || s->us.rb_full_drops || s->us.status_errors ||
-        s->us.resubmit_errors  || s->ws.bursts_dropped) {
-        ESP_LOGW(TAG, "STATUS-ERR: dsp_cap=%.0f%% worker_cap=%.0f%% "
-                      "rb_full_drops=%u status_err=%u resubmit_err=%u "
-                      "worker_dropped=%u last_err=0x%02x",
-                 dsp_pct, worker_pct,
-                 s->us.rb_full_drops, s->us.status_errors,
-                 s->us.resubmit_errors, s->ws.bursts_dropped,
-                 s->us.last_error_status);
+        s->us.resubmit_errors  || s->ws.bursts_dropped || any_recovery) {
+        ESP_LOGW(TAG,
+            "STATUS-ERR: cap[dsp=%.0f%% worker=%.0f%%] "
+            "usb[rb_full=%u status_err=%u resubmit_err=%u pool_lost=%u last=0x%02x] "
+            "worker[dropped=%u] "
+            "sb[stash_fails=%u recoveries=%u audio_dropped=%u dma_timeouts=%u] "
+            "ing[dispatch_drops=%u slow_waits=%u]",
+            dsp_pct, worker_pct,
+            s->us.rb_full_drops, s->us.status_errors,
+            s->us.resubmit_errors, lu_pool_lost, s->us.last_error_status,
+            s->ws.bursts_dropped,
+            sb_fails, sb_recoveries, sb_audio_drop, sb_dma_to,
+            ic_disp_drops, ic_slow_waits);
     }
 #endif
 }

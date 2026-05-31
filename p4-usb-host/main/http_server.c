@@ -22,6 +22,8 @@
 #include "esp_libusb.h"
 #include "worker_core1.h"
 #include "dsp_processor.h"
+#include "signal_buffer.h"
+#include "ingest_core1.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -741,6 +743,49 @@ static esp_err_t diag_dsp_health_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// GET /diag/recovery_counters — surface every defensive failure-mode
+// counter the firmware tracks. These are mostly "have-never-fired"
+// guards for #106-class deadlocks; exposing them turns dormant
+// instrumentation into useful diag the watch loop can poll without
+// log scraping. Aligned with the #122 fault-injection plan.
+//
+// JSON nested by source component; field names match the per-counter
+// docstrings in signal_buffer.h / ingest_core1.h / esp_libusb.h. Same
+// names also appear in the STATUS-ERR log line so log-vs-endpoint
+// reading is consistent.
+static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
+{
+    uint32_t sb_fails      = signal_buffer_stash_alloc_fails();
+    uint32_t sb_recoveries = signal_buffer_stash_alloc_recoveries();
+    uint32_t sb_audio_drop = (sb_fails > sb_recoveries) ? (sb_fails - sb_recoveries) : 0;
+    char body[640];
+    int n = snprintf(body, sizeof(body),
+        "{"
+        "\"signal_buffer\":{"
+            "\"stash_alloc_fails\":%u,"
+            "\"stash_alloc_recoveries\":%u,"
+            "\"audio_dropped\":%u,"
+            "\"dma_timeouts\":%u"
+        "},"
+        "\"ingest_core1\":{"
+            "\"dispatch_drops\":%u,"
+            "\"slow_waits\":%u"
+        "},"
+        "\"esp_libusb\":{"
+            "\"xfer_pool_lost\":%u"
+        "}"
+        "}\n",
+        (unsigned)sb_fails, (unsigned)sb_recoveries, (unsigned)sb_audio_drop,
+        (unsigned)signal_buffer_dma_timeouts(),
+        (unsigned)ingest_core1_dispatch_drops(),
+        (unsigned)ingest_core1_take_converted_slow_waits(),
+        (unsigned)esp_libusb_xfer_pool_lost());
+    if (n < 0 || n >= (int)sizeof(body)) n = sizeof(body) - 1;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, n);
+}
+
 // POST /debug/inject — synthesise one ACARS message and push it through
 // the exact same fan-out the real decode path uses (frame_decoder.c):
 // RAM ring, UDP push, and the SD NDJSON log. This proves the decode ->
@@ -1268,6 +1313,7 @@ esp_err_t http_server_start(void)
         { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
         { .uri = "/diag/histograms", .method = HTTP_GET, .handler = diag_histograms_get, .user_ctx = NULL },
         { .uri = "/diag/dsp_health", .method = HTTP_GET, .handler = diag_dsp_health_get, .user_ctx = NULL },
+        { .uri = "/diag/recovery_counters", .method = HTTP_GET, .handler = diag_recovery_counters_get, .user_ctx = NULL },
         { .uri = "/messages", .method = HTTP_GET,  .handler = messages_get, .user_ctx = NULL },
         { .uri = "/ota",      .method = HTTP_GET,  .handler = ota_get,      .user_ctx = NULL },
         { .uri = "/config",   .method = HTTP_POST, .handler = config_post,    .user_ctx = NULL },

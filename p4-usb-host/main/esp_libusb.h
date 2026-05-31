@@ -112,4 +112,10 @@ typedef struct {
 } usb_stream_totals_t;
 
 void esp_libusb_get_stream_totals(usb_stream_totals_t *out);
+
+// #124: URBs whose 3-attempt resubmit retry exhausted (pool size
+// shrinks). Has never fired in production; surfaced here so
+// /diag/recovery_counters can prove it.
+uint32_t esp_libusb_xfer_pool_lost(void);
+
 #endif // ESP_LIBUSB_H

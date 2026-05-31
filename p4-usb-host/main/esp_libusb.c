@@ -12,6 +12,7 @@ static volatile uint32_t s_xfer_completed = 0;
 static volatile uint32_t s_xfer_status_errors = 0;
 static volatile uint32_t s_xfer_resubmit_errors = 0;
 static volatile uint32_t s_xfer_pool_lost = 0;  // URBs whose 3-attempt resubmit retry exhausted; pool size shrinks (#124)
+uint32_t esp_libusb_xfer_pool_lost(void) { return s_xfer_pool_lost; }
 static volatile uint32_t s_xfer_rb_full_drops = 0;
 static volatile uint32_t s_xfer_short = 0;
 static volatile uint64_t s_xfer_actual_bytes = 0;

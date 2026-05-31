@@ -75,22 +75,28 @@ static uint8_t  s_carry_n_complex = 0;
 // transfer carries the give-back callback.
 static SemaphoreHandle_t s_dma_done = NULL;
 
-// Deadlock-guard diagnostics (#106). dma_submit_errors: esp_async_memcpy
-// returned non-OK (its completion callback then never fires). dma_timeouts:
-// the s_dma_done wait timed out (a previous DMA's give never came). Either,
-// untreated, would hang signal_buffer_push forever -> ingest never signals
-// s_ready -> class deadlocks in take_converted.
-static volatile uint32_t s_dma_submit_errors = 0;
-static volatile uint32_t s_dma_timeouts      = 0;
-// #126E: count of CPU memcpy fallbacks (simple-path submit errors that
-// did NOT drop audio). s_dma_submit_errors covers both the fallback
-// case AND the wrap-path drop case; the difference (s_dma_submit_errors
-// - s_dma_cpu_fallbacks) is the audio-dropped count.
-static volatile uint32_t s_dma_cpu_fallbacks = 0;
+// Deadlock-guard diagnostics (#106). Named to match what they actually
+// measure (was dma_submit_errors / dma_cpu_fallbacks until 2026-05-31):
+//
+//   stash_alloc_fails  — IDF dma_utils failed to allocate the 128 B
+//     cache-line stash buffer; esp_async_memcpy returns ESP_ERR_NO_MEM.
+//     This IS the count of "no mem for stash buffer" events that
+//     LOG_VERSION_2 + esp_log_level_set silence in the UART log.
+//   stash_alloc_recoveries — simple-path submit fails that we
+//     recovered via CPU memcpy (#126E). audio-dropped count =
+//     stash_alloc_fails - stash_alloc_recoveries (the wrap-path
+//     remainder we can't safely CPU-fallback).
+//   dma_timeouts — s_dma_done wait timed out (a previous DMA's give
+//     never came). Untreated would hang signal_buffer_push forever ->
+//     ingest never signals s_ready -> class deadlocks in
+//     take_converted. Has never fired in production.
+static volatile uint32_t s_stash_alloc_fails       = 0;
+static volatile uint32_t s_stash_alloc_recoveries  = 0;
+static volatile uint32_t s_dma_timeouts            = 0;
 
-uint32_t signal_buffer_dma_submit_errors(void) { return s_dma_submit_errors; }
-uint32_t signal_buffer_dma_timeouts(void)      { return s_dma_timeouts; }
-uint32_t signal_buffer_dma_cpu_fallbacks(void) { return s_dma_cpu_fallbacks; }
+uint32_t signal_buffer_stash_alloc_fails(void)      { return s_stash_alloc_fails; }
+uint32_t signal_buffer_stash_alloc_recoveries(void) { return s_stash_alloc_recoveries; }
+uint32_t signal_buffer_dma_timeouts(void)           { return s_dma_timeouts; }
 
 static IRAM_ATTR bool dma_done_cb(async_memcpy_handle_t mcp,
                                   async_memcpy_event_t *evt, void *arg)
@@ -108,7 +114,7 @@ esp_err_t signal_buffer_init()
     //                no mem for stash buffer
     //   E async_mcp.gdma: mcp_gdma_memcpy(411): failed to split RX
     //                buffer into aligned ones
-    // These are the same events we already count via s_dma_submit_errors
+    // These are the same events we already count via s_stash_alloc_fails
     // and recover from via #126E's CPU memcpy fallback (100% recovery
     // observed in 33 min soak — zero audio dropped). Per-event ESP_LOGE
     // formatting + UART output burned a measurable slice of Core 0 for
@@ -268,15 +274,19 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
         //   rare with #125's alignment (the wrap itself is only at the
         //   end of the 32 MB ring, and even then the per-transaction
         //   alloc usually succeeds); not worth the complexity.
-        s_dma_submit_errors++;
-        if ((s_dma_submit_errors & 0x3f) == 1) {   // rate-limit to ~1/64
-            ESP_LOGW(TAG, "esp_async_memcpy submit failed: %s (n=%u, wrap=%d) — %s",
+        s_stash_alloc_fails++;
+        if ((s_stash_alloc_fails & 0x3f) == 1) {   // rate-limit to ~1/64
+            // Log contains both 'stash_alloc_fail' (new canonical name)
+            // and 'submit failed' (legacy phrase) so old grep filters
+            // and any external dashboards keep matching.
+            ESP_LOGW(TAG, "stash_alloc_fail (esp_async_memcpy submit failed): %s "
+                          "(n=%u, wrap=%d) — %s",
                      esp_err_to_name(r), (unsigned)aligned_count, (int)wrap,
                      wrap ? "chunk dropped, sem restored" : "CPU memcpy fallback");
         }
         if (!wrap) {
             memcpy(dst_base + head_bytes, s_align_scratch, aligned_bytes);
-            s_dma_cpu_fallbacks++;
+            s_stash_alloc_recoveries++;
             xSemaphoreGive(s_dma_done);
             // fall through to head + carry update — data IS in ring
         } else {
