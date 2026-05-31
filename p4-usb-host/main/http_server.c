@@ -46,6 +46,12 @@ static httpd_handle_t s_server = NULL;
 static uint8_t *s_download_buf = NULL;
 #define DOWNLOAD_BUF_BYTES   4096
 
+// Max URI handlers the httpd will accept. Used both to size the IDF
+// httpd slot table AND in a static_assert on the routes[] array length,
+// so adding a route past the limit breaks the build instead of panic-
+// looping at boot. Each slot is ~32 bytes; 32 slots = ~1 KB negligible.
+#define HTTPD_URI_LIMIT      32
+
 // NVS-write + reboot helper. MUST run with an internal-SRAM stack:
 // nvs_commit() takes spi_flash_disable_interrupts_caches_and_other_cpu(),
 // which makes PSRAM (cached) inaccessible. A task whose own stack
@@ -1280,7 +1286,7 @@ esp_err_t http_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port    = 80;
-    cfg.max_uri_handlers = 32;   // route count = 21; headroom for growth
+    cfg.max_uri_handlers = HTTPD_URI_LIMIT;
     cfg.lru_purge_enable = true;
     cfg.stack_size     = 6144;
     // Pin to Core 0: Core 1 is ~98% saturated (ingest + worker), so a
@@ -1308,6 +1314,12 @@ esp_err_t http_server_start(void)
         return r;
     }
 
+    // Adding a route past HTTPD_URI_LIMIT past would cause
+    // httpd_register_uri_handler to return ESP_ERR_HTTPD_HANDLERS_FULL
+    // -> the ESP_ERROR_CHECK below aborts -> panic-loop on boot. The
+    // static_assert after the array initializer catches the overflow at
+    // build time so we never re-pay the "1372 reboots to find it" tax
+    // (see commit 2260ae9 / feedback_httpd_max_uri_handlers memory note).
     httpd_uri_t routes[] = {
         { .uri = "/",         .method = HTTP_GET,  .handler = index_get,    .user_ctx = NULL },
         { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
@@ -1331,6 +1343,10 @@ esp_err_t http_server_start(void)
         { .uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get,  .user_ctx = NULL },
         { .uri = "/capture/file",   .method = HTTP_GET, .handler = capture_file_get,    .user_ctx = NULL },
     };
+    _Static_assert(sizeof(routes) / sizeof(routes[0]) <= HTTPD_URI_LIMIT,
+                   "route count exceeds HTTPD_URI_LIMIT; bump HTTPD_URI_LIMIT "
+                   "in http_server.c before adding more routes (see "
+                   "feedback_httpd_max_uri_handlers memory)");
     for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
     }
