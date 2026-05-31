@@ -21,6 +21,7 @@
 #include "acars_push.h"
 #include "esp_libusb.h"
 #include "worker_core1.h"
+#include "dsp_processor.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -667,6 +668,76 @@ static esp_err_t ota_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// GET /diag/dsp_health (#118). Two-second DSP-pipeline heartbeat. Takes
+// counter snapshots 2 s apart and returns deltas + a pass/fail verdict.
+// Converts "did the OTA / refactor / config-change break the DSP?" from
+// an offline-test-only question into a one-curl yes/no.
+//
+// What this proves on PASS:
+//   - USB stream is producing samples (usb.completed climbing)
+//   - dsp_processor is consuming samples (tagger FFT frames climbing)
+//   - frame_decoder is running (its class counts are read but not gated)
+// What it does NOT prove: any real Iridium frame decoded. That requires
+// real signal arriving, which is the antenna's job. The heartbeat just
+// asserts the chain is alive.
+//
+// Concurrency: the inner sleep is on the httpd task; class_driver +
+// worker continue running normally throughout. Idempotent; safe to call
+// from a cron / monitor.
+static esp_err_t diag_dsp_health_get(httpd_req_t *req)
+{
+    // Snapshot 1: read+reset the per-window tagger counters; also read
+    // the cumulative usb.completed.
+    dsp_stage_stats_t dsp0 = {0};
+    dsp_processor_get_stage_stats(&dsp0);   // reset only — value ignored
+    usb_stream_totals_t usb0 = {0};
+    esp_libusb_get_stream_totals(&usb0);
+    uint64_t acars0 = frame_decoder_acars_decoded_total();
+    int64_t t0 = esp_timer_get_time();
+
+    // 2-second window. Real production has plenty of FFT frames in 2 s
+    // (~1900 at 2.56 MSPS with FBT_FFT_SIZE=2048).
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    dsp_stage_stats_t dsp1 = {0};
+    dsp_processor_get_stage_stats(&dsp1);
+    usb_stream_totals_t usb1 = {0};
+    esp_libusb_get_stream_totals(&usb1);
+    uint64_t acars1 = frame_decoder_acars_decoded_total();
+    int64_t t1 = esp_timer_get_time();
+
+    uint64_t usb_delta   = usb1.completed - usb0.completed;
+    uint32_t dsp_frames  = dsp1.frames;    // second call's value = window count
+    uint64_t acars_delta = acars1 - acars0;
+    int64_t  window_us   = t1 - t0;
+
+    // PASS criteria: both USB and DSP must show forward progress in the
+    // 2 s window. Thresholds are loose — at 2.56 MSPS / 16 KB transfers
+    // we expect ~600 completed/s × 2 s = ~1200; at FBT_FFT_SIZE 2048 we
+    // expect ~1900 FFT frames/s × 2 s = ~3800.
+    bool usb_ok = (usb_delta > 200);    // ~10% of nominal — generous floor
+    bool dsp_ok = (dsp_frames > 200);   // ditto
+    bool pass   = usb_ok && dsp_ok;
+
+    char body[512];
+    int n = snprintf(body, sizeof(body),
+        "{\"window_us\":%lld,"
+        "\"usb_completed_delta\":%llu,\"usb_ok\":%s,"
+        "\"dsp_fft_frames\":%u,\"dsp_ok\":%s,"
+        "\"acars_decoded_delta\":%llu,"
+        "\"pass\":%s}\n",
+        (long long)window_us,
+        (unsigned long long)usb_delta, usb_ok ? "true" : "false",
+        (unsigned)dsp_frames, dsp_ok ? "true" : "false",
+        (unsigned long long)acars_delta,
+        pass ? "true" : "false");
+    if (n < 0 || n >= (int)sizeof(body)) n = sizeof(body) - 1;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (!pass) httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_send(req, body, n);
+}
+
 // POST /debug/inject — synthesise one ACARS message and push it through
 // the exact same fan-out the real decode path uses (frame_decoder.c):
 // RAM ring, UDP push, and the SD NDJSON log. This proves the decode ->
@@ -1193,6 +1264,7 @@ esp_err_t http_server_start(void)
         { .uri = "/",         .method = HTTP_GET,  .handler = index_get,    .user_ctx = NULL },
         { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
         { .uri = "/diag/histograms", .method = HTTP_GET, .handler = diag_histograms_get, .user_ctx = NULL },
+        { .uri = "/diag/dsp_health", .method = HTTP_GET, .handler = diag_dsp_health_get, .user_ctx = NULL },
         { .uri = "/messages", .method = HTTP_GET,  .handler = messages_get, .user_ctx = NULL },
         { .uri = "/ota",      .method = HTTP_GET,  .handler = ota_get,      .user_ctx = NULL },
         { .uri = "/config",   .method = HTTP_POST, .handler = config_post,    .user_ctx = NULL },
