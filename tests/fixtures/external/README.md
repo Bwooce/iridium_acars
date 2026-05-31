@@ -39,11 +39,13 @@ Burst-level sources currently in use:
 |---|---|---|---|
 | **In-repo ALBQ slice** | ~82 | ISY×28 IDA×20 RAW×11 IBC×11 IIU×7 I36×4 IRI×1 | `tests/fixtures/fixture_albq_*.h` — derived from the in-repo wideband; covers all the variants the production pipeline classifies. |
 
-Optional / deferred:
+Optional / deferred (alphabetical):
 
-| Source | What it would add | Why deferred |
-|---|---|---|
-| **Oligeri/Sciancalepore Mendeley** ([DOI 10.17632/xcxspv8c2r.2](https://data.mendeley.com/datasets/xcxspv8c2r/2)) | 3.8 M IRA packets across 66 sats × 2 months in Doha QA — *horizontal* diversity (sat ID, beam ID, Doppler, time of day) for ONE burst type | Our ALBQ has *vertical* diversity (7 burst types in one capture). The Mendeley set's win is per-sat/beam variation, which only matters if we want to debug a specific sat-ID-dependent regression or do per-beam SNR statistics. 4.67 GB download + per-packet format (already burst-extracted at unclear sample rate) — the cost is real. Fetcher + extractor + skeleton test are committed; populate the cache + run the build script if/when needed. |
+| Source | Scale & format | What it would add | Why deferred |
+|---|---|---|---|
+| **Oligeri/Sciancalepore Mendeley** ([DOI 10.17632/xcxspv8c2r.2](https://data.mendeley.com/datasets/xcxspv8c2r/2)) | 4.67 GB zip → 14 GB text. 3.8 M IRA packets, ~2000 samples per packet, sample rate unclear from paper | *Horizontal* diversity for ONE burst type across 66 sats × 2 months in Doha QA (sat ID, beam ID, Doppler, time of day variation) | Our ALBQ has *vertical* diversity (7 burst types in one capture). Mendeley's win only matters if we want sat-ID-dependent regression or per-beam SNR statistics. Fetcher + extractor + skeleton test are committed; populate the cache + run the build script if/when needed. |
+| **Oxford SatIQ — Watch This Space** ([Zenodo 8220494](https://zenodo.org/record/8220494)) | 135 GB compressed → 67 TB uncompressed. 1.7 M IRA messages as numpy .npy files, **25 MS/s** per-burst | Highest-rate per-burst dataset publicly available; ideal for fingerprinting research. Code at [ssloxford/SatIQ](https://github.com/ssloxford/SatIQ) | Massive — far exceeds what's needed for pipeline regression testing. Per-burst layer (same as Mendeley). |
+| **Oxford SatIQ — 3 locations** ([UK](https://doi.org/10.7910/DVN/P5FUAW), [Germany](https://doi.org/10.7910/DVN/RXWV1M), [Switzerland](https://doi.org/10.7910/DVN/OSSJ68) on Harvard Dataverse) | Three geographic captures, full size each unknown but on the order of the Watch This Space set | Geographic diversity (channel statistics vary with antenna location); useful if we ever want to debug a propagation-channel-related issue | Same per-burst layer; storage cost > usefulness for our regression goals. |
 
 ### Layer B — wideband fixtures
 
