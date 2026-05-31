@@ -102,6 +102,21 @@ static IRAM_ATTR bool dma_done_cb(async_memcpy_handle_t mcp,
 
 esp_err_t signal_buffer_init()
 {
+    // Suppress the IDF GDMA noise that fires once per failed cache-
+    // aligned stash allocation (~100/min on production hardware):
+    //   E dma_utils: esp_dma_split_rx_buffer_to_cache_aligned(54):
+    //                no mem for stash buffer
+    //   E async_mcp.gdma: mcp_gdma_memcpy(411): failed to split RX
+    //                buffer into aligned ones
+    // These are the same events we already count via s_dma_submit_errors
+    // and recover from via #126E's CPU memcpy fallback (100% recovery
+    // observed in 33 min soak — zero audio dropped). Per-event ESP_LOGE
+    // formatting + UART output burned a measurable slice of Core 0 for
+    // information we already track at our layer. Bumping the tag to
+    // ERROR-only would still print these; need NONE to silence.
+    esp_log_level_set("dma_utils",      ESP_LOG_NONE);
+    esp_log_level_set("async_mcp.gdma", ESP_LOG_NONE);
+
     ESP_LOGI(TAG, "Allocating 4MB Signal Buffer in PSRAM (DMA-aligned)...");
     // 64-byte cache-line alignment for the DMA destination.
     circular_buf = heap_caps_aligned_alloc(64, SIGNAL_BUF_SIZE,
