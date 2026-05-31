@@ -438,14 +438,6 @@ volatile uint64_t g_pie_fft_outer_us = 0;   // interleave + de-interleave
 volatile uint32_t g_pie_fft_calls    = 0;
 volatile uint64_t g_uw_specmul_us    = 0;
 volatile uint64_t g_uw_magsearch_us  = 0;
-// Pre-UW CFO peak-confidence counter (#115): cfo_fine_estimate returned
-// 0 because the squared-FFT peak wasn't ≥ 6 dB above the second-best
-// peak outside its main lobe. Healthy bursts should rarely trigger;
-// elevated rate = noise dominating the pre-UW window.
-static volatile uint32_t s_cfo_low_confidence_count = 0;
-uint32_t uw_correlator_get_cfo_low_confidence_count(void) {
-    return s_cfo_low_confidence_count;
-}
 
 #if defined(ESP_PLATFORM)
 // Task #58/#67: PIE float FFT wrapper. Replaces ~3× radix2_fft_f32 calls
@@ -1007,50 +999,14 @@ static float cfo_fine_estimate(const int16_t *burst_2sps, int n_complex,
     // squared signal has noise peaks beating the preamble's DC tone,
     // the cause is upstream divergence in the windowed signal, not the
     // peak finder.
-    //
-    // Peak-confidence filter (#115): also track the second-best peak
-    // outside the main lobe (±2 bins of the best). For a real preamble
-    // tone, the squared-FFT peak is 30-50 dB above the noise floor; for
-    // a noise-dominated input, the "peak" is only a few dB above other
-    // noise bins. Returning a noise-driven CFO leads burst_pipeline to
-    // mis-rotate the burst past the PLL's capture range. If the peak
-    // isn't at least 4× (= 6 dB) above the second peak, return 0.0f —
-    // the post-UW CFO refinement will then carry the load on its
-    // anchored (preamble-only) window. Gain: 0.3-0.8 dB on borderline
-    // bursts. Cost: <1 us extra arithmetic per CFO estimate.
-    float peak_mag    = -1.0f;
-    int   peak_k      = 0;
-    float second_mag  = -1.0f;
+    float peak_mag = -1.0f;
+    int   peak_k   = 0;
     for (int k = 0; k < CFO_FFT_N; k++) {
         float rr = re[k], ii = im[k];
         float m = rr * rr + ii * ii;
-        if (m > peak_mag) {
-            // Demote previous best (if any) to the second-best candidate.
-            // It must lie outside the main lobe — that check happens in
-            // the next pass below.
-            peak_mag = m; peak_k = k;
-        }
+        if (m > peak_mag) { peak_mag = m; peak_k = k; }
     }
     if (peak_mag <= 0.0f) return 0.0f;
-    // Second-best magnitude OUTSIDE the main lobe (±2 bins of peak_k,
-    // mod CFO_FFT_N for wrap). Excluding the lobe avoids reporting the
-    // peak's own sidelobe as the second peak.
-    for (int k = 0; k < CFO_FFT_N; k++) {
-        int dk = k - peak_k;
-        if (dk < 0) dk = -dk;
-        if (dk > CFO_FFT_N / 2) dk = CFO_FFT_N - dk;  // wrap distance
-        if (dk <= 2) continue;
-        float rr = re[k], ii = im[k];
-        float m = rr * rr + ii * ii;
-        if (m > second_mag) second_mag = m;
-    }
-    // Confidence test: require ≥ 6 dB (4×) peak-to-second-best ratio.
-    // second_mag < 0 means there were < 5 valid bins, which shouldn't
-    // happen at CFO_FFT_N >= 16 — but treat as untrusted.
-    if (second_mag <= 0.0f || peak_mag < 4.0f * second_mag) {
-        s_cfo_low_confidence_count++;
-        return 0.0f;
-    }
 
 #ifdef UW_CORRELATOR_CFO_DEBUG
     {
