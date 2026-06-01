@@ -26,12 +26,12 @@
 // answers "what does our stream contain when MS arrives?".
 
 typedef struct {
-    bool      bch_ok;            // first block BCH decoded cleanly
-    int       ms_type;           // 0 = normal, 1 = Acq group
-    int       block;             // 0..15
-    int       frame;             // 0..63
-    int       bch_blocks;        // total blocks (length field)
-    int       group;             // 0..3 (only if ms_type=0); 'A' marker if ms_type=1
+    bool bch_ok;     // first block BCH decoded cleanly
+    int  ms_type;    // 0 = normal, 1 = Acq group
+    int  block;      // 0..15
+    int  frame;      // 0..63
+    int  bch_blocks; // total blocks (length field)
+    int  group;      // 0..3 (only if ms_type=0); 'A' marker if ms_type=1
 } ims_decoded_t;
 
 // Decode the first block of an Iridium Messaging frame's header.

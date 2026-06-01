@@ -9,9 +9,9 @@
 
 static const char *TAG = "MSGR";
 
-static acars_msg_t *s_ring = NULL;     // PSRAM, MSG_RING_CAPACITY slots
-static uint32_t     s_head = 0;        // next slot to write (index)
-static uint64_t     s_last_id = 0;
+static acars_msg_t      *s_ring    = NULL; // PSRAM, MSG_RING_CAPACITY slots
+static uint32_t          s_head    = 0;    // next slot to write (index)
+static uint64_t          s_last_id = 0;
 static SemaphoreHandle_t s_mutex;
 
 void msg_ring_init(void)
@@ -47,9 +47,9 @@ void msg_ring_push(const acars_msg_t *m)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_last_id += 1;
     acars_msg_t *slot = &s_ring[s_head];
-    *slot = *m;
-    slot->id = s_last_id;
-    s_head = (s_head + 1) % MSG_RING_CAPACITY;
+    *slot             = *m;
+    slot->id          = s_last_id;
+    s_head            = (s_head + 1) % MSG_RING_CAPACITY;
     xSemaphoreGive(s_mutex);
 }
 
@@ -60,8 +60,8 @@ size_t msg_ring_snapshot(uint64_t since_id, acars_msg_t *out, size_t cap)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     // Walk from oldest to newest. Oldest is at s_head (next-to-write).
     for (uint32_t k = 0; k < MSG_RING_CAPACITY && n < cap; k++) {
-        uint32_t idx = (s_head + k) % MSG_RING_CAPACITY;
-        const acars_msg_t *e = &s_ring[idx];
+        uint32_t           idx = (s_head + k) % MSG_RING_CAPACITY;
+        const acars_msg_t *e   = &s_ring[idx];
         if (e->id == 0 || e->id <= since_id) continue;
         out[n++] = *e;
     }

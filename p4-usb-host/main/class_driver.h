@@ -13,7 +13,7 @@ bool class_driver_set_tuner_gain_dbx10(int gain_dbx10);
 
 // Returns the most recently applied tuner gain in tenths of dB,
 // or -1 if not yet set. Useful for AGC state tracking.
-int  class_driver_get_tuner_gain_dbx10(void);
+int class_driver_get_tuner_gain_dbx10(void);
 
 // Forensic dump for a wedged USB stream: which consumer-loop stage is stuck
 // (and for how long), USB transfer totals, and all task states + stack

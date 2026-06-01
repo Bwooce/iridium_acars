@@ -22,16 +22,16 @@ static const char *TAG = "SIG_BUF";
 // slow fallback or returning an error. Catch that at compile time.
 #ifdef CONFIG_GDMA_ENABLE_WEIGHTED_ARBITRATION
 _Static_assert(0,
-    "GDMA weighted arbitration changes alignment requirements; review "
-    "signal_buffer_push's 4-byte multiples vs dma_burst_size=64 before "
-    "enabling. See memory/project_p4_errata_status.md (MSPI-750).");
+               "GDMA weighted arbitration changes alignment requirements; review "
+               "signal_buffer_push's 4-byte multiples vs dma_burst_size=64 before "
+               "enabling. See memory/project_p4_errata_status.md (MSPI-750).");
 #endif
 
 // 4 MB circular buffer in PSRAM. int16 IQ pairs:
 //   circular_buf[head*2 + 0] = I
 //   circular_buf[head*2 + 1] = Q
 static int16_t *circular_buf = NULL;
-static uint32_t head = 0;        // in complex samples
+static uint32_t head         = 0; // in complex samples
 
 // AXI-GDMA async memcpy. signal_buffer_push fires PSRAM writes off to this
 // channel so Core 0 doesn't block on the ~800 us PSRAM transfer per cycle.
@@ -60,14 +60,14 @@ static async_memcpy_handle_t s_dma = NULL;
 // Scratch must be DMA-readable and 64-aligned. PSRAM (cap-DMA) is fine
 // for source; sized to fit one max push (INGEST_SLOT_ELEMS complex =
 // 32 KB).
-#define ALIGN_COMPLEX           16   // 16 complex × 4 B = 64 B = one cache line
-#define ALIGN_BYTES             (ALIGN_COMPLEX * 4)
-#define ALIGN_SCRATCH_MAX_BYTES (16 * 1024 * 4)   // 16 K complex × 4 B = 64 KB
+#define ALIGN_COMPLEX 16 // 16 complex × 4 B = 64 B = one cache line
+#define ALIGN_BYTES (ALIGN_COMPLEX * 4)
+#define ALIGN_SCRATCH_MAX_BYTES (16 * 1024 * 4) // 16 K complex × 4 B = 64 KB
 static int16_t *s_align_scratch = NULL;
 // Carry: 0..15 complex samples = at most 60 bytes of "left over" from
 // the previous push, prepended to the next push so no samples are lost.
-static int16_t  s_carry[ALIGN_COMPLEX * 2];   // 16 complex × 2 int16 = 64 B
-static uint8_t  s_carry_n_complex = 0;
+static int16_t s_carry[ALIGN_COMPLEX * 2]; // 16 complex × 2 int16 = 64 B
+static uint8_t s_carry_n_complex = 0;
 
 // Binary semaphore given by the completion ISR. Pre-given at init so the
 // very first push doesn't block. Each push takes the semaphore (waits for
@@ -90,13 +90,22 @@ static SemaphoreHandle_t s_dma_done = NULL;
 //     never came). Untreated would hang signal_buffer_push forever ->
 //     ingest never signals s_ready -> class deadlocks in
 //     take_converted. Has never fired in production.
-static volatile uint32_t s_stash_alloc_fails       = 0;
-static volatile uint32_t s_stash_alloc_recoveries  = 0;
-static volatile uint32_t s_dma_timeouts            = 0;
+static volatile uint32_t s_stash_alloc_fails      = 0;
+static volatile uint32_t s_stash_alloc_recoveries = 0;
+static volatile uint32_t s_dma_timeouts           = 0;
 
-uint32_t signal_buffer_stash_alloc_fails(void)      { return s_stash_alloc_fails; }
-uint32_t signal_buffer_stash_alloc_recoveries(void) { return s_stash_alloc_recoveries; }
-uint32_t signal_buffer_dma_timeouts(void)           { return s_dma_timeouts; }
+uint32_t signal_buffer_stash_alloc_fails(void)
+{
+    return s_stash_alloc_fails;
+}
+uint32_t signal_buffer_stash_alloc_recoveries(void)
+{
+    return s_stash_alloc_recoveries;
+}
+uint32_t signal_buffer_dma_timeouts(void)
+{
+    return s_dma_timeouts;
+}
 
 static IRAM_ATTR bool dma_done_cb(async_memcpy_handle_t mcp,
                                   async_memcpy_event_t *evt, void *arg)
@@ -120,7 +129,7 @@ esp_err_t signal_buffer_init()
     // formatting + UART output burned a measurable slice of Core 0 for
     // information we already track at our layer. Bumping the tag to
     // ERROR-only would still print these; need NONE to silence.
-    esp_log_level_set("dma_utils",      ESP_LOG_NONE);
+    esp_log_level_set("dma_utils", ESP_LOG_NONE);
     esp_log_level_set("async_mcp.gdma", ESP_LOG_NONE);
 
     ESP_LOGI(TAG, "Allocating 4MB Signal Buffer in PSRAM (DMA-aligned)...");
@@ -132,8 +141,8 @@ esp_err_t signal_buffer_init()
     head = 0;
 
     async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
-    cfg.backlog = 4;          // up to 4 outstanding transfers
-    cfg.dma_burst_size = 64;  // match L2 cache line for efficient bursts
+    cfg.backlog               = 4;  // up to 4 outstanding transfers
+    cfg.dma_burst_size        = 64; // match L2 cache line for efficient bursts
     // Note: IDF v6.1's async_memcpy_config_t doesn't expose
     // psram_trans_align / sram_trans_align (those were earlier-IDF
     // fields). We can't tell GDMA "skip the split-RX path because
@@ -165,7 +174,7 @@ esp_err_t signal_buffer_init()
 
     s_dma_done = xSemaphoreCreateBinary();
     if (!s_dma_done) return ESP_ERR_NO_MEM;
-    xSemaphoreGive(s_dma_done);  // first push doesn't wait
+    xSemaphoreGive(s_dma_done); // first push doesn't wait
 
     ESP_LOGI(TAG, "Signal buffer + AXI-GDMA installed (align scratch %d B PSRAM)",
              (int)ALIGN_SCRATCH_MAX_BYTES);
@@ -176,7 +185,7 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
 {
     if (!circular_buf || !s_dma) return;
 
-    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;  // complex samples
+    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4; // complex samples
 
     // Cache-line alignment via carry-forward (#125). Available = previous
     // carry + this push. If less than ALIGN_COMPLEX (16), accumulate in
@@ -192,16 +201,16 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
 
     // Round down to 16-complex granularity. The remaining 0..15 complex
     // samples become the new carry for the next push (no sample loss).
-    size_t aligned_count    = total_avail & ~((size_t)(ALIGN_COMPLEX - 1));
-    size_t new_carry_count  = total_avail - aligned_count;
-    size_t aligned_bytes    = aligned_count * 4;
+    size_t aligned_count   = total_avail & ~((size_t)(ALIGN_COMPLEX - 1));
+    size_t new_carry_count = total_avail - aligned_count;
+    size_t aligned_bytes   = aligned_count * 4;
     // Sanity: scratch is sized for one max push; very large overruns are
     // a caller error. Clamp defensively rather than overflow.
     if (aligned_bytes > (size_t)ALIGN_SCRATCH_MAX_BYTES) {
         ESP_LOGW(TAG, "push %u complex exceeds scratch (%d B max) — clamping",
                  (unsigned)aligned_count, (int)ALIGN_SCRATCH_MAX_BYTES);
-        aligned_bytes  = ALIGN_SCRATCH_MAX_BYTES & ~((size_t)63);
-        aligned_count  = aligned_bytes / 4;
+        aligned_bytes   = ALIGN_SCRATCH_MAX_BYTES & ~((size_t)63);
+        aligned_count   = aligned_bytes / 4;
         new_carry_count = total_avail - aligned_count;
     }
 
@@ -230,12 +239,12 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
     }
     memcpy(((uint8_t *)s_align_scratch) + carry_bytes, samples, src_take * 4);
 
-    uint8_t *dst_base = (uint8_t *)circular_buf;
-    uint32_t head_bytes = head * 4;   // 64-aligned by invariant (#125)
-    size_t bytes_to_end = (uint32_t)SIGNAL_BUF_SIZE - head_bytes;
+    uint8_t *dst_base     = (uint8_t *)circular_buf;
+    uint32_t head_bytes   = head * 4; // 64-aligned by invariant (#125)
+    size_t   bytes_to_end = (uint32_t)SIGNAL_BUF_SIZE - head_bytes;
 
     esp_err_t r;
-    bool wrap = (aligned_bytes > bytes_to_end);
+    bool      wrap = (aligned_bytes > bytes_to_end);
     if (!wrap) {
         // Common path: single contiguous write. All three (src, dst, len)
         // are 64-aligned, so no cache-split-RX path triggered.
@@ -250,9 +259,9 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
                              bytes_to_end, NULL, NULL);
         if (r == ESP_OK) {
             size_t remainder = aligned_bytes - bytes_to_end;
-            r = esp_async_memcpy(s_dma, dst_base,
-                                 ((uint8_t *)s_align_scratch) + bytes_to_end,
-                                 remainder, dma_done_cb, NULL);
+            r                = esp_async_memcpy(s_dma, dst_base,
+                                                ((uint8_t *)s_align_scratch) + bytes_to_end,
+                                                remainder, dma_done_cb, NULL);
         }
     }
     if (r != ESP_OK) {
@@ -275,7 +284,7 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
         //   end of the 32 MB ring, and even then the per-transaction
         //   alloc usually succeeds); not worth the complexity.
         s_stash_alloc_fails++;
-        if ((s_stash_alloc_fails & 0x3f) == 1) {   // rate-limit to ~1/64
+        if ((s_stash_alloc_fails & 0x3f) == 1) { // rate-limit to ~1/64
             // Log contains both 'stash_alloc_fail' (new canonical name)
             // and 'submit failed' (legacy phrase) so old grep filters
             // and any external dashboards keep matching.
@@ -337,32 +346,32 @@ void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest)
     // CPU caches may hold stale lines for the region we just wrote, so
     // invalidate before the worker reads. M2C + INVALIDATE drops cached
     // lines so the next reads pull fresh data from PSRAM.
-    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
-    uint32_t actual_start = start_idx % total_cap;
-    size_t bytes_to_read = length * 4;
-    uint8_t *base = (uint8_t *)circular_buf;
-    uint32_t start_bytes = actual_start * 4;
-    size_t to_end_bytes = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
+    const uint32_t total_cap     = SIGNAL_BUF_SIZE / 4;
+    uint32_t       actual_start  = start_idx % total_cap;
+    size_t         bytes_to_read = length * 4;
+    uint8_t       *base          = (uint8_t *)circular_buf;
+    uint32_t       start_bytes   = actual_start * 4;
+    size_t         to_end_bytes  = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
 
     if (bytes_to_read <= to_end_bytes) {
         esp_cache_msync(base + start_bytes, bytes_to_read,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
     } else {
         esp_cache_msync(base + start_bytes, to_end_bytes,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
         size_t rem = bytes_to_read - to_end_bytes;
         esp_cache_msync(base, rem,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
     }
 
     // Per-element copy across the wrap. Runs once per detected burst (not
     // per sample on the hot path), so the loop overhead is fine relative
     // to the rest of the worker pipeline.
     for (uint32_t i = 0; i < length; i++) {
-        uint32_t idx = (actual_start + i) % total_cap;
+        uint32_t idx    = (actual_start + i) % total_cap;
         dest[i * 2 + 0] = circular_buf[idx * 2 + 0];
         dest[i * 2 + 1] = circular_buf[idx * 2 + 1];
     }
@@ -371,33 +380,33 @@ void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest)
 void signal_buffer_invalidate_range(uint32_t start_idx, uint32_t length)
 {
     if (!circular_buf) return;
-    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
-    uint32_t actual_start = start_idx % total_cap;
-    size_t bytes_to_read = length * 4;
-    uint8_t *base = (uint8_t *)circular_buf;
-    uint32_t start_bytes = actual_start * 4;
-    size_t to_end_bytes = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
+    const uint32_t total_cap     = SIGNAL_BUF_SIZE / 4;
+    uint32_t       actual_start  = start_idx % total_cap;
+    size_t         bytes_to_read = length * 4;
+    uint8_t       *base          = (uint8_t *)circular_buf;
+    uint32_t       start_bytes   = actual_start * 4;
+    size_t         to_end_bytes  = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
 
     if (bytes_to_read <= to_end_bytes) {
         esp_cache_msync(base + start_bytes, bytes_to_read,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
     } else {
         esp_cache_msync(base + start_bytes, to_end_bytes,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
         size_t rem = bytes_to_read - to_end_bytes;
         esp_cache_msync(base, rem,
                         ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                        ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
     }
 }
 
 void signal_buffer_read_chunk(uint32_t start_idx, uint32_t length, int16_t *dest)
 {
     if (!circular_buf) return;
-    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
-    uint32_t actual_start = start_idx % total_cap;
+    const uint32_t total_cap    = SIGNAL_BUF_SIZE / 4;
+    uint32_t       actual_start = start_idx % total_cap;
     // Fast path: chunk is fully contiguous (no wrap). memcpy beats the
     // per-element loop -- it can do 16-byte burst PSRAM reads via the
     // L2 cache prefetcher.

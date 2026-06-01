@@ -30,11 +30,11 @@
 // Synthesise a complex sinusoid at f_in Hz, amplitude 16000 (well below
 // Q15 saturation), sampled at fs Hz. n_complex IQ samples.
 static void synth_tone(int16_t *iq, int n_complex,
-                        double f_in, double fs)
+                       double f_in, double fs)
 {
     double dphi = 2.0 * M_PI * f_in / fs;
     for (int k = 0; k < n_complex; k++) {
-        double a = dphi * (double)k;
+        double a      = dphi * (double)k;
         iq[k * 2 + 0] = (int16_t)lrint(16000.0 * cos(a));
         iq[k * 2 + 1] = (int16_t)lrint(16000.0 * sin(a));
     }
@@ -42,16 +42,15 @@ static void synth_tone(int16_t *iq, int n_complex,
 
 // Compute NMSE (10·log10(Σ|err|² / Σ|sig|²)) between two int16 IQ buffers.
 static double nmse_db(const int16_t *a, const int16_t *b, int n_complex,
-                       int *out_max_diff)
+                      int *out_max_diff)
 {
     double err = 0, sig = 0;
-    int max_diff = 0;
+    int    max_diff = 0;
     for (int k = 0; k < n_complex; k++) {
         int dr = (int)a[k * 2 + 0] - (int)b[k * 2 + 0];
         int di = (int)a[k * 2 + 1] - (int)b[k * 2 + 1];
         err += (double)dr * dr + (double)di * di;
-        sig += (double)a[k * 2 + 0] * a[k * 2 + 0]
-              + (double)a[k * 2 + 1] * a[k * 2 + 1];
+        sig += (double)a[k * 2 + 0] * a[k * 2 + 0] + (double)a[k * 2 + 1] * a[k * 2 + 1];
         int adr = dr < 0 ? -dr : dr;
         int adi = di < 0 ? -di : di;
         if (adr > max_diff) max_diff = adr;
@@ -83,14 +82,19 @@ static double rms_mag(const int16_t *iq, int n_complex)
 // of the chunk-aligned renormalisation. Catches bugs in the chunk
 // boundary handling, the tail path, and the lane-table build that
 // might otherwise show up only after the PIE asm lands.
-static int check_simd_ref_matches_inc(int n_complex,
-                                       double f_in_hz, double f_shift_hz,
-                                       double fs_hz)
+static int check_simd_ref_matches_inc(int    n_complex,
+                                      double f_in_hz, double f_shift_hz,
+                                      double fs_hz)
 {
-    int16_t *src = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
-    int16_t *inc = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
+    int16_t *src  = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
+    int16_t *inc  = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
     int16_t *simd = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
-    if (!src || !inc || !simd) { free(src); free(inc); free(simd); return 1; }
+    if (!src || !inc || !simd) {
+        free(src);
+        free(inc);
+        free(simd);
+        return 1;
+    }
 
     synth_tone(src, n_complex, f_in_hz, fs_hz);
     double phase_step = -2.0 * M_PI * f_shift_hz / fs_hz;
@@ -100,8 +104,8 @@ static int check_simd_ref_matches_inc(int n_complex,
     memcpy(simd, src, 2 * n_complex * sizeof(int16_t));
     rotate_to_dc_q15_simd_ref(simd, n_complex, phase_step);
 
-    int max_diff = 0;
-    double nmse = nmse_db(inc, simd, n_complex, &max_diff);
+    int    max_diff = 0;
+    double nmse     = nmse_db(inc, simd, n_complex, &max_diff);
     printf("    SIMD-ref vs q15_inc: NMSE %.2f dB, max diff %d LSB\n",
            nmse, max_diff);
     int fail = 0;
@@ -109,15 +113,17 @@ static int check_simd_ref_matches_inc(int n_complex,
         printf("    FAIL: SIMD-ref drift from q15_inc exceeds -55 dB NMSE\n");
         fail = 1;
     }
-    free(src); free(inc); free(simd);
+    free(src);
+    free(inc);
+    free(simd);
     return fail;
 }
 
 // One test case: rotate a synthesised tone, compare reference vs Q15-inc.
 // `description` is logged in the per-case header.
 static int run_case(const char *description,
-                     int n_complex, double f_in_hz, double f_shift_hz,
-                     double fs_hz, double nmse_threshold_db)
+                    int n_complex, double f_in_hz, double f_shift_hz,
+                    double fs_hz, double nmse_threshold_db)
 {
     printf("--- %s ---\n", description);
     printf("    n=%d, f_in=%.1f Hz, f_shift=%.1f Hz, fs=%.1f Hz\n",
@@ -128,7 +134,9 @@ static int run_case(const char *description,
     int16_t *q15 = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
     if (!src || !ref || !q15) {
         fprintf(stderr, "ALLOC FAIL\n");
-        free(src); free(ref); free(q15);
+        free(src);
+        free(ref);
+        free(q15);
         return 1;
     }
 
@@ -147,7 +155,7 @@ static int run_case(const char *description,
 
     double ref_rms = rms_mag(ref, n_complex);
     double q15_rms = rms_mag(q15, n_complex);
-    int max_diff;
+    int    max_diff;
     double nmse = nmse_db(ref, q15, n_complex, &max_diff);
 
     printf("    ref RMS: %.1f   q15-inc RMS: %.1f   ratio: %.4f\n",
@@ -167,12 +175,15 @@ static int run_case(const char *description,
     double mag_ratio = q15_rms / ref_rms;
     if (mag_ratio < 0.98 || mag_ratio > 1.02) {
         printf("    FAIL: RMS ratio %.4f outside [0.98, 1.02] — "
-               "renormalisation not holding\n", mag_ratio);
+               "renormalisation not holding\n",
+               mag_ratio);
         fail = 1;
     }
     printf("    %s\n", fail ? "FAIL" : "PASS");
 
-    free(src); free(ref); free(q15);
+    free(src);
+    free(ref);
+    free(q15);
     return fail;
 }
 
@@ -185,31 +196,31 @@ int main(void)
     // Case 1: short window. Renormalisation only kicks in once or twice;
     // tests basic correctness of the incremental multiply.
     fails += run_case("short window (1k samples)",
-                       1024, 1000.0, 800000.0, 2500000.0, -45.0);
+                      1024, 1000.0, 800000.0, 2500000.0, -45.0);
 
     // Case 2: typical wideband-burst window (~16 ms at 2.5 MSPS).
     // This is the size the firmware worker handles per burst, so
     // matches the actual production load.
     fails += run_case("burst-size window (40k samples)",
-                       40000, 1000.0, 800000.0, 2500000.0, -40.0);
+                      40000, 1000.0, 800000.0, 2500000.0, -40.0);
 
     // Case 3: long window (100k samples) — well past the 44k samples
     // at which the non-renormalised Q15 phasor would collapse the
     // amplitude (per the memory feedback note). Confirms renormalisation
     // is preventing the decay over long windows.
     fails += run_case("long window (100k samples, would catastrophically "
-                       "decay without renorm)",
-                       100000, 1000.0, 800000.0, 2500000.0, -40.0);
+                      "decay without renorm)",
+                      100000, 1000.0, 800000.0, 2500000.0, -40.0);
 
     // Case 4: small shift (in case the renormalisation interacts oddly
     // with near-DC rotation).
     fails += run_case("small shift (5 kHz, near-DC)",
-                       40000, 1000.0, 5000.0, 2500000.0, -40.0);
+                      40000, 1000.0, 5000.0, 2500000.0, -40.0);
 
     // Case 5: phase_step near ±π (Nyquist-ish, where cos/sin quantisation
     // pressure is highest).
     fails += run_case("large shift (1.2 MHz, near-Nyquist)",
-                       40000, 1000.0, 1200000.0, 2500000.0, -40.0);
+                      40000, 1000.0, 1200000.0, 2500000.0, -40.0);
 
     // SIMD-reference cross-check: chunked scalar reference for the
     // future PIE asm must produce output very close to q15_inc.

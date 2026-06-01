@@ -28,8 +28,8 @@
 #include <limits.h>
 
 #include "qpsk_demod.h"
-#include "fixture_albq_2sps.h"      // ALBQ_2SPS, ALBQ_2SPS_LEN
-#include "fixture_albq_truth.h"     // ALBQ_TRUTH_BITS, *_LEN, *_DIRECTION
+#include "fixture_albq_2sps.h"  // ALBQ_2SPS, ALBQ_2SPS_LEN
+#include "fixture_albq_truth.h" // ALBQ_TRUTH_BITS, *_LEN, *_DIRECTION
 
 static int compare_bits(const uint8_t *demod, int demod_n,
                         const uint8_t *truth, int truth_n,
@@ -50,12 +50,15 @@ static int compare_bits(const uint8_t *demod, int demod_n,
         printf("  first bit mismatch at index %d (demod=%d truth=%d)\n",
                first_diff, demod[first_diff] & 1, truth[first_diff] & 1);
         int s = first_diff - 8 < 0 ? 0 : first_diff - 8;
-        int e = first_diff + 24; if (e > n) e = n;
+        int e = first_diff + 24;
+        if (e > n) e = n;
         printf("  demod[%d..%d]: ", s, e - 1);
-        for (int i = s; i < e; i++) putchar('0' + (demod[i] & 1));
+        for (int i = s; i < e; i++)
+            putchar('0' + (demod[i] & 1));
         putchar('\n');
         printf("  truth[%d..%d]: ", s, e - 1);
-        for (int i = s; i < e; i++) putchar('0' + (truth[i] & 1));
+        for (int i = s; i < e; i++)
+            putchar('0' + (truth[i] & 1));
         putchar('\n');
     }
     return diffs;
@@ -80,17 +83,20 @@ int main(void)
     // For real-RF bursts with PLL locking on the BPSK chirp preamble
     // before the UW, this should be unambiguous — true match ~0% BER,
     // false matches ~50% BER.
-    decoded_frame_t best_frame = { 0 };
-    int best_diffs   = INT_MAX;
-    int best_compare = 0;
-    int best_offset  = -1;
-    int best_rot     = -1;
-    const char *best_dir = "?";
-    const int STEP_INT16 = 4;
-    const int MAX_SYMBOLS_OFFSET = 500;
+    decoded_frame_t best_frame         = {0};
+    int             best_diffs         = INT_MAX;
+    int             best_compare       = 0;
+    int             best_offset        = -1;
+    int             best_rot           = -1;
+    const char     *best_dir           = "?";
+    const int       STEP_INT16         = 4;
+    const int       MAX_SYMBOLS_OFFSET = 500;
 
     int16_t *rotated = malloc(ALBQ_2SPS_LEN * sizeof(int16_t));
-    if (!rotated) { fprintf(stderr, "OOM\n"); return 2; }
+    if (!rotated) {
+        fprintf(stderr, "OOM\n");
+        return 2;
+    }
 
     for (int rot = 0; rot < 4; rot++) {
         for (unsigned i = 0; i < ALBQ_2SPS_LEN; i += 2) {
@@ -98,10 +104,22 @@ int main(void)
             int16_t qq = ALBQ_2SPS[i + 1];
             int16_t ir, qr;
             switch (rot) {
-            case 0: ir =  ii; qr =  qq; break;
-            case 1: ir = -qq; qr =  ii; break;
-            case 2: ir = -ii; qr = -qq; break;
-            default:ir =  qq; qr = -ii; break;
+            case 0:
+                ir = ii;
+                qr = qq;
+                break;
+            case 1:
+                ir = -qq;
+                qr = ii;
+                break;
+            case 2:
+                ir = -ii;
+                qr = -qq;
+                break;
+            default:
+                ir = qq;
+                qr = -ii;
+                break;
             }
             rotated[i + 0] = ir;
             rotated[i + 1] = qr;
@@ -109,19 +127,21 @@ int main(void)
         for (int sym_off = 0; sym_off < MAX_SYMBOLS_OFFSET; sym_off++) {
             int int16_off = sym_off * STEP_INT16;
             if ((int)ALBQ_2SPS_LEN - int16_off < 24 * STEP_INT16) break;
-            decoded_frame_t f = { 0 };
-            int rc = qpsk_demod_process(rotated + int16_off,
-                                        ALBQ_2SPS_LEN - int16_off, &f);
+            decoded_frame_t f  = {0};
+            int             rc = qpsk_demod_process(rotated + int16_off,
+                                                    ALBQ_2SPS_LEN - int16_off, &f);
             if (!rc) continue;
             const char *dir =
-                (f.direction == DIR_DOWNLINK) ? "DL" :
-                (f.direction == DIR_UPLINK)   ? "UL" : "?";
+                (f.direction == DIR_DOWNLINK) ? "DL" : (f.direction == DIR_UPLINK) ? "UL"
+                                                                                   : "?";
             if (strcmp(dir, ALBQ_TRUTH_BITS_DIRECTION) != 0) {
-                free(f.bits); continue;  // wrong direction — false UW
+                free(f.bits);
+                continue; // wrong direction — false UW
             }
             int compare = (f.n_bits < (int)ALBQ_TRUTH_BITS_LEN
-                           ? f.n_bits : (int)ALBQ_TRUTH_BITS_LEN);
-            int diffs = 0;
+                               ? f.n_bits
+                               : (int)ALBQ_TRUTH_BITS_LEN);
+            int diffs   = 0;
             for (int i = 0; i < compare; i++) {
                 if ((f.bits[i] & 1) != (ALBQ_TRUTH_BITS[i] & 1)) diffs++;
             }

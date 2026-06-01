@@ -34,14 +34,14 @@
 // NDJSON log. When OFF, all public functions become inline no-ops.
 
 typedef struct {
-    bool     active;             // capture currently running
+    bool     active; // capture currently running
     bool     file_open;
-    uint64_t bytes_captured;     // bytes written to file
-    uint64_t bytes_target;       // 0 = unlimited
-    uint32_t bytes_dropped;      // bytes that didn't fit in stream buffer
+    uint64_t bytes_captured; // bytes written to file
+    uint64_t bytes_target;   // 0 = unlimited
+    uint32_t bytes_dropped;  // bytes that didn't fit in stream buffer
     uint32_t write_errors;
-    char     path[64];           // empty until started
-    int64_t  start_us;           // boot-relative
+    char     path[64]; // empty until started
+    int64_t  start_us; // boot-relative
 } sd_capture_stats_t;
 
 #if CONFIG_ENABLE_SD_LOG
@@ -96,18 +96,18 @@ FILE *sd_capture_open_for_read(const char *name);
 // Magic "BRST" lets a parser resync if the file is truncated mid-
 // record. Header size is fixed so a parser doesn't need TLV logic.
 
-#define SD_CAPTURE_BURST_MAGIC  0x54535242u   /* "BRST" little-endian */
+#define SD_CAPTURE_BURST_MAGIC 0x54535242u /* "BRST" little-endian */
 
 typedef struct __attribute__((packed)) {
-    uint32_t magic;             /* SD_CAPTURE_BURST_MAGIC */
-    uint32_t seq;               /* monotonic per-capture, starts at 0 */
-    uint64_t t_us;              /* esp_timer_get_time at burst-begin */
-    uint32_t length_samples;    /* complex samples that follow (×4 bytes) */
-    float    rel_freq_hz;       /* tagger-reported offset from LO */
+    uint32_t magic;          /* SD_CAPTURE_BURST_MAGIC */
+    uint32_t seq;            /* monotonic per-capture, starts at 0 */
+    uint64_t t_us;           /* esp_timer_get_time at burst-begin */
+    uint32_t length_samples; /* complex samples that follow (×4 bytes) */
+    float    rel_freq_hz;    /* tagger-reported offset from LO */
     float    peak_snr_db;
     float    magnitude_db;
     float    noise_db;
-    uint32_t reserved;          /* zero; pads to 40 bytes for future fields */
+    uint32_t reserved; /* zero; pads to 40 bytes for future fields */
 } sd_capture_burst_hdr_t;
 _Static_assert(sizeof(sd_capture_burst_hdr_t) == 40,
                "burst header layout must be 40 bytes (file format)");
@@ -132,25 +132,36 @@ esp_err_t sd_capture_start_bursts(void);
 // and _end after the final chunk. Caller is one task (worker_core1)
 // so no concurrency between burst records.
 void sd_capture_record_burst_begin(uint32_t length_samples,
-                                    float rel_freq_hz,
-                                    float peak_snr_db,
-                                    float magnitude_db,
-                                    float noise_db);
+                                   float    rel_freq_hz,
+                                   float    peak_snr_db,
+                                   float    magnitude_db,
+                                   float    noise_db);
 void sd_capture_record_burst_chunk(const int16_t *iq, size_t n_complex);
 void sd_capture_record_burst_end(void);
 
-#else  /* !CONFIG_ENABLE_SD_LOG — provide inline no-op stubs. */
+#else /* !CONFIG_ENABLE_SD_LOG — provide inline no-op stubs. */
 
-static inline esp_err_t sd_capture_init(void) { return ESP_OK; }
-static inline esp_err_t sd_capture_alloc_writer_buf(void) { return ESP_OK; }
+static inline esp_err_t sd_capture_init(void)
+{
+    return ESP_OK;
+}
+static inline esp_err_t sd_capture_alloc_writer_buf(void)
+{
+    return ESP_OK;
+}
 static inline esp_err_t sd_capture_start(uint64_t target_bytes)
 {
-    (void)target_bytes; return ESP_ERR_NOT_SUPPORTED;
+    (void)target_bytes;
+    return ESP_ERR_NOT_SUPPORTED;
 }
-static inline esp_err_t sd_capture_stop(void) { return ESP_ERR_NOT_SUPPORTED; }
+static inline esp_err_t sd_capture_stop(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
 static inline void sd_capture_write(const uint8_t *data, size_t n)
 {
-    (void)data; (void)n;
+    (void)data;
+    (void)n;
 }
 static inline void sd_capture_get_stats(sd_capture_stats_t *out)
 {
@@ -158,20 +169,29 @@ static inline void sd_capture_get_stats(sd_capture_stats_t *out)
     memset(out, 0, sizeof(*out));
     snprintf(out->path, sizeof(out->path), "disabled (CONFIG_ENABLE_SD_LOG=n)");
 }
-static inline esp_err_t sd_capture_start_bursts(void) { return ESP_ERR_NOT_SUPPORTED; }
-static inline void sd_capture_record_burst_begin(uint32_t length_samples,
-                                                  float rel_freq_hz,
-                                                  float peak_snr_db,
-                                                  float magnitude_db,
-                                                  float noise_db)
+static inline esp_err_t sd_capture_start_bursts(void)
 {
-    (void)length_samples; (void)rel_freq_hz; (void)peak_snr_db;
-    (void)magnitude_db; (void)noise_db;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+static inline void sd_capture_record_burst_begin(uint32_t length_samples,
+                                                 float    rel_freq_hz,
+                                                 float    peak_snr_db,
+                                                 float    magnitude_db,
+                                                 float    noise_db)
+{
+    (void)length_samples;
+    (void)rel_freq_hz;
+    (void)peak_snr_db;
+    (void)magnitude_db;
+    (void)noise_db;
 }
 static inline void sd_capture_record_burst_chunk(const int16_t *iq, size_t n_complex)
 {
-    (void)iq; (void)n_complex;
+    (void)iq;
+    (void)n_complex;
 }
-static inline void sd_capture_record_burst_end(void) {}
+static inline void sd_capture_record_burst_end(void)
+{
+}
 
-#endif  /* CONFIG_ENABLE_SD_LOG */
+#endif /* CONFIG_ENABLE_SD_LOG */

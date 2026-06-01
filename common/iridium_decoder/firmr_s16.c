@@ -25,12 +25,12 @@ void firmr_s16_init(firmr_s16_t *fir,
     }
 }
 
-int32_t firmr_s16_process(firmr_s16_t *fir,
+int32_t firmr_s16_process(firmr_s16_t   *fir,
                           const int16_t *input, int16_t *output,
                           int32_t input_len)
 {
-    int32_t result = 0;
-    long long rounding = (long long)fir->rounding_val;
+    int32_t       result      = 0;
+    long long     rounding    = (long long)fir->rounding_val;
     const int32_t final_shift = fir->shift - 15;
 
     // Pre-scale the rounding term to match the final shift direction
@@ -47,19 +47,17 @@ int32_t firmr_s16_process(firmr_s16_t *fir,
         fir->delay[fir->pos] = input[i];
 
         for (m = fir->start_pos; m < fir->interp; m += fir->decim) {
-            long long acc = rounding;
-            int coeff_pos = 0;
+            long long acc       = rounding;
+            int       coeff_pos = 0;
             // Walk the delay line as a circular buffer starting at
             // the newest position. For each tap we use the
             // transposed-polyphase coefficient index
             // coeffs[tap_pos * interp + phase].
             for (int n = fir->pos; n < fir->delay_size; n++) {
-                acc += (int32_t)fir->delay[n]
-                     * (int32_t)fir->coeffs[coeff_pos++ * fir->interp + m];
+                acc += (int32_t)fir->delay[n] * (int32_t)fir->coeffs[coeff_pos++ * fir->interp + m];
             }
             for (int n = 0; n < fir->pos; n++) {
-                acc += (int32_t)fir->delay[n]
-                     * (int32_t)fir->coeffs[coeff_pos++ * fir->interp + m];
+                acc += (int32_t)fir->delay[n] * (int32_t)fir->coeffs[coeff_pos++ * fir->interp + m];
             }
 
             int16_t out;

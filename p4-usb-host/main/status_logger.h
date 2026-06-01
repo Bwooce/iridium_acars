@@ -20,23 +20,23 @@
 // Moving the formatting to Core 1 (which is otherwise idle outside the
 // short ingest_core1 bursts) brings drops to 0.
 typedef struct {
-    int64_t  window_us;            // wall-time of this 1 s window
-    int64_t  elapsed_us;            // wall-time since boot
-    uint64_t bytes_window;          // USB bytes received in this window
-    uint64_t total_bytes;           // USB bytes received since boot
-    uint32_t feed_calls_window;     // dsp_processor_feed calls in this window
-    uint64_t dsp_total_time_us;     // sum of feed wall time
-    uint32_t dsp_frame_count;       // FFT frames processed in this window
-    uint64_t cycle_read_us;         // sum of esp_libusb_read_stream wall time
-    uint64_t cycle_handle_events_us; // sum of usb_host_client_handle_events wall time
-    uint64_t cycle_take_converted_us;// sum of ingest_core1_take_converted wall time
-    uint32_t cycle_iterations;       // count of class_driver loop iterations
-    int      psram_free_bytes;      // heap_caps_get_free_size(MALLOC_CAP_SPIRAM)
+    int64_t  window_us;               // wall-time of this 1 s window
+    int64_t  elapsed_us;              // wall-time since boot
+    uint64_t bytes_window;            // USB bytes received in this window
+    uint64_t total_bytes;             // USB bytes received since boot
+    uint32_t feed_calls_window;       // dsp_processor_feed calls in this window
+    uint64_t dsp_total_time_us;       // sum of feed wall time
+    uint32_t dsp_frame_count;         // FFT frames processed in this window
+    uint64_t cycle_read_us;           // sum of esp_libusb_read_stream wall time
+    uint64_t cycle_handle_events_us;  // sum of usb_host_client_handle_events wall time
+    uint64_t cycle_take_converted_us; // sum of ingest_core1_take_converted wall time
+    uint32_t cycle_iterations;        // count of class_driver loop iterations
+    int      psram_free_bytes;        // heap_caps_get_free_size(MALLOC_CAP_SPIRAM)
 
-    usb_stream_stats_t  us;
-    dsp_stage_stats_t   dsp;
-    ingest_stats_t      ingest;
-    worker_stats_t      ws;
+    usb_stream_stats_t us;
+    dsp_stage_stats_t  dsp;
+    ingest_stats_t     ingest;
+    worker_stats_t     ws;
 } status_snapshot_t;
 
 // Bring up the logger task + queue. Call once at startup. Task pinned to

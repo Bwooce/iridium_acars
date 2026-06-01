@@ -4,11 +4,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define BCH_POLY_RA 1207   // BCH(31,21) t=2
+#define BCH_POLY_RA 1207 // BCH(31,21) t=2
 #define BCH_RA_DATA 21
 
 void bch_decoder_init();
-int bch_decode_block(const uint8_t *block31, uint8_t *out_data);
+int  bch_decode_block(const uint8_t *block31, uint8_t *out_data);
 
 // Chase-2 soft-decision BCH decoder. soft_in is 31 signed values
 // where sign carries the hard bit (≥0 → 0, <0 → 1) and magnitude is

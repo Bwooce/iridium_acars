@@ -28,15 +28,15 @@
 
 static const char *TAG = "PUSH";
 
-#define QUEUE_DEPTH    16
+#define QUEUE_DEPTH 16
 
-static QueueHandle_t s_q     = NULL;
+static QueueHandle_t s_q      = NULL;
 static volatile bool s_active = false;
 
-static int  s_sock         = -1;
+static int                s_sock = -1;
 static struct sockaddr_in s_dst;
-static char s_host_resolved[64];
-static uint16_t s_port_resolved = 0;
+static char               s_host_resolved[64];
+static uint16_t           s_port_resolved = 0;
 
 static bool resolve_target(const char *host, uint16_t port)
 {
@@ -48,13 +48,13 @@ static bool resolve_target(const char *host, uint16_t port)
         }
     }
 
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
-    struct addrinfo *res = NULL;
+    struct addrinfo  hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
+    struct addrinfo *res   = NULL;
     if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
         ESP_LOGW(TAG, "DNS lookup '%s' failed (will retry on next push)", host);
         return false;
     }
-    s_dst = *(struct sockaddr_in *)res->ai_addr;
+    s_dst          = *(struct sockaddr_in *)res->ai_addr;
     s_dst.sin_port = htons(port);
     freeaddrinfo(res);
 
@@ -72,23 +72,40 @@ static size_t format_msg(char *buf, size_t cap, const acars_msg_t *m)
     // Same shape as one entry from GET /messages. Reuse a tiny JSON
     // string escape — control chars in ACARS text are common (CR/LF
     // separators in long flight plans).
-    char esc_txt[2 * MSG_RING_TXT_MAX + 8];
+    char   esc_txt[2 * MSG_RING_TXT_MAX + 8];
     size_t w = 0;
     for (const char *p = m->txt; *p && w + 7 < sizeof(esc_txt); p++) {
         unsigned char c = (unsigned char)*p;
         switch (c) {
-        case '"':  esc_txt[w++] = '\\'; esc_txt[w++] = '"';  break;
-        case '\\': esc_txt[w++] = '\\'; esc_txt[w++] = '\\'; break;
-        case '\n': esc_txt[w++] = '\\'; esc_txt[w++] = 'n';  break;
-        case '\r': esc_txt[w++] = '\\'; esc_txt[w++] = 'r';  break;
-        case '\t': esc_txt[w++] = '\\'; esc_txt[w++] = 't';  break;
+        case '"':
+            esc_txt[w++] = '\\';
+            esc_txt[w++] = '"';
+            break;
+        case '\\':
+            esc_txt[w++] = '\\';
+            esc_txt[w++] = '\\';
+            break;
+        case '\n':
+            esc_txt[w++] = '\\';
+            esc_txt[w++] = 'n';
+            break;
+        case '\r':
+            esc_txt[w++] = '\\';
+            esc_txt[w++] = 'r';
+            break;
+        case '\t':
+            esc_txt[w++] = '\\';
+            esc_txt[w++] = 't';
+            break;
         default:
             if (c < 0x20) {
                 static const char hex[] = "0123456789abcdef";
-                esc_txt[w++] = '\\'; esc_txt[w++] = 'u';
-                esc_txt[w++] = '0'; esc_txt[w++] = '0';
-                esc_txt[w++] = hex[(c >> 4) & 0xf];
-                esc_txt[w++] = hex[c & 0xf];
+                esc_txt[w++]            = '\\';
+                esc_txt[w++]            = 'u';
+                esc_txt[w++]            = '0';
+                esc_txt[w++]            = '0';
+                esc_txt[w++]            = hex[(c >> 4) & 0xf];
+                esc_txt[w++]            = hex[c & 0xf];
             } else {
                 esc_txt[w++] = (char)c;
             }
@@ -97,32 +114,32 @@ static size_t format_msg(char *buf, size_t cap, const acars_msg_t *m)
     esc_txt[w] = '\0';
 
     int n = snprintf(buf, cap,
-        "{"
-            "\"id\":%llu,"
-            "\"t_us\":%llu,"
-            "\"dir\":\"%s\","
-            "\"mode\":\"%c\","
-            "\"label\":\"%.2s\","
-            "\"block\":\"%c\","
-            "\"msg_num\":\"%s\","
-            "\"flight\":\"%s\","
-            "\"crc\":%s,"
-            "\"peak_bin\":%ld,"
-            "\"snr_db\":%.1f,"
-            "\"txt\":\"%s\""
-        "}\n",
-        (unsigned long long)m->id,
-        (unsigned long long)m->timestamp_us,
-        m->uplink ? "UL" : "DL",
-        m->mode,
-        m->label,
-        m->block_id,
-        m->msg_num,
-        m->flight_id,
-        m->crc_ok ? "true" : "false",
-        (long)m->peak_bin,
-        (double)m->snr_db,
-        esc_txt);
+                     "{"
+                     "\"id\":%llu,"
+                     "\"t_us\":%llu,"
+                     "\"dir\":\"%s\","
+                     "\"mode\":\"%c\","
+                     "\"label\":\"%.2s\","
+                     "\"block\":\"%c\","
+                     "\"msg_num\":\"%s\","
+                     "\"flight\":\"%s\","
+                     "\"crc\":%s,"
+                     "\"peak_bin\":%ld,"
+                     "\"snr_db\":%.1f,"
+                     "\"txt\":\"%s\""
+                     "}\n",
+                     (unsigned long long)m->id,
+                     (unsigned long long)m->timestamp_us,
+                     m->uplink ? "UL" : "DL",
+                     m->mode,
+                     m->label,
+                     m->block_id,
+                     m->msg_num,
+                     m->flight_id,
+                     m->crc_ok ? "true" : "false",
+                     (long)m->peak_bin,
+                     (double)m->snr_db,
+                     esc_txt);
     if (n < 0 || (size_t)n >= cap) {
         ESP_LOGW(TAG, "format truncated (n=%d cap=%u)", n, (unsigned)cap);
         if (n < 0) return 0;
@@ -138,7 +155,7 @@ static void push_task(void *arg)
     // Wait for the queue to fill at least once before bothering to set
     // anything up — saves work if push is enabled but never used.
     acars_msg_t m;
-    static char pkt[2048];     // 2 KB max per UDP datagram; JSON usually ~400 B
+    static char pkt[2048]; // 2 KB max per UDP datagram; JSON usually ~400 B
 
     while (1) {
         if (xQueueReceive(s_q, &m, portMAX_DELAY) != pdTRUE) continue;
@@ -165,7 +182,7 @@ static void push_task(void *arg)
             ESP_LOGW(TAG, "sendto failed errno=%d (will re-resolve next msg)", errno);
             // Force re-resolve on next message — could be a stale DHCP
             // lease, AP roam, etc.
-            s_port_resolved = 0;
+            s_port_resolved    = 0;
             s_host_resolved[0] = '\0';
         }
     }
@@ -178,15 +195,15 @@ void acars_push_init(void)
     // (datagram emit, ~ms-scale), no reason to take internal SRAM
     // away from USB DMA. See memory note feedback_usb_pool_size_not_throttle.
     s_q = xQueueCreateWithCaps(QUEUE_DEPTH, sizeof(acars_msg_t),
-                                MALLOC_CAP_SPIRAM);
+                               MALLOC_CAP_SPIRAM);
     if (!s_q) {
         ESP_LOGE(TAG, "queue create failed");
         return;
     }
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(push_task, "acars_push",
-                                                     4096, NULL, 3, NULL,
-                                                     tskNO_AFFINITY,
-                                                     MALLOC_CAP_SPIRAM);
+                                                    4096, NULL, 3, NULL,
+                                                    tskNO_AFFINITY,
+                                                    MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "task create failed");
         vQueueDelete(s_q);

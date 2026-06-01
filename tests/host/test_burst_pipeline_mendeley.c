@@ -23,19 +23,20 @@
 #include "burst_pipeline.h"
 
 #if __has_include("fixture_mendeley_burst_sample.h")
-#  include "fixture_mendeley_burst_sample.h"
-#  define HAVE_FIXTURE 1
+#include "fixture_mendeley_burst_sample.h"
+#define HAVE_FIXTURE 1
 #else
-#  define HAVE_FIXTURE 0
+#define HAVE_FIXTURE 0
 #endif
 
 #if HAVE_FIXTURE
 
 // SNR-bucket boundaries (dB) for reporting.
-static const float SNR_BUCKETS[] = {  0.0f,  5.0f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f, 40.0f };
-#define N_BUCKETS  (sizeof(SNR_BUCKETS) / sizeof(SNR_BUCKETS[0]) - 1)
+static const float SNR_BUCKETS[] = {0.0f, 5.0f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f, 40.0f};
+#define N_BUCKETS (sizeof(SNR_BUCKETS) / sizeof(SNR_BUCKETS[0]) - 1)
 
-static int bucket_idx(float snr_db) {
+static int bucket_idx(float snr_db)
+{
     for (int i = 0; i < (int)N_BUCKETS; i++) {
         if (snr_db < SNR_BUCKETS[i + 1]) return i;
     }
@@ -44,22 +45,23 @@ static int bucket_idx(float snr_db) {
 
 int main(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    (void)argc;
+    (void)argv;
 
     printf("Mendeley burst pipeline test\n");
     printf("  fixture: %u bursts, %u IQ samples total\n",
            (unsigned)MENDELEY_FIXTURE_N_BURSTS,
            (unsigned)MENDELEY_FIXTURE_TOTAL_IQ_SAMPLES);
 
-    int per_bucket_total[N_BUCKETS]   = {0};
-    int per_bucket_demod[N_BUCKETS]   = {0};
-    int per_bucket_bch[N_BUCKETS]     = {0};
+    int per_bucket_total[N_BUCKETS] = {0};
+    int per_bucket_demod[N_BUCKETS] = {0};
+    int per_bucket_bch[N_BUCKETS]   = {0};
     int total_demod = 0, total_bch = 0;
 
     for (uint32_t i = 0; i < MENDELEY_FIXTURE_N_BURSTS; i++) {
-        const mendeley_burst_meta_t *m = &mendeley_meta[i];
-        float snr_db = (float)m->snr_db_q4 / 16.0f;
-        int b = bucket_idx(snr_db);
+        const mendeley_burst_meta_t *m      = &mendeley_meta[i];
+        float                        snr_db = (float)m->snr_db_q4 / 16.0f;
+        int                          b      = bucket_idx(snr_db);
         per_bucket_total[b]++;
 
         // The fixture IQ is at whatever rate the dataset was captured
@@ -72,9 +74,12 @@ int main(int argc, char **argv)
         int16_t *iq = (int16_t *)&mendeley_iq[m->offset_iq * 2];
         // Make a writable copy because burst_pipeline does in-place
         // operations (DC removal, pre-rotation).
-        int n = (int)m->n_complex;
+        int      n    = (int)m->n_complex;
         int16_t *work = malloc((size_t)n * 2 * sizeof(int16_t));
-        if (!work) { fprintf(stderr, "OOM\n"); return 2; }
+        if (!work) {
+            fprintf(stderr, "OOM\n");
+            return 2;
+        }
         memcpy(work, iq, (size_t)n * 2 * sizeof(int16_t));
 
         burst_pipeline_result_t res;
@@ -88,7 +93,7 @@ int main(int argc, char **argv)
                 total_bch++;
             }
         }
-        if (res.frame.bits)      free(res.frame.bits);
+        if (res.frame.bits) free(res.frame.bits);
         if (res.frame.soft_bits) free(res.frame.soft_bits);
         free(work);
     }
@@ -123,9 +128,10 @@ int main(int argc, char **argv)
     return 0;
 }
 
-#else  // !HAVE_FIXTURE
+#else // !HAVE_FIXTURE
 
-int main(void) {
+int main(void)
+{
     printf("SKIP: fixture_mendeley_burst_sample.h not generated.\n");
     printf("Run: python3 tests/scripts/fetch_mendeley_iridium.py\n");
     printf("     python3 tests/scripts/build_mendeley_fixture.py\n");

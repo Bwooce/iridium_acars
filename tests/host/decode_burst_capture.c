@@ -33,7 +33,7 @@
 #include "uw_correlator.h"
 #include "iridium_frame.h"
 
-#define SD_CAPTURE_BURST_MAGIC  0x54535242u   /* "BRST" little-endian */
+#define SD_CAPTURE_BURST_MAGIC 0x54535242u /* "BRST" little-endian */
 
 // Must match sd_capture_burst_hdr_t in sd_capture.h.
 typedef struct __attribute__((packed)) {
@@ -61,26 +61,41 @@ static void on_frame(burst_pipeline_result_t *res, void *ctx)
     burst_summary_t *bs = (burst_summary_t *)ctx;
     bs->frames_decoded++;
 
-    iridium_frame_t f;
+    iridium_frame_t      f;
     ir_frame_direction_t dir = (res->uw_res.direction == UW_DIR_UPLINK)
-                                ? IR_FRM_DIR_UPLINK : IR_FRM_DIR_DOWNLINK;
+                                   ? IR_FRM_DIR_UPLINK
+                                   : IR_FRM_DIR_DOWNLINK;
     if (iridium_frame_classify(res->frame.bits, res->frame.n_bits, dir, &f) == 0) {
         switch (f.type) {
-            case IR_FRAME_MS: bs->frames_ms++; break;
-            case IR_FRAME_TL: bs->frames_tl++; break;
-            case IR_FRAME_BC: bs->frames_bc++; break;
-            case IR_FRAME_LW: bs->frames_lw++; break;
-            case IR_FRAME_RA: bs->frames_ra++; break;
-            default:          bs->frames_unk++; break;
+        case IR_FRAME_MS:
+            bs->frames_ms++;
+            break;
+        case IR_FRAME_TL:
+            bs->frames_tl++;
+            break;
+        case IR_FRAME_BC:
+            bs->frames_bc++;
+            break;
+        case IR_FRAME_LW:
+            bs->frames_lw++;
+            break;
+        case IR_FRAME_RA:
+            bs->frames_ra++;
+            break;
+        default:
+            bs->frames_unk++;
+            break;
         }
     } else {
         bs->frames_unk++;
     }
-    if (dir == IR_FRM_DIR_UPLINK) bs->frames_ul++;
-    else                          bs->frames_dl++;
+    if (dir == IR_FRM_DIR_UPLINK)
+        bs->frames_ul++;
+    else
+        bs->frames_dl++;
 
     free(res->frame.bits);
-    free(res->frame.soft_bits);   // #112
+    free(res->frame.soft_bits); // #112
 }
 
 int main(int argc, char **argv)
@@ -109,26 +124,26 @@ int main(int argc, char **argv)
     // we might see. WB_MAX_BURST_SAMPLES (worker_core1.c) is 625000;
     // round up a touch. The split-resample variant needs scratch in
     // chunks of DECIM_CHUNK_IN samples. Allocate worst-case once.
-    const int MAX_IN = 700000;
+    const int MAX_IN  = 700000;
     const int MAX_OUT = MAX_IN / DIDECIM_DECIM;
-    int16_t *iq25  = malloc((size_t)MAX_IN * 2 * sizeof(int16_t));
-    int16_t *iq250 = malloc((size_t)MAX_OUT * 2 * sizeof(int16_t));
-    int16_t *si    = malloc((size_t)MAX_IN * sizeof(int16_t));
-    int16_t *sq    = malloc((size_t)MAX_IN * sizeof(int16_t));
-    int16_t *so    = malloc((size_t)MAX_OUT * sizeof(int16_t));
-    int16_t *sp    = malloc((size_t)MAX_OUT * sizeof(int16_t));
+    int16_t  *iq25    = malloc((size_t)MAX_IN * 2 * sizeof(int16_t));
+    int16_t  *iq250   = malloc((size_t)MAX_OUT * 2 * sizeof(int16_t));
+    int16_t  *si      = malloc((size_t)MAX_IN * sizeof(int16_t));
+    int16_t  *sq      = malloc((size_t)MAX_IN * sizeof(int16_t));
+    int16_t  *so      = malloc((size_t)MAX_OUT * sizeof(int16_t));
+    int16_t  *sp      = malloc((size_t)MAX_OUT * sizeof(int16_t));
     if (!iq25 || !iq250 || !si || !sq || !so || !sp) {
         fprintf(stderr, "out of memory\n");
         return 1;
     }
 
-    int bursts_seen = 0, bursts_too_short = 0, bursts_decode_ok = 0;
-    int frames_total = 0;
-    burst_summary_t total = {0};
+    int             bursts_seen = 0, bursts_too_short = 0, bursts_decode_ok = 0;
+    int             frames_total = 0;
+    burst_summary_t total        = {0};
 
     while (1) {
         burst_hdr_t h;
-        size_t got = fread(&h, 1, sizeof(h), fp);
+        size_t      got = fread(&h, 1, sizeof(h), fp);
         if (got == 0) break;
         if (got != sizeof(h)) {
             fprintf(stderr, "short header read (got %zu) — file truncated\n", got);
@@ -162,19 +177,19 @@ int main(int argc, char **argv)
         // after a reset).
         direct_if_decim_reset_state(&dec);
         int n250 = direct_if_decim_process_split(&dec,
-                        iq25, (int)h.length_samples,
-                        iq250, si, sq, so, sp);
+                                                 iq25, (int)h.length_samples,
+                                                 iq250, si, sq, so, sp);
         if (n250 <= 64) {
             bursts_too_short++;
             if (emit_csv) {
                 printf("%u,%u,%.0f,%.1f,0,0,0,0,0,0,0,0,0\n",
-                        h.seq, h.length_samples, h.rel_freq_hz, h.peak_snr_db);
+                       h.seq, h.length_samples, h.rel_freq_hz, h.peak_snr_db);
             }
             continue;
         }
 
-        burst_summary_t bs = {0};
-        int frames = burst_pipeline_process_burst(iq250, n250, on_frame, &bs);
+        burst_summary_t bs     = {0};
+        int             frames = burst_pipeline_process_burst(iq250, n250, on_frame, &bs);
         if (frames > 0) bursts_decode_ok++;
         frames_total += frames;
         total.frames_decoded += bs.frames_decoded;
@@ -189,31 +204,31 @@ int main(int argc, char **argv)
 
         if (emit_csv) {
             printf("%u,%u,%.0f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
-                    h.seq, h.length_samples, h.rel_freq_hz, h.peak_snr_db,
-                    bs.frames_decoded, bs.frames_ms, bs.frames_tl, bs.frames_bc,
-                    bs.frames_lw, bs.frames_ra, bs.frames_unk,
-                    bs.frames_dl, bs.frames_ul);
+                   h.seq, h.length_samples, h.rel_freq_hz, h.peak_snr_db,
+                   bs.frames_decoded, bs.frames_ms, bs.frames_tl, bs.frames_bc,
+                   bs.frames_lw, bs.frames_ra, bs.frames_unk,
+                   bs.frames_dl, bs.frames_ul);
         }
     }
 
     fclose(fp);
 
     fprintf(stderr,
-        "\n== %s summary ==\n"
-        "  bursts            : %d\n"
-        "  too short (<64)   : %d\n"
-        "  decode ok         : %d (%.1f%%)\n"
-        "  frames            : %d\n"
-        "    MS/TL/BC/LW/RA : %d/%d/%d/%d/%d  unknown: %d\n"
-        "    DL/UL           : %d/%d\n",
-        argv[1],
-        bursts_seen, bursts_too_short,
-        bursts_decode_ok,
-        bursts_seen ? 100.0 * bursts_decode_ok / bursts_seen : 0.0,
-        frames_total,
-        total.frames_ms, total.frames_tl, total.frames_bc, total.frames_lw,
-        total.frames_ra, total.frames_unk,
-        total.frames_dl, total.frames_ul);
+            "\n== %s summary ==\n"
+            "  bursts            : %d\n"
+            "  too short (<64)   : %d\n"
+            "  decode ok         : %d (%.1f%%)\n"
+            "  frames            : %d\n"
+            "    MS/TL/BC/LW/RA : %d/%d/%d/%d/%d  unknown: %d\n"
+            "    DL/UL           : %d/%d\n",
+            argv[1],
+            bursts_seen, bursts_too_short,
+            bursts_decode_ok,
+            bursts_seen ? 100.0 * bursts_decode_ok / bursts_seen : 0.0,
+            frames_total,
+            total.frames_ms, total.frames_tl, total.frames_bc, total.frames_lw,
+            total.frames_ra, total.frames_unk,
+            total.frames_dl, total.frames_ul);
 
     return 0;
 }

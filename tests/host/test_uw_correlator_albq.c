@@ -28,22 +28,23 @@
 #include <string.h>
 
 #include "uw_correlator.h"
-#include "fixture_albq_2sps.h"      // ALBQ_2SPS, ALBQ_2SPS_LEN
-#include "fixture_albq_truth.h"     // ALBQ_TRUTH_BITS_DIRECTION
+#include "fixture_albq_2sps.h"  // ALBQ_2SPS, ALBQ_2SPS_LEN
+#include "fixture_albq_truth.h" // ALBQ_TRUTH_BITS_DIRECTION
 
 static int s_passed = 0;
 static int s_failed = 0;
 
-#define CHECK(cond, ...) do {                              \
-    if (!(cond)) {                                         \
-        fprintf(stderr, "  FAIL line %d: ", __LINE__);     \
-        fprintf(stderr, __VA_ARGS__);                      \
-        fprintf(stderr, "\n");                             \
-        s_failed++;                                        \
-    } else {                                               \
-        s_passed++;                                        \
-    }                                                      \
-} while (0)
+#define CHECK(cond, ...)                                   \
+    do {                                                   \
+        if (!(cond)) {                                     \
+            fprintf(stderr, "  FAIL line %d: ", __LINE__); \
+            fprintf(stderr, __VA_ARGS__);                  \
+            fprintf(stderr, "\n");                         \
+            s_failed++;                                    \
+        } else {                                           \
+            s_passed++;                                    \
+        }                                                  \
+    } while (0)
 
 int main(void)
 {
@@ -53,19 +54,17 @@ int main(void)
     // The reconstruction noise from 2→10 linear interp is acceptable
     // for this test (we check direction + UW found + bounded CFO,
     // not bit-exact reproduction).
-    int n_complex_2sps = (int)(ALBQ_2SPS_LEN / 2);
-    int n_complex = n_complex_2sps * 5;          // 10 sps
-    int n_int16 = n_complex * 2;
-    int16_t *burst = malloc(n_int16 * sizeof(int16_t));
+    int      n_complex_2sps = (int)(ALBQ_2SPS_LEN / 2);
+    int      n_complex      = n_complex_2sps * 5; // 10 sps
+    int      n_int16        = n_complex * 2;
+    int16_t *burst          = malloc(n_int16 * sizeof(int16_t));
     for (int n = 0; n < n_complex; n++) {
         // Position in 2-sps units: n / 5 + (n % 5) / 5.0
-        int n2 = n / 5;
-        int n2p = (n2 + 1 < n_complex_2sps) ? n2 + 1 : n2;
-        float frac = (n % 5) / 5.0f;
-        float re = (1.0f - frac) * (float)ALBQ_2SPS[2 * n2]
-                 +         frac  * (float)ALBQ_2SPS[2 * n2p];
-        float im = (1.0f - frac) * (float)ALBQ_2SPS[2 * n2 + 1]
-                 +         frac  * (float)ALBQ_2SPS[2 * n2p + 1];
+        int   n2         = n / 5;
+        int   n2p        = (n2 + 1 < n_complex_2sps) ? n2 + 1 : n2;
+        float frac       = (n % 5) / 5.0f;
+        float re         = (1.0f - frac) * (float)ALBQ_2SPS[2 * n2] + frac * (float)ALBQ_2SPS[2 * n2p];
+        float im         = (1.0f - frac) * (float)ALBQ_2SPS[2 * n2 + 1] + frac * (float)ALBQ_2SPS[2 * n2p + 1];
         burst[2 * n + 0] = (int16_t)re;
         burst[2 * n + 1] = (int16_t)im;
     }
@@ -78,13 +77,13 @@ int main(void)
     // gr-iridium pipeline order: D13 BEFORE RRC, search the whole
     // burst (matches worker_core1 and burst_downmix_impl.cc 841-880).
     int burst_start = uw_correlator_find_burst_start(burst, n_complex,
-                                                      /*search_max=*/n_complex);
+                                                     /*search_max=*/n_complex);
     printf("D13 burst start: %d (of %d samples)\n", burst_start, n_complex);
     CHECK(burst_start >= 0 && burst_start < n_complex - 64,
           "D13 burst start in plausible range (got %d)", burst_start);
 
     int16_t *adj_burst = burst + burst_start * 2;
-    int adj_n = n_complex - burst_start;
+    int      adj_n     = n_complex - burst_start;
 
     // Stage 2: RRC matched filter on the trimmed burst.
     uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
@@ -96,7 +95,8 @@ int main(void)
 
     printf("UW corr: dir=%s offset=%d corr=%.3f SNR=%.1f dB peak=%.2e omega=%.3f\n",
            res.direction == UW_DIR_DOWNLINK ? "DL"
-           : res.direction == UW_DIR_UPLINK ? "UL" : "UNKNOWN",
+           : res.direction == UW_DIR_UPLINK ? "UL"
+                                            : "UNKNOWN",
            res.uw_offset, (double)res.correction,
            (double)res.snr_estimate_db, (double)res.peak_value,
            (double)res.omega_per_sym);
@@ -133,7 +133,7 @@ int main(void)
     // rad/sym ≈ ±25 kHz at 25 ksym/s, slightly wider than the 40
     // kHz channelizer bin). Anything at the clamp is a noise peak.
     float abs_omega = res.omega_per_sym < 0 ? -res.omega_per_sym : res.omega_per_sym;
-    CHECK(abs_omega < 6.30f,   /* clamp widened to ±2π for edge bursts */
+    CHECK(abs_omega < 6.30f, /* clamp widened to ±2π for edge bursts */
           "CFO magnitude inside clamp (got %.3f)",
           (double)res.omega_per_sym);
 

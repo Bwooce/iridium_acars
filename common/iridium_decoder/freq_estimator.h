@@ -32,7 +32,7 @@ extern "C" {
 // width is the rule-of-thumb worst-case error for windowed FFTs).
 // We started at 256 but the interpolation bias reached 1.2 kHz —
 // 512 halves the bin width and brings worst-case error to ~600 Hz.
-#define FREQ_EST_FFT_N   512
+#define FREQ_EST_FFT_N 512
 
 // Run the estimator on n_complex int16 IQ samples (interleaved
 // I,Q,I,Q,... so the caller passes 2*n_complex int16_t values).

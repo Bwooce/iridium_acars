@@ -22,35 +22,38 @@
 // Iridium parameters. We synthesise at 10 sps (250 ksps) — matches
 // the worker's pre-correlator state (uw_correlator hardcoded to SPS=10
 // = UW_SPS = gr-iridium's burst_downmix internal rate).
-#define FS_SYM       25000.0    // symbol rate
-#define SPS          10         // samples per symbol (= UW_SPS)
-#define FS_SAMP      (FS_SYM * SPS)
+#define FS_SYM 25000.0 // symbol rate
+#define SPS 10         // samples per symbol (= UW_SPS)
+#define FS_SAMP (FS_SYM * SPS)
 
 // UW patterns (must match IR_UW_DL / IR_UW_UL from iridium.h, mapped
 // to BPSK ±(1+j) on the +1+j / -1-j axis).
-static const int UW_DL_SIGN[12] = { +1,-1,-1,-1,-1,+1,+1,+1,-1,+1,+1,-1 };
-static const int UW_UL_SIGN[12] = { -1,-1,+1,+1,+1,-1,+1,+1,-1,+1,-1,-1 };
+static const int UW_DL_SIGN[12] = {+1, -1, -1, -1, -1, +1, +1, +1, -1, +1, +1, -1};
+static const int UW_UL_SIGN[12] = {-1, -1, +1, +1, +1, -1, +1, +1, -1, +1, -1, -1};
 
 static int s_passed = 0;
 static int s_failed = 0;
 
-#define CHECK_NEAR(actual, expected, tol, ...) do {              \
-    double _a = (actual), _e = (expected), _t = (tol);           \
-    double _d = _a - _e; if (_d < 0) _d = -_d;                   \
-    if (_d > _t) {                                               \
-        fprintf(stderr, "  FAIL line %d: %s = %.4f (expected %.4f ± %.4f)\n", \
-                __LINE__, #actual, _a, _e, _t);                  \
-        fprintf(stderr, "  ");                                   \
-        fprintf(stderr, __VA_ARGS__);                            \
-        fprintf(stderr, "\n");                                   \
-        s_failed++;                                              \
-    } else {                                                     \
-        s_passed++;                                              \
-    }                                                            \
-} while (0)
+#define CHECK_NEAR(actual, expected, tol, ...)                                    \
+    do {                                                                          \
+        double _a = (actual), _e = (expected), _t = (tol);                        \
+        double _d = _a - _e;                                                      \
+        if (_d < 0) _d = -_d;                                                     \
+        if (_d > _t) {                                                            \
+            fprintf(stderr, "  FAIL line %d: %s = %.4f (expected %.4f ± %.4f)\n", \
+                    __LINE__, #actual, _a, _e, _t);                               \
+            fprintf(stderr, "  ");                                                \
+            fprintf(stderr, __VA_ARGS__);                                         \
+            fprintf(stderr, "\n");                                                \
+            s_failed++;                                                           \
+        } else {                                                                  \
+            s_passed++;                                                           \
+        }                                                                         \
+    } while (0)
 
 // Direction selector for the synthetic burst.
-typedef enum { DIR_DL = 0, DIR_UL = 1 } burst_dir_t;
+typedef enum { DIR_DL = 0,
+               DIR_UL = 1 } burst_dir_t;
 
 // Build a synthetic 2-sps interleaved int16 burst:
 //   - PREAMBLE_LEN syms (DL: all s0; UL: alternating s1,s0)
@@ -62,13 +65,13 @@ typedef enum { DIR_DL = 0, DIR_UL = 1 } burst_dir_t;
 // burst[2i+0..2i+1] is sample i (interleaved I, Q).
 // Returns total complex sample count (= PREAMBLE_LEN+12+TAIL_LEN syms × SPS).
 static int build_burst_dir(int16_t *burst, int preamble_len, int tail_len,
-                            double omega_per_sym, double amp, double sigma,
-                            burst_dir_t dir)
+                           double omega_per_sym, double amp, double sigma,
+                           burst_dir_t dir)
 {
-    const int total_syms = preamble_len + 12 + tail_len;
-    const int total_samps = total_syms * SPS;
+    const int    total_syms       = preamble_len + 12 + tail_len;
+    const int    total_samps      = total_syms * SPS;
     const double per_sample_phase = omega_per_sym / (double)SPS;
-    const int *uw_signs = (dir == DIR_DL) ? UW_DL_SIGN : UW_UL_SIGN;
+    const int   *uw_signs         = (dir == DIR_DL) ? UW_DL_SIGN : UW_UL_SIGN;
 
     for (int n = 0; n < total_samps; n++) {
         int sym = n / SPS;
@@ -76,7 +79,7 @@ static int build_burst_dir(int16_t *burst, int preamble_len, int tail_len,
         int sign;
         if (sym < preamble_len) {
             if (dir == DIR_DL) {
-                sign = +1;          // DL preamble all s0
+                sign = +1; // DL preamble all s0
             } else {
                 // UL preamble alternates s1, s0, s1, s0, ... starting s1.
                 sign = (sym & 1) ? +1 : -1;
@@ -93,8 +96,8 @@ static int build_burst_dir(int16_t *burst, int preamble_len, int tail_len,
         double s_im = sign * amp;
 
         // Apply carrier offset: multiply by exp(+j·per_sample_phase·n)
-        double c = cos(per_sample_phase * (double)n);
-        double s = sin(per_sample_phase * (double)n);
+        double c    = cos(per_sample_phase * (double)n);
+        double s    = sin(per_sample_phase * (double)n);
         double v_re = s_re * c - s_im * s;
         double v_im = s_re * s + s_im * c;
 
@@ -108,9 +111,9 @@ static int build_burst_dir(int16_t *burst, int preamble_len, int tail_len,
         }
 
         // Saturate to int16
-        if (v_re >  32767.0) v_re =  32767.0;
+        if (v_re > 32767.0) v_re = 32767.0;
         if (v_re < -32768.0) v_re = -32768.0;
-        if (v_im >  32767.0) v_im =  32767.0;
+        if (v_im > 32767.0) v_im = 32767.0;
         if (v_im < -32768.0) v_im = -32768.0;
         burst[2 * n + 0] = (int16_t)v_re;
         burst[2 * n + 1] = (int16_t)v_im;
@@ -134,12 +137,12 @@ static int build_burst(int16_t *burst, int preamble_len, int tail_len,
 // Returns the COMBINED omega (coarse + residual) that the worker
 // effectively removes from the burst.
 static float run_correlator(int16_t *burst, int n_complex,
-                             int *out_uw_offset, uw_direction_t *out_dir)
+                            int *out_uw_offset, uw_direction_t *out_dir)
 {
     float coarse_omega = uw_correlator_estimate_cfo(burst, n_complex);
     if (coarse_omega != 0.0f) {
         // Per-sample phase = omega / sps (omega is per SYMBOL).
-        float dphi = coarse_omega / (float)SPS;
+        float  dphi   = coarse_omega / (float)SPS;
         double c_step = cos(dphi), s_step = sin(dphi);
         double pr = 1.0, pi = 0.0;
         for (int i = 0; i < n_complex; i++) {
@@ -147,15 +150,16 @@ static float run_correlator(int16_t *burst, int n_complex,
             double im = burst[i * 2 + 1];
             double nr = re * pr - im * pi;
             double ni = re * pi + im * pr;
-            if (nr >  32767.0) nr =  32767.0;
+            if (nr > 32767.0) nr = 32767.0;
             if (nr < -32768.0) nr = -32768.0;
-            if (ni >  32767.0) ni =  32767.0;
+            if (ni > 32767.0) ni = 32767.0;
             if (ni < -32768.0) ni = -32768.0;
             burst[i * 2 + 0] = (int16_t)nr;
             burst[i * 2 + 1] = (int16_t)ni;
-            double npr = pr * c_step - pi * s_step;
-            double npi = pr * s_step + pi * c_step;
-            pr = npr; pi = npi;
+            double npr       = pr * c_step - pi * s_step;
+            double npi       = pr * s_step + pi * c_step;
+            pr               = npr;
+            pi               = npi;
         }
     }
     uw_corr_result_t res;
@@ -171,16 +175,17 @@ static float run_correlator(int16_t *burst, int n_complex,
 
 int main(void)
 {
-    const int PREAMBLE_LEN = 16;
-    const int TAIL_LEN = 30;
-    int16_t burst[(PREAMBLE_LEN + 12 + TAIL_LEN) * SPS * 2];
-    const double AMP = 8000.0;     // ~quarter-scale int16 to leave headroom for offset
+    const int    PREAMBLE_LEN = 16;
+    const int    TAIL_LEN     = 30;
+    int16_t      burst[(PREAMBLE_LEN + 12 + TAIL_LEN) * SPS * 2];
+    const double AMP = 8000.0; // ~quarter-scale int16 to leave headroom for offset
 
     printf("Test 1: zero CFO, no noise — expect omega ≈ 0\n");
     {
-        int n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, 0.0, AMP, 0.0);
-        int off; uw_direction_t dir;
-        float omega = run_correlator(burst, n, &off, &dir);
+        int            n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, 0.0, AMP, 0.0);
+        int            off;
+        uw_direction_t dir;
+        float          omega = run_correlator(burst, n, &off, &dir);
         printf("  uw_offset=%d (expect %d) dir=%d omega=%.4f\n",
                off, PREAMBLE_LEN * SPS, dir, omega);
         CHECK_NEAR(omega, 0.0, 0.05, "zero CFO ground truth");
@@ -191,9 +196,10 @@ int main(void)
 
     printf("\nTest 2: small positive CFO (+0.2 rad/sym), no noise\n");
     {
-        int n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, 0.2, AMP, 0.0);
-        int off; uw_direction_t dir;
-        float omega = run_correlator(burst, n, &off, &dir);
+        int            n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, 0.2, AMP, 0.0);
+        int            off;
+        uw_direction_t dir;
+        float          omega = run_correlator(burst, n, &off, &dir);
         printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ -0.2 by worker convention)\n",
                off, dir, omega);
         CHECK_NEAR(omega, -0.2, 0.10, "+0.2 rad/sym CFO ground truth (worker expects negation)");
@@ -201,9 +207,10 @@ int main(void)
 
     printf("\nTest 3: small negative CFO (-0.3 rad/sym), no noise\n");
     {
-        int n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, -0.3, AMP, 0.0);
-        int off; uw_direction_t dir;
-        float omega = run_correlator(burst, n, &off, &dir);
+        int            n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, -0.3, AMP, 0.0);
+        int            off;
+        uw_direction_t dir;
+        float          omega = run_correlator(burst, n, &off, &dir);
         printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ +0.3)\n",
                off, dir, omega);
         CHECK_NEAR(omega, +0.3, 0.10, "-0.3 rad/sym CFO ground truth");
@@ -211,9 +218,10 @@ int main(void)
 
     printf("\nTest 4: larger CFO (+0.5 rad/sym), no noise\n");
     {
-        int n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, 0.5, AMP, 0.0);
-        int off; uw_direction_t dir;
-        float omega = run_correlator(burst, n, &off, &dir);
+        int            n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, 0.5, AMP, 0.0);
+        int            off;
+        uw_direction_t dir;
+        float          omega = run_correlator(burst, n, &off, &dir);
         printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ -0.5)\n",
                off, dir, omega);
         CHECK_NEAR(omega, -0.5, 0.15, "+0.5 rad/sym CFO ground truth");
@@ -222,9 +230,10 @@ int main(void)
     printf("\nTest 5: moderate noise (σ=2000), small CFO (+0.2 rad/sym)\n");
     {
         srand(42);
-        int n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, 0.2, AMP, 2000.0);
-        int off; uw_direction_t dir;
-        float omega = run_correlator(burst, n, &off, &dir);
+        int            n = build_burst(burst, PREAMBLE_LEN, TAIL_LEN, 0.2, AMP, 2000.0);
+        int            off;
+        uw_direction_t dir;
+        float          omega = run_correlator(burst, n, &off, &dir);
         printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ -0.2)\n",
                off, dir, omega);
         CHECK_NEAR(omega, -0.2, 0.20, "+0.2 rad/sym CFO + noise");
@@ -233,10 +242,11 @@ int main(void)
     // --- UL direction tests (gr-iridium alignment coverage) ---
     printf("\nTest 6: UL direction, zero CFO, no noise\n");
     {
-        int n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
-                                0.0, AMP, 0.0, DIR_UL);
-        int off; uw_direction_t dir;
-        float omega = run_correlator(burst, n, &off, &dir);
+        int            n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
+                                           0.0, AMP, 0.0, DIR_UL);
+        int            off;
+        uw_direction_t dir;
+        float          omega = run_correlator(burst, n, &off, &dir);
         printf("  uw_offset=%d dir=%d omega=%.4f\n", off, dir, omega);
         CHECK_NEAR(dir, (int)UW_DIR_UPLINK, 0, "UL direction detected");
         CHECK_NEAR(omega, 0.0, 0.05, "UL zero CFO ground truth");
@@ -245,10 +255,11 @@ int main(void)
 
     printf("\nTest 7: UL direction, +0.4 rad/sym CFO, no noise\n");
     {
-        int n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
-                                0.4, AMP, 0.0, DIR_UL);
-        int off; uw_direction_t dir;
-        float omega = run_correlator(burst, n, &off, &dir);
+        int            n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
+                                           0.4, AMP, 0.0, DIR_UL);
+        int            off;
+        uw_direction_t dir;
+        float          omega = run_correlator(burst, n, &off, &dir);
         printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ -0.4)\n",
                off, dir, omega);
         CHECK_NEAR(dir, (int)UW_DIR_UPLINK, 0, "UL direction with CFO");
@@ -258,13 +269,14 @@ int main(void)
     // --- Low-SNR sweep on DL ---
     printf("\nTest 8: low SNR sweep (σ ∈ {2000, 4000, 6000})\n");
     {
-        const double sigmas[] = { 2000.0, 4000.0, 6000.0 };
+        const double sigmas[] = {2000.0, 4000.0, 6000.0};
         for (int s = 0; s < 3; s++) {
             srand(0xc0fee + s);
-            int n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
-                                    0.1, AMP, sigmas[s], DIR_DL);
-            int off; uw_direction_t dir;
-            float omega = run_correlator(burst, n, &off, &dir);
+            int            n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
+                                               0.1, AMP, sigmas[s], DIR_DL);
+            int            off;
+            uw_direction_t dir;
+            float          omega = run_correlator(burst, n, &off, &dir);
             printf("  σ=%.0f: uw_offset=%d dir=%d omega=%.4f\n",
                    sigmas[s], off, dir, omega);
             // At AMP=8000, sigma=6000 is roughly SNR ≈ 2.5 dB per sample.
@@ -278,10 +290,11 @@ int main(void)
     printf("\nTest 9: large CFO (+0.6) + moderate noise (σ=3000), DL\n");
     {
         srand(0xbeef);
-        int n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
-                                0.6, AMP, 3000.0, DIR_DL);
-        int off; uw_direction_t dir;
-        float omega = run_correlator(burst, n, &off, &dir);
+        int            n = build_burst_dir(burst, PREAMBLE_LEN, TAIL_LEN,
+                                           0.6, AMP, 3000.0, DIR_DL);
+        int            off;
+        uw_direction_t dir;
+        float          omega = run_correlator(burst, n, &off, &dir);
         printf("  uw_offset=%d dir=%d omega=%.4f (expect ≈ -0.6)\n",
                off, dir, omega);
         CHECK_NEAR(dir, (int)UW_DIR_DOWNLINK, 0, "DL at large CFO + noise");

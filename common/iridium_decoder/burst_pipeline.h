@@ -46,12 +46,12 @@
 // packed structs; ESP32-P4 (RV32) is more permissive but slow on
 // unaligned access, and there's no need.
 typedef struct {
-    uw_corr_result_t uw_res;         // matched-filter + CFO diagnostic
-    decoded_frame_t  frame;          // populated when demod_ok; caller frees frame.bits
-    float            omega_coarse;   // pre-RRC squared-FFT estimate (rad/sym)
-    int              burst_start;    // D13 envelope start (samples into iq250)
-    int              n_post_2sps;    // 2-sps samples handed to qpsk_demod
-    bool             demod_ok;       // true if qpsk_demod produced a frame
+    uw_corr_result_t uw_res;       // matched-filter + CFO diagnostic
+    decoded_frame_t  frame;        // populated when demod_ok; caller frees frame.bits
+    float            omega_coarse; // pre-RRC squared-FFT estimate (rad/sym)
+    int              burst_start;  // D13 envelope start (samples into iq250)
+    int              n_post_2sps;  // 2-sps samples handed to qpsk_demod
+    bool             demod_ok;     // true if qpsk_demod produced a frame
 } burst_pipeline_result_t;
 
 // Run the per-burst pipeline on a 250 kHz (10 sps) int16 IQ buffer.
@@ -74,7 +74,7 @@ typedef struct {
 // the first decoded frame. Prefer burst_pipeline_process_burst() for
 // new code so additional sub-frames are not lost.
 bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
-                                    burst_pipeline_result_t *result);
+                                   burst_pipeline_result_t *result);
 
 // Callback fired once per successfully-decoded frame within a burst.
 // The result is borrowed for the duration of the callback; the
@@ -99,7 +99,7 @@ typedef void (*burst_pipeline_frame_cb)(burst_pipeline_result_t *res, void *ctx)
 //
 // Returns the number of frames emitted (0 if no decode).
 int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
-                                  burst_pipeline_frame_cb cb, void *ctx);
+                                 burst_pipeline_frame_cb cb, void *ctx);
 
 // Diagnostic: override D13's burst_start for the NEXT call only,
 // then auto-clear. Used by the path-C host harness to bypass our
@@ -134,4 +134,4 @@ void burst_pipeline_set_dump_once(const char *dir);
 // Returns first/retry call counts via out params so per-call cost
 // can be derived.
 void burst_pipeline_get_stage_us(uint32_t out[10], uint32_t *first_calls,
-                                  uint32_t *retry_calls);
+                                 uint32_t *retry_calls);

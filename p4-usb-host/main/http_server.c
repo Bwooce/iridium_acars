@@ -35,7 +35,7 @@
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 
-static const char *TAG = "HTTP";
+static const char    *TAG      = "HTTP";
 static httpd_handle_t s_server = NULL;
 
 // Pre-allocated DMA-INT read buffer for /capture/file. Allocated at
@@ -44,13 +44,13 @@ static httpd_handle_t s_server = NULL;
 // handler's lazy 4 KB DMA-INT alloc fails, falls back to PSRAM, and
 // the SDMMC read into PSRAM hits the stash path which is also tight.
 static uint8_t *s_download_buf = NULL;
-#define DOWNLOAD_BUF_BYTES   4096
+#define DOWNLOAD_BUF_BYTES 4096
 
 // Max URI handlers the httpd will accept. Used both to size the IDF
 // httpd slot table AND in a static_assert on the routes[] array length,
 // so adding a route past the limit breaks the build instead of panic-
 // looping at boot. Each slot is ~32 bytes; 32 slots = ~1 KB negligible.
-#define HTTPD_URI_LIMIT      32
+#define HTTPD_URI_LIMIT 32
 
 // NVS-write + reboot helper. MUST run with an internal-SRAM stack:
 // nvs_commit() takes spi_flash_disable_interrupts_caches_and_other_cpu(),
@@ -66,7 +66,7 @@ typedef struct {
     uint16_t out_port;
     char     ota_url[128];
     bool     bias_tee;
-    bool     clear_only;   // true = reset_post path (clear SSID+PSK, ignore other fields)
+    bool     clear_only; // true = reset_post path (clear SSID+PSK, ignore other fields)
 } nvs_save_args_t;
 
 static void nvs_save_and_reboot_task(void *arg)
@@ -109,8 +109,8 @@ static void nvs_save_and_reboot_task(void *arg)
 // programmed at stream start, so reboot to apply.
 static void tune_apply_reboot_task(void *arg)
 {
-    uint32_t hz = (uint32_t)(uintptr_t)arg;
-    esp_err_t r = app_config_set_lo_freq_hz(hz);
+    uint32_t  hz = (uint32_t)(uintptr_t)arg;
+    esp_err_t r  = app_config_set_lo_freq_hz(hz);
     ESP_LOGI(TAG, "/tune: set lo_freq_hz=%u (%s) — rebooting to apply",
              (unsigned)hz, esp_err_to_name(r));
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -125,7 +125,7 @@ static esp_err_t status_get(httpd_req_t *req)
     const esp_app_desc_t *app = esp_app_get_description();
 
     uint32_t ip = wifi_link_ip_u32();
-    char ip_str[16];
+    char     ip_str[16];
     if (wifi_link_is_ap_mode()) {
         // SoftAP default gateway is 192.168.4.1.
         snprintf(ip_str, sizeof(ip_str), "192.168.4.1");
@@ -147,98 +147,101 @@ static esp_err_t status_get(httpd_req_t *req)
     uint64_t sbd_total   = frame_decoder_sbd_complete_total();
     uint64_t msgs_total  = msg_ring_total();
     uint32_t rate_1h = 0, rate_24h = 0;
-    frame_decoder_get_rolling_rates(&rate_1h, &rate_24h);   // #117
+    frame_decoder_get_rolling_rates(&rate_1h, &rate_24h); // #117
     sd_log_stats_t sd = {0};
     sd_log_get_stats(&sd);
     usb_stream_totals_t usbt = {0};
     esp_libusb_get_stream_totals(&usbt);
 
     // Health watchdog (#104 gateway + #105 USB stream) state.
-    uint32_t wdt_gw = 0; bool wdt_armed = false; int wdt_fails = 0;
-    bool wdt_stream_live = false; int wdt_stream_stalls = 0;
+    uint32_t wdt_gw            = 0;
+    bool     wdt_armed         = false;
+    int      wdt_fails         = 0;
+    bool     wdt_stream_live   = false;
+    int      wdt_stream_stalls = 0;
     wifi_link_wdt_status(&wdt_gw, &wdt_armed, &wdt_fails,
                          &wdt_stream_live, &wdt_stream_stalls);
 
     char body[1600];
-    int n = snprintf(body, sizeof(body),
-        "{"
-            "\"build\":\"%s\","
-            "\"build_time\":\"%s\","
-            "\"wifi_mode\":\"%s\","
-            "\"wifi_ssid\":\"%s\","
-            "\"wifi_up\":%s,"
-            "\"ip\":\"%s\","
-            "\"uptime_s\":%lld,"
-            "\"station_id\":\"%s\","
-            "\"lo_freq_hz\":%u,"
-            "\"sample_rate_hz\":%u,"
-            "\"bias_tee\":%s,"
-            "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
-            "\"ota_url\":\"%s\","
-            "\"usb\":{"
-                "\"completed\":%llu,\"rb_full_drops\":%llu,"
-                "\"status_errors\":%llu,\"short_xfers\":%llu"
-            "},"
-            "\"decode\":{"
-                "\"messages_total\":%llu,"
-                "\"acars_decoded\":%llu,"
-                "\"sbd_complete\":%llu,"
-                "\"rate_1h\":%u,\"rate_24h\":%u,"
-                "\"frames\":{"
-                    "\"ms\":%llu,\"tl\":%llu,\"bc\":%llu,"
-                    "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu"
-                "}"
-            "},"
-            "\"health_wdt\":{\"gw\":\"%u.%u.%u.%u\",\"gw_armed\":%s,\"gw_fails\":%d,"
-                "\"stream_live\":%s,\"stream_stalls\":%d},"
-            "\"sd\":{"
-                "\"mounted\":%s,\"log_open\":%s,"
-                "\"messages_written\":%u,\"bytes_written\":%llu,"
-                "\"write_errors\":%u,"
-                "\"log_path\":\"%s\",\"mount_error\":\"%s\""
-            "}"
-        "}",
-        app->version,
-        app->date,
-        wifi_link_is_ap_mode() ? "AP" : "STA",
-        wifi_link_ssid(),
-        wifi_link_is_connected() ? "true" : "false",
-        ip_str,
-        (long long)(uptime_us / 1000000),
-        cfg.station_id,
-        (unsigned)cfg.lo_freq_hz,
-        (unsigned)cfg.sample_rate_hz,
-        cfg.bias_tee ? "true" : "false",
-        cfg.out_host,
-        (unsigned)cfg.out_port,
-        (cfg.out_host[0] && cfg.out_port) ? "true" : "false",
-        cfg.ota_url,
-        (unsigned long long)usbt.completed,
-        (unsigned long long)usbt.rb_full_drops,
-        (unsigned long long)usbt.status_errors,
-        (unsigned long long)usbt.short_xfers,
-        (unsigned long long)msgs_total,
-        (unsigned long long)acars_total,
-        (unsigned long long)sbd_total,
-        (unsigned)rate_1h, (unsigned)rate_24h,
-        (unsigned long long)cc.ms,    (unsigned long long)cc.tl,
-        (unsigned long long)cc.bc,    (unsigned long long)cc.lw_da,
-        (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown,
-        (unsigned)(wdt_gw & 0xff), (unsigned)((wdt_gw >> 8) & 0xff),
-        (unsigned)((wdt_gw >> 16) & 0xff), (unsigned)((wdt_gw >> 24) & 0xff),
-        wdt_armed ? "true" : "false", wdt_fails,
-        wdt_stream_live ? "true" : "false", wdt_stream_stalls,
-        sd.mounted  ? "true" : "false",
-        sd.log_open ? "true" : "false",
-        (unsigned)sd.messages_written,
-        (unsigned long long)sd.bytes_written,
-        (unsigned)sd.write_errors,
-        sd.log_path,
-        sd.mount_error);
+    int  n = snprintf(body, sizeof(body),
+                      "{"
+                       "\"build\":\"%s\","
+                       "\"build_time\":\"%s\","
+                       "\"wifi_mode\":\"%s\","
+                       "\"wifi_ssid\":\"%s\","
+                       "\"wifi_up\":%s,"
+                       "\"ip\":\"%s\","
+                       "\"uptime_s\":%lld,"
+                       "\"station_id\":\"%s\","
+                       "\"lo_freq_hz\":%u,"
+                       "\"sample_rate_hz\":%u,"
+                       "\"bias_tee\":%s,"
+                       "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
+                       "\"ota_url\":\"%s\","
+                       "\"usb\":{"
+                       "\"completed\":%llu,\"rb_full_drops\":%llu,"
+                       "\"status_errors\":%llu,\"short_xfers\":%llu"
+                       "},"
+                       "\"decode\":{"
+                       "\"messages_total\":%llu,"
+                       "\"acars_decoded\":%llu,"
+                       "\"sbd_complete\":%llu,"
+                       "\"rate_1h\":%u,\"rate_24h\":%u,"
+                       "\"frames\":{"
+                       "\"ms\":%llu,\"tl\":%llu,\"bc\":%llu,"
+                       "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu"
+                       "}"
+                       "},"
+                       "\"health_wdt\":{\"gw\":\"%u.%u.%u.%u\",\"gw_armed\":%s,\"gw_fails\":%d,"
+                       "\"stream_live\":%s,\"stream_stalls\":%d},"
+                       "\"sd\":{"
+                       "\"mounted\":%s,\"log_open\":%s,"
+                       "\"messages_written\":%u,\"bytes_written\":%llu,"
+                       "\"write_errors\":%u,"
+                       "\"log_path\":\"%s\",\"mount_error\":\"%s\""
+                       "}"
+                       "}",
+                      app->version,
+                      app->date,
+                     wifi_link_is_ap_mode() ? "AP" : "STA",
+                      wifi_link_ssid(),
+                     wifi_link_is_connected() ? "true" : "false",
+                      ip_str,
+                      (long long)(uptime_us / 1000000),
+                      cfg.station_id,
+                      (unsigned)cfg.lo_freq_hz,
+                      (unsigned)cfg.sample_rate_hz,
+                     cfg.bias_tee ? "true" : "false",
+                      cfg.out_host,
+                      (unsigned)cfg.out_port,
+                     (cfg.out_host[0] && cfg.out_port) ? "true" : "false",
+                      cfg.ota_url,
+                      (unsigned long long)usbt.completed,
+                      (unsigned long long)usbt.rb_full_drops,
+                      (unsigned long long)usbt.status_errors,
+                      (unsigned long long)usbt.short_xfers,
+                      (unsigned long long)msgs_total,
+                      (unsigned long long)acars_total,
+                      (unsigned long long)sbd_total,
+                      (unsigned)rate_1h, (unsigned)rate_24h,
+                      (unsigned long long)cc.ms, (unsigned long long)cc.tl,
+                      (unsigned long long)cc.bc, (unsigned long long)cc.lw_da,
+                      (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown,
+                      (unsigned)(wdt_gw & 0xff), (unsigned)((wdt_gw >> 8) & 0xff),
+                      (unsigned)((wdt_gw >> 16) & 0xff), (unsigned)((wdt_gw >> 24) & 0xff),
+                     wdt_armed ? "true" : "false", wdt_fails,
+                     wdt_stream_live ? "true" : "false", wdt_stream_stalls,
+                     sd.mounted ? "true" : "false",
+                     sd.log_open ? "true" : "false",
+                      (unsigned)sd.messages_written,
+                      (unsigned long long)sd.bytes_written,
+                      (unsigned)sd.write_errors,
+                      sd.log_path,
+                      sd.mount_error);
 
     if (n < 0 || n >= (int)sizeof(body)) {
         ESP_LOGW(TAG, "status body truncated (n=%d, cap=%d)", n, (int)sizeof(body));
-        n = sizeof(body) - 1;
+        n       = sizeof(body) - 1;
         body[n] = '\0';
     }
 
@@ -257,7 +260,7 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
     worker_core1_get_histograms(&h);
 
     char body[1024];
-    int n = 0;
+    int  n = 0;
     n += snprintf(body + n, sizeof(body) - n,
                   "{\"snr_total\":%u,\"bch_total\":%u,"
                   "\"snr_bin_dB_width\":1,\"snr\":[",
@@ -289,14 +292,29 @@ static size_t html_attr_escape(char *dst, size_t cap, const char *src)
     size_t w = 0;
     if (cap == 0) return 0;
     for (const char *p = src; *p; p++) {
-        const char *rep = NULL;
+        const char *rep     = NULL;
         size_t      rep_len = 0;
         switch (*p) {
-        case '"': rep = "&quot;"; rep_len = 6; break;
-        case '&': rep = "&amp;";  rep_len = 5; break;
-        case '<': rep = "&lt;";   rep_len = 4; break;
-        case '>': rep = "&gt;";   rep_len = 4; break;
-        default:  rep = p;        rep_len = 1; break;
+        case '"':
+            rep     = "&quot;";
+            rep_len = 6;
+            break;
+        case '&':
+            rep     = "&amp;";
+            rep_len = 5;
+            break;
+        case '<':
+            rep     = "&lt;";
+            rep_len = 4;
+            break;
+        case '>':
+            rep     = "&gt;";
+            rep_len = 4;
+            break;
+        default:
+            rep     = p;
+            rep_len = 1;
+            break;
         }
         if (w + rep_len + 1 > cap) break;
         memcpy(dst + w, rep, rep_len);
@@ -350,40 +368,40 @@ static esp_err_t index_get(httpd_req_t *req)
     app_config_snapshot(&cfg);
 
     char ssid_esc[2 * sizeof(cfg.wifi_ssid) + 8];
-    char psk_esc [2 * sizeof(cfg.wifi_psk)  + 8];
-    char host_esc[2 * sizeof(cfg.out_host)  + 8];
-    char ota_esc [2 * sizeof(cfg.ota_url)   + 8];
+    char psk_esc[2 * sizeof(cfg.wifi_psk) + 8];
+    char host_esc[2 * sizeof(cfg.out_host) + 8];
+    char ota_esc[2 * sizeof(cfg.ota_url) + 8];
     html_attr_escape(ssid_esc, sizeof(ssid_esc), cfg.wifi_ssid);
-    html_attr_escape(psk_esc,  sizeof(psk_esc),  cfg.wifi_psk);
+    html_attr_escape(psk_esc, sizeof(psk_esc), cfg.wifi_psk);
     html_attr_escape(host_esc, sizeof(host_esc), cfg.out_host);
-    html_attr_escape(ota_esc,  sizeof(ota_esc),  cfg.ota_url);
+    html_attr_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
 
     char form[2048];
-    int n = snprintf(form, sizeof(form),
-        "<form method=\"POST\" action=\"/config\">"
-        "<h2>Wi-Fi</h2>"
-        "<label>SSID</label>"
-        "<input type=\"text\" name=\"ssid\" required maxlength=\"32\" value=\"%s\">"
-        "<label>Password</label>"
-        "<input type=\"password\" name=\"psk\" maxlength=\"63\" value=\"%s\">"
-        "<h2>SDR</h2>"
-        "<label><input type=\"checkbox\" name=\"bias_tee\" value=\"1\"%s> "
-        "Enable RTL-SDR v4 bias tee (5 V on antenna line, for active antennas / LNAs)</label>"
-        "<h2>ACARS push (optional, UDP)</h2>"
-        "<label>Host (IP or hostname; leave empty to disable)</label>"
-        "<input type=\"text\" name=\"out_host\" maxlength=\"63\" value=\"%s\">"
-        "<label>Port</label>"
-        "<input type=\"number\" name=\"out_port\" min=\"0\" max=\"65535\" placeholder=\"e.g. 6700\" value=\"%u\">"
-        "<h2>OTA</h2>"
-        "<label>Firmware URL (http:// or https://)</label>"
-        "<input type=\"text\" name=\"ota_url\" maxlength=\"127\" placeholder=\"http://server/p4-usb-host.bin\" value=\"%s\">"
-        "<button type=\"submit\">Save &amp; reboot</button>"
-        "</form>",
-        ssid_esc, psk_esc,
-        cfg.bias_tee ? " checked" : "",
-        host_esc,
-        (unsigned)cfg.out_port,
-        ota_esc);
+    int  n = snprintf(form, sizeof(form),
+                      "<form method=\"POST\" action=\"/config\">"
+                       "<h2>Wi-Fi</h2>"
+                       "<label>SSID</label>"
+                       "<input type=\"text\" name=\"ssid\" required maxlength=\"32\" value=\"%s\">"
+                       "<label>Password</label>"
+                       "<input type=\"password\" name=\"psk\" maxlength=\"63\" value=\"%s\">"
+                       "<h2>SDR</h2>"
+                       "<label><input type=\"checkbox\" name=\"bias_tee\" value=\"1\"%s> "
+                       "Enable RTL-SDR v4 bias tee (5 V on antenna line, for active antennas / LNAs)</label>"
+                       "<h2>ACARS push (optional, UDP)</h2>"
+                       "<label>Host (IP or hostname; leave empty to disable)</label>"
+                       "<input type=\"text\" name=\"out_host\" maxlength=\"63\" value=\"%s\">"
+                       "<label>Port</label>"
+                       "<input type=\"number\" name=\"out_port\" min=\"0\" max=\"65535\" placeholder=\"e.g. 6700\" value=\"%u\">"
+                       "<h2>OTA</h2>"
+                       "<label>Firmware URL (http:// or https://)</label>"
+                       "<input type=\"text\" name=\"ota_url\" maxlength=\"127\" placeholder=\"http://server/p4-usb-host.bin\" value=\"%s\">"
+                       "<button type=\"submit\">Save &amp; reboot</button>"
+                       "</form>",
+                      ssid_esc, psk_esc,
+                     cfg.bias_tee ? " checked" : "",
+                      host_esc,
+                      (unsigned)cfg.out_port,
+                      ota_esc);
     if (n < 0) n = 0;
     if (n > (int)sizeof(form)) n = sizeof(form);
     httpd_resp_send_chunk(req, form, n);
@@ -406,8 +424,8 @@ static size_t url_decode(char *dst, const char *src, size_t srclen)
         if (c == '+') {
             dst[w++] = ' ';
         } else if (c == '%' && i + 2 < srclen) {
-            char buf[3] = { src[i+1], src[i+2], 0 };
-            dst[w++] = (char)strtol(buf, NULL, 16);
+            char buf[3] = {src[i + 1], src[i + 2], 0};
+            dst[w++]    = (char)strtol(buf, NULL, 16);
             i += 2;
         } else {
             dst[w++] = c;
@@ -422,13 +440,13 @@ static esp_err_t form_field(const char *body, size_t blen,
                             const char *key,
                             char *out, size_t outsz)
 {
-    size_t klen = strlen(key);
-    const char *p = body;
-    const char *end = body + blen;
+    size_t      klen = strlen(key);
+    const char *p    = body;
+    const char *end  = body + blen;
     while (p < end) {
-        const char *amp = memchr(p, '&', end - p);
+        const char *amp     = memchr(p, '&', end - p);
         const char *seg_end = amp ? amp : end;
-        const char *eq = memchr(p, '=', seg_end - p);
+        const char *eq      = memchr(p, '=', seg_end - p);
         if (eq && (size_t)(eq - p) == klen && memcmp(p, key, klen) == 0) {
             size_t vlen = seg_end - (eq + 1);
             if (vlen >= outsz) vlen = outsz - 1;
@@ -447,7 +465,7 @@ static esp_err_t form_field(const char *body, size_t blen,
 static esp_err_t config_post(httpd_req_t *req)
 {
     char body[256];
-    int total = 0;
+    int  total = 0;
     while (total < (int)sizeof(body) - 1) {
         int n = httpd_req_recv(req, body + total, sizeof(body) - 1 - total);
         if (n <= 0) {
@@ -466,12 +484,12 @@ static esp_err_t config_post(httpd_req_t *req)
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req, "ssid required\n", HTTPD_RESP_USE_STRLEN);
     }
-    form_field(body, total, "psk", psk, sizeof(psk));  // psk optional (open AP)
+    form_field(body, total, "psk", psk, sizeof(psk)); // psk optional (open AP)
 
     // Optional UDP push target. Both fields empty / 0 = disabled.
-    char out_host[64] = {0};
+    char out_host[64]  = {0};
     char out_port_s[8] = {0};
-    form_field(body, total, "out_host", out_host,   sizeof(out_host));
+    form_field(body, total, "out_host", out_host, sizeof(out_host));
     form_field(body, total, "out_port", out_port_s, sizeof(out_port_s));
     uint16_t out_port = (uint16_t)strtoul(out_port_s, NULL, 10);
 
@@ -482,8 +500,8 @@ static esp_err_t config_post(httpd_req_t *req)
     // Bias-tee checkbox: present in form body only if checked (HTML form
     // convention). form_field returns ESP_OK iff the key is present.
     char bias_tee_s[4] = {0};
-    bool bias_tee = (form_field(body, total, "bias_tee", bias_tee_s,
-                                sizeof(bias_tee_s)) == ESP_OK);
+    bool bias_tee      = (form_field(body, total, "bias_tee", bias_tee_s,
+                                     sizeof(bias_tee_s)) == ESP_OK);
 
     ESP_LOGI(TAG, "/config POST: ssid='%s' (psk %s), bias_tee=%d, out=%s:%u, ota_url=%s",
              ssid, psk[0] ? "set" : "empty", (int)bias_tee,
@@ -498,11 +516,11 @@ static esp_err_t config_post(httpd_req_t *req)
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "alloc failed\n", HTTPD_RESP_USE_STRLEN);
     }
-    strlcpy(args->ssid,     ssid,     sizeof(args->ssid));
-    strlcpy(args->psk,      psk,      sizeof(args->psk));
+    strlcpy(args->ssid, ssid, sizeof(args->ssid));
+    strlcpy(args->psk, psk, sizeof(args->psk));
     strlcpy(args->out_host, out_host, sizeof(args->out_host));
     args->out_port = out_port;
-    strlcpy(args->ota_url,  ota_url,  sizeof(args->ota_url));
+    strlcpy(args->ota_url, ota_url, sizeof(args->ota_url));
     args->bias_tee   = bias_tee;
     args->clear_only = false;
 
@@ -519,7 +537,7 @@ static esp_err_t config_post(httpd_req_t *req)
     httpd_resp_send(req, ok, HTTPD_RESP_USE_STRLEN);
 
     BaseType_t spawned = xTaskCreatePinnedToCore(nvs_save_and_reboot_task,
-        "nvs_save", 4096, args, 5, NULL, tskNO_AFFINITY);
+                                                 "nvs_save", 4096, args, 5, NULL, tskNO_AFFINITY);
     if (spawned != pdPASS) {
         ESP_LOGE(TAG, "nvs_save task spawn failed — NVS not written, no reboot");
         free(args);
@@ -536,18 +554,36 @@ static size_t json_escape(char *out, size_t outsz, const char *in)
     for (; *in && w + 7 < outsz; in++) {
         unsigned char c = (unsigned char)*in;
         switch (c) {
-        case '"':  out[w++] = '\\'; out[w++] = '"';  break;
-        case '\\': out[w++] = '\\'; out[w++] = '\\'; break;
-        case '\n': out[w++] = '\\'; out[w++] = 'n';  break;
-        case '\r': out[w++] = '\\'; out[w++] = 'r';  break;
-        case '\t': out[w++] = '\\'; out[w++] = 't';  break;
+        case '"':
+            out[w++] = '\\';
+            out[w++] = '"';
+            break;
+        case '\\':
+            out[w++] = '\\';
+            out[w++] = '\\';
+            break;
+        case '\n':
+            out[w++] = '\\';
+            out[w++] = 'n';
+            break;
+        case '\r':
+            out[w++] = '\\';
+            out[w++] = 'r';
+            break;
+        case '\t':
+            out[w++] = '\\';
+            out[w++] = 't';
+            break;
         default:
             if (c < 0x20) {
                 // \u00XX
                 static const char hex[] = "0123456789abcdef";
-                out[w++] = '\\'; out[w++] = 'u'; out[w++] = '0'; out[w++] = '0';
-                out[w++] = hex[(c >> 4) & 0xf];
-                out[w++] = hex[c & 0xf];
+                out[w++]                = '\\';
+                out[w++]                = 'u';
+                out[w++]                = '0';
+                out[w++]                = '0';
+                out[w++]                = hex[(c >> 4) & 0xf];
+                out[w++]                = hex[c & 0xf];
             } else {
                 out[w++] = (char)c;
             }
@@ -560,7 +596,7 @@ static size_t json_escape(char *out, size_t outsz, const char *in)
 static esp_err_t messages_get(httpd_req_t *req)
 {
     uint64_t since_id = 0;
-    char qbuf[64];
+    char     qbuf[64];
     if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
         char val[24];
         if (httpd_query_key_value(qbuf, "since", val, sizeof(val)) == ESP_OK) {
@@ -568,7 +604,7 @@ static esp_err_t messages_get(httpd_req_t *req)
         }
     }
 
-    static acars_msg_t s_snap[MSG_RING_CAPACITY];   // ~9 KB; fine on logger task stack? no — too big.
+    static acars_msg_t s_snap[MSG_RING_CAPACITY]; // ~9 KB; fine on logger task stack? no — too big.
     // BSS-allocated above to avoid the 6 KB http_server task stack.
     size_t n = msg_ring_snapshot(since_id, s_snap, MSG_RING_CAPACITY);
 
@@ -577,9 +613,9 @@ static esp_err_t messages_get(httpd_req_t *req)
 
     // Stream: {"total":N,"messages":[ {...}, {...} ]}
     char chunk[600];
-    int len = snprintf(chunk, sizeof(chunk),
-                       "{\"total\":%llu,\"messages\":[",
-                       (unsigned long long)msg_ring_total());
+    int  len = snprintf(chunk, sizeof(chunk),
+                        "{\"total\":%llu,\"messages\":[",
+                        (unsigned long long)msg_ring_total());
     httpd_resp_send_chunk(req, chunk, len);
 
     char esc_txt[2 * MSG_RING_TXT_MAX + 8];
@@ -589,46 +625,46 @@ static esp_err_t messages_get(httpd_req_t *req)
     for (size_t i = 0; i < n; i++) {
         const acars_msg_t *m = &s_snap[i];
 
-        char label_buf[3] = { m->label[0], m->label[1], 0 };
-        json_escape(esc_label,  sizeof(esc_label),  label_buf);
+        char label_buf[3] = {m->label[0], m->label[1], 0};
+        json_escape(esc_label, sizeof(esc_label), label_buf);
         json_escape(esc_msgnum, sizeof(esc_msgnum), m->msg_num);
         json_escape(esc_flight, sizeof(esc_flight), m->flight_id);
-        json_escape(esc_txt,    sizeof(esc_txt),    m->txt);
+        json_escape(esc_txt, sizeof(esc_txt), m->txt);
 
         len = snprintf(chunk, sizeof(chunk),
-            "%s{"
-                "\"id\":%llu,"
-                "\"t_us\":%llu,"
-                "\"dir\":\"%s\","
-                "\"mode\":\"%c\","
-                "\"label\":\"%s\","
-                "\"block\":\"%c\","
-                "\"msg_num\":\"%s\","
-                "\"flight\":\"%s\","
-                "\"crc\":%s,"
-                "\"peak_bin\":%ld,"
-                "\"snr_db\":%.1f,"
-                "\"txt\":\"%s\""
-            "}",
-            (i == 0) ? "" : ",",
-            (unsigned long long)m->id,
-            (unsigned long long)m->timestamp_us,
-            m->uplink ? "UL" : "DL",
-            m->mode,
-            esc_label,
-            m->block_id,
-            esc_msgnum,
-            esc_flight,
-            m->crc_ok ? "true" : "false",
-            (long)m->peak_bin,
-            (double)m->snr_db,
-            esc_txt);
+                       "%s{"
+                       "\"id\":%llu,"
+                       "\"t_us\":%llu,"
+                       "\"dir\":\"%s\","
+                       "\"mode\":\"%c\","
+                       "\"label\":\"%s\","
+                       "\"block\":\"%c\","
+                       "\"msg_num\":\"%s\","
+                       "\"flight\":\"%s\","
+                       "\"crc\":%s,"
+                       "\"peak_bin\":%ld,"
+                       "\"snr_db\":%.1f,"
+                       "\"txt\":\"%s\""
+                       "}",
+                       (i == 0) ? "" : ",",
+                       (unsigned long long)m->id,
+                       (unsigned long long)m->timestamp_us,
+                       m->uplink ? "UL" : "DL",
+                       m->mode,
+                       esc_label,
+                       m->block_id,
+                       esc_msgnum,
+                       esc_flight,
+                       m->crc_ok ? "true" : "false",
+                       (long)m->peak_bin,
+                       (double)m->snr_db,
+                       esc_txt);
         if (len > 0) {
             httpd_resp_send_chunk(req, chunk, len);
         }
     }
     httpd_resp_send_chunk(req, "]}", 2);
-    return httpd_resp_send_chunk(req, NULL, 0);   // end of chunked response
+    return httpd_resp_send_chunk(req, NULL, 0); // end of chunked response
 }
 
 static esp_err_t ota_post(httpd_req_t *req)
@@ -661,15 +697,22 @@ static esp_err_t ota_get(httpd_req_t *req)
     ota_runner_get_status(&s);
     const char *state = "idle";
     switch (s.state) {
-    case OTA_RUNNING: state = "running"; break;
-    case OTA_SUCCESS: state = "success"; break;
-    case OTA_FAILED:  state = "failed";  break;
-    default: break;
+    case OTA_RUNNING:
+        state = "running";
+        break;
+    case OTA_SUCCESS:
+        state = "success";
+        break;
+    case OTA_FAILED:
+        state = "failed";
+        break;
+    default:
+        break;
     }
     char body[300];
-    int n = snprintf(body, sizeof(body),
-        "{\"state\":\"%s\",\"http_status\":%d,\"bytes_written\":%d,\"last_error\":\"%s\"}",
-        state, s.http_status, s.bytes_written, s.last_error);
+    int  n = snprintf(body, sizeof(body),
+                      "{\"state\":\"%s\",\"http_status\":%d,\"bytes_written\":%d,\"last_error\":\"%s\"}",
+                      state, s.http_status, s.bytes_written, s.last_error);
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -701,21 +744,21 @@ static esp_err_t diag_dsp_health_get(httpd_req_t *req)
     // frames whenever status_logger fired between snapshots and reported
     // a phantom dsp_ok=false. dsp_processor_get_total_fft_frames is
     // monotonic; subtracting two snapshots gives an exact count.
-    uint64_t dsp_frames0 = dsp_processor_get_total_fft_frames();
-    usb_stream_totals_t usb0 = {0};
+    uint64_t            dsp_frames0 = dsp_processor_get_total_fft_frames();
+    usb_stream_totals_t usb0        = {0};
     esp_libusb_get_stream_totals(&usb0);
     uint64_t acars0 = frame_decoder_acars_decoded_total();
-    int64_t t0 = esp_timer_get_time();
+    int64_t  t0     = esp_timer_get_time();
 
     // 2-second window. Real production has plenty of FFT frames in 2 s
     // (~1900 at 2.56 MSPS with FBT_FFT_SIZE=2048).
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    uint64_t dsp_frames1 = dsp_processor_get_total_fft_frames();
-    usb_stream_totals_t usb1 = {0};
+    uint64_t            dsp_frames1 = dsp_processor_get_total_fft_frames();
+    usb_stream_totals_t usb1        = {0};
     esp_libusb_get_stream_totals(&usb1);
     uint64_t acars1 = frame_decoder_acars_decoded_total();
-    int64_t t1 = esp_timer_get_time();
+    int64_t  t1     = esp_timer_get_time();
 
     uint64_t usb_delta   = usb1.completed - usb0.completed;
     uint64_t dsp_frames  = dsp_frames1 - dsp_frames0;
@@ -726,22 +769,22 @@ static esp_err_t diag_dsp_health_get(httpd_req_t *req)
     // 2 s window. Thresholds are loose — at 2.56 MSPS / 16 KB transfers
     // we expect ~600 completed/s × 2 s = ~1200; at FBT_FFT_SIZE 2048 we
     // expect ~1900 FFT frames/s × 2 s = ~3800.
-    bool usb_ok = (usb_delta > 200);    // ~10% of nominal — generous floor
-    bool dsp_ok = (dsp_frames > 200);   // ditto
+    bool usb_ok = (usb_delta > 200);  // ~10% of nominal — generous floor
+    bool dsp_ok = (dsp_frames > 200); // ditto
     bool pass   = usb_ok && dsp_ok;
 
     char body[512];
-    int n = snprintf(body, sizeof(body),
-        "{\"window_us\":%lld,"
-        "\"usb_completed_delta\":%llu,\"usb_ok\":%s,"
-        "\"dsp_fft_frames\":%u,\"dsp_ok\":%s,"
-        "\"acars_decoded_delta\":%llu,"
-        "\"pass\":%s}\n",
-        (long long)window_us,
-        (unsigned long long)usb_delta, usb_ok ? "true" : "false",
-        (unsigned)dsp_frames, dsp_ok ? "true" : "false",
-        (unsigned long long)acars_delta,
-        pass ? "true" : "false");
+    int  n = snprintf(body, sizeof(body),
+                      "{\"window_us\":%lld,"
+                       "\"usb_completed_delta\":%llu,\"usb_ok\":%s,"
+                       "\"dsp_fft_frames\":%u,\"dsp_ok\":%s,"
+                       "\"acars_decoded_delta\":%llu,"
+                       "\"pass\":%s}\n",
+                      (long long)window_us,
+                      (unsigned long long)usb_delta, usb_ok ? "true" : "false",
+                      (unsigned)dsp_frames, dsp_ok ? "true" : "false",
+                      (unsigned long long)acars_delta,
+                     pass ? "true" : "false");
     if (n < 0 || n >= (int)sizeof(body)) n = sizeof(body) - 1;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -764,28 +807,28 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
     uint32_t sb_fails      = signal_buffer_stash_alloc_fails();
     uint32_t sb_recoveries = signal_buffer_stash_alloc_recoveries();
     uint32_t sb_audio_drop = (sb_fails > sb_recoveries) ? (sb_fails - sb_recoveries) : 0;
-    char body[640];
-    int n = snprintf(body, sizeof(body),
-        "{"
-        "\"signal_buffer\":{"
-            "\"stash_alloc_fails\":%u,"
-            "\"stash_alloc_recoveries\":%u,"
-            "\"audio_dropped\":%u,"
-            "\"dma_timeouts\":%u"
-        "},"
-        "\"ingest_core1\":{"
-            "\"dispatch_drops\":%u,"
-            "\"slow_waits\":%u"
-        "},"
-        "\"esp_libusb\":{"
-            "\"xfer_pool_lost\":%u"
-        "}"
-        "}\n",
-        (unsigned)sb_fails, (unsigned)sb_recoveries, (unsigned)sb_audio_drop,
-        (unsigned)signal_buffer_dma_timeouts(),
-        (unsigned)ingest_core1_dispatch_drops(),
-        (unsigned)ingest_core1_take_converted_slow_waits(),
-        (unsigned)esp_libusb_xfer_pool_lost());
+    char     body[640];
+    int      n = snprintf(body, sizeof(body),
+                          "{"
+                               "\"signal_buffer\":{"
+                               "\"stash_alloc_fails\":%u,"
+                               "\"stash_alloc_recoveries\":%u,"
+                               "\"audio_dropped\":%u,"
+                               "\"dma_timeouts\":%u"
+                               "},"
+                               "\"ingest_core1\":{"
+                               "\"dispatch_drops\":%u,"
+                               "\"slow_waits\":%u"
+                               "},"
+                               "\"esp_libusb\":{"
+                               "\"xfer_pool_lost\":%u"
+                               "}"
+                               "}\n",
+                          (unsigned)sb_fails, (unsigned)sb_recoveries, (unsigned)sb_audio_drop,
+                          (unsigned)signal_buffer_dma_timeouts(),
+                          (unsigned)ingest_core1_dispatch_drops(),
+                          (unsigned)ingest_core1_take_converted_slow_waits(),
+                          (unsigned)esp_libusb_xfer_pool_lost());
     if (n < 0 || n >= (int)sizeof(body)) n = sizeof(body) - 1;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -799,17 +842,19 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
 // runs at bench SNR (no real decodes). Internal-LAN debug aid (task #102).
 static esp_err_t debug_inject_post(httpd_req_t *req)
 {
-    acars_msg_t m = {0};
+    acars_msg_t m  = {0};
     m.timestamp_us = (uint64_t)esp_timer_get_time();
     m.uplink       = false;
     m.mode         = 'A';
-    m.label[0]     = 'Q'; m.label[1] = '0'; m.label[2] = '\0';
+    m.label[0]     = 'Q';
+    m.label[1]     = '0';
+    m.label[2]     = '\0';
     m.block_id     = '1';
-    strlcpy(m.msg_num,   "T001", sizeof(m.msg_num));
+    strlcpy(m.msg_num, "T001", sizeof(m.msg_num));
     strlcpy(m.flight_id, "TEST01", sizeof(m.flight_id));
-    m.crc_ok       = true;
-    m.peak_bin     = -1;
-    m.snr_db       = 0.0f;
+    m.crc_ok   = true;
+    m.peak_bin = -1;
+    m.snr_db   = 0.0f;
     strlcpy(m.txt, "debug/inject write-path proof", sizeof(m.txt));
 
     msg_ring_push(&m);
@@ -819,8 +864,8 @@ static esp_err_t debug_inject_post(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req,
-        "{\"result\":\"injected\",\"sinks\":[\"msg_ring\",\"udp\",\"sd_log\"]}",
-        HTTPD_RESP_USE_STRLEN);
+                           "{\"result\":\"injected\",\"sinks\":[\"msg_ring\",\"udp\",\"sd_log\"]}",
+                           HTTPD_RESP_USE_STRLEN);
 }
 
 // POST /tune?hz=<lo_freq_hz> — set the SDR centre frequency dynamically and
@@ -839,8 +884,8 @@ static esp_err_t tune_post(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req,
-            "usage: POST /tune?hz=<lo_freq_hz>  (e.g. 1622000000)\n",
-            HTTPD_RESP_USE_STRLEN);
+                               "usage: POST /tune?hz=<lo_freq_hz>  (e.g. 1622000000)\n",
+                               HTTPD_RESP_USE_STRLEN);
     }
     uint32_t hz = (uint32_t)strtoul(hz_s, NULL, 10);
     // Iridium L-band downlink is 1616.0-1626.5 MHz; allow a little slack so
@@ -849,8 +894,8 @@ static esp_err_t tune_post(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         char m[112];
-        int mn = snprintf(m, sizeof(m),
-            "hz=%u out of Iridium band [1615000000, 1628000000]\n", (unsigned)hz);
+        int  mn = snprintf(m, sizeof(m),
+                           "hz=%u out of Iridium band [1615000000, 1628000000]\n", (unsigned)hz);
         return httpd_resp_send(req, m, mn);
     }
     // Reply first, then do the NVS write + reboot on an internal-stack task
@@ -858,8 +903,8 @@ static esp_err_t tune_post(httpd_req_t *req)
     // tune_apply_reboot_task). 4096 B internal stack covers nvs_commit +
     // esp_restart.
     char body[96];
-    int n = snprintf(body, sizeof(body),
-        "{\"result\":\"ok\",\"lo_freq_hz\":%u,\"reboot\":true}", (unsigned)hz);
+    int  n = snprintf(body, sizeof(body),
+                      "{\"result\":\"ok\",\"lo_freq_hz\":%u,\"reboot\":true}", (unsigned)hz);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_send(req, body, n);
@@ -872,16 +917,16 @@ static esp_err_t tune_post(httpd_req_t *req)
 
 static esp_err_t sd_mount_post(httpd_req_t *req)
 {
-    esp_err_t r = sd_log_force_mount();
+    esp_err_t      r = sd_log_force_mount();
     sd_log_stats_t s;
     sd_log_get_stats(&s);
     char body[256];
-    int n = snprintf(body, sizeof(body),
-        "{\"result\":\"%s\",\"mounted\":%s,\"log_path\":\"%s\",\"mount_error\":\"%s\"}",
-        esp_err_to_name(r),
-        s.mounted ? "true" : "false",
-        s.log_path,
-        s.mount_error);
+    int  n = snprintf(body, sizeof(body),
+                      "{\"result\":\"%s\",\"mounted\":%s,\"log_path\":\"%s\",\"mount_error\":\"%s\"}",
+                      esp_err_to_name(r),
+                     s.mounted ? "true" : "false",
+                      s.log_path,
+                      s.mount_error);
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "503 Service Unavailable");
@@ -907,14 +952,14 @@ static esp_err_t tasks_get(httpd_req_t *req)
     }
     // Header so the output's columns are obvious to a human reader.
     int n = snprintf(buf, 4096,
-        "Name             State Prio Stack Num CPU\n"
-        "-------------------------------------------\n");
+                     "Name             State Prio Stack Num CPU\n"
+                     "-------------------------------------------\n");
     vTaskList(buf + n);
     size_t off = strlen(buf);
     off += snprintf(buf + off, 4096 - off,
-        "\n=== CPU runtime stats (since boot) ===\n"
-        "Name             Time%%\n"
-        "----------------------\n");
+                    "\n=== CPU runtime stats (since boot) ===\n"
+                    "Name             Time%%\n"
+                    "----------------------\n");
     vTaskGetRunTimeStats(buf + off);
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
@@ -933,24 +978,24 @@ static esp_err_t sd_list_get(httpd_req_t *req)
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_send(req, "{\"error\":\"opendir failed\"}",
-                                HTTPD_RESP_USE_STRLEN);
+                               HTTPD_RESP_USE_STRLEN);
     }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send_chunk(req, "[", 1);
     struct dirent *e;
-    bool first = true;
-    char line[160];
+    bool           first = true;
+    char           line[160];
     while ((e = readdir(d)) != NULL) {
         if (e->d_name[0] == '.') continue;
         char path[320];
         snprintf(path, sizeof(path), "/sdcard/acars/%s", e->d_name);
         struct stat st;
-        bool ok = (stat(path, &st) == 0);
-        long long sz = ok ? (long long)st.st_size : -1;
-        long long mt = ok ? (long long)st.st_mtime : 0;
-        int n = snprintf(line, sizeof(line),
-            "%s{\"name\":\"%s\",\"size\":%lld,\"mtime\":%lld}",
-            first ? "" : ",", e->d_name, sz, mt);
+        bool        ok = (stat(path, &st) == 0);
+        long long   sz = ok ? (long long)st.st_size : -1;
+        long long   mt = ok ? (long long)st.st_mtime : 0;
+        int         n  = snprintf(line, sizeof(line),
+                                  "%s{\"name\":\"%s\",\"size\":%lld,\"mtime\":%lld}",
+                         first ? "" : ",", e->d_name, sz, mt);
         if (n > 0) httpd_resp_send_chunk(req, line, n);
         first = false;
     }
@@ -972,13 +1017,13 @@ static esp_err_t sd_format_post(httpd_req_t *req)
     if (cs.active) {
         httpd_resp_set_status(req, "409 Conflict");
         return httpd_resp_send(req,
-            "capture is active — POST /capture/stop first\n",
-            HTTPD_RESP_USE_STRLEN);
+                               "capture is active — POST /capture/stop first\n",
+                               HTTPD_RESP_USE_STRLEN);
     }
     esp_err_t r = sd_log_force_format();
-    char body[128];
-    int n = snprintf(body, sizeof(body),
-        "{\"result\":\"%s\"}", esp_err_to_name(r));
+    char      body[128];
+    int       n = snprintf(body, sizeof(body),
+                           "{\"result\":\"%s\"}", esp_err_to_name(r));
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "500 Internal Server Error");
@@ -1000,12 +1045,12 @@ static esp_err_t sd_delete_post(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req,
-            "?name=<bare-filename> required (no slashes, no ..)\n",
-            HTTPD_RESP_USE_STRLEN);
+                               "?name=<bare-filename> required (no slashes, no ..)\n",
+                               HTTPD_RESP_USE_STRLEN);
     }
 
     char path[96];
-    int wrote = snprintf(path, sizeof(path), "/sdcard/acars/%s", name);
+    int  wrote = snprintf(path, sizeof(path), "/sdcard/acars/%s", name);
     if (wrote <= 0 || wrote >= (int)sizeof(path)) {
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_send(req, "name too long\n", HTTPD_RESP_USE_STRLEN);
@@ -1017,8 +1062,8 @@ static esp_err_t sd_delete_post(httpd_req_t *req)
         httpd_resp_set_status(req, "409 Conflict");
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req,
-            "refusing to delete the active capture file — stop first\n",
-            HTTPD_RESP_USE_STRLEN);
+                               "refusing to delete the active capture file — stop first\n",
+                               HTTPD_RESP_USE_STRLEN);
     }
 
     int r = unlink(path);
@@ -1026,12 +1071,12 @@ static esp_err_t sd_delete_post(httpd_req_t *req)
         httpd_resp_set_status(req, (errno == ENOENT) ? "404 Not Found" : "500 Internal Server Error");
         httpd_resp_set_type(req, "text/plain");
         char msg[96];
-        int mn = snprintf(msg, sizeof(msg), "unlink failed: %s\n", strerror(errno));
+        int  mn = snprintf(msg, sizeof(msg), "unlink failed: %s\n", strerror(errno));
         return httpd_resp_send(req, msg, mn);
     }
     char body[128];
-    int n = snprintf(body, sizeof(body),
-        "{\"result\":\"ESP_OK\",\"deleted\":\"%s\"}", name);
+    int  n = snprintf(body, sizeof(body),
+                      "{\"result\":\"ESP_OK\",\"deleted\":\"%s\"}", name);
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, n);
@@ -1043,11 +1088,13 @@ static esp_err_t sd_delete_post(httpd_req_t *req)
 static esp_err_t capture_start_post(httpd_req_t *req)
 {
     char body[128] = {0};
-    int len = req->content_len;
+    int  len       = req->content_len;
     if (len > 0 && len < (int)sizeof(body)) {
         int got = httpd_req_recv(req, body, len);
-        if (got <= 0) body[0] = '\0';
-        else          body[got] = '\0';
+        if (got <= 0)
+            body[0] = '\0';
+        else
+            body[got] = '\0';
     }
 
     uint64_t target = 0;
@@ -1059,7 +1106,8 @@ static esp_err_t capture_start_post(httpd_req_t *req)
         p = strchr(p, ':');
         if (p) {
             p++;
-            while (*p == ' ') p++;
+            while (*p == ' ')
+                p++;
             target = strtoull(p, NULL, 10);
         }
     }
@@ -1073,19 +1121,19 @@ static esp_err_t capture_start_post(httpd_req_t *req)
         burst_mode = true;
     }
 
-    esp_err_t r = burst_mode ? sd_capture_start_bursts()
-                              : sd_capture_start(target);
+    esp_err_t          r = burst_mode ? sd_capture_start_bursts()
+                                      : sd_capture_start(target);
     sd_capture_stats_t s;
     sd_capture_get_stats(&s);
     char resp[256];
-    int n = snprintf(resp, sizeof(resp),
-        "{\"result\":\"%s\",\"active\":%s,\"mode\":\"%s\",\"path\":\"%s\","
-        "\"target_bytes\":%llu}",
-        esp_err_to_name(r),
-        s.active ? "true" : "false",
-        burst_mode ? "bursts" : "continuous",
-        s.path,
-        (unsigned long long)s.bytes_target);
+    int  n = snprintf(resp, sizeof(resp),
+                      "{\"result\":\"%s\",\"active\":%s,\"mode\":\"%s\",\"path\":\"%s\","
+                       "\"target_bytes\":%llu}",
+                      esp_err_to_name(r),
+                     s.active ? "true" : "false",
+                     burst_mode ? "bursts" : "continuous",
+                      s.path,
+                      (unsigned long long)s.bytes_target);
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "503 Service Unavailable");
@@ -1096,19 +1144,19 @@ static esp_err_t capture_start_post(httpd_req_t *req)
 // Idempotent in spirit; returns 409 if no capture was active.
 static esp_err_t capture_stop_post(httpd_req_t *req)
 {
-    esp_err_t r = sd_capture_stop();
+    esp_err_t          r = sd_capture_stop();
     sd_capture_stats_t s;
     sd_capture_get_stats(&s);
     char resp[256];
-    int n = snprintf(resp, sizeof(resp),
-        "{\"result\":\"%s\",\"path\":\"%s\","
-        "\"bytes_captured\":%llu,\"bytes_dropped\":%lu,"
-        "\"write_errors\":%lu}",
-        esp_err_to_name(r),
-        s.path,
-        (unsigned long long)s.bytes_captured,
-        (unsigned long)s.bytes_dropped,
-        (unsigned long)s.write_errors);
+    int  n = snprintf(resp, sizeof(resp),
+                      "{\"result\":\"%s\",\"path\":\"%s\","
+                       "\"bytes_captured\":%llu,\"bytes_dropped\":%lu,"
+                       "\"write_errors\":%lu}",
+                      esp_err_to_name(r),
+                      s.path,
+                      (unsigned long long)s.bytes_captured,
+                      (unsigned long)s.bytes_dropped,
+                      (unsigned long)s.write_errors);
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "409 Conflict");
@@ -1130,8 +1178,8 @@ static esp_err_t capture_file_get(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req,
-            "?name=<filename> required (try /capture/status for the current path)\n",
-            HTTPD_RESP_USE_STRLEN);
+                               "?name=<filename> required (try /capture/status for the current path)\n",
+                               HTTPD_RESP_USE_STRLEN);
     }
 
     // Validate same-path checks via sd_capture_open_for_read, but
@@ -1147,8 +1195,8 @@ static esp_err_t capture_file_get(httpd_req_t *req)
             httpd_resp_set_status(req, "409 Conflict");
             httpd_resp_set_type(req, "text/plain");
             return httpd_resp_send(req,
-                "capture is still writing this file — stop first\n",
-                HTTPD_RESP_USE_STRLEN);
+                                   "capture is still writing this file — stop first\n",
+                                   HTTPD_RESP_USE_STRLEN);
         }
         httpd_resp_set_status(req, "404 Not Found");
         httpd_resp_set_type(req, "text/plain");
@@ -1159,7 +1207,7 @@ static esp_err_t capture_file_get(httpd_req_t *req)
     // Size for the log line — fstat() goes through the same VFS
     // layer as the fd; consistent with what we'll actually read.
     struct stat st;
-    long long size_stat = (fstat(fd, &st) == 0) ? (long long)st.st_size : -1;
+    long long   size_stat = (fstat(fd, &st) == 0) ? (long long)st.st_size : -1;
     ESP_LOGI(TAG, "/capture/file: serving %s (size=%lld bytes, fd=%d)",
              name, size_stat, fd);
 
@@ -1177,7 +1225,7 @@ static esp_err_t capture_file_get(httpd_req_t *req)
         fclose(fp);
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "download buf unavailable",
-                                HTTPD_RESP_USE_STRLEN);
+                               HTTPD_RESP_USE_STRLEN);
     }
 
     // No cooperative yield here: the USB consumer (class task) runs at a
@@ -1186,8 +1234,8 @@ static esp_err_t capture_file_get(httpd_req_t *req)
     // arrives and keeps the ringbuffer drained. A vTaskDelay() yield was
     // tried and didn't help — httpd outranked the consumer at the time,
     // so the tick just bounced straight back to httpd. See task #91.
-    size_t total_sent = 0;
-    int read_errors = 0;
+    size_t total_sent  = 0;
+    int    read_errors = 0;
     while (1) {
         ssize_t n = read(fd, s_download_buf, DOWNLOAD_BUF_BYTES);
         if (n < 0) {
@@ -1196,7 +1244,7 @@ static esp_err_t capture_file_get(httpd_req_t *req)
             if (++read_errors > 3) break;
             continue;
         }
-        if (n == 0) break;       // EOF
+        if (n == 0) break; // EOF
         if (httpd_resp_send_chunk(req, (const char *)s_download_buf, n) != ESP_OK) {
             fclose(fp);
             return ESP_FAIL;
@@ -1218,19 +1266,19 @@ static esp_err_t capture_status_get(httpd_req_t *req)
     sd_capture_stats_t s;
     sd_capture_get_stats(&s);
     char resp[320];
-    int n = snprintf(resp, sizeof(resp),
-        "{\"active\":%s,\"file_open\":%s,\"path\":\"%s\","
-        "\"bytes_captured\":%llu,\"bytes_target\":%llu,"
-        "\"bytes_dropped\":%lu,\"write_errors\":%lu,"
-        "\"start_us\":%lld}",
-        s.active ? "true" : "false",
-        s.file_open ? "true" : "false",
-        s.path,
-        (unsigned long long)s.bytes_captured,
-        (unsigned long long)s.bytes_target,
-        (unsigned long)s.bytes_dropped,
-        (unsigned long)s.write_errors,
-        (long long)s.start_us);
+    int  n = snprintf(resp, sizeof(resp),
+                      "{\"active\":%s,\"file_open\":%s,\"path\":\"%s\","
+                       "\"bytes_captured\":%llu,\"bytes_target\":%llu,"
+                       "\"bytes_dropped\":%lu,\"write_errors\":%lu,"
+                       "\"start_us\":%lld}",
+                     s.active ? "true" : "false",
+                     s.file_open ? "true" : "false",
+                      s.path,
+                      (unsigned long long)s.bytes_captured,
+                      (unsigned long long)s.bytes_target,
+                      (unsigned long)s.bytes_dropped,
+                      (unsigned long)s.write_errors,
+                      (long long)s.start_us);
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -1260,7 +1308,7 @@ static esp_err_t reset_post(httpd_req_t *req)
     httpd_resp_send(req, ok, HTTPD_RESP_USE_STRLEN);
 
     BaseType_t spawned = xTaskCreatePinnedToCore(nvs_save_and_reboot_task,
-        "nvs_save", 4096, args, 5, NULL, tskNO_AFFINITY);
+                                                 "nvs_save", 4096, args, 5, NULL, tskNO_AFFINITY);
     if (spawned != pdPASS) {
         ESP_LOGE(TAG, "nvs_save task spawn failed — NVS not cleared, no reboot");
         free(args);
@@ -1276,7 +1324,7 @@ esp_err_t http_server_start(void)
     // and tagger have a chance to fragment DMA-INT. See
     // s_download_buf decl for the why.
     s_download_buf = heap_caps_aligned_alloc(64, DOWNLOAD_BUF_BYTES,
-                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (s_download_buf) {
         ESP_LOGI(TAG, "pre-allocated %d-byte DMA-INT download buf @ %p",
                  DOWNLOAD_BUF_BYTES, s_download_buf);
@@ -1284,11 +1332,11 @@ esp_err_t http_server_start(void)
         ESP_LOGW(TAG, "download buf alloc failed — /capture/file will 500");
     }
 
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port    = 80;
+    httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port      = 80;
     cfg.max_uri_handlers = HTTPD_URI_LIMIT;
     cfg.lru_purge_enable = true;
-    cfg.stack_size     = 6144;
+    cfg.stack_size       = 6144;
     // Pin to Core 0: Core 1 is ~98% saturated (ingest + worker), so a
     // no-affinity httpd task can get parked there and barely run. Core 0
     // has ~23% idle headroom. Prio 5 cleanly outranks class_driver (3)
@@ -1297,15 +1345,15 @@ esp_err_t http_server_start(void)
     // serve task, making the WHOLE server unreachable; a short timeout
     // bounds that worst case so one stalled connection can't hold off
     // accept() for everyone. See task #101.
-    cfg.task_priority  = 5;
-    cfg.core_id        = 0;
+    cfg.task_priority     = 5;
+    cfg.core_id           = 0;
     cfg.recv_wait_timeout = 2;
     cfg.send_wait_timeout = 2;
     // HTTP server task stack in PSRAM — default task_caps is
     // MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT, which on P4 also satisfies
     // MALLOC_CAP_DMA and steals from USB pool. esp_http_server is
     // request/response over TCP, latency-tolerant; PSRAM stack is fine.
-    cfg.task_caps      = MALLOC_CAP_SPIRAM;
+    cfg.task_caps = MALLOC_CAP_SPIRAM;
 
     esp_err_t r = httpd_start(&s_server, &cfg);
     if (r != ESP_OK) {
@@ -1321,33 +1369,33 @@ esp_err_t http_server_start(void)
     // build time so we never re-pay the "1372 reboots to find it" tax
     // (see commit 2260ae9 / feedback_httpd_max_uri_handlers memory note).
     httpd_uri_t routes[] = {
-        { .uri = "/",         .method = HTTP_GET,  .handler = index_get,    .user_ctx = NULL },
-        { .uri = "/status",   .method = HTTP_GET,  .handler = status_get,   .user_ctx = NULL },
-        { .uri = "/diag/histograms", .method = HTTP_GET, .handler = diag_histograms_get, .user_ctx = NULL },
-        { .uri = "/diag/dsp_health", .method = HTTP_GET, .handler = diag_dsp_health_get, .user_ctx = NULL },
-        { .uri = "/diag/recovery_counters", .method = HTTP_GET, .handler = diag_recovery_counters_get, .user_ctx = NULL },
-        { .uri = "/messages", .method = HTTP_GET,  .handler = messages_get, .user_ctx = NULL },
-        { .uri = "/ota",      .method = HTTP_GET,  .handler = ota_get,      .user_ctx = NULL },
-        { .uri = "/config",   .method = HTTP_POST, .handler = config_post,    .user_ctx = NULL },
-        { .uri = "/reset",    .method = HTTP_POST, .handler = reset_post,     .user_ctx = NULL },
-        { .uri = "/ota",      .method = HTTP_POST, .handler = ota_post,       .user_ctx = NULL },
-        { .uri = "/debug/inject",  .method = HTTP_POST, .handler = debug_inject_post,    .user_ctx = NULL },
-        { .uri = "/tune",          .method = HTTP_POST, .handler = tune_post,            .user_ctx = NULL },
-        { .uri = "/sd/mount",      .method = HTTP_POST, .handler = sd_mount_post,       .user_ctx = NULL },
-        { .uri = "/sd/format",     .method = HTTP_POST, .handler = sd_format_post,      .user_ctx = NULL },
-        { .uri = "/sd/delete",     .method = HTTP_POST, .handler = sd_delete_post,      .user_ctx = NULL },
-        { .uri = "/sd/list",       .method = HTTP_GET,  .handler = sd_list_get,         .user_ctx = NULL },
-        { .uri = "/tasks",         .method = HTTP_GET,  .handler = tasks_get,           .user_ctx = NULL },
-        { .uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post,  .user_ctx = NULL },
-        { .uri = "/capture/stop",  .method = HTTP_POST, .handler = capture_stop_post,   .user_ctx = NULL },
-        { .uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get,  .user_ctx = NULL },
-        { .uri = "/capture/file",   .method = HTTP_GET, .handler = capture_file_get,    .user_ctx = NULL },
+        {.uri = "/", .method = HTTP_GET, .handler = index_get, .user_ctx = NULL},
+        {.uri = "/status", .method = HTTP_GET, .handler = status_get, .user_ctx = NULL},
+        {.uri = "/diag/histograms", .method = HTTP_GET, .handler = diag_histograms_get, .user_ctx = NULL},
+        {.uri = "/diag/dsp_health", .method = HTTP_GET, .handler = diag_dsp_health_get, .user_ctx = NULL},
+        {.uri = "/diag/recovery_counters", .method = HTTP_GET, .handler = diag_recovery_counters_get, .user_ctx = NULL},
+        {.uri = "/messages", .method = HTTP_GET, .handler = messages_get, .user_ctx = NULL},
+        {.uri = "/ota", .method = HTTP_GET, .handler = ota_get, .user_ctx = NULL},
+        {.uri = "/config", .method = HTTP_POST, .handler = config_post, .user_ctx = NULL},
+        {.uri = "/reset", .method = HTTP_POST, .handler = reset_post, .user_ctx = NULL},
+        {.uri = "/ota", .method = HTTP_POST, .handler = ota_post, .user_ctx = NULL},
+        {.uri = "/debug/inject", .method = HTTP_POST, .handler = debug_inject_post, .user_ctx = NULL},
+        {.uri = "/tune", .method = HTTP_POST, .handler = tune_post, .user_ctx = NULL},
+        {.uri = "/sd/mount", .method = HTTP_POST, .handler = sd_mount_post, .user_ctx = NULL},
+        {.uri = "/sd/format", .method = HTTP_POST, .handler = sd_format_post, .user_ctx = NULL},
+        {.uri = "/sd/delete", .method = HTTP_POST, .handler = sd_delete_post, .user_ctx = NULL},
+        {.uri = "/sd/list", .method = HTTP_GET, .handler = sd_list_get, .user_ctx = NULL},
+        {.uri = "/tasks", .method = HTTP_GET, .handler = tasks_get, .user_ctx = NULL},
+        {.uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post, .user_ctx = NULL},
+        {.uri = "/capture/stop", .method = HTTP_POST, .handler = capture_stop_post, .user_ctx = NULL},
+        {.uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get, .user_ctx = NULL},
+        {.uri = "/capture/file", .method = HTTP_GET, .handler = capture_file_get, .user_ctx = NULL},
     };
     _Static_assert(sizeof(routes) / sizeof(routes[0]) <= HTTPD_URI_LIMIT,
                    "route count exceeds HTTPD_URI_LIMIT; bump HTTPD_URI_LIMIT "
                    "in http_server.c before adding more routes (see "
                    "feedback_httpd_max_uri_handlers memory)");
-    for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &routes[i]));
     }
 

@@ -17,8 +17,8 @@
 // before signal_buffer_push, so everything DOWNSTREAM of ingest sees
 // FS_DETECT_HZ. Keeping FS_IN_HZ for code that still reasons about
 // the SDR's nominal rate (status logger, etc.).
-#define FS_IN_HZ                2560000u
-#define FS_DETECT_HZ            2500000u    // wideband path rate
+#define FS_IN_HZ 2560000u
+#define FS_DETECT_HZ 2500000u // wideband path rate
 // SDR tuned LO. NOTE: 1626 MHz is NOT mid-band — it's the boundary between
 // the duplex band (1616.0-1626.0 MHz, 240 user channels @ 41.667 kHz, where
 // SBD / aircraft ACARS traffic lives) and the simplex band (1626.0-1626.5
@@ -29,27 +29,27 @@
 // user/ACARS traffic, move the LO lower (gr-iridium suggests ~1622 MHz),
 // trading away the simplex/ring-alert band. Runtime-settable via POST
 // /tune?hz=<lo_freq_hz> (NVS-persisted, reboots to apply).
-#define IRIDIUM_CENTER_FREQ_HZ  1626000000u
-#define IRIDIUM_CHANNEL_HZ      41666.67f   // Iridium channel grid spacing
+#define IRIDIUM_CENTER_FREQ_HZ 1626000000u
+#define IRIDIUM_CHANNEL_HZ 41666.67f // Iridium channel grid spacing
 
 // One detected burst, as emitted by the wideband fft_burst_tagger
 // front end. Coordinates are at FS_DETECT_HZ (2.5 MSPS) in signal_buffer
 // frame. rel_freq_hz is the signed offset of the burst's center bin
 // from band center (positive = above LO).
 typedef struct {
-    uint32_t start_sample_idx;   // signal_buffer frame, FS_DETECT_HZ units
-    uint32_t length_samples;     // FS_DETECT_HZ samples
-    float    rel_freq_hz;        // signed offset from band centre
-    float    peak_snr_db;        // magnitude_db - noise_db
+    uint32_t start_sample_idx; // signal_buffer frame, FS_DETECT_HZ units
+    uint32_t length_samples;   // FS_DETECT_HZ samples
+    float    rel_freq_hz;      // signed offset from band centre
+    float    peak_snr_db;      // magnitude_db - noise_db
     float    magnitude_db;
     float    noise_db;
-    int      peak_bin;           // FFT bin, 0..FFT_SIZE-1 (diagnostic)
+    int      peak_bin; // FFT bin, 0..FFT_SIZE-1 (diagnostic)
 } detected_burst_t;
 
 typedef void (*burst_detected_cb_t)(const detected_burst_t *burst);
 
 esp_err_t dsp_processor_init(burst_detected_cb_t cb);
-void dsp_processor_feed(const int16_t *samples, size_t n_samples);
+void      dsp_processor_feed(const int16_t *samples, size_t n_samples);
 
 // End-of-stream flush. Forces still-active bursts to emit their
 // gone callback with stop = current sample index. Use at end of
@@ -61,13 +61,13 @@ void dsp_processor_flush(void);
 // computed over frames seen since the last call. Calling this resets the
 // internal accumulators so the next call covers a fresh window.
 typedef struct {
-    uint32_t frames;          // FBT FFT frames in this window
-    float    wind_us;         // unused under wideband tagger
-    float    fft_us;          // combined fft_burst_tagger_step wall time
-    float    mag_us;          // unused
-    float    detect_us;       // unused
-    float    baseline_us;     // unused
-    float    total_us;        // total per-frame
+    uint32_t frames;      // FBT FFT frames in this window
+    float    wind_us;     // unused under wideband tagger
+    float    fft_us;      // combined fft_burst_tagger_step wall time
+    float    mag_us;      // unused
+    float    detect_us;   // unused
+    float    baseline_us; // unused
+    float    total_us;    // total per-frame
 } dsp_stage_stats_t;
 
 void dsp_processor_get_stage_stats(dsp_stage_stats_t *out);

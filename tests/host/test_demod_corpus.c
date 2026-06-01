@@ -19,8 +19,8 @@
 #include <string.h>
 
 #include "qpsk_demod.h"
-#include "fixture_corpus_2sps.h"     // CORPUS_2SPS, CORPUS_2SPS_LEN
-#include "fixture_ground_truth.h"    // GROUND_TRUTH_BITS, *_LEN, *_DIRECTION
+#include "fixture_corpus_2sps.h"  // CORPUS_2SPS, CORPUS_2SPS_LEN
+#include "fixture_ground_truth.h" // GROUND_TRUTH_BITS, *_LEN, *_DIRECTION
 
 static int compare_bits(const uint8_t *demod, int demod_n,
                         const uint8_t *truth, int truth_n,
@@ -31,7 +31,7 @@ static int compare_bits(const uint8_t *demod, int demod_n,
     // Both demod->bits and truth[] are stored as raw 0/1 bytes (not
     // ASCII '0'/'1'). The fixture builder emits the ground truth bits
     // as literal C integer values 0 and 1.
-    int diffs = 0;
+    int diffs      = 0;
     int first_diff = -1;
     for (int i = 0; i < n; i++) {
         uint8_t d = demod[i] & 1;
@@ -45,12 +45,15 @@ static int compare_bits(const uint8_t *demod, int demod_n,
         printf("  first bit mismatch at index %d (demod=%d truth=%d)\n",
                first_diff, demod[first_diff] & 1, truth[first_diff] & 1);
         int s = first_diff - 8 < 0 ? 0 : first_diff - 8;
-        int e = first_diff + 24; if (e > n) e = n;
+        int e = first_diff + 24;
+        if (e > n) e = n;
         printf("  demod[%d..%d]: ", s, e - 1);
-        for (int i = s; i < e; i++) putchar('0' + (demod[i] & 1));
+        for (int i = s; i < e; i++)
+            putchar('0' + (demod[i] & 1));
         putchar('\n');
         printf("  truth[%d..%d]: ", s, e - 1);
-        for (int i = s; i < e; i++) putchar('0' + (truth[i] & 1));
+        for (int i = s; i < e; i++)
+            putchar('0' + (truth[i] & 1));
         putchar('\n');
     }
     return diffs;
@@ -75,12 +78,12 @@ int main(void)
     // succeeds. In production this alignment work is the worker's job;
     // we replicate it here so the regression test stays focused on
     // demod correctness, not alignment.
-    decoded_frame_t frame = { 0 };
-    int rc = 0;
-    int alignment_offset = -1;
+    decoded_frame_t frame            = {0};
+    int             rc               = 0;
+    int             alignment_offset = -1;
     // Try up to ~200 symbols of leading offset (covers a generous
     // preamble + envelope slack of ~8 ms at 25 ksym/s).
-    const int STEP_INT16 = 4;          // 1 symbol = 2 complex × 2 int16
+    const int STEP_INT16         = 4; // 1 symbol = 2 complex × 2 int16
     const int MAX_SYMBOLS_OFFSET = 200;
     for (int sym_off = 0; sym_off < MAX_SYMBOLS_OFFSET; sym_off++) {
         int int16_off = sym_off * STEP_INT16;
@@ -104,8 +107,8 @@ int main(void)
         printf("  UW found after %d-symbol offset (preamble length)\n",
                alignment_offset);
         const char *dir =
-            (frame.direction == DIR_DOWNLINK) ? "DL" :
-            (frame.direction == DIR_UPLINK) ? "UL" : "UNKNOWN";
+            (frame.direction == DIR_DOWNLINK) ? "DL" : (frame.direction == DIR_UPLINK) ? "UL"
+                                                                                       : "UNKNOWN";
         printf("  demod success: direction=%s, n_bits=%d\n", dir, frame.n_bits);
 
         // Direction must match.
@@ -121,7 +124,8 @@ int main(void)
             printf("  bit comparison: %d differences across %d bits\n",
                    diffs,
                    (frame.n_bits < (int)GROUND_TRUTH_BITS_LEN
-                       ? frame.n_bits : (int)GROUND_TRUTH_BITS_LEN));
+                        ? frame.n_bits
+                        : (int)GROUND_TRUTH_BITS_LEN));
 
             // Tolerance: ≤2 mismatches over the full ground truth.
             const int TOLERANCE = 2;
@@ -134,7 +138,7 @@ int main(void)
             }
         }
         free(frame.bits);
-        free(frame.soft_bits);   // #112
+        free(frame.soft_bits); // #112
     }
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);

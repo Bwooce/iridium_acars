@@ -11,5 +11,5 @@
 // in case other modules adopt Q14 RRC-shaped filtering later.
 #pragma once
 
-#define Q14_SHIFT  14
-#define Q14_ONE    (1 << Q14_SHIFT)   // 16384 — represents 1.0 in Q14
+#define Q14_SHIFT 14
+#define Q14_ONE (1 << Q14_SHIFT) // 16384 — represents 1.0 in Q14

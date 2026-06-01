@@ -13,12 +13,16 @@
 
 static int passed = 0, failed = 0;
 
-#define CHECK(cond, fmt, ...) do {                                       \
-    if (!(cond)) {                                                       \
-        printf("  FAIL line %d: " fmt "\n", __LINE__, ##__VA_ARGS__);    \
-        failed++; return;                                                \
-    } else { passed++; }                                                 \
-} while (0)
+#define CHECK(cond, fmt, ...)                                             \
+    do {                                                                  \
+        if (!(cond)) {                                                    \
+            printf("  FAIL line %d: " fmt "\n", __LINE__, ##__VA_ARGS__); \
+            failed++;                                                     \
+            return;                                                       \
+        } else {                                                          \
+            passed++;                                                     \
+        }                                                                 \
+    } while (0)
 
 // Encode a k-bit message with a `poly_len`-bit polynomial. Result is k +
 // (poly_len-1) bits stored as a 0/1-per-byte array. Encoder: append
@@ -30,8 +34,10 @@ static void bch_encode(uint32_t poly, int poly_len,
 {
     int n = k + poly_len - 1;
     // Pad with zeros.
-    for (int i = 0; i < k; i++) out[i] = msg[i] & 1;
-    for (int i = k; i < n; i++) out[i] = 0;
+    for (int i = 0; i < k; i++)
+        out[i] = msg[i] & 1;
+    for (int i = k; i < n; i++)
+        out[i] = 0;
     // Remainder of (out) % poly using the same long-division as ndivide.
     // We can compute it via ndivide directly.
     uint32_t r = iridium_bch_ndivide(poly, out, n);
@@ -44,14 +50,20 @@ static void bch_encode(uint32_t poly, int poly_len,
     }
 }
 
-static int u32_bit_length(uint32_t x) {
-    int n = 0; while (x) { n++; x >>= 1; } return n;
+static int u32_bit_length(uint32_t x)
+{
+    int n = 0;
+    while (x) {
+        n++;
+        x >>= 1;
+    }
+    return n;
 }
 
 static void test_clean_codeword(uint32_t poly, const uint8_t *msg, int k)
 {
-    int poly_len = u32_bit_length(poly);
-    int n = k + poly_len - 1;
+    int     poly_len = u32_bit_length(poly);
+    int     n        = k + poly_len - 1;
     uint8_t cw[40];
     bch_encode(poly, poly_len, msg, k, cw);
     uint32_t r = iridium_bch_ndivide(poly, cw, n);
@@ -60,8 +72,8 @@ static void test_clean_codeword(uint32_t poly, const uint8_t *msg, int k)
 
 static void test_single_bit_repair(uint32_t poly, const uint8_t *msg, int k)
 {
-    int poly_len = u32_bit_length(poly);
-    int n = k + poly_len - 1;
+    int     poly_len = u32_bit_length(poly);
+    int     n        = k + poly_len - 1;
     uint8_t cw[40];
     bch_encode(poly, poly_len, msg, k, cw);
 
@@ -85,8 +97,8 @@ static void test_single_bit_repair(uint32_t poly, const uint8_t *msg, int k)
 
 static void test_already_clean_returns_zero(uint32_t poly, const uint8_t *msg, int k)
 {
-    int poly_len = u32_bit_length(poly);
-    int n = k + poly_len - 1;
+    int     poly_len = u32_bit_length(poly);
+    int     n        = k + poly_len - 1;
     uint8_t cw[40];
     bch_encode(poly, poly_len, msg, k, cw);
     int rc = iridium_bch_repair1(poly, cw, n);
@@ -95,8 +107,8 @@ static void test_already_clean_returns_zero(uint32_t poly, const uint8_t *msg, i
 
 static void test_two_bit_error_fails(uint32_t poly, const uint8_t *msg, int k)
 {
-    int poly_len = u32_bit_length(poly);
-    int n = k + poly_len - 1;
+    int     poly_len = u32_bit_length(poly);
+    int     n        = k + poly_len - 1;
     uint8_t cw[40];
     bch_encode(poly, poly_len, msg, k, cw);
     // Flip two adjacent bits — outside the single-error correction
@@ -123,7 +135,7 @@ static void run_for_poly(uint32_t poly, int poly_len, int k, const char *name)
 
     // Use a fixed pseudo-random message — different bits set, not all
     // zeros (which is trivially clean).
-    uint8_t msg[32] = { 0 };
+    uint8_t msg[32] = {0};
     for (int i = 0; i < k; i++) {
         msg[i] = (uint8_t)((i * 7 + 3) & 1);
     }
@@ -137,12 +149,12 @@ static void run_for_poly(uint32_t poly, int poly_len, int k, const char *name)
 int main(void)
 {
     // Iridium polys — see iridium_bch.h for cite.
-    run_for_poly(29u,    5, 2, "hdr_poly / lcw1");        // BCH(7,2)
-    run_for_poly(41u,    6, 21, "lcw3");                  // BCH(26,21)
-    run_for_poly(465u,   9, 7, "lcw2 (uses 14-bit codeword)"); // BCH(14,7)
-    run_for_poly(1207u, 11, 21, "ringalert / IBC");       // BCH(31,21)
-    run_for_poly(1897u, 11, 21, "messaging");             // BCH(31,21)
-    run_for_poly(3545u, 12, 21, "ACCH");                  // BCH(31,21) wider poly
+    run_for_poly(29u, 5, 2, "hdr_poly / lcw1");              // BCH(7,2)
+    run_for_poly(41u, 6, 21, "lcw3");                        // BCH(26,21)
+    run_for_poly(465u, 9, 7, "lcw2 (uses 14-bit codeword)"); // BCH(14,7)
+    run_for_poly(1207u, 11, 21, "ringalert / IBC");          // BCH(31,21)
+    run_for_poly(1897u, 11, 21, "messaging");                // BCH(31,21)
+    run_for_poly(3545u, 12, 21, "ACCH");                     // BCH(31,21) wider poly
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;

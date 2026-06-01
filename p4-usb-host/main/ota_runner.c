@@ -75,7 +75,7 @@ static void ota_task(void *arg)
         // requires CA bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) which
         // IDF defaults on, but skipping CN check makes self-signed
         // dev servers easier.
-        .crt_bundle_attach    = NULL,
+        .crt_bundle_attach           = NULL,
         .skip_cert_common_name_check = true,
     };
     esp_https_ota_config_t ota_cfg = {
@@ -83,7 +83,7 @@ static void ota_task(void *arg)
     };
 
     esp_https_ota_handle_t handle = NULL;
-    esp_err_t r = esp_https_ota_begin(&ota_cfg, &handle);
+    esp_err_t              r      = esp_https_ota_begin(&ota_cfg, &handle);
     if (r != ESP_OK || !handle) {
         set_status_error("esp_https_ota_begin failed: %s", esp_err_to_name(r));
         goto done;
@@ -182,8 +182,8 @@ esp_err_t ota_runner_start(void)
     // spawned on user-triggered OTA (not boot), so it can't fragment
     // tagger init the way a boot-time internal stack would.
     BaseType_t ok = xTaskCreatePinnedToCore(ota_task, "ota", 8192,
-                                             NULL, 5, NULL,
-                                             tskNO_AFFINITY);
+                                            NULL, 5, NULL,
+                                            tskNO_AFFINITY);
     if (ok != pdPASS) {
         s_running = false;
         set_status_error("xTaskCreate failed");

@@ -8,16 +8,19 @@ static class_adsb_dev *adsbdev;
 // Streaming bulk-IN diagnostic counters. Read & reset by
 // esp_libusb_get_stream_stats(). volatile because they're written from the
 // USB host task (transfer callback) and read from the class_driver task.
-static volatile uint32_t s_xfer_completed = 0;
-static volatile uint32_t s_xfer_status_errors = 0;
+static volatile uint32_t s_xfer_completed       = 0;
+static volatile uint32_t s_xfer_status_errors   = 0;
 static volatile uint32_t s_xfer_resubmit_errors = 0;
-static volatile uint32_t s_xfer_pool_lost = 0;  // URBs whose 3-attempt resubmit retry exhausted; pool size shrinks (#124)
-uint32_t esp_libusb_xfer_pool_lost(void) { return s_xfer_pool_lost; }
-static volatile uint32_t s_xfer_rb_full_drops = 0;
-static volatile uint32_t s_xfer_short = 0;
-static volatile uint64_t s_xfer_actual_bytes = 0;
+static volatile uint32_t s_xfer_pool_lost       = 0; // URBs whose 3-attempt resubmit retry exhausted; pool size shrinks (#124)
+uint32_t                 esp_libusb_xfer_pool_lost(void)
+{
+    return s_xfer_pool_lost;
+}
+static volatile uint32_t s_xfer_rb_full_drops   = 0;
+static volatile uint32_t s_xfer_short           = 0;
+static volatile uint64_t s_xfer_actual_bytes    = 0;
 static volatile uint64_t s_xfer_requested_bytes = 0;
-static volatile uint8_t  s_xfer_last_error = 0;
+static volatile uint8_t  s_xfer_last_error      = 0;
 // Cumulative-since-boot counters that never reset. The above are
 // consumed by status_logger every second (read-and-reset); these
 // parallel counters let /status JSON expose lifetime totals so an
@@ -32,44 +35,42 @@ static volatile uint8_t  s_xfer_last_error = 0;
 // monitors don't get a misleading 0.86% lifetime drop rate driven
 // entirely by boot transients.
 #define STREAM_STATS_GRACE_US (5 * 1000 * 1000)
-static volatile int64_t  s_stream_start_us       = 0;
-static volatile uint64_t s_total_completed       = 0;
-static volatile uint64_t s_total_rb_full_drops   = 0;
-static volatile uint64_t s_total_status_errors   = 0;
-static volatile uint64_t s_total_short_xfers     = 0;
+static volatile int64_t  s_stream_start_us     = 0;
+static volatile uint64_t s_total_completed     = 0;
+static volatile uint64_t s_total_rb_full_drops = 0;
+static volatile uint64_t s_total_status_errors = 0;
+static volatile uint64_t s_total_short_xfers   = 0;
 // Producer-side ringbuffer fill tracking. The class_driver consumer measures
 // HWM after each read which biases towards 0; these are sampled in the USB
 // callback (the producer) so we capture the actual peak fills.
-static volatile size_t   s_producer_rb_max_used = 0;
+static volatile size_t   s_producer_rb_max_used     = 0;
 static volatile size_t   s_producer_rb_used_at_drop = 0;
-static volatile uint32_t s_producer_samples = 0;
+static volatile uint32_t s_producer_samples         = 0;
 
 void init_adsb_dev()
 {
-    adsbdev = calloc(1, sizeof(class_adsb_dev));
+    adsbdev          = calloc(1, sizeof(class_adsb_dev));
     adsbdev->is_adsb = true;
 }
 
 void bulk_transfer_read_cb(usb_transfer_t *transfer)
 {
-    for (int i = 0; i < transfer->actual_num_bytes; i++)
-    {
+    for (int i = 0; i < transfer->actual_num_bytes; i++) {
         adsbdev->response_buf[i] = transfer->data_buffer[i];
     }
-    adsbdev->is_done = true;
-    adsbdev->is_success = transfer->status == 0;
+    adsbdev->is_done           = true;
+    adsbdev->is_success        = transfer->status == 0;
     adsbdev->bytes_transferred = transfer->num_bytes;
     if (adsbdev->dev_hdl == NULL) adsbdev->dev_hdl = transfer->device_handle;
 }
 
 void transfer_read_cb(usb_transfer_t *transfer)
 {
-    for (int i = 0; i < transfer->actual_num_bytes; i++)
-    {
+    for (int i = 0; i < transfer->actual_num_bytes; i++) {
         adsbdev->response_buf[i] = transfer->data_buffer[i];
     }
-    adsbdev->is_done = true;
-    adsbdev->is_success = transfer->status == 0;
+    adsbdev->is_done           = true;
+    adsbdev->is_success        = transfer->status == 0;
     adsbdev->bytes_transferred = transfer->actual_num_bytes - sizeof(usb_setup_packet_t);
     if (adsbdev->dev_hdl == NULL) adsbdev->dev_hdl = transfer->device_handle;
 }
@@ -78,42 +79,38 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
 {
     assert(driver_obj->client_hdl != NULL);
     usb_device_handle_t dev_hdl = driver_obj->dev_hdl ? driver_obj->dev_hdl : adsbdev->dev_hdl;
-    
-    size_t sizePacket = usb_round_up_to_mps(length, 64);
-    usb_transfer_t *transfer = NULL;
+
+    size_t          sizePacket = usb_round_up_to_mps(length, 64);
+    usb_transfer_t *transfer   = NULL;
     usb_host_transfer_alloc(sizePacket, 0, &transfer);
-    
-    transfer->num_bytes = sizePacket;
-    transfer->device_handle = dev_hdl;
+
+    transfer->num_bytes        = sizePacket;
+    transfer->device_handle    = dev_hdl;
     transfer->bEndpointAddress = endpoint;
-    transfer->callback = bulk_transfer_read_cb;
-    transfer->context = (void *)&driver_obj;
-    transfer->timeout_ms = timeout;
-    adsbdev->is_done = false;
-    adsbdev->response_buf = calloc(sizePacket, sizeof(uint8_t));
+    transfer->callback         = bulk_transfer_read_cb;
+    transfer->context          = (void *)&driver_obj;
+    transfer->timeout_ms       = timeout;
+    adsbdev->is_done           = false;
+    adsbdev->response_buf      = calloc(sizePacket, sizeof(uint8_t));
 
     esp_err_t r = usb_host_transfer_submit(transfer);
-    if (r != ESP_OK)
-    {
+    if (r != ESP_OK) {
         free(adsbdev->response_buf);
         usb_host_transfer_free(transfer);
         return -1;
     }
-    while (!adsbdev->is_done)
-    {
+    while (!adsbdev->is_done) {
         usb_host_client_handle_events(driver_obj->client_hdl, portMAX_DELAY);
     }
-    
-    if (!adsbdev->is_success)
-    {
+
+    if (!adsbdev->is_success) {
         free(adsbdev->response_buf);
         usb_host_transfer_free(transfer);
         return -1;
     }
-    
+
     ESP_ERROR_CHECK(usb_host_endpoint_clear(dev_hdl, endpoint));
-    for (int i = 0; i < length; i++)
-    {
+    for (int i = 0; i < length; i++) {
         data[i] = adsbdev->response_buf[i];
     }
     *transferred = adsbdev->bytes_transferred;
@@ -133,43 +130,37 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
         free(adsbdev->response_buf);
         adsbdev->response_buf = NULL;
     }
-    
+
     size_t sizePacket = sizeof(usb_setup_packet_t) + wLength;
     usb_host_transfer_alloc(sizePacket, 0, &adsbdev->transfer);
     USB_SETUP_PACKET_INIT_CONTROL((usb_setup_packet_t *)adsbdev->transfer->data_buffer, bm_req_type, b_request, wValue, wIndex, wLength);
-    adsbdev->transfer->num_bytes = sizePacket;
+    adsbdev->transfer->num_bytes     = sizePacket;
     adsbdev->transfer->device_handle = driver_obj->dev_hdl ? driver_obj->dev_hdl : adsbdev->dev_hdl;
-    adsbdev->transfer->timeout_ms = timeout;
-    adsbdev->transfer->context = (void *)&driver_obj;
-    adsbdev->transfer->callback = transfer_read_cb;
-    adsbdev->is_done = false;
-    adsbdev->response_buf = calloc(sizePacket, sizeof(uint8_t));
+    adsbdev->transfer->timeout_ms    = timeout;
+    adsbdev->transfer->context       = (void *)&driver_obj;
+    adsbdev->transfer->callback      = transfer_read_cb;
+    adsbdev->is_done                 = false;
+    adsbdev->response_buf            = calloc(sizePacket, sizeof(uint8_t));
 
-    if (bm_req_type == CTRL_OUT)
-    {
-        for (uint8_t i = 0; i < wLength; i++)
-        {
+    if (bm_req_type == CTRL_OUT) {
+        for (uint8_t i = 0; i < wLength; i++) {
             adsbdev->transfer->data_buffer[sizeof(usb_setup_packet_t) + i] = data[i];
         }
     }
     esp_err_t r = usb_host_transfer_submit_control(driver_obj->client_hdl, adsbdev->transfer);
-    if (r != ESP_OK)
-    {
+    if (r != ESP_OK) {
         return -1;
     }
 
-    while (!adsbdev->is_done)
-    {
+    while (!adsbdev->is_done) {
         usb_host_client_handle_events(driver_obj->client_hdl, portMAX_DELAY);
     }
-    
-    if (!adsbdev->is_success)
-    {
+
+    if (!adsbdev->is_success) {
         return -1;
     }
-    
-    for (uint8_t i = 0; i < wLength; i++)
-    {
+
+    for (uint8_t i = 0; i < wLength; i++) {
         data[i] = adsbdev->response_buf[sizeof(usb_setup_packet_t) + i];
     }
     return adsbdev->bytes_transferred;
@@ -191,7 +182,7 @@ void stream_transfer_cb(usb_transfer_t *transfer)
     if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_xfer_completed++;
         if (post_grace) s_total_completed++;
-        s_xfer_actual_bytes    += (uint32_t)transfer->actual_num_bytes;
+        s_xfer_actual_bytes += (uint32_t)transfer->actual_num_bytes;
         s_xfer_requested_bytes += (uint32_t)transfer->num_bytes;
         if (transfer->actual_num_bytes < transfer->num_bytes) {
             s_xfer_short++;
@@ -226,11 +217,14 @@ void stream_transfer_cb(usb_transfer_t *transfer)
     // accumulate, the ring empties → no more completions → the stream stalls
     // (eventually caught by the stall watchdog). Retry a bounded few times to
     // ride out transient submit failures rather than leaking the URB.
-    bool submitted = false;
-    esp_err_t last_err = ESP_OK;
+    bool      submitted = false;
+    esp_err_t last_err  = ESP_OK;
     for (int attempt = 0; attempt < 3; attempt++) {
         last_err = usb_host_transfer_submit(transfer);
-        if (last_err == ESP_OK) { submitted = true; break; }
+        if (last_err == ESP_OK) {
+            submitted = true;
+            break;
+        }
         s_xfer_resubmit_errors++;
     }
     if (!submitted) {
@@ -248,28 +242,28 @@ void stream_transfer_cb(usb_transfer_t *transfer)
 
 void esp_libusb_get_stream_stats(usb_stream_stats_t *out)
 {
-    out->completed             = s_xfer_completed;
-    out->status_errors         = s_xfer_status_errors;
-    out->resubmit_errors       = s_xfer_resubmit_errors;
-    out->rb_full_drops         = s_xfer_rb_full_drops;
-    out->short_xfers           = s_xfer_short;
-    out->total_actual_bytes    = s_xfer_actual_bytes;
-    out->total_requested_bytes = s_xfer_requested_bytes;
-    out->last_error_status     = s_xfer_last_error;
-    out->producer_rb_max_used  = s_producer_rb_max_used;
+    out->completed                = s_xfer_completed;
+    out->status_errors            = s_xfer_status_errors;
+    out->resubmit_errors          = s_xfer_resubmit_errors;
+    out->rb_full_drops            = s_xfer_rb_full_drops;
+    out->short_xfers              = s_xfer_short;
+    out->total_actual_bytes       = s_xfer_actual_bytes;
+    out->total_requested_bytes    = s_xfer_requested_bytes;
+    out->last_error_status        = s_xfer_last_error;
+    out->producer_rb_max_used     = s_producer_rb_max_used;
     out->producer_rb_used_at_drop = s_producer_rb_used_at_drop;
-    out->producer_samples      = s_producer_samples;
-    s_xfer_completed = 0;
-    s_xfer_status_errors = 0;
-    s_xfer_resubmit_errors = 0;
-    s_xfer_rb_full_drops = 0;
-    s_xfer_short = 0;
-    s_xfer_actual_bytes = 0;
-    s_xfer_requested_bytes = 0;
-    s_xfer_last_error = 0;
-    s_producer_rb_max_used = 0;
-    s_producer_rb_used_at_drop = 0;
-    s_producer_samples = 0;
+    out->producer_samples         = s_producer_samples;
+    s_xfer_completed              = 0;
+    s_xfer_status_errors          = 0;
+    s_xfer_resubmit_errors        = 0;
+    s_xfer_rb_full_drops          = 0;
+    s_xfer_short                  = 0;
+    s_xfer_actual_bytes           = 0;
+    s_xfer_requested_bytes        = 0;
+    s_xfer_last_error             = 0;
+    s_producer_rb_max_used        = 0;
+    s_producer_rb_used_at_drop    = 0;
+    s_producer_samples            = 0;
 }
 
 void esp_libusb_get_stream_totals(usb_stream_totals_t *out)
@@ -314,7 +308,7 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
     // the 32 MB PSRAM budget and turns the consumer-stall window
     // into a true elastic queue.
     dev->ringbuf = xRingbufferCreateWithCaps(4 * 1024 * 1024,
-                                              RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+                                             RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     if (dev->ringbuf == NULL) {
         ESP_LOGE("LIBUSB", "Failed to create stream ringbuffer in PSRAM");
         return -1;
@@ -332,7 +326,7 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
     // (silicon errata hardening, see sdkconfig.defaults). Print heap
     // state so a future failure points immediately at the right
     // budget knob.
-    size_t internal_free_at_start = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    size_t internal_free_at_start    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     size_t internal_largest_at_start = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     ESP_LOGI("LIBUSB", "Pre-stream DMA-internal heap: free=%u KB, largest=%u KB; "
                        "need %d × %d KB = %d KB",
@@ -343,23 +337,23 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
     for (int i = 0; i < ASYNC_TRANSFER_COUNT; i++) {
         esp_err_t r = usb_host_transfer_alloc(ASYNC_TRANSFER_SIZE, 0, &dev->transfers[i]);
         if (r != ESP_OK || dev->transfers[i] == NULL) {
-            size_t free_now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            size_t free_now    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
             size_t largest_now = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
             ESP_LOGE("LIBUSB", "transfer_alloc #%d failed: r=0x%x (%s), "
-                              "DMA-internal heap free=%u KB largest=%u KB "
-                              "(needed %d KB). Bump CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL "
-                              "or shrink ASYNC_TRANSFER_COUNT/_SIZE.",
+                               "DMA-internal heap free=%u KB largest=%u KB "
+                               "(needed %d KB). Bump CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL "
+                               "or shrink ASYNC_TRANSFER_COUNT/_SIZE.",
                      i, r, esp_err_to_name(r),
                      (unsigned)(free_now / 1024),
                      (unsigned)(largest_now / 1024),
                      ASYNC_TRANSFER_SIZE / 1024);
             return -1;
         }
-        dev->transfers[i]->device_handle = dev_hdl;
+        dev->transfers[i]->device_handle    = dev_hdl;
         dev->transfers[i]->bEndpointAddress = endpoint;
-        dev->transfers[i]->callback = stream_transfer_cb;
-        dev->transfers[i]->context = (void *)driver_obj;
-        dev->transfers[i]->num_bytes = ASYNC_TRANSFER_SIZE;
+        dev->transfers[i]->callback         = stream_transfer_cb;
+        dev->transfers[i]->context          = (void *)driver_obj;
+        dev->transfers[i]->num_bytes        = ASYNC_TRANSFER_SIZE;
 
         r = usb_host_transfer_submit(dev->transfers[i]);
         if (r != ESP_OK) {
@@ -378,8 +372,8 @@ int esp_libusb_read_stream(uint8_t *buffer, size_t length, size_t *received, Tic
         *received = 0;
         return -1;
     }
-    
-    size_t item_size;
+
+    size_t   item_size;
     uint8_t *item = xRingbufferReceiveUpTo(dev->ringbuf, &item_size, timeout, length);
     if (item != NULL) {
         memcpy(buffer, item, item_size);
@@ -406,7 +400,7 @@ void esp_libusb_get_ringbuffer_info(size_t *used, size_t *capacity)
         // every /status utilisation metric was 8× under-reported). #109
         *capacity = 4 * 1024 * 1024;
     } else {
-        *used = 0;
+        *used     = 0;
         *capacity = 0;
     }
 }

@@ -32,22 +32,22 @@
 // doesn't need them, and the assignment record format is variable).
 
 typedef struct {
-    bool        header_ok;       // BCH(6,2) header CRC passed
-    int         bc_type;         // 4-bit type from header (0..15)
-    bool        block0_ok;       // both BCH(31,21) codewords passed for block 0
-    bool        block1_ok;       // ... for block 1
-    int         n_blocks_ok;     // count of blocks 0..3 that passed BCH
+    bool header_ok;   // BCH(6,2) header CRC passed
+    int  bc_type;     // 4-bit type from header (0..15)
+    bool block0_ok;   // both BCH(31,21) codewords passed for block 0
+    bool block1_ok;   // ... for block 1
+    int  n_blocks_ok; // count of blocks 0..3 that passed BCH
 
     // Block 0 fields (valid iff bc_type==0 && block0_ok)
-    int         sv_id;           // satellite ID
-    int         beam_id;         // cell/beam ID
-    int         slot;            // 0/1
-    int         sv_blocking;     // 0/1
+    int sv_id;       // satellite ID
+    int beam_id;     // cell/beam ID
+    int slot;        // 0/1
+    int sv_blocking; // 0/1
 
     // Block 1 fields (valid iff bc_type==0 && block1_ok)
-    int         block1_subtype;  // 0=power, 1=time, 2=tmsi
-    uint32_t    iri_time;        // valid iff block1_subtype==1
-    uint32_t    tmsi_expiry;     // valid iff block1_subtype==2
+    int      block1_subtype; // 0=power, 1=time, 2=tmsi
+    uint32_t iri_time;       // valid iff block1_subtype==1
+    uint32_t tmsi_expiry;    // valid iff block1_subtype==2
 } ibc_decoded_t;
 
 // Decode an Iridium Broadcast frame. `frame` must have been classified

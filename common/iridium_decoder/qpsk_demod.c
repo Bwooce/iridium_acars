@@ -15,8 +15,8 @@ static const char *TAG = "QPSK";
 // stream diverges from gri's expected symbols past the UW. One-shot.
 static int s_qpsk_dump_done = 0;
 
-static const int IR_UW_DL[] = { 0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2 };
-static const int IR_UW_UL[] = { 2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2 };
+static const int IR_UW_DL[] = {0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2};
+static const int IR_UW_UL[] = {2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2};
 // DQPSK Gray-code mapping for our pipeline's conventions.
 //   diff 0 → 00, diff 1 → 10, diff 2 → 11, diff 3 → 01.
 // EMPIRICAL: alternative {0, 1, 3, 2} (the more common Iridium-toolkit
@@ -25,7 +25,7 @@ static const int IR_UW_UL[] = { 2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2 };
 // downstream deinterleave + BCH + frame_decoder chain — do not change
 // without re-validating end-to-end against the RAW_IRIDIUM smoke
 // frame-class counts.
-static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
+static const int DQPSK_MAP[] = {0, 2, 3, 1};
 
 // Second-order PLL gains. ALPHA is the phase (proportional) term;
 // BETA is the frequency (integral) term. Critically-damped second-
@@ -52,7 +52,7 @@ static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 // for ±700 Hz residual (verified by simulation). Trades steady-
 // state noise for acquisition speed — acceptable for burst-mode
 // demod where each burst is a fresh acquisition.
-#define PLL_ALPHA       0.2f
+#define PLL_ALPHA 0.2f
 // PLL_BETA = 0 to match gr-iridium's qpskFirstOrderPLL (alpha=1/5,
 // no frequency tracking). With β=0 omega_hat stays at 0 and the PLL
 // is pure phase-only — exactly first-order. Their pipeline assumes
@@ -63,7 +63,7 @@ static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 // 90°-off symbol gave β·(π/2) = 0.16 rad/sym of fake omega, then
 // the next 6 syms accumulated π rad of bogus rotation → cascading
 // quadrant flips. Setting β=0 prevents this cascade.
-#define PLL_BETA        0.0f
+#define PLL_BETA 0.0f
 // D9 two-stage acquisition was tried (PLL_ACQUIRE_ALPHA=0.5,
 // PLL_ACQUIRE_BETA=0.25, PLL_ACQUIRE_SYMS=16) and reverted: wider
 // initial gains did help omega_hat catch large residuals, but the
@@ -71,12 +71,12 @@ static const int DQPSK_MAP[] = { 0, 2, 3, 1 };
 // dropped below its diffs<=2 threshold. Net regression on the smoke
 // corpus. Real improvement needs upstream CFO accuracy, not wider-
 // band PLL.
-#define M_SQRT1_2f      0.70710678f
+#define M_SQRT1_2f 0.70710678f
 
 // Iridium frame is at most 191 symbols (MAX_FRAME_LEN_NORMAL_10SPS / 5 / 2
 // in burst_pipeline.c). 256 leaves headroom and is power-of-two for
 // stack alignment.
-#define QPSK_MAX_SYMBOLS  256
+#define QPSK_MAX_SYMBOLS 256
 
 int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame_t *out)
 {
@@ -111,7 +111,7 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     // run on the main thread with default 8 MB stack.
     float complex symbols[QPSK_MAX_SYMBOLS];
     float complex pll_out[QPSK_MAX_SYMBOLS];
-    int hard_decisions[QPSK_MAX_SYMBOLS];
+    int           hard_decisions[QPSK_MAX_SYMBOLS];
 
     // 1. Fixed decimation to 1 sps. Symbol timing recovery (D10) is
     // available as sym_timing_correct_2sps but is NOT yet wired
@@ -119,8 +119,7 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     // decoded with correlator + pre-rotation alone. Module retained
     // for offline tuning (tests/host/test_sym_timing_trace.c).
     for (int i = 0; i < n_symbols; i++) {
-        symbols[i] = (float)samples_2sps[i * 4 + 0]
-                   + (float)samples_2sps[i * 4 + 1] * _Complex_I;
+        symbols[i] = (float)samples_2sps[i * 4 + 0] + (float)samples_2sps[i * 4 + 1] * _Complex_I;
     }
 
     // 2. First-order PLL (matches gr-iridium's qpskFirstOrderPLL). Per
@@ -143,8 +142,8 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     //     to phi_hat magnitude drift. Float roundoff over 191 mults
     //     is sub-1e-4 anyway -- no quadrant slips.
     //   - PLL_BETA path elided (compile-time 0).
-    float complex phi_hat = 1.0f + 0.0f * _Complex_I;
-    float omega_hat = 0.0f;
+    float complex phi_hat   = 1.0f + 0.0f * _Complex_I;
+    float         omega_hat = 0.0f;
     // Power-decay truncation (task #73, gri-aligned). Track the running
     // peak magnitude across the burst; if three consecutive symbols
     // come in below peak/8, the actual signal has ended and the rest
@@ -153,9 +152,9 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     // See gr-iridium iridium_qpsk_demod_impl.cc:216-225.
     // Compare in squared magnitude (max/8 linear ≡ max²/64) so no sqrt
     // per symbol.
-    float max_mag2 = 0.0f;
+    float max_mag2  = 0.0f;
     int   low_count = 0;
-    int   n_eff = n_symbols;
+    int   n_eff     = n_symbols;
     for (int i = 0; i < n_symbols; i++) {
         pll_out[i] = symbols[i] * phi_hat;
 
@@ -164,13 +163,22 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
 
         // Hard decision (QPSK: pi/4, 3pi/4, -3pi/4, -pi/4)
         float complex x_hat;
-        if (re >= 0 && im >= 0)      { x_hat = M_SQRT1_2f + M_SQRT1_2f * _Complex_I; hard_decisions[i] = 0; }
-        else if (re < 0 && im >= 0) { x_hat = -M_SQRT1_2f + M_SQRT1_2f * _Complex_I; hard_decisions[i] = 1; }
-        else if (re < 0 && im < 0)  { x_hat = -M_SQRT1_2f - M_SQRT1_2f * _Complex_I; hard_decisions[i] = 2; }
-        else                        { x_hat = M_SQRT1_2f - M_SQRT1_2f * _Complex_I; hard_decisions[i] = 3; }
+        if (re >= 0 && im >= 0) {
+            x_hat             = M_SQRT1_2f + M_SQRT1_2f * _Complex_I;
+            hard_decisions[i] = 0;
+        } else if (re < 0 && im >= 0) {
+            x_hat             = -M_SQRT1_2f + M_SQRT1_2f * _Complex_I;
+            hard_decisions[i] = 1;
+        } else if (re < 0 && im < 0) {
+            x_hat             = -M_SQRT1_2f - M_SQRT1_2f * _Complex_I;
+            hard_decisions[i] = 2;
+        } else {
+            x_hat             = M_SQRT1_2f - M_SQRT1_2f * _Complex_I;
+            hard_decisions[i] = 3;
+        }
 
-        float complex er = conjf(x_hat) * pll_out[i];
-        float angle = cargf(er);
+        float complex er    = conjf(x_hat) * pll_out[i];
+        float         angle = cargf(er);
 
         // First-order phase correction: phi_hat *= exp(-j·α·angle).
         float total = PLL_ALPHA * angle;
@@ -178,19 +186,19 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         // exp(-j·t) = cos(t) - j·sin(t). Multiply: (c - j·s) * phi_hat.
         float ph_re = crealf(phi_hat);
         float ph_im = cimagf(phi_hat);
-        phi_hat = (c * ph_re + s * ph_im) + (c * ph_im - s * ph_re) * _Complex_I;
+        phi_hat     = (c * ph_re + s * ph_im) + (c * ph_im - s * ph_re) * _Complex_I;
 
         // Power-decay tracking on the PRE-PLL symbol magnitude (matches
         // gri — its d_magnitude_f is volk_32fc_magnitude_32f over the
         // raw `burst` input, not the PLL output). No sqrt: max_mag2 is
         // max(re² + im²).
-        float sym_re   = crealf(symbols[i]);
-        float sym_im   = cimagf(symbols[i]);
-        float mag2     = sym_re * sym_re + sym_im * sym_im;
+        float sym_re = crealf(symbols[i]);
+        float sym_im = cimagf(symbols[i]);
+        float mag2   = sym_re * sym_re + sym_im * sym_im;
         if (mag2 > max_mag2) max_mag2 = mag2;
         if (mag2 < max_mag2 * (1.0f / 64.0f)) {
             if (++low_count == 3) {
-                n_eff = i - 2;       // drop the 3 low symbols themselves
+                n_eff = i - 2; // drop the 3 low symbols themselves
                 if (n_eff < 0) n_eff = 0;
                 break;
             }
@@ -242,9 +250,12 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     }
     bool dl_uw_ok = (dl_diffs <= 2);
     bool ul_uw_ok = (ul_diffs <= 2);
-    if (dl_uw_ok)      out->direction = DIR_DOWNLINK;
-    else if (ul_uw_ok) out->direction = DIR_UPLINK;
-    else               out->direction = DIR_UNKNOWN;
+    if (dl_uw_ok)
+        out->direction = DIR_DOWNLINK;
+    else if (ul_uw_ok)
+        out->direction = DIR_UPLINK;
+    else
+        out->direction = DIR_UNKNOWN;
 
     if (out->direction == DIR_UNKNOWN) {
         // Diagnostic: show how close we were to each UW + the actual
@@ -252,12 +263,12 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         // "PLL never locked" (random hard_decisions) from "wrong
         // burst alignment" (decisions structured but offset).
         ESP_LOGI(TAG,
-            "UW no match: dl_diffs=%d ul_diffs=%d omega=%.4f hd[0..11]=[%d %d %d %d %d %d %d %d %d %d %d %d]",
-            dl_diffs, ul_diffs, (double)omega_hat,
-            hard_decisions[0], hard_decisions[1], hard_decisions[2],
-            hard_decisions[3], hard_decisions[4], hard_decisions[5],
-            hard_decisions[6], hard_decisions[7], hard_decisions[8],
-            hard_decisions[9], hard_decisions[10], hard_decisions[11]);
+                 "UW no match: dl_diffs=%d ul_diffs=%d omega=%.4f hd[0..11]=[%d %d %d %d %d %d %d %d %d %d %d %d]",
+                 dl_diffs, ul_diffs, (double)omega_hat,
+                 hard_decisions[0], hard_decisions[1], hard_decisions[2],
+                 hard_decisions[3], hard_decisions[4], hard_decisions[5],
+                 hard_decisions[6], hard_decisions[7], hard_decisions[8],
+                 hard_decisions[9], hard_decisions[10], hard_decisions[11]);
         return 0;
     }
 
@@ -277,23 +288,23 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     // giving Chase-2 plenty of soft headroom without overflow.
     float mag_scale = 0.0f;
     if (max_mag2 > 0.0f) {
-        mag_scale = 16384.0f / sqrtf(max_mag2);   // brightest symbol → ~16k
+        mag_scale = 16384.0f / sqrtf(max_mag2); // brightest symbol → ~16k
     }
-    int old_sym = 0;
-    out->bits = malloc(n_symbols * 2);
+    int old_sym    = 0;
+    out->bits      = malloc(n_symbols * 2);
     out->soft_bits = malloc(n_symbols * 2 * sizeof(int16_t));
-    out->n_bits = n_symbols * 2;
+    out->n_bits    = n_symbols * 2;
     for (int i = 0; i < n_symbols; i++) {
-        int diff = (hard_decisions[i] - old_sym + 4) % 4;
-        old_sym = hard_decisions[i];
-        int decoded = DQPSK_MAP[diff];
-        uint8_t b0 = (decoded >> 1) & 1;
-        uint8_t b1 = decoded & 1;
+        int diff             = (hard_decisions[i] - old_sym + 4) % 4;
+        old_sym              = hard_decisions[i];
+        int     decoded      = DQPSK_MAP[diff];
+        uint8_t b0           = (decoded >> 1) & 1;
+        uint8_t b1           = decoded & 1;
         out->bits[2 * i + 0] = b0;
         out->bits[2 * i + 1] = b1;
         if (out->soft_bits) {
-            float re = crealf(pll_out[i]);
-            float im = cimagf(pll_out[i]);
+            float re  = crealf(pll_out[i]);
+            float im  = cimagf(pll_out[i]);
             float mag = sqrtf(re * re + im * im) * mag_scale;
             if (mag > 32000.0f) mag = 32000.0f;
             int16_t conf = (int16_t)mag;
@@ -320,8 +331,8 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
                 fprintf(fp, "i,re_in,im_in,re_pll,im_pll,hd,bit_hi,bit_lo\n");
                 int prev = 0;
                 for (int i = 0; i < n_symbols; i++) {
-                    int diff = (hard_decisions[i] - prev + 4) % 4;
-                    prev = hard_decisions[i];
+                    int diff    = (hard_decisions[i] - prev + 4) % 4;
+                    prev        = hard_decisions[i];
                     int decoded = DQPSK_MAP[diff];
                     fprintf(fp, "%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d\n",
                             i,

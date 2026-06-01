@@ -49,20 +49,20 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define FBT_FFT_SIZE        2048   // matches fft_sc16_2048
-#define FBT_MAX_BURSTS      64     // gri default at fs=2.5MHz / burst_width=40k * 0.8 = 50, round up
-#define FBT_HISTORY_SIZE    512    // gri default (set in iridium_extractor_flowgraph.py)
+#define FBT_FFT_SIZE 2048    // matches fft_sc16_2048
+#define FBT_MAX_BURSTS 64    // gri default at fs=2.5MHz / burst_width=40k * 0.8 = 50, round up
+#define FBT_HISTORY_SIZE 512 // gri default (set in iridium_extractor_flowgraph.py)
 
 // One detected burst (output record).
 typedef struct {
-    uint64_t id;             // monotonically increasing, +10 per detection
-    uint64_t start;          // absolute sample index in caller's frame
-                             //  (= d_index - burst_pre_len, see gri:306)
-    uint64_t last_active;    // last FFT step where the burst was seen above threshold
-    uint64_t stop;           // set when the burst is removed (last_active + burst_post_len)
-    int      center_bin;     // FFT bin, 0..N-1 (DC-centred after FFT-shift)
-    float    magnitude_db;   // 10·log10(peak relative magnitude)
-    float    noise_db;       // 10·log10(EMA baseline at center_bin)
+    uint64_t id;           // monotonically increasing, +10 per detection
+    uint64_t start;        // absolute sample index in caller's frame
+                           //  (= d_index - burst_pre_len, see gri:306)
+    uint64_t last_active;  // last FFT step where the burst was seen above threshold
+    uint64_t stop;         // set when the burst is removed (last_active + burst_post_len)
+    int      center_bin;   // FFT bin, 0..N-1 (DC-centred after FFT-shift)
+    float    magnitude_db; // 10·log10(peak relative magnitude)
+    float    noise_db;     // 10·log10(EMA baseline at center_bin)
 } fbt_burst_t;
 
 typedef struct fft_burst_tagger_s fft_burst_tagger_t;
@@ -87,11 +87,11 @@ typedef struct fft_burst_tagger_s fft_burst_tagger_t;
 // to be tagged.
 //
 // Returns NULL on allocation failure.
-fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
-                                           int burst_post_len,
-                                           int burst_width,
-                                           float threshold_mult_db,
-                                           int32_t *baseline_history_ext);
+fft_burst_tagger_t *fft_burst_tagger_init(int      burst_pre_len,
+                                          int      burst_post_len,
+                                          int      burst_width,
+                                          float    threshold_mult_db,
+                                          int32_t *baseline_history_ext);
 
 void fft_burst_tagger_destroy(fft_burst_tagger_t *t);
 
@@ -121,10 +121,10 @@ void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start);
 // (first HISTORY_SIZE steps) — caller should just keep feeding and
 // the EMA will fill in.
 bool fft_burst_tagger_step(fft_burst_tagger_t *t,
-                            const int16_t *input,
-                            const int16_t *lookback,
-                            fbt_burst_t *out_new_bursts,  int *n_new,
-                            fbt_burst_t *out_gone_bursts, int *n_gone);
+                           const int16_t      *input,
+                           const int16_t      *lookback,
+                           fbt_burst_t *out_new_bursts, int *n_new,
+                           fbt_burst_t *out_gone_bursts, int *n_gone);
 
 // Force-emit any bursts still active. Used at end-of-stream in
 // offline tests / when an input source closes — without this, the
@@ -136,7 +136,7 @@ bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 // is updated to the actual count emitted. Internal state is cleared
 // so subsequent _step calls start fresh.
 void fft_burst_tagger_flush(fft_burst_tagger_t *t,
-                             fbt_burst_t *out_gone_bursts, int *n_gone);
+                            fbt_burst_t *out_gone_bursts, int *n_gone);
 
 // Diagnostic — read accumulated per-stage wall-times (µs) since the
 // last call, plus the number of steps that contributed. Order:

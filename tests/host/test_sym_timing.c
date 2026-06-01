@@ -15,18 +15,21 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define SPS               2        // samples per symbol (2 sps input)
-#define SYMBOL_AMPLITUDE  5000     // int16 amplitude per symbol arm
+#define SPS 2                 // samples per symbol (2 sps input)
+#define SYMBOL_AMPLITUDE 5000 // int16 amplitude per symbol arm
 
 static int s_passed = 0, s_failed = 0;
-#define CHECK(cond, ...) do {                                  \
-    if (!(cond)) {                                             \
-        fprintf(stderr, "  FAIL line %d: ", __LINE__);         \
-        fprintf(stderr, __VA_ARGS__);                          \
-        fprintf(stderr, "\n");                                 \
-        s_failed++;                                            \
-    } else { s_passed++; }                                     \
-} while (0)
+#define CHECK(cond, ...)                                   \
+    do {                                                   \
+        if (!(cond)) {                                     \
+            fprintf(stderr, "  FAIL line %d: ", __LINE__); \
+            fprintf(stderr, __VA_ARGS__);                  \
+            fprintf(stderr, "\n");                         \
+            s_failed++;                                    \
+        } else {                                           \
+            s_passed++;                                    \
+        }                                                  \
+    } while (0)
 
 // Generate `n_sym` QPSK symbols (random ±1 ±1) sampled at 2 sps,
 // with `sample_offset` of 0 or 1 controlling which sample of each
@@ -36,13 +39,13 @@ static void synth_qpsk(int16_t *out_iq, int n_sym, int sample_offset,
                        uint32_t seed)
 {
     // Pass 1: generate the peak (slot 0) sample for each symbol.
-    int16_t peak_re[256], peak_im[256];
+    int16_t  peak_re[256], peak_im[256];
     uint32_t r = seed;
     for (int s = 0; s < n_sym; s++) {
-        r = r * 1664525u + 1013904223u;
-        peak_re[s] = (r & 1) ? +SYMBOL_AMPLITUDE : -SYMBOL_AMPLITUDE;
-        peak_im[s] = (r & 2) ? +SYMBOL_AMPLITUDE : -SYMBOL_AMPLITUDE;
-        int slot0 = 2 * (s * SPS + 0);
+        r                 = r * 1664525u + 1013904223u;
+        peak_re[s]        = (r & 1) ? +SYMBOL_AMPLITUDE : -SYMBOL_AMPLITUDE;
+        peak_im[s]        = (r & 2) ? +SYMBOL_AMPLITUDE : -SYMBOL_AMPLITUDE;
+        int slot0         = 2 * (s * SPS + 0);
         out_iq[slot0 + 0] = peak_re[s];
         out_iq[slot0 + 1] = peak_im[s];
     }
@@ -52,9 +55,9 @@ static void synth_qpsk(int16_t *out_iq, int n_sym, int sample_offset,
     // Gardner TED that is zero-mean at the correct strobe and pulls
     // monotonically when off-strobe.
     for (int s = 0; s < n_sym; s++) {
-        int slot1 = 2 * (s * SPS + 1);
-        int16_t next_re = (s + 1 < n_sym) ? peak_re[s + 1] : peak_re[s];
-        int16_t next_im = (s + 1 < n_sym) ? peak_im[s + 1] : peak_im[s];
+        int     slot1     = 2 * (s * SPS + 1);
+        int16_t next_re   = (s + 1 < n_sym) ? peak_re[s + 1] : peak_re[s];
+        int16_t next_im   = (s + 1 < n_sym) ? peak_im[s + 1] : peak_im[s];
         out_iq[slot1 + 0] = (int16_t)((peak_re[s] + next_re) / 2);
         out_iq[slot1 + 1] = (int16_t)((peak_im[s] + next_im) / 2);
     }
@@ -79,13 +82,13 @@ static void synth_qpsk(int16_t *out_iq, int n_sym, int sample_offset,
 // number of symbols out of n_check whose hard QPSK decision matches
 // the input. Excludes the first `skip` symbols (PLL acquisition).
 static int score_recovery(const float complex *syms, int n,
-                           const int16_t *input_iq, int n_input_sym,
-                           int skip)
+                          const int16_t *input_iq, int n_input_sym,
+                          int skip)
 {
     int correct = 0;
     int checked = 0;
     for (int i = skip; i < n && i < n_input_sym; i++) {
-        int slot0 = 2 * (i * SPS + 0);
+        int slot0         = 2 * (i * SPS + 0);
         int expect_re_pos = (input_iq[slot0 + 0] > 0);
         int expect_im_pos = (input_iq[slot0 + 1] > 0);
         int got_re_pos    = (crealf(syms[i]) > 0);
@@ -102,15 +105,15 @@ static void test_aligned_input(void)
 {
     printf("Test 1: aligned input (timing offset = 0)\n");
     const int n_sym = 100;
-    int16_t iq[100 * SPS * 2];
+    int16_t   iq[100 * SPS * 2];
     synth_qpsk(iq, n_sym, 0, 0xDEADBEEF);
 
     sym_timing_t st;
     sym_timing_init(&st);
     float complex out[n_sym];
-    int n_out = sym_timing_process(&st, iq, sizeof(iq) / sizeof(iq[0]),
-                                    out, n_sym);
-    int pct = score_recovery(out, n_out, iq, n_sym, /*skip=*/20);
+    int           n_out = sym_timing_process(&st, iq, sizeof(iq) / sizeof(iq[0]),
+                                             out, n_sym);
+    int           pct   = score_recovery(out, n_out, iq, n_sym, /*skip=*/20);
     printf("    recovered %d symbols; correct-sign agreement = %d%% (after 20-sym warmup)\n",
            n_out, pct);
     CHECK(n_out >= n_sym - 5,

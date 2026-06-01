@@ -35,24 +35,24 @@ typedef enum {
 } uw_direction_t;
 
 typedef struct {
-    int             uw_offset;       // sample index in burst where UW starts
-                                     //  (in 2-sps complex units, NOT int16
-                                     //   bytes). The first sample of the
-                                     //   UW pattern is burst[2*uw_offset]
-                                     //   in interleaved int16 IQ layout.
-    float           correction;      // sub-sample fractional offset from
-                                     //  parabolic interpolation of the peak;
-                                     //  range (-0.5, +0.5) for valid peaks.
-    uw_direction_t  direction;       // DL or UL (whichever had the higher peak)
-    float           snr_estimate_db; // 10·log10(peak² / off-peak-mean²)
-    float           peak_value;      // raw peak magnitude² (for debugging)
+    int uw_offset;                  // sample index in burst where UW starts
+                                    //  (in 2-sps complex units, NOT int16
+                                    //   bytes). The first sample of the
+                                    //   UW pattern is burst[2*uw_offset]
+                                    //   in interleaved int16 IQ layout.
+    float correction;               // sub-sample fractional offset from
+                                    //  parabolic interpolation of the peak;
+                                    //  range (-0.5, +0.5) for valid peaks.
+    uw_direction_t direction;       // DL or UL (whichever had the higher peak)
+    float          snr_estimate_db; // 10·log10(peak² / off-peak-mean²)
+    float          peak_value;      // raw peak magnitude² (for debugging)
     // Complex peak value. The PHASE of this complex number is the
     // residual carrier phase relative to the UW pattern — pre-rotating
     // the burst by conj(peak / |peak|) aligns the constellation so
     // the PLL starts already locked. gr-iridium uses the same trick
     // (burst_downmix_impl.cc, `corr_result` variable).
-    float           peak_re;
-    float           peak_im;
+    float peak_re;
+    float peak_im;
     // Per-symbol residual carrier frequency in rad/sym, estimated from
     // the phase difference between the first-half and second-half UW
     // correlations. If the burst has a residual freq offset Δω, the
@@ -61,14 +61,14 @@ typedef struct {
     // linear-phase-ramp correction across the whole burst before
     // calling qpsk_demod, giving the PLL a near-zero starting omega
     // instead of having to chase 0.5+ rad/sym within 12 UW symbols.
-    float           omega_per_sym;
+    float omega_per_sym;
 } uw_corr_result_t;
 
 // Samples-per-symbol the module operates at. Hardcoded to 10 to
 // match gr-iridium's burst_downmix internal rate. Worker must
 // produce 10 sps input to these functions; host tests must
 // synthesize bursts at 10 sps.
-#define UW_SPS  10
+#define UW_SPS 10
 
 // Run correlation on a 10-sps interleaved int16 IQ burst. Searches
 // for the UW pattern across the first `search_complex_samples`
@@ -79,8 +79,8 @@ typedef struct {
 // search_complex : how many candidate UW start positions to test
 // out_result  : result; .direction == UW_DIR_UNKNOWN if SNR too low
 void uw_correlator_find(const int16_t *burst, int n_complex,
-                         int search_complex,
-                         uw_corr_result_t *out_result);
+                        int               search_complex,
+                        uw_corr_result_t *out_result);
 
 // Coarse CFO estimator for use BEFORE the UW correlator search.
 // Squares the first n_in complex samples (which the worker arranges
@@ -112,7 +112,7 @@ float uw_correlator_estimate_cfo(const int16_t *burst, int n_complex);
 // burst_out   : output interleaved int16 IQ (may alias burst_in)
 // n_complex   : number of complex samples
 void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
-                              int n_complex);
+                             int n_complex);
 
 // D13: sub-frame burst-edge detection. Ports gr-iridium's start-
 // finding algorithm (burst_downmix_impl.cc, lines 841-880):
@@ -138,7 +138,7 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
 // Returns the burst-start sample offset (in complex samples). Zero
 // if no clear envelope rise found (caller leaves burst unshifted).
 int uw_correlator_find_burst_start(const int16_t *burst,
-                                    int n_complex, int search_max);
+                                   int n_complex, int search_max);
 
 #ifdef __cplusplus
 }

@@ -19,11 +19,11 @@ typedef struct {
     // magnitude = reliability). Same length as bits[]. NULL if qpsk_demod
     // didn't run (or older callers). Used by Chase-2 BCH (#112). Caller
     // must free() alongside bits.
-    int16_t *soft_bits;
-    int n_bits;
+    int16_t       *soft_bits;
+    int            n_bits;
     ir_direction_t direction;
-    float snr_db;
-    uint32_t timestamp;
+    float          snr_db;
+    uint32_t       timestamp;
 } decoded_frame_t;
 
 int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame_t *out);

@@ -95,25 +95,25 @@ static void fbt_pipe_helper_task(void *arg)
 #endif
 
 struct fft_burst_tagger_s {
-    int      burst_pre_len;
-    int      burst_post_len;
-    int      burst_width;       // in bins
-    int32_t  threshold_q15;     // 10^(db/10) in Q15 (1.0 = 2^15)
-                                // — we use this so the comparison is
-                                // mag² × HISTORY_SIZE > (baseline_sum × threshold_q15) >> 15
+    int     burst_pre_len;
+    int     burst_post_len;
+    int     burst_width;   // in bins
+    int32_t threshold_q15; // 10^(db/10) in Q15 (1.0 = 2^15)
+                           // — we use this so the comparison is
+                           // mag² × HISTORY_SIZE > (baseline_sum × threshold_q15) >> 15
 
-    int16_t  window[N];         // Q15 Blackman
-    int16_t  fft_buf[2 * N];    // scratch (rotation + FFT)
-    int32_t  magnitude_shifted[N];   // mag² of FFT output, FFT-shifted to DC-centred
-    int32_t  baseline_sum[N];        // sum of last HISTORY_SIZE magnitudes (per bin)
-    uint8_t  burst_mask[N];          // 1 = bin is allowed to declare new burst
+    int16_t window[N];            // Q15 Blackman
+    int16_t fft_buf[2 * N];       // scratch (rotation + FFT)
+    int32_t magnitude_shifted[N]; // mag² of FFT output, FFT-shifted to DC-centred
+    int32_t baseline_sum[N];      // sum of last HISTORY_SIZE magnitudes (per bin)
+    uint8_t burst_mask[N];        // 1 = bin is allowed to declare new burst
 
-    int32_t *baseline_history;       // [HISTORY_SIZE × N], caller-owned (PSRAM)
+    int32_t *baseline_history; // [HISTORY_SIZE × N], caller-owned (PSRAM)
     int      history_index;
     bool     history_primed;
 
-    fbt_burst_t  bursts[FBT_MAX_BURSTS];
-    int          n_bursts;
+    fbt_burst_t bursts[FBT_MAX_BURSTS];
+    int         n_bursts;
 
     // Per-step peak workspace (used inside create_new_bursts_internal).
     // Lives in the struct (heap-backed) rather than on the stack
@@ -127,11 +127,11 @@ struct fft_burst_tagger_s {
     // bandwidth pressure or write-pattern aliasing. Keep inline.
     struct {
         int     bin;
-        int64_t sort_key;   // relative_magnitude × HISTORY (gri sort order)
+        int64_t sort_key; // relative_magnitude × HISTORY (gri sort order)
     } peaks[N];
 
-    float    window_enbw;        // Blackman ENBW, computed at init
-    uint64_t d_index;            // sample index of CURRENT FFT step's start
+    float    window_enbw; // Blackman ENBW, computed at init
+    uint64_t d_index;     // sample index of CURRENT FFT step's start
     uint64_t burst_id;
 
     // Pipelined helper state (ESP_PLATFORM only).
@@ -145,21 +145,21 @@ struct fft_burst_tagger_s {
     // fft_buf (inline above, internal SRAM) is one of the two
     // buffers. fft_buf_alt (PSRAM heap, fft_sc16_2048 bounces both
     // through its internal scratch so PSRAM is fine) is the other.
-    int16_t      *fft_buf_alt;
-    int           pipe_active_idx;       // 0 or 1: which buf tagger writes
-    bool          pipe_in_flight;        // helper currently processing
-    int           pipe_pending_idx;      // which buf helper is processing
-    uint64_t      pipe_pending_d_index;  // d_index snapshot at dispatch
+    int16_t *fft_buf_alt;
+    int      pipe_active_idx;      // 0 or 1: which buf tagger writes
+    bool     pipe_in_flight;       // helper currently processing
+    int      pipe_pending_idx;     // which buf helper is processing
+    uint64_t pipe_pending_d_index; // d_index snapshot at dispatch
     // Staged outputs — heap-allocated (PSRAM) to keep the struct
     // size unchanged from baseline. Inline arrays would grow the
     // struct by ~6 KB, shifting downstream allocations enough to
     // trip the P4 PIE position-sensitivity bug in unknown ways.
-    fbt_burst_t  *staged_new;
-    int           staged_n_new;
-    int           staged_max_new;        // upper bound caller passed
-    fbt_burst_t  *staged_gone;
-    int           staged_n_gone;
-    int           staged_max_gone;
+    fbt_burst_t *staged_new;
+    int          staged_n_new;
+    int          staged_max_new; // upper bound caller passed
+    fbt_burst_t *staged_gone;
+    int          staged_n_gone;
+    int          staged_max_gone;
 };
 
 // Build a Q15 Blackman window of length N.
@@ -168,8 +168,7 @@ static void build_blackman_q15(int16_t *w_out)
     const double PI = 3.14159265358979323846;
     for (int i = 0; i < N; i++) {
         double t = (double)i / (double)(N - 1);
-        double v = 0.42 - 0.5 * cos(2.0 * PI * t)
-                        + 0.08 * cos(4.0 * PI * t);
+        double v = 0.42 - 0.5 * cos(2.0 * PI * t) + 0.08 * cos(4.0 * PI * t);
         // Scale to Q15. Blackman peaks at ~1.0 (mid-window), edges ~0.
         // Multiplying by INT16_MAX preserves dynamic range.
         double q = v * (double)INT16_MAX;
@@ -195,17 +194,17 @@ static float compute_window_enbw(const int16_t *w, int n)
     double sum = 0, sum_sq = 0;
     for (int i = 0; i < n; i++) {
         double v = (double)w[i] / 32767.0;
-        sum    += v;
+        sum += v;
         sum_sq += v * v;
     }
     return (float)((double)n * sum_sq / (sum * sum));
 }
 
-fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
-                                           int burst_post_len,
-                                           int burst_width,
-                                           float threshold_mult_db,
-                                           int32_t *baseline_history_ext)
+fft_burst_tagger_t *fft_burst_tagger_init(int      burst_pre_len,
+                                          int      burst_post_len,
+                                          int      burst_width,
+                                          float    threshold_mult_db,
+                                          int32_t *baseline_history_ext)
 {
     if (!baseline_history_ext) return NULL;
 #if defined(ESP_PLATFORM)
@@ -255,19 +254,20 @@ fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
     // burst count (verified by experiment: 146 → 1345). The 2× FP rate
     // we see vs gri is NOT a threshold issue — it's somewhere else in
     // the detector logic.
-    double t_lin = pow(10.0, (double)threshold_mult_db / 10.0);
+    double t_lin     = pow(10.0, (double)threshold_mult_db / 10.0);
     t->threshold_q15 = (int32_t)(t_lin * 32768.0 + 0.5);
 
     t->baseline_history = baseline_history_ext;
     memset(t->baseline_history, 0,
            sizeof(int32_t) * N * FBT_HISTORY_SIZE);
     memset(t->baseline_sum, 0, sizeof(t->baseline_sum));
-    for (int i = 0; i < N; i++) t->burst_mask[i] = 1;
-    t->history_index = 0;
+    for (int i = 0; i < N; i++)
+        t->burst_mask[i] = 1;
+    t->history_index  = 0;
     t->history_primed = false;
-    t->n_bursts = 0;
-    t->d_index = 0;
-    t->burst_id = 0;
+    t->n_bursts       = 0;
+    t->d_index        = 0;
+    t->burst_id       = 0;
 
 #if defined(ESP_PLATFORM)
     // Pipelined helper: alt fft_buf in PSRAM.
@@ -286,21 +286,21 @@ fft_burst_tagger_t *fft_burst_tagger_init(int burst_pre_len,
         ESP_LOGE("FBT_INIT", "fft_buf_alt PSRAM alloc failed (pipelining disabled)");
     }
     // Staged outputs in PSRAM, keeps the struct small.
-    t->staged_new  = (fbt_burst_t *)heap_caps_calloc(
+    t->staged_new = (fbt_burst_t *)heap_caps_calloc(
         FBT_MAX_BURSTS, sizeof(fbt_burst_t), MALLOC_CAP_SPIRAM);
     t->staged_gone = (fbt_burst_t *)heap_caps_calloc(
         FBT_MAX_BURSTS, sizeof(fbt_burst_t), MALLOC_CAP_SPIRAM);
     if (!t->staged_new || !t->staged_gone) {
         ESP_LOGE("FBT_INIT", "staged_new/gone PSRAM alloc failed");
     }
-    t->pipe_active_idx       = 0;       // tagger starts writing to fft_buf (inline)
-    t->pipe_in_flight        = false;
-    t->pipe_pending_idx      = 0;
-    t->pipe_pending_d_index  = 0;
-    t->staged_n_new          = 0;
-    t->staged_n_gone         = 0;
-    t->staged_max_new        = FBT_MAX_BURSTS;
-    t->staged_max_gone       = FBT_MAX_BURSTS;
+    t->pipe_active_idx      = 0; // tagger starts writing to fft_buf (inline)
+    t->pipe_in_flight       = false;
+    t->pipe_pending_idx     = 0;
+    t->pipe_pending_d_index = 0;
+    t->staged_n_new         = 0;
+    t->staged_n_gone        = 0;
+    t->staged_max_new       = FBT_MAX_BURSTS;
+    t->staged_max_gone      = FBT_MAX_BURSTS;
 
     // (Mon 2026-05-25) Pipeline helper DISABLED. Was prio 9 on Core 1
     // and ate 24% of Core 1 CPU under noise-heavy bench load (tagger
@@ -325,7 +325,7 @@ void fft_burst_tagger_destroy(fft_burst_tagger_t *t)
     if (!t) return;
 #if defined(ESP_PLATFORM)
     if (t->fft_buf_alt) heap_caps_free(t->fft_buf_alt);
-    if (t->staged_new)  heap_caps_free(t->staged_new);
+    if (t->staged_new) heap_caps_free(t->staged_new);
     if (t->staged_gone) heap_caps_free(t->staged_gone);
     heap_caps_free(t);
 #else
@@ -334,18 +334,19 @@ void fft_burst_tagger_destroy(fft_burst_tagger_t *t)
 }
 
 void fft_burst_tagger_flush(fft_burst_tagger_t *t,
-                             fbt_burst_t *out_gone, int *n_gone)
+                            fbt_burst_t *out_gone, int *n_gone)
 {
-    int max = (n_gone && *n_gone > 0) ? *n_gone : 0;
+    int max     = (n_gone && *n_gone > 0) ? *n_gone : 0;
     int emitted = 0;
     for (int b = 0; b < t->n_bursts && emitted < max; b++) {
-        t->bursts[b].stop = t->d_index;       // force-close at current sample
+        t->bursts[b].stop   = t->d_index; // force-close at current sample
         out_gone[emitted++] = t->bursts[b];
     }
     if (n_gone) *n_gone = emitted;
     // Drop all active bursts; mask is full-rebuild on next step.
     t->n_bursts = 0;
-    for (int k = 0; k < N; k++) t->burst_mask[k] = 1;
+    for (int k = 0; k < N; k++)
+        t->burst_mask[k] = 1;
 }
 
 void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start)
@@ -357,12 +358,12 @@ void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start)
 // buffer. Q15 × Q15 → Q15. Buffer-pointer parameter so pipelined
 // mode can ping-pong between two fft_buf instances.
 static FBT_HOT void window_multiply(fft_burst_tagger_t *t,
-                             const int16_t *input,
-                             int16_t *fb_out)
+                                    const int16_t      *input,
+                                    int16_t            *fb_out)
 {
     for (int i = 0; i < N; i++) {
-        int32_t re = (int32_t)input[i * 2 + 0] * (int32_t)t->window[i];
-        int32_t im = (int32_t)input[i * 2 + 1] * (int32_t)t->window[i];
+        int32_t re        = (int32_t)input[i * 2 + 0] * (int32_t)t->window[i];
+        int32_t im        = (int32_t)input[i * 2 + 1] * (int32_t)t->window[i];
         fb_out[i * 2 + 0] = (int16_t)(re >> 15);
         fb_out[i * 2 + 1] = (int16_t)(im >> 15);
     }
@@ -377,18 +378,18 @@ static FBT_HOT void window_multiply(fft_burst_tagger_t *t,
 // split into two contiguous mag² passes: src=N/2..N-1 → dst=0..N/2-1
 // and src=0..N/2-1 → dst=N/2..N-1. Each inner loop is a simple
 // re²+im² → int32 store and -O3 will SLP-vectorise it.
-static inline void mag_sq_pass(const int16_t * __restrict__ src_iq,
-                                int32_t * __restrict__ dst, int n)
+static inline void mag_sq_pass(const int16_t *__restrict__ src_iq,
+                               int32_t *__restrict__ dst, int n)
 {
     for (int k = 0; k < n; k++) {
         int32_t re = src_iq[2 * k + 0];
         int32_t im = src_iq[2 * k + 1];
-        dst[k] = re * re + im * im;
+        dst[k]     = re * re + im * im;
     }
 }
 
 static FBT_HOT void compute_magnitude_shifted(fft_burst_tagger_t *t,
-                                       const int16_t *fb)
+                                              const int16_t      *fb)
 {
     int32_t *out = t->magnitude_shifted;
     // Pass A: upper half of fft_buf → lower half of output.
@@ -401,7 +402,7 @@ static FBT_HOT void compute_magnitude_shifted(fft_burst_tagger_t *t,
 // Comparison: (mag² × HISTORY_SIZE) > (baseline_sum × threshold_q15) >> 15.
 // Both sides as int64 to avoid overflow.
 static inline bool above_threshold(int32_t mag2, int32_t baseline_sum,
-                                    int32_t threshold_q15)
+                                   int32_t threshold_q15)
 {
     int64_t lhs = (int64_t)mag2 * (int64_t)FBT_HISTORY_SIZE;
     int64_t rhs = ((int64_t)baseline_sum * (int64_t)threshold_q15) >> 15;
@@ -434,12 +435,14 @@ static void mask_burst(fft_burst_tagger_t *t, int center_bin)
     int hi = center_bin + t->burst_width / 2;
     if (lo < 0) lo = 0;
     if (hi > N - 1) hi = N - 1;
-    for (int k = lo; k <= hi; k++) t->burst_mask[k] = 0;
+    for (int k = lo; k <= hi; k++)
+        t->burst_mask[k] = 0;
 }
 
 static void rebuild_burst_mask(fft_burst_tagger_t *t)
 {
-    for (int k = 0; k < N; k++) t->burst_mask[k] = 1;
+    for (int k = 0; k < N; k++)
+        t->burst_mask[k] = 1;
     for (int b = 0; b < t->n_bursts; b++) {
         mask_burst(t, t->bursts[b].center_bin);
     }
@@ -461,7 +464,7 @@ static void rebuild_burst_mask(fft_burst_tagger_t *t)
 // — same numerator we already form in above_threshold, so the cost
 // added by the sort-key swap is a single int64 divide per peak.
 static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
-                                       fbt_burst_t *out_new, int max_new)
+                                              fbt_burst_t *out_new, int max_new)
 {
     int n_peaks = 0;
 
@@ -476,8 +479,7 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
             // to keep an int64 representation that's stable for
             // ordering. Same ordering as the float ratio mag²/baseline.
             t->peaks[n_peaks].sort_key =
-                ((int64_t)mag2 * (int64_t)FBT_HISTORY_SIZE)
-                / ((int64_t)base + 1);
+                ((int64_t)mag2 * (int64_t)FBT_HISTORY_SIZE) / ((int64_t)base + 1);
             n_peaks++;
         }
     }
@@ -487,10 +489,10 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
     for (int i = 0; i < n_peaks - 1; i++) {
         for (int j = i + 1; j < n_peaks; j++) {
             if (t->peaks[j].sort_key > t->peaks[i].sort_key) {
-                int     bin_tmp = t->peaks[i].bin;
-                int64_t key_tmp = t->peaks[i].sort_key;
-                t->peaks[i] = t->peaks[j];
-                t->peaks[j].bin = bin_tmp;
+                int     bin_tmp      = t->peaks[i].bin;
+                int64_t key_tmp      = t->peaks[i].sort_key;
+                t->peaks[i]          = t->peaks[j];
+                t->peaks[j].bin      = bin_tmp;
                 t->peaks[j].sort_key = key_tmp;
             }
         }
@@ -499,16 +501,16 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
     int n_emitted = 0;
     for (int p = 0; p < n_peaks; p++) {
         int bin = t->peaks[p].bin;
-        if (!t->burst_mask[bin]) continue;     // got masked by an earlier peak in this loop
+        if (!t->burst_mask[bin]) continue; // got masked by an earlier peak in this loop
         if (t->n_bursts >= FBT_MAX_BURSTS) break;
 
         fbt_burst_t *b = &t->bursts[t->n_bursts++];
-        b->id = t->burst_id;
+        b->id          = t->burst_id;
         t->burst_id += 10;
-        b->center_bin = bin;
-        b->start = t->d_index - t->burst_pre_len;
+        b->center_bin  = bin;
+        b->start       = t->d_index - t->burst_pre_len;
         b->last_active = b->start;
-        b->stop = 0;
+        b->stop        = 0;
         // Magnitude in dB, with the window ENBW scaling that gr-iridium
         // applies (fft_burst_tagger_impl.cc:303):
         //   magnitude = 10·log10(rel × HISTORY × window_enbw)
@@ -517,13 +519,11 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
         // a rectangular bin width — the noise per bin is wider than
         // the FFT's nominal bin spacing. Without the factor our
         // magnitude_db reads ~2.4 dB low vs gri for the same burst.
-        double rel = (double)t->magnitude_shifted[bin]
-                     * (double)FBT_HISTORY_SIZE
-                     / ((double)t->baseline_sum[bin] + 1.0);
+        double rel      = (double)t->magnitude_shifted[bin] * (double)FBT_HISTORY_SIZE / ((double)t->baseline_sum[bin] + 1.0);
         b->magnitude_db = (float)(10.0 * log10(
-                          rel * (double)t->window_enbw + 1e-12));
-        b->noise_db = (float)(10.0 * log10(
-            (double)t->baseline_sum[bin] / (double)FBT_HISTORY_SIZE + 1e-12));
+                                             rel * (double)t->window_enbw + 1e-12));
+        b->noise_db     = (float)(10.0 * log10(
+                                         (double)t->baseline_sum[bin] / (double)FBT_HISTORY_SIZE + 1e-12));
 
         mask_burst(t, bin);
 
@@ -537,10 +537,10 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
 // Erase bursts whose last_active is older than burst_post_len. Emit
 // the timed-out bursts in out_gone.
 static FBT_HOT int delete_gone_bursts_internal(fft_burst_tagger_t *t,
-                                        fbt_burst_t *out_gone, int max_gone)
+                                               fbt_burst_t *out_gone, int max_gone)
 {
-    int n_emitted = 0;
-    int dst = 0;
+    int  n_emitted   = 0;
+    int  dst         = 0;
     bool any_removed = false;
     for (int src = 0; src < t->n_bursts; src++) {
         fbt_burst_t *b = &t->bursts[src];
@@ -576,16 +576,16 @@ static FBT_HOT int delete_gone_bursts_internal(fft_burst_tagger_t *t,
 // load each `old_slot[k]` exactly once, and overlap the PSRAM write
 // with the same iteration so memcpy() isn't a separate sequential
 // pass. restrict + -O3 SLPvec the int32 inner.
-static inline void ema_step_inner(int32_t * __restrict__ bsum,
-                                   int32_t * __restrict__ slot,
-                                   const int32_t * __restrict__ mag,
-                                   int n)
+static inline void ema_step_inner(int32_t *__restrict__ bsum,
+                                  int32_t *__restrict__ slot,
+                                  const int32_t *__restrict__ mag,
+                                  int n)
 {
     for (int k = 0; k < n; k++) {
-        int32_t old = slot[k];                  // one PSRAM read (L2 cached)
-        int32_t cur = mag[k];                   // in-SRAM read
-        bsum[k] = bsum[k] - old + cur;          // in-SRAM RMW
-        slot[k] = cur;                          // one PSRAM write (L2 writeback)
+        int32_t old = slot[k];             // one PSRAM read (L2 cached)
+        int32_t cur = mag[k];              // in-SRAM read
+        bsum[k]     = bsum[k] - old + cur; // in-SRAM RMW
+        slot[k]     = cur;                 // one PSRAM write (L2 writeback)
     }
 }
 
@@ -600,14 +600,14 @@ static inline void ema_step_inner(int32_t * __restrict__ bsum,
 // base 73 → 99 µs and was reverted).
 static FBT_HOT void update_baseline_ema(fft_burst_tagger_t *t)
 {
-    if (t->n_bursts > 0) return;     // burst active → freeze EMA
+    if (t->n_bursts > 0) return; // burst active → freeze EMA
 
     int32_t *old_slot = HIST(t, t->history_index);
     ema_step_inner(t->baseline_sum, old_slot, t->magnitude_shifted, N);
 
     t->history_index++;
     if (t->history_index >= FBT_HISTORY_SIZE) {
-        t->history_index = 0;
+        t->history_index  = 0;
         t->history_primed = true;
     }
 }
@@ -634,9 +634,9 @@ static inline int16_t *fbt_buf_at(fft_burst_tagger_t *t, int idx)
 // post-advance value when it next reads t->d_index.
 static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
 {
-    int16_t *fb = fbt_buf_at(t, t->pipe_pending_idx);
+    int16_t *fb      = fbt_buf_at(t, t->pipe_pending_idx);
     uint64_t saved_d = t->d_index;
-    t->d_index = t->pipe_pending_d_index;
+    t->d_index       = t->pipe_pending_d_index;
 
     uint64_t t2 = FBT_NOW_US();
     compute_magnitude_shifted(t, fb);
@@ -652,7 +652,7 @@ static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
     } else {
         uint64_t d0 = FBT_NOW_US();
         update_bursts_internal(t);
-        t->staged_n_new  = create_new_bursts_internal(
+        t->staged_n_new = create_new_bursts_internal(
             t, t->staged_new, t->staged_max_new);
         t->staged_n_gone = delete_gone_bursts_internal(
             t, t->staged_gone, t->staged_max_gone);
@@ -668,16 +668,16 @@ static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
 }
 
 FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
-                            const int16_t *input,
-                            const int16_t *lookback,
-                            fbt_burst_t *out_new_bursts, int *n_new,
-                            fbt_burst_t *out_gone_bursts, int *n_gone)
+                                   const int16_t      *input,
+                                   const int16_t      *lookback,
+                                   fbt_burst_t *out_new_bursts, int *n_new,
+                                   fbt_burst_t *out_gone_bursts, int *n_gone)
 {
-    (void)lookback;     // reserved for future per-burst-cut step
+    (void)lookback; // reserved for future per-burst-cut step
 
-    int max_new  = (n_new  && out_new_bursts ) ? *n_new  : 0;
+    int max_new  = (n_new && out_new_bursts) ? *n_new : 0;
     int max_gone = (n_gone && out_gone_bursts) ? *n_gone : 0;
-    if (n_new)  *n_new  = 0;
+    if (n_new) *n_new = 0;
     if (n_gone) *n_gone = 0;
 
 #if defined(ESP_PLATFORM)
@@ -693,17 +693,19 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
         if (t->pipe_in_flight) {
             ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
             t->pipe_in_flight = false;
-            int n_new_out  = (t->staged_n_new  < max_new ) ? t->staged_n_new  : max_new;
-            int n_gone_out = (t->staged_n_gone < max_gone) ? t->staged_n_gone : max_gone;
-            for (int i = 0; i < n_new_out;  i++) out_new_bursts [i] = t->staged_new [i];
-            for (int i = 0; i < n_gone_out; i++) out_gone_bursts[i] = t->staged_gone[i];
-            if (n_new ) *n_new  = n_new_out;
+            int n_new_out     = (t->staged_n_new < max_new) ? t->staged_n_new : max_new;
+            int n_gone_out    = (t->staged_n_gone < max_gone) ? t->staged_n_gone : max_gone;
+            for (int i = 0; i < n_new_out; i++)
+                out_new_bursts[i] = t->staged_new[i];
+            for (int i = 0; i < n_gone_out; i++)
+                out_gone_bursts[i] = t->staged_gone[i];
+            if (n_new) *n_new = n_new_out;
             if (n_gone) *n_gone = n_gone_out;
         }
 
         // 2. Window+FFT this step into the buffer NOT held by helper.
-        int next_idx = 1 - t->pipe_active_idx;
-        int16_t *fb  = fbt_buf_at(t, next_idx);
+        int      next_idx = 1 - t->pipe_active_idx;
+        int16_t *fb       = fbt_buf_at(t, next_idx);
 
         uint64_t t0 = FBT_NOW_US();
         window_multiply(t, input, fb);
@@ -711,8 +713,8 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
         fft_sc16_2048(fb);
         uint64_t t2 = FBT_NOW_US();
         s_acc_wind_us += (t1 - t0);
-        s_acc_fft_us  += (t2 - t1);
-        s_acc_steps   += 1;
+        s_acc_fft_us += (t2 - t1);
+        s_acc_steps += 1;
 
         // 3. Snapshot pending state, ADVANCE d_index, then notify.
         //    Race-fix: t->d_index must be at its post-advance value
@@ -720,14 +722,14 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
         //    `saved_d = t->d_index; ...; t->d_index = saved_d` and
         //    would overwrite a post-notify advance).
         t->pipe_pending_idx     = next_idx;
-        t->pipe_pending_d_index = t->d_index;     // step N's value
+        t->pipe_pending_d_index = t->d_index; // step N's value
         t->staged_max_new       = max_new;
         t->staged_max_gone      = max_gone;
         s_pipe_state_t          = t;
         s_pipe_coord_task       = xTaskGetCurrentTaskHandle();
         t->pipe_active_idx      = next_idx;
         t->pipe_in_flight       = true;
-        t->d_index             += N;              // advance BEFORE notify
+        t->d_index += N; // advance BEFORE notify
         xTaskNotifyGive(s_pipe_helper_task);
 
         // Return value: was the step BEFORE this one "primed" enough
@@ -748,9 +750,9 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
     uint64_t t3 = FBT_NOW_US();
 
     s_acc_wind_us += (t1 - t0);
-    s_acc_fft_us  += (t2 - t1);
-    s_acc_mag_us  += (t3 - t2);
-    s_acc_steps   += 1;
+    s_acc_fft_us += (t2 - t1);
+    s_acc_mag_us += (t3 - t2);
+    s_acc_steps += 1;
 
     if (!t->history_primed) {
         uint64_t b0 = FBT_NOW_US();
@@ -762,12 +764,12 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 
     uint64_t d0 = FBT_NOW_US();
     update_bursts_internal(t);
-    int n_new_out  = create_new_bursts_internal(t, out_new_bursts, max_new);
-    int n_gone_out = delete_gone_bursts_internal(t, out_gone_bursts, max_gone);
-    uint64_t d1 = FBT_NOW_US();
+    int      n_new_out  = create_new_bursts_internal(t, out_new_bursts, max_new);
+    int      n_gone_out = delete_gone_bursts_internal(t, out_gone_bursts, max_gone);
+    uint64_t d1         = FBT_NOW_US();
     s_acc_detect_us += (d1 - d0);
 
-    if (n_new)  *n_new  = n_new_out;
+    if (n_new) *n_new = n_new_out;
     if (n_gone) *n_gone = n_gone_out;
 
     uint64_t b0 = FBT_NOW_US();
@@ -788,10 +790,10 @@ void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps)
         out[4] = s_acc_base_us;
     }
     if (steps) *steps = s_acc_steps;
-    s_acc_wind_us = 0;
-    s_acc_fft_us = 0;
-    s_acc_mag_us = 0;
+    s_acc_wind_us   = 0;
+    s_acc_fft_us    = 0;
+    s_acc_mag_us    = 0;
     s_acc_detect_us = 0;
-    s_acc_base_us = 0;
-    s_acc_steps = 0;
+    s_acc_base_us   = 0;
+    s_acc_steps     = 0;
 }

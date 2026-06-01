@@ -29,31 +29,32 @@
 #include "uw_correlator.h"
 
 #define MANIFEST_PATH "/tmp/host_direct_if/manifest.csv"
-#define BURST_DIR     "/tmp/host_direct_if"
-#define MAX_BURSTS    1024
-#define MAX_SAMPLES   65536          // 250 ksps * (1.6+16+...) ms headroom
+#define BURST_DIR "/tmp/host_direct_if"
+#define MAX_BURSTS 1024
+#define MAX_SAMPLES 65536 // 250 ksps * (1.6+16+...) ms headroom
 
 typedef struct {
-    int   idx;             // path-C enumeration order
-    int   gri_burst_id;    // gri's internal burst ID (from RAW "I:" field)
+    int    idx;          // path-C enumeration order
+    int    gri_burst_id; // gri's internal burst ID (from RAW "I:" field)
     double timestamp_ms;
-    long  abs_freq_hz;
-    long  freq_offset_hz;
-    int   n_samples_250k;
-    int   confidence_pct;
-    char  filename[64];
+    long   abs_freq_hz;
+    long   freq_offset_hz;
+    int    n_samples_250k;
+    int    confidence_pct;
+    char   filename[64];
 } manifest_entry_t;
 
-static int load_manifest(manifest_entry_t *entries, int max_n) {
+static int load_manifest(manifest_entry_t *entries, int max_n)
+{
     FILE *fh = fopen(MANIFEST_PATH, "r");
     if (!fh) {
         fprintf(stderr, "manifest missing: %s\n"
                         "  run: python3 tests/scripts/direct_if_dump.py\n",
-                        MANIFEST_PATH);
+                MANIFEST_PATH);
         return -1;
     }
     char line[512];
-    if (!fgets(line, sizeof(line), fh)) {       // header
+    if (!fgets(line, sizeof(line), fh)) { // header
         fclose(fh);
         return 0;
     }
@@ -73,17 +74,18 @@ static int load_manifest(manifest_entry_t *entries, int max_n) {
 
 // Load a cf32 (interleaved float32 IQ) and convert to int16 Q15.
 // Returns number of complex samples loaded; writes 2*n int16s.
-static int load_cf32_as_sc16(const char *path, int16_t *out, int max_complex) {
+static int load_cf32_as_sc16(const char *path, int16_t *out, int max_complex)
+{
     FILE *fh = fopen(path, "rb");
     if (!fh) return -1;
     fseek(fh, 0, SEEK_END);
     long bytes = ftell(fh);
     fseek(fh, 0, SEEK_SET);
-    int n_complex = (int)(bytes / 8);   // 2 * float32 = 8 bytes
+    int n_complex = (int)(bytes / 8); // 2 * float32 = 8 bytes
     if (n_complex > max_complex) n_complex = max_complex;
 
     static float buf[2 * MAX_SAMPLES];
-    size_t got = fread(buf, sizeof(float), 2 * n_complex, fh);
+    size_t       got = fread(buf, sizeof(float), 2 * n_complex, fh);
     fclose(fh);
     if ((int)got != 2 * n_complex) return -1;
 
@@ -95,18 +97,20 @@ static int load_cf32_as_sc16(const char *path, int16_t *out, int max_complex) {
     // differences between bursts the downstream chain depends on.
     for (int i = 0; i < 2 * n_complex; i++) {
         float v = buf[i] * 32768.0f;
-        if (v >  32767.0f) v =  32767.0f;
+        if (v > 32767.0f) v = 32767.0f;
         if (v < -32768.0f) v = -32768.0f;
         out[i] = (int16_t)lrintf(v);
     }
     return n_complex;
 }
 
-int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+int main(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
 
     static manifest_entry_t entries[MAX_BURSTS];
-    int n_entries = load_manifest(entries, MAX_BURSTS);
+    int                     n_entries = load_manifest(entries, MAX_BURSTS);
     if (n_entries < 0) return 2;
     if (n_entries == 0) {
         fprintf(stderr, "manifest empty\n");
@@ -132,16 +136,16 @@ int main(int argc, char **argv) {
     //
     // PRE_SAMPLES_RAW / DECIM = 4096 / 10 = 409.6 → preamble at iq250[250]
     // → forced burst_start = 200 places preamble at adj_burst[50].
-    const int PRE_SAMPLES_BB = 200;
-    const char *bypass_env = getenv("CFO_BYPASS_D13");
-    int bypass_d13 = !(bypass_env && bypass_env[0] == '0');   // default ON
+    const int   PRE_SAMPLES_BB = 200;
+    const char *bypass_env     = getenv("CFO_BYPASS_D13");
+    int         bypass_d13     = !(bypass_env && bypass_env[0] == '0'); // default ON
 
     // For stagewise gr-iridium comparison: when set, dump per-stage
     // cf32 signals to /tmp/host_signals/ for this one path-C burst.
     // Example: DUMP_BURST_IDX=0 reproduces gr-iridium's --debug-id 30
     // (the first decoded burst at timestamp 418 ms).
-    const char *dump_env = getenv("DUMP_BURST_IDX");
-    int dump_burst_idx = dump_env ? atoi(dump_env) : -1;
+    const char *dump_env       = getenv("DUMP_BURST_IDX");
+    int         dump_burst_idx = dump_env ? atoi(dump_env) : -1;
 
     printf("path-C direct-IF host test: %d gr-iridium-tagged bursts\n",
            n_entries);
@@ -154,12 +158,12 @@ int main(int argc, char **argv) {
            "uw", "snr", "omega", "result");
     printf("--------------------------------------------------------------------------------------\n");
 
-    int decoded = 0, pipeline_ok = 0, uw_found = 0;
+    int            decoded = 0, pipeline_ok = 0, uw_found = 0;
     static int16_t iq250[2 * MAX_SAMPLES];
 
     for (int i = 0; i < n_entries; i++) {
         manifest_entry_t *e = &entries[i];
-        char path[256];
+        char              path[256];
         snprintf(path, sizeof(path), "%s/%s", BURST_DIR, e->filename);
         int n_complex = load_cf32_as_sc16(path, iq250, MAX_SAMPLES);
         if (n_complex < 0) {
@@ -182,8 +186,8 @@ int main(int argc, char **argv) {
         if (have_uw) uw_found++;
         if (res.demod_ok) {
             decoded++;
-            const char *dir = (res.frame.direction == DIR_DOWNLINK) ? "DL" :
-                              (res.frame.direction == DIR_UPLINK)   ? "UL" : "??";
+            const char *dir = (res.frame.direction == DIR_DOWNLINK) ? "DL" : (res.frame.direction == DIR_UPLINK) ? "UL"
+                                                                                                                 : "??";
             printf("%4d %5d %10.4f %12ld %8ld %7d %5d %4d %5.1f %+6.3f DECODED-%s (%d bits)\n",
                    e->idx, e->gri_burst_id, e->timestamp_ms,
                    e->abs_freq_hz, e->freq_offset_hz,
@@ -191,10 +195,10 @@ int main(int argc, char **argv) {
                    res.uw_res.snr_estimate_db, res.omega_coarse,
                    dir, res.frame.n_bits);
             free(res.frame.bits);
-            free(res.frame.soft_bits);   // #112
+            free(res.frame.soft_bits); // #112
         } else {
             const char *why = !ok ? "TOO-SHORT"
-                              : (!have_uw ? "no-UW" : "no-demod");
+                                  : (!have_uw ? "no-UW" : "no-demod");
             printf("%4d %5d %10.4f %12ld %8ld %7d %5d %4d %5.1f %+6.3f %s\n",
                    e->idx, e->gri_burst_id, e->timestamp_ms,
                    e->abs_freq_hz, e->freq_offset_hz,

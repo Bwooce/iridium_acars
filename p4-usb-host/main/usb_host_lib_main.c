@@ -89,9 +89,9 @@ void host_lib_daemon_task(void *arg)
     // re-evaluates attach, which recovers most stuck states without a physical
     // unplug.
     usb_host_config_t host_config = {
-        .skip_phy_setup = false,
+        .skip_phy_setup      = false,
         .root_port_unpowered = true,
-        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+        .intr_flags          = ESP_INTR_FLAG_LEVEL1,
     };
     ESP_ERROR_CHECK(usb_host_install(&host_config));
     ESP_LOGI(TAG, "USB Host Library installed; powering root port ON");
@@ -106,13 +106,12 @@ void host_lib_daemon_task(void *arg)
     xSemaphoreGive(signaling_sem);
     vTaskDelay(10); // Short delay to let client task spin up
 
-    bool has_clients = true;
-    bool has_devices = true;
+    bool    has_clients   = true;
+    bool    has_devices   = true;
     int64_t last_idle_log = esp_timer_get_time();
-    while (has_clients || has_devices)
-    {
-        uint32_t event_flags = 0;
-        esp_err_t r = usb_host_lib_handle_events(pdMS_TO_TICKS(2000), &event_flags);
+    while (has_clients || has_devices) {
+        uint32_t  event_flags = 0;
+        esp_err_t r           = usb_host_lib_handle_events(pdMS_TO_TICKS(2000), &event_flags);
         if (r != ESP_OK && r != ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "usb_host_lib_handle_events returned 0x%x (%s)", r, esp_err_to_name(r));
         }
@@ -124,12 +123,10 @@ void host_lib_daemon_task(void *arg)
             ESP_LOGI(TAG, "Host lib idle (no NEW_DEV yet — check D+/D- polarity on Picoblade pigtail, VBUS at device)");
             last_idle_log = now;
         }
-        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
-        {
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
             has_clients = false;
         }
-        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE)
-        {
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
             has_devices = false;
         }
     }
@@ -151,23 +148,51 @@ void app_main(void)
     // line — distinguishes brownout (RST_BROWNOUT) from USB-CDC line-
     // state reset (RST_EXT or RST_USB) from a silent abort.
     {
-        esp_reset_reason_t r = esp_reset_reason();
-        const char *name = "?";
+        esp_reset_reason_t r    = esp_reset_reason();
+        const char        *name = "?";
         switch (r) {
-            case ESP_RST_POWERON:  name = "POWERON";        break;
-            case ESP_RST_EXT:      name = "EXT";            break;
-            case ESP_RST_SW:       name = "SW";             break;
-            case ESP_RST_PANIC:    name = "PANIC";          break;
-            case ESP_RST_INT_WDT:  name = "INT_WDT";        break;
-            case ESP_RST_TASK_WDT: name = "TASK_WDT";       break;
-            case ESP_RST_WDT:      name = "OTHER_WDT";      break;
-            case ESP_RST_DEEPSLEEP:name = "DEEPSLEEP";      break;
-            case ESP_RST_BROWNOUT: name = "BROWNOUT";       break;
-            case ESP_RST_SDIO:     name = "SDIO";           break;
-            case ESP_RST_USB:      name = "USB";            break;
-            case ESP_RST_JTAG:     name = "JTAG";           break;
-            case ESP_RST_UNKNOWN:  name = "UNKNOWN";        break;
-            default:               name = "(other)";        break;
+        case ESP_RST_POWERON:
+            name = "POWERON";
+            break;
+        case ESP_RST_EXT:
+            name = "EXT";
+            break;
+        case ESP_RST_SW:
+            name = "SW";
+            break;
+        case ESP_RST_PANIC:
+            name = "PANIC";
+            break;
+        case ESP_RST_INT_WDT:
+            name = "INT_WDT";
+            break;
+        case ESP_RST_TASK_WDT:
+            name = "TASK_WDT";
+            break;
+        case ESP_RST_WDT:
+            name = "OTHER_WDT";
+            break;
+        case ESP_RST_DEEPSLEEP:
+            name = "DEEPSLEEP";
+            break;
+        case ESP_RST_BROWNOUT:
+            name = "BROWNOUT";
+            break;
+        case ESP_RST_SDIO:
+            name = "SDIO";
+            break;
+        case ESP_RST_USB:
+            name = "USB";
+            break;
+        case ESP_RST_JTAG:
+            name = "JTAG";
+            break;
+        case ESP_RST_UNKNOWN:
+            name = "UNKNOWN";
+            break;
+        default:
+            name = "(other)";
+            break;
         }
         ESP_LOGW("BOOT", "reset reason: %s (%d)", name, (int)r);
     }
@@ -259,8 +284,7 @@ void app_main(void)
     vTaskDelay(10); // Add a short delay to let the tasks run
 
     // Wait for the tasks to complete
-    for (int i = 0; i < 2; i++)
-    {
+    for (int i = 0; i < 2; i++) {
         xSemaphoreTake(signaling_sem, portMAX_DELAY);
     }
 

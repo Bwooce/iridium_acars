@@ -7,17 +7,17 @@
 // DA frames use the ACCH BCH(31,21) polynomial (poly=3545, 12-bit
 // syndrome), NOT the ringalert poly=1207. See iridium-toolkit/
 // bitsparser.py:IridiumLCWECCMessage line 1294: `self.poly=acch_bch_poly`.
-#define ACCH_BCH_POLY  3545u
+#define ACCH_BCH_POLY 3545u
 
-#define UW_BITS         24
-#define LCW_BITS        46
+#define UW_BITS 24
+#define LCW_BITS 46
 #define DATA_BITS_TOTAL 312
-#define CHUNK_124       124
-#define END_64           64
-#define BCH_CW_BITS      31
+#define CHUNK_124 124
+#define END_64 64
+#define BCH_CW_BITS 31
 // ACCH BCH(31,20): 20 message bits + 11 ECC bits per codeword.
 // (NOT BCH(31,21) — that's the ringalert variant for IBC frames.)
-#define BCH_MSG_BITS     20
+#define BCH_MSG_BITS 20
 
 // CRC-16/CCITT-FALSE (a.k.a. CRC-16/IBM-3740):
 //   poly = 0x1021, init = 0xFFFF, refin = false, refout = false, xorout = 0.
@@ -30,7 +30,7 @@ static uint16_t crc16_ccitt_false(const uint8_t *data, size_t n_bytes)
         crc ^= (uint16_t)data[i] << 8;
         for (int b = 0; b < 8; b++) {
             crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u)
-                                   : (uint16_t)(crc << 1);
+                                  : (uint16_t)(crc << 1);
         }
     }
     return crc;
@@ -43,8 +43,8 @@ static uint16_t crc16_ccitt_false(const uint8_t *data, size_t n_bytes)
 static void pair_swap(uint8_t *bits, size_t n)
 {
     for (size_t i = 0; i + 1 < n; i += 2) {
-        uint8_t t = bits[i];
-        bits[i]   = bits[i + 1];
+        uint8_t t   = bits[i];
+        bits[i]     = bits[i + 1];
         bits[i + 1] = t;
     }
 }
@@ -56,7 +56,7 @@ static void pair_swap(uint8_t *bits, size_t n)
 static void de_interleave(const uint8_t *in, int n_in,
                           uint8_t *odd_out, uint8_t *even_out)
 {
-    int n_sym = n_in / 2;
+    int n_sym    = n_in / 2;
     int even_idx = 0, odd_idx = 0;
     for (int s = n_sym - 1; s >= 0; s -= 2) {
         odd_out[odd_idx++] = in[2 * s + 1] & 1;
@@ -89,10 +89,10 @@ static void chunk_124_to_codewords(const uint8_t *chunk, uint8_t *out_codewords)
     //   b2 = cat[31..61]
     //   b3 = cat[62..92]
     //   b4 = cat[93..123]
-    memcpy(out_codewords + 0 * 31, cat + 93, 31);   // b4
-    memcpy(out_codewords + 1 * 31, cat + 31, 31);   // b2
-    memcpy(out_codewords + 2 * 31, cat + 62, 31);   // b3
-    memcpy(out_codewords + 3 * 31, cat +  0, 31);   // b1
+    memcpy(out_codewords + 0 * 31, cat + 93, 31); // b4
+    memcpy(out_codewords + 1 * 31, cat + 31, 31); // b2
+    memcpy(out_codewords + 2 * 31, cat + 62, 31); // b3
+    memcpy(out_codewords + 3 * 31, cat + 0, 31);  // b1
 }
 
 // 64-bit tail → 2 BCH(31,21) codewords. IridiumDAMessage logic:
@@ -102,8 +102,8 @@ static void tail_64_to_codewords(const uint8_t *tail, uint8_t *out_codewords)
 {
     uint8_t b1[32], b2[32];
     de_interleave(tail, END_64, b1, b2);
-    memcpy(out_codewords + 0 * 31, b2 + 1, 31);     // b2[1:]
-    memcpy(out_codewords + 1 * 31, b1 + 1, 31);     // b1[1:]
+    memcpy(out_codewords + 0 * 31, b2 + 1, 31); // b2[1:]
+    memcpy(out_codewords + 1 * 31, b1 + 1, 31); // b1[1:]
 }
 
 int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
@@ -125,9 +125,9 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
 
     // Build all 10 31-bit codewords.
     uint8_t codewords[10 * 31];
-    chunk_124_to_codewords(data + 0,                 codewords + 0 * 4 * 31);
-    chunk_124_to_codewords(data + CHUNK_124,         codewords + 1 * 4 * 31);
-    tail_64_to_codewords  (data + 2 * CHUNK_124,     codewords + 2 * 4 * 31);
+    chunk_124_to_codewords(data + 0, codewords + 0 * 4 * 31);
+    chunk_124_to_codewords(data + CHUNK_124, codewords + 1 * 4 * 31);
+    tail_64_to_codewords(data + 2 * CHUNK_124, codewords + 2 * 4 * 31);
 
     // BCH-decode each codeword using the ACCH poly with up to 2-bit ECC
     // repair (matches upstream bch_repair() / nrepair2 syndrome table
@@ -150,22 +150,22 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
         out->total_errors += errs;
     }
     out->n_bits = (uint16_t)bit_pos;
-    out->ok = (out->blocks_ok == out->n_blocks);
+    out->ok     = (out->blocks_ok == out->n_blocks);
 
     // Parse the 20-bit header per bitsparser.py:IridiumDAMessage.
     // Need at least 196 bits (9*20+16) for header + payload + CRC.
     if (bit_pos < 196) {
-        return 0;   // BCH ok but not enough decoded data — leave header fields zero
+        return 0; // BCH ok but not enough decoded data — leave header fields zero
     }
     const uint8_t *b = out->bits;
-    // Helper: pack n bits MSB-first from b[off..off+n-1]
-    #define PACKBITS_N(off, n) ({                                    \
-        uint32_t _v = 0;                                             \
-        for (int _k = 0; _k < (int)(n); _k++) {                      \
-            _v = (_v << 1) | (b[(off) + _k] & 1);                    \
-        }                                                            \
-        _v;                                                          \
-    })
+// Helper: pack n bits MSB-first from b[off..off+n-1]
+#define PACKBITS_N(off, n) ({                 \
+    uint32_t _v = 0;                          \
+    for (int _k = 0; _k < (int)(n); _k++) {   \
+        _v = (_v << 1) | (b[(off) + _k] & 1); \
+    }                                         \
+    _v;                                       \
+})
     out->da_flags1 = (uint8_t)PACKBITS_N(0, 4);
     out->da_cont   = (uint8_t)PACKBITS_N(4, 1);
     out->da_ctr    = (uint8_t)PACKBITS_N(5, 3);
@@ -180,8 +180,8 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
     // da_len == 0 the payload spans bits[20..end] = up to 23 bytes
     // for our 210-bit bitstream_bch (bits[20:220] truncates to 210).
     int payload_bits = (out->da_len > 0)
-                       ? 9 * 20 - 20         // 160 bits = 20 bytes
-                       : (bit_pos - 20);      // up to ~190 bits = 23 bytes
+                           ? 9 * 20 - 20     // 160 bits = 20 bytes
+                           : (bit_pos - 20); // up to ~190 bits = 23 bytes
     if (payload_bits < 0) payload_bits = 0;
     int max_len = payload_bits / 8;
     if (max_len > 24) max_len = 24;
@@ -215,16 +215,16 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
         // Bits 20..31 of crc_buf = 12 zeros (already 0 from memset).
         // Bits 32..207 = out->bits[20..195] (176 bits).
         for (int b = 0; b < 176; b++) {
-            int src = 20 + b;
-            int dst = 32 + b;
+            int src    = 20 + b;
+            int dst    = 32 + b;
             int byte_i = dst / 8;
             int bit_i  = 7 - (dst % 8);
             if (out->bits[src]) crc_buf[byte_i] |= 1 << bit_i;
         }
         out->da_crc_computed = crc16_ccitt_false(crc_buf, 26);
-        out->crc_ok = (out->da_len > 0) && (out->da_crc_computed == 0);
+        out->crc_ok          = (out->da_len > 0) && (out->da_crc_computed == 0);
     }
-    #undef PACKBITS_N
+#undef PACKBITS_N
 
     return 0;
 }

@@ -24,9 +24,9 @@
 #include <stdint.h>
 #include "firmr_s16.h"
 
-#define RS25_INTERP        125
-#define RS25_DECIM         128
-#define RS25_DELAY_SIZE    9
+#define RS25_INTERP 125
+#define RS25_DECIM 128
+#define RS25_DELAY_SIZE 9
 
 // Caller-allocated batch_scratch capacity for _process_explicit.
 // 8 complex pairs = 32 bytes = half a cache line — enough to
@@ -34,7 +34,7 @@
 #define RS25_BATCH_COMPLEX 8
 
 typedef struct {
-    int16_t     coeffs[RS25_DELAY_SIZE * RS25_INTERP];   // legacy layout (used by firmr_s16 host comparison)
+    int16_t coeffs[RS25_DELAY_SIZE * RS25_INTERP]; // legacy layout (used by firmr_s16 host comparison)
     // Circular delay buffers with double-mirror layout (task #58).
     // The 16-slot logical ring is stored as 32 int16 — slots
     // [0..15] are the live ring, slots [16..31] mirror the same
@@ -50,9 +50,9 @@ typedef struct {
     // accounting that justifies it.
     int16_t     delay_i[32] __attribute__((aligned(16)));
     int16_t     delay_q[32] __attribute__((aligned(16)));
-    int         start_pos;     // phase counter (shared by I/Q)
-    int         wpos;          // circular write index in [0..15]
-    firmr_s16_t fir_i;         // retained for host comparison build only
+    int         start_pos; // phase counter (shared by I/Q)
+    int         wpos;      // circular write index in [0..15]
+    firmr_s16_t fir_i;     // retained for host comparison build only
     firmr_s16_t fir_q;
 } resample_256_to_250_t;
 
@@ -77,8 +77,8 @@ void resample_256_to_250_init(resample_256_to_250_t *r);
 // Caller must size `out` for at least n_in (a generous upper bound;
 // trim using the returned count).
 int resample_256_to_250_process(resample_256_to_250_t *r,
-                                 const int16_t *in_iq, int n_in_complex,
-                                 int16_t *out_iq);
+                                const int16_t *in_iq, int n_in_complex,
+                                int16_t *out_iq);
 
 // Caller-managed-state variant of _process. The polyphase delay
 // line uses the double-mirror layout described in
@@ -101,17 +101,17 @@ int resample_256_to_250_process(resample_256_to_250_t *r,
 // (internal-SRAM stack) was ~525 µs of the ~3.7 ms resample cost
 // (2026-05-24 profile).
 int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *delay_q,
-                                          int *wpos_io,
-                                          int *start_pos_io,
-                                          const int16_t *in_iq, int n_in_complex,
-                                          int16_t *out_iq, int max_out,
-                                          int16_t *batch_scratch);
+                                         int           *wpos_io,
+                                         int           *start_pos_io,
+                                         const int16_t *in_iq, int n_in_complex,
+                                         int16_t *out_iq, int max_out,
+                                         int16_t *batch_scratch);
 
 // "Advance only" — process inputs but do NOT emit outputs. Used to
 // pre-position Worker B's (delay_line, wpos, start_pos) to the
 // chunk's midpoint before it starts its MAC slice. Same state
 // evolution as _process_explicit, just no per-output MAC work.
 void resample_256_to_250_advance(int16_t *delay_i, int16_t *delay_q,
-                                  int *wpos_io,
-                                  int *start_pos_io,
-                                  const int16_t *in_iq, int n_in_complex);
+                                 int           *wpos_io,
+                                 int           *start_pos_io,
+                                 const int16_t *in_iq, int n_in_complex);

@@ -17,16 +17,43 @@
 
 static int passed = 0, failed = 0;
 
-#define CHECK(cond, fmt, ...) do {                                        \
-    if (!(cond)) {                                                        \
-        printf("  FAIL line %d: " fmt "\n", __LINE__, ##__VA_ARGS__);     \
-        failed++; return;                                                 \
-    } else { passed++; }                                                  \
-} while (0)
+#define CHECK(cond, fmt, ...)                                             \
+    do {                                                                  \
+        if (!(cond)) {                                                    \
+            printf("  FAIL line %d: " fmt "\n", __LINE__, ##__VA_ARGS__); \
+            failed++;                                                     \
+            return;                                                       \
+        } else {                                                          \
+            passed++;                                                     \
+        }                                                                 \
+    } while (0)
 
 #define UW_LEN 24
 static const uint8_t UW_DL_BITS[UW_LEN] = {
-    0,0, 1,1, 0,0, 0,0, 0,0, 1,1, 0,0, 0,0, 1,1, 1,1, 0,0, 1,1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
 };
 
 // Helper: pair-swap len bytes in-place (the inverse of what the
@@ -35,8 +62,8 @@ static const uint8_t UW_DL_BITS[UW_LEN] = {
 static void pair_swap(uint8_t *bits, size_t len)
 {
     for (size_t i = 0; i + 1 < len; i += 2) {
-        uint8_t t = bits[i];
-        bits[i]   = bits[i + 1];
+        uint8_t t   = bits[i];
+        bits[i]     = bits[i + 1];
         bits[i + 1] = t;
     }
 }
@@ -44,13 +71,23 @@ static void pair_swap(uint8_t *bits, size_t len)
 // BCH-encode a k-bit message into a (k + poly_len-1)-bit codeword in
 // the supplied output buffer. Same shift-and-XOR encoder as
 // test_iridium_bch.c.
-static int u32_bit_length(uint32_t x) { int n = 0; while (x) { n++; x >>= 1; } return n; }
+static int u32_bit_length(uint32_t x)
+{
+    int n = 0;
+    while (x) {
+        n++;
+        x >>= 1;
+    }
+    return n;
+}
 static void bch_encode(uint32_t poly, const uint8_t *msg, int k, uint8_t *out)
 {
     int poly_len = u32_bit_length(poly);
-    int n = k + poly_len - 1;
-    for (int i = 0; i < k; i++) out[i] = msg[i] & 1;
-    for (int i = k; i < n; i++) out[i] = 0;
+    int n        = k + poly_len - 1;
+    for (int i = 0; i < k; i++)
+        out[i] = msg[i] & 1;
+    for (int i = k; i < n; i++)
+        out[i] = 0;
     uint32_t r = iridium_bch_ndivide(poly, out, n);
     for (int i = 0; i < poly_len - 1; i++) {
         out[k + i] = (uint8_t)((r >> (poly_len - 2 - i)) & 1);
@@ -87,9 +124,9 @@ static void test_synthetic_bc(void)
     pair_swap(payload, sizeof(payload));
     memcpy(bits + UW_LEN, payload, sizeof(payload));
 
-    iridium_frame_t f = { 0 };
-    int rc = iridium_frame_classify(bits, sizeof(bits),
-                                    IR_FRM_DIR_DOWNLINK, &f);
+    iridium_frame_t f  = {0};
+    int             rc = iridium_frame_classify(bits, sizeof(bits),
+                                                IR_FRM_DIR_DOWNLINK, &f);
     CHECK(rc == 0, "rc=%d", rc);
     CHECK(f.type == IR_FRAME_BC, "type=%s (expected BC)",
           iridium_frame_type_name(f.type));
@@ -103,27 +140,34 @@ static void test_synthetic_lw_da(void)
     printf("Test: synthetic LW with ft=2 (DA / SBD) -> IR_FRAME_LW + IR_LW_DA\n");
 
     // Build the THREE LCW codewords first (in upstream's orientation).
-    uint8_t lcw1_msg[3] = { 0, 1, 0 };       // ft=2 (= 010 binary)
-    uint8_t lcw2_msg[6] = { 0, 1, 0, 1, 0, 1 };  // arbitrary 6-bit
-    uint8_t lcw3_msg[21] = { 0 };             // arbitrary 21-bit
-    for (int i = 0; i < 21; i++) lcw3_msg[i] = (uint8_t)((i * 5 + 1) & 1);
+    uint8_t lcw1_msg[3]  = {0, 1, 0};          // ft=2 (= 010 binary)
+    uint8_t lcw2_msg[6]  = {0, 1, 0, 1, 0, 1}; // arbitrary 6-bit
+    uint8_t lcw3_msg[21] = {0};                // arbitrary 21-bit
+    for (int i = 0; i < 21; i++)
+        lcw3_msg[i] = (uint8_t)((i * 5 + 1) & 1);
 
-    uint8_t lcw1_cw[7];   // 3 + 4 = 7 bits, poly=29 (5-bit)
-    uint8_t lcw2_cw[14];  // 6 + 8 = 14 bits, poly=465 (9-bit)
-    uint8_t lcw3_cw[26];  // 21 + 5 = 26 bits, poly=41 (6-bit)
-    bch_encode(29u,  lcw1_msg, 3,  lcw1_cw);
-    bch_encode(465u, lcw2_msg, 6,  lcw2_cw);
-    bch_encode(41u,  lcw3_msg, 21, lcw3_cw);
+    uint8_t lcw1_cw[7];  // 3 + 4 = 7 bits, poly=29 (5-bit)
+    uint8_t lcw2_cw[14]; // 6 + 8 = 14 bits, poly=465 (9-bit)
+    uint8_t lcw3_cw[26]; // 21 + 5 = 26 bits, poly=41 (6-bit)
+    bch_encode(29u, lcw1_msg, 3, lcw1_cw);
+    bch_encode(465u, lcw2_msg, 6, lcw2_cw);
+    bch_encode(41u, lcw3_msg, 21, lcw3_cw);
 
     // Verify they divide cleanly (sanity).
-    if (iridium_bch_ndivide(29u,   lcw1_cw, 7)  != 0) {
-        printf("  FAIL: encoded lcw1 doesn't divide poly=29\n"); failed++; return;
+    if (iridium_bch_ndivide(29u, lcw1_cw, 7) != 0) {
+        printf("  FAIL: encoded lcw1 doesn't divide poly=29\n");
+        failed++;
+        return;
     }
-    if (iridium_bch_ndivide(465u,  lcw2_cw, 14) != 0) {
-        printf("  FAIL: encoded lcw2 doesn't divide poly=465\n"); failed++; return;
+    if (iridium_bch_ndivide(465u, lcw2_cw, 14) != 0) {
+        printf("  FAIL: encoded lcw2 doesn't divide poly=465\n");
+        failed++;
+        return;
     }
-    if (iridium_bch_ndivide(41u,   lcw3_cw, 26) != 0) {
-        printf("  FAIL: encoded lcw3 doesn't divide poly=41\n"); failed++; return;
+    if (iridium_bch_ndivide(41u, lcw3_cw, 26) != 0) {
+        printf("  FAIL: encoded lcw3 doesn't divide poly=41\n");
+        failed++;
+        return;
     }
 
     // Place them into a 46-element 'permuted' array per the upstream
@@ -131,9 +175,9 @@ static void test_synthetic_lw_da(void)
     //   permuted[0..6]   = lcw1
     //   permuted[7..19]  = lcw2 first 13 bits  (pad bit at 13 dropped)
     //   permuted[20..45] = lcw3
-    uint8_t permuted[46] = { 0 };
-    memcpy(permuted +  0, lcw1_cw, 7);
-    memcpy(permuted +  7, lcw2_cw, 13);   // 13 of 14 — drop the trailing pad
+    uint8_t permuted[46] = {0};
+    memcpy(permuted + 0, lcw1_cw, 7);
+    memcpy(permuted + 7, lcw2_cw, 13); // 13 of 14 — drop the trailing pad
     memcpy(permuted + 20, lcw3_cw, 26);
 
     // Apply the inverse of the classifier's permutation. Forward map:
@@ -141,11 +185,54 @@ static void test_synthetic_lw_da(void)
     // Inverse:
     //   data[LCW_TBL[i]] = permuted[i]
     static const uint8_t LCW_TBL[46] = {
-        39, 38, 35, 34, 31, 30, 27, 26, 23, 22, 19, 18, 15, 14, 11, 10,  7,  6,  3,  2,
-        40, 37, 36, 33, 32, 29, 28, 25, 24, 21, 20, 17, 16, 13, 12,  9,  8,  5,  4,  1,
-         0, 45, 44, 43, 42, 41,
+        39,
+        38,
+        35,
+        34,
+        31,
+        30,
+        27,
+        26,
+        23,
+        22,
+        19,
+        18,
+        15,
+        14,
+        11,
+        10,
+        7,
+        6,
+        3,
+        2,
+        40,
+        37,
+        36,
+        33,
+        32,
+        29,
+        28,
+        25,
+        24,
+        21,
+        20,
+        17,
+        16,
+        13,
+        12,
+        9,
+        8,
+        5,
+        4,
+        1,
+        0,
+        45,
+        44,
+        43,
+        42,
+        41,
     };
-    uint8_t payload[46] = { 0 };
+    uint8_t payload[46] = {0};
     for (int i = 0; i < 46; i++) {
         payload[LCW_TBL[i]] = permuted[i];
     }
@@ -153,14 +240,14 @@ static void test_synthetic_lw_da(void)
     // Pair-swap so the classifier's internal swap recovers our payload.
     pair_swap(payload, sizeof(payload));
 
-    uint8_t bits[UW_LEN + 46 + 32];   // extra tail = required min size
-    memcpy(bits,                UW_DL_BITS, UW_LEN);
-    memcpy(bits + UW_LEN,       payload,    46);
-    memset(bits + UW_LEN + 46,  0,          32);   // post-LCW tail
+    uint8_t bits[UW_LEN + 46 + 32]; // extra tail = required min size
+    memcpy(bits, UW_DL_BITS, UW_LEN);
+    memcpy(bits + UW_LEN, payload, 46);
+    memset(bits + UW_LEN + 46, 0, 32); // post-LCW tail
 
-    iridium_frame_t f = { 0 };
-    int rc = iridium_frame_classify(bits, sizeof(bits),
-                                    IR_FRM_DIR_DOWNLINK, &f);
+    iridium_frame_t f  = {0};
+    int             rc = iridium_frame_classify(bits, sizeof(bits),
+                                                IR_FRM_DIR_DOWNLINK, &f);
     CHECK(rc == 0, "rc=%d", rc);
     CHECK(f.type == IR_FRAME_LW, "type=%s (expected LW)",
           iridium_frame_type_name(f.type));
@@ -172,38 +259,83 @@ static void test_synthetic_lw_da(void)
 static void test_synthetic_lw_sy(void)
 {
     printf("Test: synthetic LW with ft=7 (SY / sync) -> IR_LW_SY\n");
-    uint8_t lcw1_msg[3] = { 1, 1, 1 };       // ft=7 (= 111 binary)
-    uint8_t lcw2_msg[6] = { 0, 1, 0, 1, 0, 1 };
-    uint8_t lcw3_msg[21] = { 0 };
-    for (int i = 0; i < 21; i++) lcw3_msg[i] = (uint8_t)((i * 5 + 1) & 1);
+    uint8_t lcw1_msg[3]  = {1, 1, 1}; // ft=7 (= 111 binary)
+    uint8_t lcw2_msg[6]  = {0, 1, 0, 1, 0, 1};
+    uint8_t lcw3_msg[21] = {0};
+    for (int i = 0; i < 21; i++)
+        lcw3_msg[i] = (uint8_t)((i * 5 + 1) & 1);
 
     uint8_t lcw1_cw[7], lcw2_cw[14], lcw3_cw[26];
-    bch_encode(29u,  lcw1_msg, 3,  lcw1_cw);
-    bch_encode(465u, lcw2_msg, 6,  lcw2_cw);
-    bch_encode(41u,  lcw3_msg, 21, lcw3_cw);
+    bch_encode(29u, lcw1_msg, 3, lcw1_cw);
+    bch_encode(465u, lcw2_msg, 6, lcw2_cw);
+    bch_encode(41u, lcw3_msg, 21, lcw3_cw);
 
-    uint8_t permuted[46] = { 0 };
-    memcpy(permuted +  0, lcw1_cw, 7);
-    memcpy(permuted +  7, lcw2_cw, 13);
+    uint8_t permuted[46] = {0};
+    memcpy(permuted + 0, lcw1_cw, 7);
+    memcpy(permuted + 7, lcw2_cw, 13);
     memcpy(permuted + 20, lcw3_cw, 26);
 
     static const uint8_t LCW_TBL[46] = {
-        39, 38, 35, 34, 31, 30, 27, 26, 23, 22, 19, 18, 15, 14, 11, 10,  7,  6,  3,  2,
-        40, 37, 36, 33, 32, 29, 28, 25, 24, 21, 20, 17, 16, 13, 12,  9,  8,  5,  4,  1,
-         0, 45, 44, 43, 42, 41,
+        39,
+        38,
+        35,
+        34,
+        31,
+        30,
+        27,
+        26,
+        23,
+        22,
+        19,
+        18,
+        15,
+        14,
+        11,
+        10,
+        7,
+        6,
+        3,
+        2,
+        40,
+        37,
+        36,
+        33,
+        32,
+        29,
+        28,
+        25,
+        24,
+        21,
+        20,
+        17,
+        16,
+        13,
+        12,
+        9,
+        8,
+        5,
+        4,
+        1,
+        0,
+        45,
+        44,
+        43,
+        42,
+        41,
     };
-    uint8_t payload[46] = { 0 };
-    for (int i = 0; i < 46; i++) payload[LCW_TBL[i]] = permuted[i];
+    uint8_t payload[46] = {0};
+    for (int i = 0; i < 46; i++)
+        payload[LCW_TBL[i]] = permuted[i];
     pair_swap(payload, sizeof(payload));
 
     uint8_t bits[UW_LEN + 46 + 32];
-    memcpy(bits,                UW_DL_BITS, UW_LEN);
-    memcpy(bits + UW_LEN,       payload,    46);
-    memset(bits + UW_LEN + 46,  0,          32);
+    memcpy(bits, UW_DL_BITS, UW_LEN);
+    memcpy(bits + UW_LEN, payload, 46);
+    memset(bits + UW_LEN + 46, 0, 32);
 
-    iridium_frame_t f = { 0 };
-    int rc = iridium_frame_classify(bits, sizeof(bits),
-                                    IR_FRM_DIR_DOWNLINK, &f);
+    iridium_frame_t f  = {0};
+    int             rc = iridium_frame_classify(bits, sizeof(bits),
+                                                IR_FRM_DIR_DOWNLINK, &f);
     CHECK(rc == 0, "rc=%d", rc);
     CHECK(f.type == IR_FRAME_LW, "type=%s (expected LW)",
           iridium_frame_type_name(f.type));
@@ -215,42 +347,86 @@ static void test_synthetic_lw_sy(void)
 static void test_synthetic_lw_corrupted_lcw1(void)
 {
     printf("Test: LW frame with lcw1 corrupted -> not classified as LW\n");
-    uint8_t lcw1_msg[3] = { 0, 1, 0 };
-    uint8_t lcw2_msg[6] = { 0, 0, 0, 0, 0, 0 };
-    uint8_t lcw3_msg[21] = { 0 };
+    uint8_t lcw1_msg[3]  = {0, 1, 0};
+    uint8_t lcw2_msg[6]  = {0, 0, 0, 0, 0, 0};
+    uint8_t lcw3_msg[21] = {0};
 
     uint8_t lcw1_cw[7], lcw2_cw[14], lcw3_cw[26];
-    bch_encode(29u,  lcw1_msg, 3,  lcw1_cw);
-    bch_encode(465u, lcw2_msg, 6,  lcw2_cw);
-    bch_encode(41u,  lcw3_msg, 21, lcw3_cw);
+    bch_encode(29u, lcw1_msg, 3, lcw1_cw);
+    bch_encode(465u, lcw2_msg, 6, lcw2_cw);
+    bch_encode(41u, lcw3_msg, 21, lcw3_cw);
 
     // Flip 2 bits in lcw1 — beyond 1-bit-repair budget AND we use
     // strict ndivide (no repair) per upstream non-harder mode.
     lcw1_cw[1] ^= 1;
     lcw1_cw[5] ^= 1;
 
-    uint8_t permuted[46] = { 0 };
-    memcpy(permuted +  0, lcw1_cw, 7);
-    memcpy(permuted +  7, lcw2_cw, 13);
+    uint8_t permuted[46] = {0};
+    memcpy(permuted + 0, lcw1_cw, 7);
+    memcpy(permuted + 7, lcw2_cw, 13);
     memcpy(permuted + 20, lcw3_cw, 26);
 
     static const uint8_t LCW_TBL[46] = {
-        39, 38, 35, 34, 31, 30, 27, 26, 23, 22, 19, 18, 15, 14, 11, 10,  7,  6,  3,  2,
-        40, 37, 36, 33, 32, 29, 28, 25, 24, 21, 20, 17, 16, 13, 12,  9,  8,  5,  4,  1,
-         0, 45, 44, 43, 42, 41,
+        39,
+        38,
+        35,
+        34,
+        31,
+        30,
+        27,
+        26,
+        23,
+        22,
+        19,
+        18,
+        15,
+        14,
+        11,
+        10,
+        7,
+        6,
+        3,
+        2,
+        40,
+        37,
+        36,
+        33,
+        32,
+        29,
+        28,
+        25,
+        24,
+        21,
+        20,
+        17,
+        16,
+        13,
+        12,
+        9,
+        8,
+        5,
+        4,
+        1,
+        0,
+        45,
+        44,
+        43,
+        42,
+        41,
     };
-    uint8_t payload[46] = { 0 };
-    for (int i = 0; i < 46; i++) payload[LCW_TBL[i]] = permuted[i];
+    uint8_t payload[46] = {0};
+    for (int i = 0; i < 46; i++)
+        payload[LCW_TBL[i]] = permuted[i];
     pair_swap(payload, sizeof(payload));
 
     uint8_t bits[UW_LEN + 46 + 32];
-    memcpy(bits,                UW_DL_BITS, UW_LEN);
-    memcpy(bits + UW_LEN,       payload,    46);
-    memset(bits + UW_LEN + 46,  0,          32);
+    memcpy(bits, UW_DL_BITS, UW_LEN);
+    memcpy(bits + UW_LEN, payload, 46);
+    memset(bits + UW_LEN + 46, 0, 32);
 
-    iridium_frame_t f = { 0 };
-    int rc = iridium_frame_classify(bits, sizeof(bits),
-                                    IR_FRM_DIR_DOWNLINK, &f);
+    iridium_frame_t f  = {0};
+    int             rc = iridium_frame_classify(bits, sizeof(bits),
+                                                IR_FRM_DIR_DOWNLINK, &f);
     CHECK(rc == 0, "rc=%d", rc);
     CHECK(f.type != IR_FRAME_LW, "expected NOT LW, got %s",
           iridium_frame_type_name(f.type));

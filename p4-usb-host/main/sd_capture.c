@@ -1,7 +1,7 @@
 // Raw IQ capture to SD — see sd_capture.h for the architecture.
 
 #include "sd_capture.h"
-#include "sd_log.h"      // for sd_log_force_mount()
+#include "sd_log.h" // for sd_log_force_mount()
 
 #include <string.h>
 #include <stdio.h>
@@ -30,12 +30,12 @@ static const char *TAG = "SDCAP";
 //
 // Was 128 KB originally — only ~28 ms of buffering, which produced
 // worker_dropped tail noise in early capture runs.
-#define STREAM_BUFFER_BYTES   (4 * 1024 * 1024)
+#define STREAM_BUFFER_BYTES (4 * 1024 * 1024)
 
 // Trigger size on the stream buffer — the writer task wakes when at
 // least this many bytes are available. 4 KB = 8 SDMMC sectors,
 // matches typical FAT optimal write granularity.
-#define STREAM_BUFFER_TRIG     4096
+#define STREAM_BUFFER_TRIG 4096
 
 // Writer task params. Pinned to Core 1. Priority 5 = above
 // worker_core1 (3) so the writer can drain the PSRAM stream
@@ -44,8 +44,8 @@ static const char *TAG = "SDCAP";
 // semaphore, so the writer task is suspended and worker / ingest
 // keep running on their own. Below ingest (8) so USB ingest itself
 // is never preempted.
-#define WRITER_STACK            6144
-#define WRITER_PRIO             5
+#define WRITER_STACK 6144
+#define WRITER_PRIO 5
 
 // Per-receive scratch. Must be DMA-capable internal SRAM (SDMMC
 // driver can't DMA from PSRAM; SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF
@@ -59,13 +59,13 @@ static const char *TAG = "SDCAP";
 // the limit but workable. If the producer outruns the writer,
 // stream-buffer back-pressure drops bytes (bytes_dropped ticks
 // up) rather than losing whole bursts.
-#define WRITER_RECV_CHUNK       (8 * 1024)
+#define WRITER_RECV_CHUNK (8 * 1024)
 
 // FATFS FILE buffer size: 64 KB. Each fwrite to a buffered FILE
 // just memcpy's into here; the actual SDMMC write happens when
 // this fills. Large buffer = fewer SDMMC sector writes = lower
 // per-byte overhead.
-#define FILE_BUFFER_BYTES       (64 * 1024)
+#define FILE_BUFFER_BYTES (64 * 1024)
 
 typedef enum {
     CAP_STATE_IDLE = 0,
@@ -84,8 +84,8 @@ static sd_capture_stats_t   s_stats    = {0};
 // from worker_core1). The two modes share the writer task and
 // stream buffer; only one is producing at any time. Set by
 // sd_capture_start / sd_capture_start_bursts.
-static volatile bool s_burst_mode = false;
-static volatile uint32_t s_burst_seq = 0;
+static volatile bool     s_burst_mode = false;
+static volatile uint32_t s_burst_seq  = 0;
 
 static void update_bytes_written(size_t n)
 {
@@ -111,7 +111,7 @@ static void update_write_error(void)
     xSemaphoreGive(s_stats_mu);
 }
 
-static uint8_t *s_writer_buf = NULL;   // DMA-INT, alloc'd in action_start_stream
+static uint8_t *s_writer_buf = NULL; // DMA-INT, alloc'd in action_start_stream
 
 static void writer_task(void *arg)
 {
@@ -126,30 +126,30 @@ static void writer_task(void *arg)
     // continuously (card bus error / unrecoverable controller state),
     // we don't want a wall of warnings. One line per WARN_THROTTLE_NS
     // and one summary on transition back to success.
-    int64_t last_warn_us = 0;
+    int64_t  last_warn_us = 0;
     uint32_t warn_skipped = 0;
-    #define WARN_THROTTLE_US  500000   // half a second between warn lines
+#define WARN_THROTTLE_US 500000 // half a second between warn lines
 
-    // Hard cap on consecutive write failures — if SDMMC won't accept a
-    // write this many times in a row, the controller is wedged. Bail
-    // out of capture rather than burn CPU on a dead card. Operator can
-    // POST /sd/format + /capture/start to retry.
-    #define CONSEC_FAIL_LIMIT  64
+// Hard cap on consecutive write failures — if SDMMC won't accept a
+// write this many times in a row, the controller is wedged. Bail
+// out of capture rather than burn CPU on a dead card. Operator can
+// POST /sd/format + /capture/start to retry.
+#define CONSEC_FAIL_LIMIT 64
     uint32_t consec_fail = 0;
 
-    // Per-write sector alignment — every fwrite size MUST be a
-    // multiple of 512 (SD sector size). Without this, FATFS detects
-    // a partial-sector tail, advances the user buf by `tail` bytes,
-    // and hands the SDMMC driver a misaligned pointer (e.g.
-    // buf+472). SDMMC's `is_aligned` check fails, it falls back to
-    // allocate_dma_buf which fails under DMA-INT pressure with
-    // ESP_ERR_NO_MEM. We saw this as deterministic 165032-byte (then
-    // 900 KB at 20 MHz) cliffs followed by every subsequent write
-    // returning EIO. Holding the unaligned tail in `stash` and
-    // prepending it to the next read keeps every fwrite aligned and
-    // every user-buf-offset aligned.
-    #define SECTOR_BYTES  512
-    size_t stash_len = 0;          // bytes held over from previous read
+// Per-write sector alignment — every fwrite size MUST be a
+// multiple of 512 (SD sector size). Without this, FATFS detects
+// a partial-sector tail, advances the user buf by `tail` bytes,
+// and hands the SDMMC driver a misaligned pointer (e.g.
+// buf+472). SDMMC's `is_aligned` check fails, it falls back to
+// allocate_dma_buf which fails under DMA-INT pressure with
+// ESP_ERR_NO_MEM. We saw this as deterministic 165032-byte (then
+// 900 KB at 20 MHz) cliffs followed by every subsequent write
+// returning EIO. Holding the unaligned tail in `stash` and
+// prepending it to the next read keeps every fwrite aligned and
+// every user-buf-offset aligned.
+#define SECTOR_BYTES 512
+    size_t stash_len = 0; // bytes held over from previous read
 
     while (1) {
         uint8_t *buf = s_writer_buf;
@@ -164,15 +164,15 @@ static void writer_task(void *arg)
         // Drain whatever the producer queued, leaving room at the
         // front of `buf` for the previous iteration's unaligned tail.
         size_t n = xStreamBufferReceive(s_stream, buf + stash_len,
-                                         WRITER_RECV_CHUNK - stash_len,
-                                         pdMS_TO_TICKS(100));
+                                        WRITER_RECV_CHUNK - stash_len,
+                                        pdMS_TO_TICKS(100));
         // Combine stash + new data, then round down to a sector
         // multiple. The leftover bytes become the next iteration's
         // stash.
-        size_t total = stash_len + n;
-        size_t aligned = total & ~(SECTOR_BYTES - 1);
+        size_t total    = stash_len + n;
+        size_t aligned  = total & ~(SECTOR_BYTES - 1);
         size_t leftover = total - aligned;
-        n = aligned;
+        n               = aligned;
         if (n > 0 && s_fp) {
             // Single fwrite of the whole received chunk. We tried
             // chunking to 512 bytes with vTaskDelay(0) between
@@ -189,7 +189,7 @@ static void writer_task(void *arg)
                     ESP_LOGI(TAG, "fwrite recovered after %u failures "
                                   "(skipped %u warn lines)",
                              (unsigned)consec_fail, (unsigned)warn_skipped);
-                    consec_fail = 0;
+                    consec_fail  = 0;
                     warn_skipped = 0;
                 }
                 // Stop on target reached. Producer also gates on
@@ -223,7 +223,7 @@ static void writer_task(void *arg)
                                   "SDMMC controller likely wedged. Aborting "
                                   "capture; POST /sd/format and try again.",
                              (unsigned)consec_fail);
-                    s_state = CAP_STATE_STOPPING;
+                    s_state     = CAP_STATE_STOPPING;
                     consec_fail = 0;
                 }
             }
@@ -255,19 +255,21 @@ static void writer_task(void *arg)
             int drain_iters = 512;
             for (; drain_iters > 0; drain_iters--) {
                 size_t rest = xStreamBufferReceive(s_stream, buf + stash_len,
-                                                    WRITER_RECV_CHUNK - stash_len, 0);
+                                                   WRITER_RECV_CHUNK - stash_len, 0);
                 if (rest == 0 && stash_len == 0) break;
-                size_t total = stash_len + rest;
-                size_t aligned = total & ~(SECTOR_BYTES - 1);
+                size_t total    = stash_len + rest;
+                size_t aligned  = total & ~(SECTOR_BYTES - 1);
                 size_t leftover = total - aligned;
                 if (aligned > 0 && s_fp) {
                     size_t wr = fwrite(buf, 1, aligned, s_fp);
-                    if (wr == aligned) update_bytes_written(aligned);
-                    else               update_write_error();
+                    if (wr == aligned)
+                        update_bytes_written(aligned);
+                    else
+                        update_write_error();
                 }
                 if (leftover > 0) memmove(buf, buf + aligned, leftover);
                 stash_len = leftover;
-                if (rest == 0) break;   // nothing new and we just flushed
+                if (rest == 0) break; // nothing new and we just flushed
             }
             if (drain_iters == 0) {
                 ESP_LOGW(TAG, "drain hit iteration cap — discarding rest");
@@ -278,8 +280,10 @@ static void writer_task(void *arg)
             // is OK because the file is being closed immediately after.
             if (stash_len > 0 && s_fp) {
                 size_t wr = fwrite(buf, 1, stash_len, s_fp);
-                if (wr == stash_len) update_bytes_written(stash_len);
-                else                 update_write_error();
+                if (wr == stash_len)
+                    update_bytes_written(stash_len);
+                else
+                    update_write_error();
                 stash_len = 0;
             }
             if (s_fp) {
@@ -299,14 +303,14 @@ static void writer_task(void *arg)
             // also clears this, but writer-initiated stops don't go
             // through it.
             s_burst_mode = false;
-            s_state = CAP_STATE_IDLE;
+            s_state      = CAP_STATE_IDLE;
         }
     }
 }
 
 esp_err_t sd_capture_init(void)
 {
-    if (s_stats_mu) return ESP_OK;       // idempotent
+    if (s_stats_mu) return ESP_OK; // idempotent
 
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
@@ -322,7 +326,7 @@ esp_err_t sd_capture_init(void)
     // source. PSRAM source produces ENOSPC (the ALLOC_ALIGNED_BUF
     // host flag is SDIO-only and does not help SD card writes).
     s_writer_buf = heap_caps_aligned_alloc(64, WRITER_RECV_CHUNK,
-                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!s_writer_buf) {
         ESP_LOGE(TAG, "writer-buf %u-byte DMA-INT alloc failed (largest=%u)",
                  (unsigned)WRITER_RECV_CHUNK,
@@ -338,8 +342,8 @@ esp_err_t sd_capture_init(void)
     // tripping a tlsf double-free assert during sd_capture_stop.
     // 4 MB of PSRAM is rounding error on a 32 MB device.
     s_stream = xStreamBufferCreateWithCaps(STREAM_BUFFER_BYTES,
-                                            STREAM_BUFFER_TRIG,
-                                            MALLOC_CAP_SPIRAM);
+                                           STREAM_BUFFER_TRIG,
+                                           MALLOC_CAP_SPIRAM);
     if (!s_stream) {
         ESP_LOGE(TAG, "stream buffer alloc failed (need %u B PSRAM)",
                  (unsigned)STREAM_BUFFER_BYTES);
@@ -349,9 +353,9 @@ esp_err_t sd_capture_init(void)
     }
 
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(writer_task, "sd_capture",
-                                                     WRITER_STACK, NULL,
-                                                     WRITER_PRIO, NULL, 1,
-                                                     MALLOC_CAP_SPIRAM);
+                                                    WRITER_STACK, NULL,
+                                                    WRITER_PRIO, NULL, 1,
+                                                    MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "writer task create failed");
         heap_caps_free(s_writer_buf);
@@ -397,7 +401,7 @@ esp_err_t sd_capture_start(uint64_t target_bytes)
 
     // One file per capture session; same /sdcard/acars/ dir as the
     // ACARS log uses. .u8 extension hints at the raw uint8 IQ format.
-    char path[64];
+    char    path[64];
     int64_t t0 = esp_timer_get_time();
     snprintf(path, sizeof(path), "/sdcard/acars/iq-%lld.u8", (long long)t0);
 
@@ -467,7 +471,7 @@ esp_err_t sd_capture_stop(void)
     // reboot. 60 s is generous for any reasonable capture; the
     // drain loop itself has a 512-iter safety cap so it can't
     // hang here indefinitely.
-    for (int i = 0; i < 3000; i++) {        // 60 s @ 20 ms tick
+    for (int i = 0; i < 3000; i++) { // 60 s @ 20 ms tick
         if (s_state == CAP_STATE_IDLE) break;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -523,9 +527,9 @@ esp_err_t sd_capture_start_bursts(void)
     // iq-4188149994.u8 (first BRST at offset 4992).
     s_burst_mode = true;
     s_burst_seq  = 0;
-    esp_err_t r = sd_capture_start(0);
+    esp_err_t r  = sd_capture_start(0);
     if (r != ESP_OK) {
-        s_burst_mode = false;       // back out so a continuous /capture/start can succeed
+        s_burst_mode = false; // back out so a continuous /capture/start can succeed
         return r;
     }
     ESP_LOGI(TAG, "burst-mode capture armed");
@@ -533,10 +537,10 @@ esp_err_t sd_capture_start_bursts(void)
 }
 
 void sd_capture_record_burst_begin(uint32_t length_samples,
-                                    float rel_freq_hz,
-                                    float peak_snr_db,
-                                    float magnitude_db,
-                                    float noise_db)
+                                   float    rel_freq_hz,
+                                   float    peak_snr_db,
+                                   float    magnitude_db,
+                                   float    noise_db)
 {
     if (!s_burst_mode || s_state != CAP_STATE_ACTIVE || !s_stream) return;
 
@@ -562,7 +566,7 @@ void sd_capture_record_burst_chunk(const int16_t *iq, size_t n_complex)
     if (!iq || n_complex == 0) return;
 
     size_t n_bytes = n_complex * 2 * sizeof(int16_t);
-    size_t sent = xStreamBufferSend(s_stream, iq, n_bytes, 0);
+    size_t sent    = xStreamBufferSend(s_stream, iq, n_bytes, 0);
     if (sent < n_bytes) {
         update_bytes_dropped(n_bytes - sent);
     }
@@ -604,7 +608,7 @@ FILE *sd_capture_open_for_read(const char *name)
         xSemaphoreTake(s_stats_mu, portMAX_DELAY);
         if (s_stats.active && s_stats.path[0]) {
             const char *base = strrchr(s_stats.path, '/');
-            base = base ? base + 1 : s_stats.path;
+            base             = base ? base + 1 : s_stats.path;
             if (strcmp(base, name) == 0) busy = true;
         }
         xSemaphoreGive(s_stats_mu);

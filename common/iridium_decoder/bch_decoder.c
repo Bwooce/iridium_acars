@@ -21,7 +21,10 @@
 // timing (3580 us baseline -> 3843 us, within run-to-run noise).
 // The L2 cache hides PSRAM latency for this read-mostly 8 KB table.
 // Reverted to keep 8 KB of internal SRAM available for other uses.
-static EXT_RAM_BSS_ATTR struct { int errs; uint32_t locator; } syn_ra[1024];
+static EXT_RAM_BSS_ATTR struct {
+    int      errs;
+    uint32_t locator;
+} syn_ra[1024];
 
 static uint32_t gf2_remainder(uint32_t poly, uint32_t val)
 {
@@ -37,16 +40,16 @@ static uint32_t gf2_remainder(uint32_t poly, uint32_t val)
 void bch_decoder_init()
 {
     for (int i = 0; i < 1024; i++) {
-        syn_ra[i].errs = -1;
+        syn_ra[i].errs    = -1;
         syn_ra[i].locator = 0;
     }
 
     // Single-bit errors
     for (int b1 = 0; b1 < 31; b1++) {
         uint32_t val = 1u << b1;
-        uint32_t r = gf2_remainder(BCH_POLY_RA, val);
+        uint32_t r   = gf2_remainder(BCH_POLY_RA, val);
         if (r < 1024) {
-            syn_ra[r].errs = 1;
+            syn_ra[r].errs    = 1;
             syn_ra[r].locator = val;
         }
     }
@@ -55,9 +58,9 @@ void bch_decoder_init()
     for (int b1 = 0; b1 < 31; b1++) {
         for (int b2 = b1 + 1; b2 < 31; b2++) {
             uint32_t val = (1u << b1) | (1u << b2);
-            uint32_t r = gf2_remainder(BCH_POLY_RA, val);
+            uint32_t r   = gf2_remainder(BCH_POLY_RA, val);
             if (r < 1024 && syn_ra[r].errs < 0) {
-                syn_ra[r].errs = 2;
+                syn_ra[r].errs    = 2;
                 syn_ra[r].locator = val;
             }
         }
@@ -67,25 +70,28 @@ void bch_decoder_init()
 static uint32_t bits_to_uint(const uint8_t *bits, int n)
 {
     uint32_t val = 0;
-    for (int i = 0; i < n; i++) val = (val << 1) | (bits[i] & 1);
+    for (int i = 0; i < n; i++)
+        val = (val << 1) | (bits[i] & 1);
     return val;
 }
 
 int bch_decode_block(const uint8_t *block31, uint8_t *out_data)
 {
-    uint32_t val = bits_to_uint(block31, 31);
+    uint32_t val      = bits_to_uint(block31, 31);
     uint32_t syndrome = gf2_remainder(BCH_POLY_RA, val);
 
     if (syndrome == 0) {
         uint32_t data_val = val >> 10;
-        for (int i = 0; i < 21; i++) out_data[20 - i] = (data_val >> i) & 1;
+        for (int i = 0; i < 21; i++)
+            out_data[20 - i] = (data_val >> i) & 1;
         return 0;
     }
 
     if (syndrome < 1024 && syn_ra[syndrome].errs >= 0) {
         val ^= syn_ra[syndrome].locator;
         uint32_t data_val = val >> 10;
-        for (int i = 0; i < 21; i++) out_data[20 - i] = (data_val >> i) & 1;
+        for (int i = 0; i < 21; i++)
+            out_data[20 - i] = (data_val >> i) & 1;
         return syn_ra[syndrome].errs;
     }
 
@@ -118,26 +124,28 @@ int bch_decode_block(const uint8_t *block31, uint8_t *out_data)
 int bch_decode_block_soft(const int16_t *soft_in31, uint8_t *out_data, int K)
 {
     if (K < 0) K = 0;
-    if (K > 6) K = 6;       // 2^6 = 64 trials is the practical limit
+    if (K > 6) K = 6; // 2^6 = 64 trials is the practical limit
 
     uint8_t hard[31];
     int16_t soft_abs[31];
     for (int i = 0; i < 31; i++) {
-        hard[i] = (soft_in31[i] >= 0) ? 0 : 1;
+        hard[i]     = (soft_in31[i] >= 0) ? 0 : 1;
         soft_abs[i] = (soft_in31[i] < 0) ? (int16_t)(-soft_in31[i]) : soft_in31[i];
     }
 
     // Find the K positions with smallest |soft| via partial sort.
     // K ≤ 6, N = 31, so a simple O(N×K) loop is cheap.
     int lcb_idx[6];
-    for (int k = 0; k < K; k++) lcb_idx[k] = -1;
+    for (int k = 0; k < K; k++)
+        lcb_idx[k] = -1;
     for (int i = 0; i < 31; i++) {
         // Insert i into lcb_idx if it's among the K smallest.
         int v = soft_abs[i];
         for (int k = 0; k < K; k++) {
             if (lcb_idx[k] < 0 || v < soft_abs[lcb_idx[k]]) {
                 // Shift larger entries right, drop the last.
-                for (int j = K - 1; j > k; j--) lcb_idx[j] = lcb_idx[j - 1];
+                for (int j = K - 1; j > k; j--)
+                    lcb_idx[j] = lcb_idx[j - 1];
                 lcb_idx[k] = i;
                 break;
             }
@@ -145,9 +153,9 @@ int bch_decode_block_soft(const int16_t *soft_in31, uint8_t *out_data, int K)
     }
 
     // Try every flip pattern p ∈ {0..2^K-1}. Track best by soft distance.
-    int trials = 1 << K;
-    int best_dist = INT32_MAX;
-    int best_errs = -1;
+    int     trials    = 1 << K;
+    int     best_dist = INT32_MAX;
+    int     best_errs = -1;
     uint8_t best_out[21];
     uint8_t flipped[31];
     uint8_t trial_data[21];
@@ -166,11 +174,13 @@ int bch_decode_block_soft(const int16_t *soft_in31, uint8_t *out_data, int K)
         // reconstruct the full codeword by re-encoding (multiply
         // data × x^10 mod poly).
         uint32_t data_val = 0;
-        for (int b = 0; b < 21; b++) data_val = (data_val << 1) | (trial_data[b] & 1);
+        for (int b = 0; b < 21; b++)
+            data_val = (data_val << 1) | (trial_data[b] & 1);
         uint32_t systematic = data_val << 10;
-        uint32_t parity = gf2_remainder(BCH_POLY_RA, systematic);
-        uint32_t cw = systematic | parity;
-        for (int i = 0; i < 31; i++) trial_codeword[i] = (cw >> (30 - i)) & 1;
+        uint32_t parity     = gf2_remainder(BCH_POLY_RA, systematic);
+        uint32_t cw         = systematic | parity;
+        for (int i = 0; i < 31; i++)
+            trial_codeword[i] = (cw >> (30 - i)) & 1;
 
         // Soft distance: sum |soft_in| where codeword differs from hard.
         int dist = 0;
@@ -179,7 +189,7 @@ int bch_decode_block_soft(const int16_t *soft_in31, uint8_t *out_data, int K)
         }
         if (dist < best_dist) {
             best_dist = dist;
-            best_errs = errs + __builtin_popcount(p);   // include the flips
+            best_errs = errs + __builtin_popcount(p); // include the flips
             memcpy(best_out, trial_data, 21);
         }
     }

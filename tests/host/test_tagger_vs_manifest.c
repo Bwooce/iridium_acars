@@ -33,8 +33,8 @@
 #include "fft_burst_tagger.h"
 #include "fft_sc16_2048.h"
 
-#define INPUT_FS_HZ          2500000
-#define BIN_HZ               (INPUT_FS_HZ / (double)FBT_FFT_SIZE)  // ≈ 1220
+#define INPUT_FS_HZ 2500000
+#define BIN_HZ (INPUT_FS_HZ / (double)FBT_FFT_SIZE) // ≈ 1220
 // Time tolerance is generous (±50 ms) because the manifest's
 // timestamp_ms is gri's DECODED-FRAME time (burst_downmix output,
 // after UW correlation), NOT the tagger's start_sample. The two
@@ -47,17 +47,17 @@
 // through the gri pipeline, our bin vs gri's freq_offset_hz/BIN_HZ
 // should agree to within ±half-channel-width = 16 bins (1 channel
 // = 32 bins at 40 kHz / 1220 Hz/bin).
-#define TIMING_TOL_SAMPLES   125000    // 50 ms
-#define BIN_TOL              16        // half burst_width (= 32 bins)
-#define MAX_TAGS             256
-#define MAX_MANIFEST         256
+#define TIMING_TOL_SAMPLES 125000 // 50 ms
+#define BIN_TOL 16                // half burst_width (= 32 bins)
+#define MAX_TAGS 256
+#define MAX_MANIFEST 256
 // gri publishes 65 entries on this fixture. Current run: we match 56
 // (recall 86%). The 9 misses are mostly low-confidence (<75%) gri
 // entries — edge-channel and adjacent-burst-masked cases. Setting
 // RECALL_MIN to 50 so the test gates major regressions (e.g., a
 // tagger config change that drops recall below 77%) without locking
 // us to today's exact number; tighten as we get closer to gri.
-#define RECALL_MIN           50
+#define RECALL_MIN 50
 
 static int32_t s_baseline_history[FBT_HISTORY_SIZE * FBT_FFT_SIZE];
 
@@ -72,42 +72,48 @@ typedef struct {
 typedef struct {
     uint64_t start_sample;
     int      center_bin;
-    int      matched;       // 0/1
+    int      matched; // 0/1
 } tag_t;
 
-static int parse_manifest(const char *path, mfst_entry_t *out, int max) {
+static int parse_manifest(const char *path, mfst_entry_t *out, int max)
+{
     FILE *fh = fopen(path, "r");
     if (!fh) {
         fprintf(stderr,
                 "Manifest %s not present. Run:\n"
-                "  python3 tests/scripts/direct_if_dump.py\n", path);
+                "  python3 tests/scripts/direct_if_dump.py\n",
+                path);
         return -1;
     }
     char line[512];
-    if (!fgets(line, sizeof(line), fh)) { fclose(fh); return -1; }   // header
+    if (!fgets(line, sizeof(line), fh)) {
+        fclose(fh);
+        return -1;
+    } // header
     int n = 0;
     while (fgets(line, sizeof(line), fh) && n < max) {
-        int idx, gri_id, n_samples, conf;
-        long abs_freq, freq_off;
+        int    idx, gri_id, n_samples, conf;
+        long   abs_freq, freq_off;
         double ts_ms;
-        char fname[64];
-        int ok = sscanf(line, "%d,%d,%lf,%ld,%ld,%d,%d,%63s",
-                        &idx, &gri_id, &ts_ms,
-                        &abs_freq, &freq_off,
-                        &n_samples, &conf, fname);
+        char   fname[64];
+        int    ok = sscanf(line, "%d,%d,%lf,%ld,%ld,%d,%d,%63s",
+                           &idx, &gri_id, &ts_ms,
+                           &abs_freq, &freq_off,
+                           &n_samples, &conf, fname);
         if (ok != 8) continue;
-        out[n].timestamp_ms     = ts_ms;
-        out[n].freq_offset_hz   = freq_off;
-        out[n].n_samples_250k   = n_samples;
-        out[n].confidence_pct   = conf;
-        out[n].gri_id           = gri_id;
+        out[n].timestamp_ms   = ts_ms;
+        out[n].freq_offset_hz = freq_off;
+        out[n].n_samples_250k = n_samples;
+        out[n].confidence_pct = conf;
+        out[n].gri_id         = gri_id;
         n++;
     }
     fclose(fh);
     return n;
 }
 
-static int load_25msps_cf32(const char *path, int16_t **out_iq) {
+static int load_25msps_cf32(const char *path, int16_t **out_iq)
+{
     FILE *fh = fopen(path, "rb");
     if (!fh) {
         fprintf(stderr,
@@ -118,16 +124,25 @@ static int load_25msps_cf32(const char *path, int16_t **out_iq) {
     fseek(fh, 0, SEEK_END);
     long bytes = ftell(fh);
     fseek(fh, 0, SEEK_SET);
-    int n = (int)(bytes / 8);
-    float *cf32 = (float *)malloc(2 * n * sizeof(float));
-    int16_t *s16 = (int16_t *)malloc(2 * n * sizeof(int16_t));
-    if (!cf32 || !s16) { free(cf32); free(s16); fclose(fh); return -1; }
+    int      n    = (int)(bytes / 8);
+    float   *cf32 = (float *)malloc(2 * n * sizeof(float));
+    int16_t *s16  = (int16_t *)malloc(2 * n * sizeof(int16_t));
+    if (!cf32 || !s16) {
+        free(cf32);
+        free(s16);
+        fclose(fh);
+        return -1;
+    }
     size_t got = fread(cf32, sizeof(float), 2 * n, fh);
     fclose(fh);
-    if ((int)got != 2 * n) { free(cf32); free(s16); return -1; }
+    if ((int)got != 2 * n) {
+        free(cf32);
+        free(s16);
+        return -1;
+    }
     for (int k = 0; k < 2 * n; k++) {
         float v = cf32[k] * 32768.0f;
-        if (v >  32767.0f) v =  32767.0f;
+        if (v > 32767.0f) v = 32767.0f;
         if (v < -32768.0f) v = -32768.0f;
         s16[k] = (int16_t)lrintf(v);
     }
@@ -136,39 +151,44 @@ static int load_25msps_cf32(const char *path, int16_t **out_iq) {
     return n;
 }
 
-int main(void) {
+int main(void)
+{
     // 1) Load manifest (gri ground truth).
     mfst_entry_t mfst[MAX_MANIFEST];
-    int n_mfst = parse_manifest("/tmp/host_direct_if/manifest.csv",
-                                 mfst, MAX_MANIFEST);
+    int          n_mfst = parse_manifest("/tmp/host_direct_if/manifest.csv",
+                                         mfst, MAX_MANIFEST);
     if (n_mfst < 0) return 2;
     printf("Loaded %d manifest entries (gri ground truth)\n", n_mfst);
 
     // 2) Load the same 2.5 MSPS cf32 gri ran against.
     int16_t *iq25 = NULL;
-    int n25 = load_25msps_cf32(
+    int      n25  = load_25msps_cf32(
         "/tmp/host_direct_if/fixture_albq_raw_2500k.cf32", &iq25);
     if (n25 <= 0) return 2;
 
     // 3) Run our tagger using gri-aligned settings (gone-trigger,
     //    threshold = 10 dB to maximise recall, end-of-stream flush).
     fft_burst_tagger_t *t = fft_burst_tagger_init(
-        /*burst_pre_len =*/ 2 * FBT_FFT_SIZE,
-        /*burst_post_len=*/ (int)(INPUT_FS_HZ * 16e-3),
-        /*burst_width   =*/ 32,
-        /*threshold_db  =*/ 10.0f,
+        /*burst_pre_len =*/2 * FBT_FFT_SIZE,
+        /*burst_post_len=*/(int)(INPUT_FS_HZ * 16e-3),
+        /*burst_width   =*/32,
+        /*threshold_db  =*/10.0f,
         s_baseline_history);
-    if (!t) { fprintf(stderr, "tagger init\n"); free(iq25); return 2; }
+    if (!t) {
+        fprintf(stderr, "tagger init\n");
+        free(iq25);
+        return 2;
+    }
     fft_burst_tagger_set_start(t, 0);
 
-    tag_t tags[MAX_TAGS];
-    int n_tags = 0;
+    tag_t       tags[MAX_TAGS];
+    int         n_tags = 0;
     fbt_burst_t new_bursts[FBT_MAX_BURSTS];
     fbt_burst_t gone_bursts[FBT_MAX_BURSTS];
     for (int off = 0; off + FBT_FFT_SIZE <= n25; off += FBT_FFT_SIZE) {
         int n_new = FBT_MAX_BURSTS, n_gone = FBT_MAX_BURSTS;
         fft_burst_tagger_step(t, iq25 + off * 2, NULL,
-                               new_bursts, &n_new, gone_bursts, &n_gone);
+                              new_bursts, &n_new, gone_bursts, &n_gone);
         for (int i = 0; i < n_gone && n_tags < MAX_TAGS; i++) {
             tags[n_tags].start_sample = gone_bursts[i].start;
             tags[n_tags].center_bin   = gone_bursts[i].center_bin;
@@ -176,7 +196,7 @@ int main(void) {
             n_tags++;
         }
     }
-    int n_flush = FBT_MAX_BURSTS;
+    int         n_flush = FBT_MAX_BURSTS;
     fbt_burst_t flushed[FBT_MAX_BURSTS];
     fft_burst_tagger_flush(t, flushed, &n_flush);
     for (int i = 0; i < n_flush && n_tags < MAX_TAGS; i++) {
@@ -198,25 +218,23 @@ int main(void) {
 
     for (int m = 0; m < n_mfst; m++) {
         double expected_start_d = mfst[m].timestamp_ms * 2500.0;
-        int    expected_bin     = FBT_FFT_SIZE / 2
-                                  + (int)round(mfst[m].freq_offset_hz / BIN_HZ);
-        int best_idx = -1;
-        int best_dist = INT32_MAX;
+        int    expected_bin     = FBT_FFT_SIZE / 2 + (int)round(mfst[m].freq_offset_hz / BIN_HZ);
+        int    best_idx         = -1;
+        int    best_dist        = INT32_MAX;
         for (int k = 0; k < n_tags; k++) {
             if (tags[k].matched) continue;
-            long ds = (long)((double)tags[k].start_sample - expected_start_d);
-            int db = tags[k].center_bin - expected_bin;
+            long ds  = (long)((double)tags[k].start_sample - expected_start_d);
+            int  db  = tags[k].center_bin - expected_bin;
             long ads = ds < 0 ? -ds : ds;
             int  adb = db < 0 ? -db : db;
             if (ads > TIMING_TOL_SAMPLES) continue;
             if (adb > BIN_TOL) continue;
             // Manhattan distance, normalised by tolerance to weight
             // dimensions equally.
-            int dist = (int)(ads * 100 / TIMING_TOL_SAMPLES)
-                     + (int)(adb * 100 / BIN_TOL);
+            int dist = (int)(ads * 100 / TIMING_TOL_SAMPLES) + (int)(adb * 100 / BIN_TOL);
             if (dist < best_dist) {
                 best_dist = dist;
-                best_idx = k;
+                best_idx  = k;
             }
         }
         if (best_idx >= 0) {
@@ -227,9 +245,10 @@ int main(void) {
         }
     }
 
-    double recall    = (double)matched / (double)n_mfst;
-    int n_unmatched_tags = 0;
-    for (int k = 0; k < n_tags; k++) if (!tags[k].matched) n_unmatched_tags++;
+    double recall           = (double)matched / (double)n_mfst;
+    int    n_unmatched_tags = 0;
+    for (int k = 0; k < n_tags; k++)
+        if (!tags[k].matched) n_unmatched_tags++;
     double precision = (double)matched / (double)n_tags;
 
     printf("\nMatch results:\n");

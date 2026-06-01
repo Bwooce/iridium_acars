@@ -10,17 +10,17 @@
 #include <string.h>
 #include <math.h>
 
-#define UW_BITS    24
-#define RA_HEAD    96    // 3 × 32-bit interleaved codewords
+#define UW_BITS 24
+#define RA_HEAD 96 // 3 × 32-bit interleaved codewords
 
 // Same de_interleave3 as in iridium_frame.c -- kept local rather than
 // exporting since the classifier was inlined for header-detection speed.
 // 96 bits → three 32-bit outputs (high-symbol-first ordering).
 static void de_interleave3(const uint8_t *in, size_t n_in,
-                            uint8_t *first_out, uint8_t *second_out,
-                            uint8_t *third_out)
+                           uint8_t *first_out, uint8_t *second_out,
+                           uint8_t *third_out)
 {
-    int n_sym = (int)(n_in / 2);
+    int n_sym     = (int)(n_in / 2);
     int third_idx = 0, second_idx = 0, first_idx = 0;
     for (int s = n_sym - 3; s >= 0; s -= 3) {
         third_out[third_idx++] = in[2 * s + 1] & 1;
@@ -49,9 +49,9 @@ static uint32_t pick_bits(const uint8_t *bits, int start, int n)
 // `sign_idx`, magnitude at `mag_start..mag_start+10`. Matches the
 // iridium-toolkit formula: int(bits[mag], 2) - bit(sign)*(1<<11).
 static int sign_extend_12(const uint8_t *bits, int sign_idx,
-                           int mag_start, int mag_n)
+                          int mag_start, int mag_n)
 {
-    int mag = (int)pick_bits(bits, mag_start, mag_n);
+    int mag  = (int)pick_bits(bits, mag_start, mag_n);
     int sign = bits[sign_idx] & 1;
     return mag - (sign << 11);
 }
@@ -88,13 +88,13 @@ int ira_decode(const iridium_frame_t *frame, ira_decoded_t *out)
 
     // Concatenate the three data parts (21 + 21 + 21 = 63 bits).
     uint8_t hdr[63];
-    memcpy(hdr +  0, cw1, 21);
+    memcpy(hdr + 0, cw1, 21);
     memcpy(hdr + 21, cw2, 21);
     memcpy(hdr + 42, cw3, 21);
 
     // Field extraction matches iridium-toolkit IridiumRAMessage:
-    out->sv_id    = (int)pick_bits(hdr,  0, 7);
-    out->beam_id  = (int)pick_bits(hdr,  7, 6);
+    out->sv_id    = (int)pick_bits(hdr, 0, 7);
+    out->beam_id  = (int)pick_bits(hdr, 7, 6);
     out->pos_x    = sign_extend_12(hdr, 13, 14, 11);
     out->pos_y    = sign_extend_12(hdr, 25, 26, 11);
     out->pos_z    = sign_extend_12(hdr, 37, 38, 11);

@@ -18,7 +18,7 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <sys/stat.h>
-#include <unistd.h>          // fsync()
+#include <unistd.h> // fsync()
 
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
@@ -31,24 +31,24 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/idf_additions.h"     // xQueueCreateWithCaps, xTaskCreatePinnedToCoreWithCaps
+#include "freertos/idf_additions.h" // xQueueCreateWithCaps, xTaskCreatePinnedToCoreWithCaps
 
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 
 static const char *TAG = "SDLOG";
 
-#define MOUNT_POINT     "/sdcard"
-#define LOG_DIR         "/sdcard/acars"
+#define MOUNT_POINT "/sdcard"
+#define LOG_DIR "/sdcard/acars"
 
 // Pin assignments — see header above.
-#define PIN_CLK  43
-#define PIN_CMD  44
-#define PIN_D0   39
-#define PIN_D1   40
-#define PIN_D2   41
-#define PIN_D3   42
-#define PIN_PWR  45        // GPIO45 LOW = SD_VDD on (P-FET)
+#define PIN_CLK 43
+#define PIN_CMD 44
+#define PIN_D0 39
+#define PIN_D1 40
+#define PIN_D2 41
+#define PIN_D3 42
+#define PIN_PWR 45 // GPIO45 LOW = SD_VDD on (P-FET)
 
 // SD1_VDD on the Waveshare P4-NANO is sourced from ESP_LDO_VO4 (P4
 // internal LDO #4), gated by Q1 / GPIO45 (see
@@ -56,14 +56,14 @@ static const char *TAG = "SDLOG";
 // turning on LDO #4, GPIO45 just gates a powerless rail — the card
 // never sees voltage and OCR (ACMD41) times out. Hours of "card
 // won't respond" on the bench traced back to this.
-#define SDMMC_PWR_LDO_CHANNEL  4
+#define SDMMC_PWR_LDO_CHANNEL 4
 
-#define EMIT_QUEUE_DEPTH    32
-#define WRITER_STACK        6144
-#define WRITER_PRIO         3
+#define EMIT_QUEUE_DEPTH 32
+#define WRITER_STACK 6144
+#define WRITER_PRIO 3
 
-static sdmmc_card_t   *s_card           = NULL;
-static FILE           *s_log            = NULL;
+static sdmmc_card_t *s_card = NULL;
+static FILE         *s_log  = NULL;
 // s_log_mu protects s_log itself — every read/write of the FILE* and
 // every fwrite/fflush/fsync/fclose/fopen-via-open_log_file must hold it
 // (#108). Without this, sd_log_force_format (httpd task) could fclose
@@ -71,16 +71,16 @@ static FILE           *s_log            = NULL;
 // fwrite+fclose on the same FILE* is UB inside FATFS/libc buffers and
 // will crash or corrupt under load. s_stats_mu only protects s_stats,
 // not s_log.
-static SemaphoreHandle_t s_log_mu        = NULL;
-static QueueHandle_t   s_q              = NULL;
+static SemaphoreHandle_t s_log_mu = NULL;
+static QueueHandle_t     s_q      = NULL;
 // 64 KB DMA-INT buffer the SDMMC driver uses for read/write to
 // PSRAM-resident user buffers. Allocated eagerly in sd_log_init
 // (early in app_main, before USB + tagger fragment DMA-INT) and
 // attached to s_card->host.dma_aligned_buffer at mount time.
-static void           *s_sdmmc_stash    = NULL;
-static SemaphoreHandle_t s_stats_mu     = NULL;
-static sd_log_stats_t  s_stats          = {0};
-static volatile bool   s_mount_attempted = false;    // lazy-mount flag
+static void             *s_sdmmc_stash     = NULL;
+static SemaphoreHandle_t s_stats_mu        = NULL;
+static sd_log_stats_t    s_stats           = {0};
+static volatile bool     s_mount_attempted = false; // lazy-mount flag
 
 static void update_stats_ok(size_t bytes_added)
 {
@@ -107,23 +107,40 @@ static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
     // Tiny JSON escape for the text field — copied from acars_push.c
     // structure rather than shared because pulling them into a common
     // helper would touch three call sites for marginal benefit.
-    char esc[2 * MSG_RING_TXT_MAX + 8];
+    char   esc[2 * MSG_RING_TXT_MAX + 8];
     size_t w = 0;
     for (const char *p = m->txt; *p && w + 7 < sizeof(esc); p++) {
         unsigned char c = (unsigned char)*p;
         switch (c) {
-        case '"':  esc[w++] = '\\'; esc[w++] = '"';  break;
-        case '\\': esc[w++] = '\\'; esc[w++] = '\\'; break;
-        case '\n': esc[w++] = '\\'; esc[w++] = 'n';  break;
-        case '\r': esc[w++] = '\\'; esc[w++] = 'r';  break;
-        case '\t': esc[w++] = '\\'; esc[w++] = 't';  break;
+        case '"':
+            esc[w++] = '\\';
+            esc[w++] = '"';
+            break;
+        case '\\':
+            esc[w++] = '\\';
+            esc[w++] = '\\';
+            break;
+        case '\n':
+            esc[w++] = '\\';
+            esc[w++] = 'n';
+            break;
+        case '\r':
+            esc[w++] = '\\';
+            esc[w++] = 'r';
+            break;
+        case '\t':
+            esc[w++] = '\\';
+            esc[w++] = 't';
+            break;
         default:
             if (c < 0x20) {
                 static const char hex[] = "0123456789abcdef";
-                esc[w++] = '\\'; esc[w++] = 'u';
-                esc[w++] = '0'; esc[w++] = '0';
-                esc[w++] = hex[(c >> 4) & 0xf];
-                esc[w++] = hex[c & 0xf];
+                esc[w++]                = '\\';
+                esc[w++]                = 'u';
+                esc[w++]                = '0';
+                esc[w++]                = '0';
+                esc[w++]                = hex[(c >> 4) & 0xf];
+                esc[w++]                = hex[c & 0xf];
             } else {
                 esc[w++] = (char)c;
             }
@@ -132,23 +149,23 @@ static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
     esc[w] = '\0';
 
     int n = snprintf(out, cap,
-        "{\"id\":%llu,\"t_us\":%llu,\"dir\":\"%s\","
-        "\"mode\":\"%c\",\"label\":\"%.2s\",\"block\":\"%c\","
-        "\"msg_num\":\"%s\",\"flight\":\"%s\","
-        "\"crc\":%s,\"peak_bin\":%ld,\"snr_db\":%.1f,"
-        "\"txt\":\"%s\"}\n",
-        (unsigned long long)m->id,
-        (unsigned long long)m->timestamp_us,
-        m->uplink ? "UL" : "DL",
-        m->mode,
-        m->label,
-        m->block_id,
-        m->msg_num,
-        m->flight_id,
-        m->crc_ok ? "true" : "false",
-        (long)m->peak_bin,
-        (double)m->snr_db,
-        esc);
+                     "{\"id\":%llu,\"t_us\":%llu,\"dir\":\"%s\","
+                     "\"mode\":\"%c\",\"label\":\"%.2s\",\"block\":\"%c\","
+                     "\"msg_num\":\"%s\",\"flight\":\"%s\","
+                     "\"crc\":%s,\"peak_bin\":%ld,\"snr_db\":%.1f,"
+                     "\"txt\":\"%s\"}\n",
+                     (unsigned long long)m->id,
+                     (unsigned long long)m->timestamp_us,
+                     m->uplink ? "UL" : "DL",
+                     m->mode,
+                     m->label,
+                     m->block_id,
+                     m->msg_num,
+                     m->flight_id,
+                     m->crc_ok ? "true" : "false",
+                     (long)m->peak_bin,
+                     (double)m->snr_db,
+                     esc);
     if (n < 0) return 0;
     if ((size_t)n >= cap) return cap - 1;
     return (size_t)n;
@@ -170,7 +187,7 @@ static esp_err_t open_log_file(void);
 static esp_err_t try_mount(void)
 {
     s_mount_attempted = true;
-    esp_err_t r = mount_sd();
+    esp_err_t r       = mount_sd();
     if (r != ESP_OK) {
         ESP_LOGW(TAG, "SD mount failed (%s) — logging stays disabled",
                  esp_err_to_name(r));
@@ -182,7 +199,7 @@ static void writer_task(void *arg)
 {
     (void)arg;
     acars_msg_t m;
-    char        line[2048];        // worst case ~600 B; 2K is generous
+    char        line[2048]; // worst case ~600 B; 2K is generous
     int64_t     last_flush = esp_timer_get_time();
 
     while (1) {
@@ -257,7 +274,7 @@ static void enable_card_power(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
-    gpio_set_level(PIN_PWR, 0);     // 0 = card power ON
+    gpio_set_level(PIN_PWR, 0); // 0 = card power ON
     // Cards need ~1 ms to come up after power-on; some 4 GB / older
     // cards need much longer for their internal controller to be
     // ready for OCR (CMD1/ACMD41) commands. 100 ms is the SD-spec
@@ -273,8 +290,14 @@ static void enable_card_power(void)
 // reuse the already-initialised controller and just add the slot.
 // Reference: managed_components/espressif__esp_hosted/examples/
 //            host_sdcard_with_hosted/main/sd_card_functions.c
-static esp_err_t sdmmc_init_noop(void)   { return ESP_OK; }
-static esp_err_t sdmmc_deinit_noop(void) { return ESP_OK; }
+static esp_err_t sdmmc_init_noop(void)
+{
+    return ESP_OK;
+}
+static esp_err_t sdmmc_deinit_noop(void)
+{
+    return ESP_OK;
+}
 
 static esp_err_t mount_sd(void)
 {
@@ -283,9 +306,9 @@ static esp_err_t mount_sd(void)
     // Enable LDO #4 so SD1_VDD actually has a voltage source. The
     // P-FET on GPIO45 only gates this rail — without the LDO, the
     // card power pin is floating regardless of GPIO45's state.
-    sd_pwr_ctrl_ldo_config_t ldo_cfg = { .ldo_chan_id = SDMMC_PWR_LDO_CHANNEL };
-    sd_pwr_ctrl_handle_t ldo_handle = NULL;
-    esp_err_t pr = sd_pwr_ctrl_new_on_chip_ldo(&ldo_cfg, &ldo_handle);
+    sd_pwr_ctrl_ldo_config_t ldo_cfg    = {.ldo_chan_id = SDMMC_PWR_LDO_CHANNEL};
+    sd_pwr_ctrl_handle_t     ldo_handle = NULL;
+    esp_err_t                pr         = sd_pwr_ctrl_new_on_chip_ldo(&ldo_cfg, &ldo_handle);
     if (pr != ESP_OK) {
         ESP_LOGW(TAG, "sd_pwr_ctrl_new_on_chip_ldo(ch=%d) failed: %s",
                  SDMMC_PWR_LDO_CHANNEL, esp_err_to_name(pr));
@@ -308,9 +331,9 @@ static esp_err_t mount_sd(void)
     host.max_freq_khz = SDMMC_FREQ_DEFAULT;
     // Slot 0 (P4-NANO's SD slot per schematic, distinct from slot 1
     // which is C6 esp_hosted).
-    host.slot = SDMMC_HOST_SLOT_0;
-    host.init   = sdmmc_init_noop;
-    host.deinit = sdmmc_deinit_noop;
+    host.slot            = SDMMC_HOST_SLOT_0;
+    host.init            = sdmmc_init_noop;
+    host.deinit          = sdmmc_deinit_noop;
     host.pwr_ctrl_handle = ldo_handle;
     // (Tried SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF here to support PSRAM
     // source buffers — that flag is documented as SDIO-only and
@@ -327,12 +350,12 @@ static esp_err_t mount_sd(void)
     // matter even more here (bus width is rarely THE bottleneck,
     // but worth trying before blaming the card).
     slot.width = 4;
-    slot.clk = PIN_CLK;
-    slot.cmd = PIN_CMD;
-    slot.d0  = PIN_D0;
-    slot.d1  = PIN_D1;
-    slot.d2  = PIN_D2;
-    slot.d3  = PIN_D3;
+    slot.clk   = PIN_CLK;
+    slot.cmd   = PIN_CMD;
+    slot.d0    = PIN_D0;
+    slot.d1    = PIN_D1;
+    slot.d2    = PIN_D2;
+    slot.d3    = PIN_D3;
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
     esp_vfs_fat_mount_config_t mount = {
@@ -355,7 +378,7 @@ static esp_err_t mount_sd(void)
     // timeout to 60 s for the duration of the mount, restore after.
     esp_task_wdt_config_t wdt_save = {
         .timeout_ms     = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000U,
-        .idle_core_mask = 0,    // restore: leave as configured
+        .idle_core_mask = 0, // restore: leave as configured
         .trigger_panic  = true,
     };
     // Format of a 4 GB card empirically took ~96 s in one bench
@@ -377,7 +400,7 @@ static esp_err_t mount_sd(void)
                  "%s", esp_err_to_name(r));
         // Power the card rail back off so a missing-card socket isn't
         // sitting with VDD asserted.
-        gpio_set_level(PIN_PWR, 1);     // 1 = card power OFF
+        gpio_set_level(PIN_PWR, 1); // 1 = card power OFF
         // Tear down what esp_vfs_fat_sdmmc_mount partially set up so
         // a retry (after the user inserts a card and POSTs /sd/mount
         // or /capture/start) can re-add the slot cleanly. Without
@@ -396,7 +419,7 @@ static esp_err_t mount_sd(void)
         return r;
     }
 
-    s_stats.mounted = true;
+    s_stats.mounted        = true;
     s_stats.mount_error[0] = '\0';
     sdmmc_card_print_info(stdout, s_card);
 
@@ -433,7 +456,7 @@ static esp_err_t open_log_file(void)
     // epoch isn't available; use esp_timer_get_time which is microseconds
     // since boot — really we want a wall-clock once NTP is integrated;
     // for now, the boot tick distinguishes runs).
-    char path[64];
+    char    path[64];
     int64_t t0 = esp_timer_get_time();
     snprintf(path, sizeof(path), LOG_DIR "/log-%lld.ndjson", (long long)t0);
 
@@ -442,7 +465,7 @@ static esp_err_t open_log_file(void)
         ESP_LOGE(TAG, "fopen(%s) failed errno=%d", path, errno);
         return ESP_FAIL;
     }
-    setvbuf(s_log, NULL, _IOFBF, 4096);    // 4 KB FILE buffer — coalesce writes
+    setvbuf(s_log, NULL, _IOFBF, 4096); // 4 KB FILE buffer — coalesce writes
     strlcpy(s_stats.log_path, path, sizeof(s_stats.log_path));
     s_stats.log_open = true;
     ESP_LOGI(TAG, "ACARS log open: %s", path);
@@ -451,7 +474,7 @@ static esp_err_t open_log_file(void)
 
 esp_err_t sd_log_init(void)
 {
-    if (s_q) return ESP_OK;        // idempotent
+    if (s_q) return ESP_OK; // idempotent
 
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
@@ -474,7 +497,7 @@ esp_err_t sd_log_init(void)
     // live-SDR throughput. PSRAM is plenty fast for the per-message
     // copy (~600 ns at 200 MHz).
     s_q = xQueueCreateWithCaps(EMIT_QUEUE_DEPTH, sizeof(acars_msg_t),
-                                MALLOC_CAP_SPIRAM);
+                               MALLOC_CAP_SPIRAM);
     if (!s_q) return ESP_ERR_NO_MEM;
 
     // Writer task pinned to Core 0 — Core 1 is already heavily loaded
@@ -483,9 +506,9 @@ esp_err_t sd_log_init(void)
     // SRAM). 6 KB stack rate is fine on PSRAM — the writer task is at
     // 1 Hz flush + ~few-Hz queue dequeue, latency-tolerant.
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(writer_task, "sd_log",
-                                                     WRITER_STACK, NULL,
-                                                     WRITER_PRIO, NULL, 0,
-                                                     MALLOC_CAP_SPIRAM);
+                                                    WRITER_STACK, NULL,
+                                                    WRITER_PRIO, NULL, 0,
+                                                    MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "writer task create failed");
         return ESP_ERR_NO_MEM;
@@ -502,7 +525,7 @@ esp_err_t sd_log_init(void)
 
 esp_err_t sd_log_force_mount(void)
 {
-    if (s_card) return ESP_OK;            // card already mounted
+    if (s_card) return ESP_OK; // card already mounted
     // Reset the latched "tried + failed" flag so the next attempt isn't
     // short-circuited by the writer task.
     s_mount_attempted = false;
@@ -525,7 +548,7 @@ esp_err_t sd_log_force_format(void)
         fclose(s_log);
         s_log = NULL;
         xSemaphoreTake(s_stats_mu, portMAX_DELAY);
-        s_stats.log_open = false;
+        s_stats.log_open    = false;
         s_stats.log_path[0] = '\0';
         xSemaphoreGive(s_stats_mu);
     }
@@ -543,7 +566,7 @@ esp_err_t sd_log_force_format(void)
         .trigger_panic  = true,
     };
     esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
-        .timeout_ms = 240000, .idle_core_mask = 0, .trigger_panic = true });
+        .timeout_ms = 240000, .idle_core_mask = 0, .trigger_panic = true});
 
     esp_err_t r = ESP_OK;
     if (s_card) {

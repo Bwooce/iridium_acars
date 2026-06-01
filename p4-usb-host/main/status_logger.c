@@ -18,41 +18,44 @@
 #include "ingest_core1.h"
 #include "esp_libusb.h"
 
-static const char *TAG = "CLASS";  // match the original tag for log continuity
+static const char *TAG = "CLASS"; // match the original tag for log continuity
 
 static QueueHandle_t s_queue;
 
 static void emit(const status_snapshot_t *s)
 {
-    double window_s  = s->window_us  / 1000000.0;
-    if (window_s <= 0)  window_s = 1.0;
+    double window_s = s->window_us / 1000000.0;
+    if (window_s <= 0) window_s = 1.0;
 
     double rate_inst = (s->bytes_window / (1024.0 * 1024.0)) / window_s;
 
 #if CONFIG_STATUS_LOG_VERBOSE
     double elapsed_s = s->elapsed_us / 1000000.0;
     if (elapsed_s <= 0) elapsed_s = 1.0;
-    double rate_avg  = (s->total_bytes  / (1024.0 * 1024.0)) / elapsed_s;
+    double rate_avg = (s->total_bytes / (1024.0 * 1024.0)) / elapsed_s;
 
-    float avg_dsp_us = (s->dsp_frame_count > 0)
-        ? (float)s->dsp_total_time_us / s->dsp_frame_count : 0;
+    float avg_dsp_us  = (s->dsp_frame_count > 0)
+                            ? (float)s->dsp_total_time_us / s->dsp_frame_count
+                            : 0;
     float feed_us_avg = (s->feed_calls_window > 0)
-        ? (float)s->dsp_total_time_us / s->feed_calls_window : 0;
+                            ? (float)s->dsp_total_time_us / s->feed_calls_window
+                            : 0;
 
     float xfer_fill = (s->us.total_requested_bytes > 0)
-        ? (100.0f * (float)s->us.total_actual_bytes / (float)s->us.total_requested_bytes)
-        : 0.0f;
+                          ? (100.0f * (float)s->us.total_actual_bytes / (float)s->us.total_requested_bytes)
+                          : 0.0f;
 
-    float feed_n = (s->feed_calls_window > 0) ? (float)s->feed_calls_window : 1.0f;
+    float feed_n      = (s->feed_calls_window > 0) ? (float)s->feed_calls_window : 1.0f;
     float read_us_avg = (float)s->cycle_read_us / feed_n;
 
-    float ingest_n = (s->ingest.dispatches > 0) ? (float)s->ingest.dispatches : 1.0f;
-    float ingest_convert_us_avg  = (float)s->ingest.convert_us_total  / ingest_n;
-    float ingest_push_us_avg     = (float)s->ingest.push_us_total     / ingest_n;
+    float ingest_n               = (s->ingest.dispatches > 0) ? (float)s->ingest.dispatches : 1.0f;
+    float ingest_convert_us_avg  = (float)s->ingest.convert_us_total / ingest_n;
+    float ingest_push_us_avg     = (float)s->ingest.push_us_total / ingest_n;
     float ingest_resample_us_avg = (float)s->ingest.resample_us_total / ingest_n;
-    float ingest_sbpush_us_avg   = (float)s->ingest.sbpush_us_total   / ingest_n;
+    float ingest_sbpush_us_avg   = (float)s->ingest.sbpush_us_total / ingest_n;
     float ingest_wait_us_avg     = (s->ingest.consumer_waits > 0)
-        ? (float)s->ingest.slot_wait_total_us / (float)s->ingest.consumer_waits : 0.0f;
+                                       ? (float)s->ingest.slot_wait_total_us / (float)s->ingest.consumer_waits
+                                       : 0.0f;
 
     float producer_peak_pct = 100.0f * (float)s->us.producer_rb_max_used / (512.0f * 1024.0f);
     float drop_fill_pct     = 100.0f * (float)s->us.producer_rb_used_at_drop / (512.0f * 1024.0f);
@@ -79,15 +82,14 @@ static void emit(const status_snapshot_t *s)
     // loop tick count over the window; if >> feed_calls then the loop
     // is spinning idle in handle_events. take_converted_us tells us
     // how often Core 0 blocks waiting for Core 1 ingest to finish.
-    float ci_n = (s->cycle_iterations > 0) ? (float)s->cycle_iterations : 1.0f;
+    float ci_n            = (s->cycle_iterations > 0) ? (float)s->cycle_iterations : 1.0f;
     float he_avg_per_iter = (float)s->cycle_handle_events_us / ci_n;
     float tc_avg_per_feed = (s->feed_calls_window > 0)
-        ? (float)s->cycle_take_converted_us / (float)s->feed_calls_window : 0.0f;
-    float ci_per_sec = ci_n * 1e6f / (float)(s->window_us > 0 ? s->window_us : 1);
-    float he_pct = 100.0f * (float)s->cycle_handle_events_us
-                            / (float)(s->window_us > 0 ? s->window_us : 1);
-    float tc_pct = 100.0f * (float)s->cycle_take_converted_us
-                            / (float)(s->window_us > 0 ? s->window_us : 1);
+                                ? (float)s->cycle_take_converted_us / (float)s->feed_calls_window
+                                : 0.0f;
+    float ci_per_sec      = ci_n * 1e6f / (float)(s->window_us > 0 ? s->window_us : 1);
+    float he_pct          = 100.0f * (float)s->cycle_handle_events_us / (float)(s->window_us > 0 ? s->window_us : 1);
+    float tc_pct          = 100.0f * (float)s->cycle_take_converted_us / (float)(s->window_us > 0 ? s->window_us : 1);
     ESP_LOGI(TAG, "Cycle (Core0): iter=%u (%.0f/s) handle_events=%.0f us/iter (%.1f%% of window)  "
                   "take_converted=%.0f us/feed (%.1f%% of window)",
              s->cycle_iterations, ci_per_sec,
@@ -116,11 +118,8 @@ static void emit(const status_snapshot_t *s)
     // multiplying it by THIS WINDOW's processed count is an
     // approximation of "would this rate be sustainable" — exact if
     // per-burst times are stable, slightly off during a transient.
-    double dsp_pct    = 100.0 * (double)s->dsp_total_time_us
-                              / (double)s->window_us;
-    double worker_pct = 100.0 * (double)s->ws.bursts_processed
-                              * (double)s->ws.avg_burst_us
-                              / (double)s->window_us;
+    double dsp_pct    = 100.0 * (double)s->dsp_total_time_us / (double)s->window_us;
+    double worker_pct = 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / (double)s->window_us;
 
     ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame, cap=%.1f%% "
                   "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
@@ -160,11 +159,8 @@ static void emit(const status_snapshot_t *s)
     // indicator — drops only start once we cross 100 %, so seeing
     // "worker_cap=92%" lets the operator anticipate saturation a few
     // seconds before the first dropped burst.
-    double dsp_pct    = 100.0 * (double)s->dsp_total_time_us
-                              / (double)s->window_us;
-    double worker_pct = 100.0 * (double)s->ws.bursts_processed
-                              * (double)s->ws.avg_burst_us
-                              / (double)s->window_us;
+    double dsp_pct    = 100.0 * (double)s->dsp_total_time_us / (double)s->window_us;
+    double worker_pct = 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / (double)s->window_us;
 
     // bch_decoded = real Iridium frame decodes (BCH pass AND classify
     // known type — task #111). bch_unknown = BCH false positives (random
@@ -196,23 +192,23 @@ static void emit(const status_snapshot_t *s)
 
     bool over_capacity = (dsp_pct > 80.0) || (worker_pct > 80.0);
     bool any_recovery  = sb_fails || sb_dma_to || ic_disp_drops ||
-                         ic_slow_waits || lu_pool_lost;
+                        ic_slow_waits || lu_pool_lost;
     if (over_capacity || s->us.rb_full_drops || s->us.status_errors ||
-        s->us.resubmit_errors  || s->ws.bursts_dropped || any_recovery) {
+        s->us.resubmit_errors || s->ws.bursts_dropped || any_recovery) {
         ESP_LOGW(TAG,
-            "STATUS-ERR: cap[dsp=%.0f%% worker=%.0f%%] "
-            "usb[rb_full=%u status_err=%u resubmit_err=%u pool_lost=%u last=0x%02x] "
-            "worker[dropped=%u] "
-            "sb[stash_fails=%u recoveries=%u audio_dropped=%u dma_timeouts=%u] "
-            "ing[dispatch_drops=%u slow_waits=%u] "
-            "heap[dma_free=%uKB dma_largest=%uKB]",
-            dsp_pct, worker_pct,
-            s->us.rb_full_drops, s->us.status_errors,
-            s->us.resubmit_errors, lu_pool_lost, s->us.last_error_status,
-            s->ws.bursts_dropped,
-            sb_fails, sb_recoveries, sb_audio_drop, sb_dma_to,
-            ic_disp_drops, ic_slow_waits,
-            dma_free / 1024, dma_largest / 1024);
+                 "STATUS-ERR: cap[dsp=%.0f%% worker=%.0f%%] "
+                 "usb[rb_full=%u status_err=%u resubmit_err=%u pool_lost=%u last=0x%02x] "
+                 "worker[dropped=%u] "
+                 "sb[stash_fails=%u recoveries=%u audio_dropped=%u dma_timeouts=%u] "
+                 "ing[dispatch_drops=%u slow_waits=%u] "
+                 "heap[dma_free=%uKB dma_largest=%uKB]",
+                 dsp_pct, worker_pct,
+                 s->us.rb_full_drops, s->us.status_errors,
+                 s->us.resubmit_errors, lu_pool_lost, s->us.last_error_status,
+                 s->ws.bursts_dropped,
+                 sb_fails, sb_recoveries, sb_audio_drop, sb_dma_to,
+                 ic_disp_drops, ic_slow_waits,
+                 dma_free / 1024, dma_largest / 1024);
     }
 #endif
 }
@@ -233,7 +229,7 @@ esp_err_t status_logger_init(void)
     // Queue in PSRAM: 2 × sizeof(status_snapshot_t) (~600 B each = ~1.2 KB)
     // — 1 Hz traffic, latency irrelevant, no reason to take DMA-INT.
     s_queue = xQueueCreateWithCaps(2, sizeof(status_snapshot_t),
-                                    MALLOC_CAP_SPIRAM);
+                                   MALLOC_CAP_SPIRAM);
     if (!s_queue) return ESP_ERR_NO_MEM;
 
     // PSRAM stack — see feedback_task_stacks_in_psram memory note.

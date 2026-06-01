@@ -27,16 +27,16 @@
 #include <stdint.h>
 
 typedef struct {
-    int16_t  *coeffs;           // length = delay_size * interp
-    int16_t  *delay;            // circular buffer, length = delay_size
-    int16_t   delay_size;       // taps per phase
-    int16_t   interp;           // interpolation factor
-    int16_t   decim;            // decimation factor
-    int16_t   shift;            // post-MAC shift (output = (acc >> (15 - shift)))
-    int16_t   rounding_val;     // rounding term (default 0x7fff)
+    int16_t *coeffs;       // length = delay_size * interp
+    int16_t *delay;        // circular buffer, length = delay_size
+    int16_t  delay_size;   // taps per phase
+    int16_t  interp;       // interpolation factor
+    int16_t  decim;        // decimation factor
+    int16_t  shift;        // post-MAC shift (output = (acc >> (15 - shift)))
+    int16_t  rounding_val; // rounding term (default 0x7fff)
     // Mutable state — updated per call:
-    int16_t   pos;              // current delay-line write position (counts DOWN)
-    int16_t   start_pos;        // current phase index within an INTERP window
+    int16_t pos;       // current delay-line write position (counts DOWN)
+    int16_t start_pos; // current phase index within an INTERP window
 } firmr_s16_t;
 
 // Initialise. coeffs must have length = delay_size * interp.
@@ -54,6 +54,6 @@ void firmr_s16_init(firmr_s16_t *fir,
 // (the phase walk produces between floor(input_len*interp/decim)
 // and ceil(input_len*interp/decim) outputs depending on initial
 // phase).
-int32_t firmr_s16_process(firmr_s16_t *fir,
+int32_t firmr_s16_process(firmr_s16_t   *fir,
                           const int16_t *input, int16_t *output,
                           int32_t input_len);

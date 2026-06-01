@@ -26,16 +26,16 @@ extern "C" {
 // Maximum decoded message size: 10 BCH(31,20) blocks under ACCH
 // poly=3545 → 20 message bits each → 200 bits total. Real-world IDA
 // frames carry ≤23 bytes of SBD payload.
-#define IDA_DECODE_MAX_BITS  200
+#define IDA_DECODE_MAX_BITS 200
 #define IDA_DECODE_MAX_BYTES 25
 
 typedef struct {
-    bool     ok;                                // true iff all BCH blocks decoded
-    int      n_blocks;                          // BCH blocks attempted (always 10 for full IDA)
-    int      blocks_ok;                         // BCH blocks that decoded successfully
-    int      total_errors;                      // total bit errors corrected across blocks
-    uint16_t n_bits;                            // valid bits in `bits[]` (= blocks_ok × 21)
-    uint8_t  bits[IDA_DECODE_MAX_BITS];         // 0/1-per-byte descrambled stream
+    bool     ok;                        // true iff all BCH blocks decoded
+    int      n_blocks;                  // BCH blocks attempted (always 10 for full IDA)
+    int      blocks_ok;                 // BCH blocks that decoded successfully
+    int      total_errors;              // total bit errors corrected across blocks
+    uint16_t n_bits;                    // valid bits in `bits[]` (= blocks_ok × 21)
+    uint8_t  bits[IDA_DECODE_MAX_BITS]; // 0/1-per-byte descrambled stream
 
     // Header fields parsed from bits[0..19] (per
     // iridium-toolkit/bitsparser.py:IridiumDAMessage):
@@ -46,17 +46,17 @@ typedef struct {
     //   bits[11..15]  da_len (5-bit payload byte count, 0..24)
     //   bits[16]      flags3
     //   bits[17..19]  zero1 (sanity-check, must be 0)
-    uint8_t  da_flags1;       // 4 bits
-    uint8_t  da_cont;         // 1 bit
-    uint8_t  da_ctr;          // 3 bits
-    uint8_t  da_flags2;       // 3 bits
-    uint8_t  da_len;          // 5 bits — number of valid payload bytes
-    uint8_t  da_flags3;       // 1 bit
-    bool     header_ok;       // zero1 == 0 (frame structure valid)
+    uint8_t da_flags1; // 4 bits
+    uint8_t da_cont;   // 1 bit
+    uint8_t da_ctr;    // 3 bits
+    uint8_t da_flags2; // 3 bits
+    uint8_t da_len;    // 5 bits — number of valid payload bytes
+    uint8_t da_flags3; // 1 bit
+    bool    header_ok; // zero1 == 0 (frame structure valid)
 
     // Payload bytes from bits[20..(20+da_len*8)], packed MSB-first.
-    uint8_t  payload[24];
-    uint8_t  payload_len;     // = da_len, capped at 24
+    uint8_t payload[24];
+    uint8_t payload_len; // = da_len, capped at 24
 
     // CRC field at bits[180..195] (= 9*20..9*20+16).
     uint16_t da_crc_reported;

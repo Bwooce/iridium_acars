@@ -14,21 +14,25 @@
 
 static int passed = 0, failed = 0;
 
-#define CHECK(cond, fmt, ...) do {                                       \
-    if (!(cond)) {                                                       \
-        printf("  FAIL line %d: " fmt "\n", __LINE__, ##__VA_ARGS__);    \
-        failed++; return;                                                \
-    } else { passed++; }                                                 \
-} while (0)
+#define CHECK(cond, fmt, ...)                                             \
+    do {                                                                  \
+        if (!(cond)) {                                                    \
+            printf("  FAIL line %d: " fmt "\n", __LINE__, ##__VA_ARGS__); \
+            failed++;                                                     \
+            return;                                                       \
+        } else {                                                          \
+            passed++;                                                     \
+        }                                                                 \
+    } while (0)
 
 // Helper: build a fake ida_decoded_t with the given payload bytes
 // (skipping the header parsing; just put the bytes in payload[]).
 static void make_ida(ida_decoded_t *ida, const uint8_t *bytes, int n)
 {
     memset(ida, 0, sizeof(*ida));
-    ida->ok = true;
-    ida->blocks_ok = 10;
-    ida->n_blocks = 10;
+    ida->ok          = true;
+    ida->blocks_ok   = 10;
+    ida->n_blocks    = 10;
     ida->payload_len = (uint8_t)(n > (int)sizeof(ida->payload) ? sizeof(ida->payload) : n);
     memcpy(ida->payload, bytes, ida->payload_len);
 }
@@ -39,11 +43,11 @@ static void test_filtered_non_sbd(void)
     printf("Test: non-SBD payload -> filtered (returns -1)\n");
     sbd_reassembler_t ctx;
     sbd_reassembler_init(&ctx);
-    uint8_t bytes[] = { 0x12, 0x34, 0x56, 0x78, 0x9a };
+    uint8_t       bytes[] = {0x12, 0x34, 0x56, 0x78, 0x9a};
     ida_decoded_t ida;
     make_ida(&ida, bytes, sizeof(bytes));
     sbd_message_t out;
-    int rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
+    int           rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
     CHECK(rc == -1, "rc=%d", rc);
     CHECK(ctx.cnt_filtered == 1, "cnt_filtered=%u", ctx.cnt_filtered);
 }
@@ -59,13 +63,14 @@ static void test_hello_mailbox_check(void)
     // prehdr (truncated — IDA can carry at most ~22 bytes; the
     // reassembler matches Python's slice-truncation behaviour).
     // Set prehdr[15]==0 so msgcnt==0 (mailbox check).
-    uint8_t bytes[24] = { 0 };
-    bytes[0] = 0x06; bytes[1] = 0x00;
-    bytes[2] = 0x20;
+    uint8_t bytes[24] = {0};
+    bytes[0]          = 0x06;
+    bytes[1]          = 0x00;
+    bytes[2]          = 0x20;
     ida_decoded_t ida;
     make_ida(&ida, bytes, sizeof(bytes));
     sbd_message_t out;
-    int rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
+    int           rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
     CHECK(rc == 1, "rc=%d (expected 1)", rc);
     CHECK(out.type == SBD_TYPE_HELLO_0600, "type=%d", out.type);
     CHECK(ctx.cnt_short == 1, "cnt_short=%u", ctx.cnt_short);
@@ -84,19 +89,28 @@ static void test_single_frame_dl(void)
     //                  | 0x10 hdr: len=4, msgno=1
     //                  | 4 bytes payload AA BB CC DD
     uint8_t bytes[16];
-    int i = 0;
-    bytes[i++] = 0x76; bytes[i++] = 0x08;
-    bytes[i++] = 0x26;                                  // prehdr[0]
-    bytes[i++] = 0x00; bytes[i++] = 0x00;                // prehdr[1..2]
-    bytes[i++] = 0x01;                                  // prehdr[3] = msgcnt
-    bytes[i++] = 0x00; bytes[i++] = 0x00; bytes[i++] = 0x00; // prehdr[4..6]
-    bytes[i++] = 0x10; bytes[i++] = 0x04; bytes[i++] = 0x01;
-    bytes[i++] = 0xAA; bytes[i++] = 0xBB; bytes[i++] = 0xCC; bytes[i++] = 0xDD;
+    int     i  = 0;
+    bytes[i++] = 0x76;
+    bytes[i++] = 0x08;
+    bytes[i++] = 0x26; // prehdr[0]
+    bytes[i++] = 0x00;
+    bytes[i++] = 0x00; // prehdr[1..2]
+    bytes[i++] = 0x01; // prehdr[3] = msgcnt
+    bytes[i++] = 0x00;
+    bytes[i++] = 0x00;
+    bytes[i++] = 0x00; // prehdr[4..6]
+    bytes[i++] = 0x10;
+    bytes[i++] = 0x04;
+    bytes[i++] = 0x01;
+    bytes[i++] = 0xAA;
+    bytes[i++] = 0xBB;
+    bytes[i++] = 0xCC;
+    bytes[i++] = 0xDD;
 
     ida_decoded_t ida;
     make_ida(&ida, bytes, i);
     sbd_message_t out;
-    int rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
+    int           rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
     CHECK(rc == 1, "rc=%d", rc);
     CHECK(out.type == SBD_TYPE_DATA_DL_7608, "type=%d", out.type);
     CHECK(out.payload_len == 4, "payload_len=%u", out.payload_len);
@@ -114,23 +128,39 @@ static void test_multi_frame_assembly(void)
 
     // Frame 1: 76 08 [26 .. .. 02 ..] [10 02 01 11 22]
     uint8_t f1[14];
-    int i = 0;
-    f1[i++] = 0x76; f1[i++] = 0x08;
-    f1[i++] = 0x26; f1[i++] = 0; f1[i++] = 0;
-    f1[i++] = 0x02;                              // msgcnt=2
-    f1[i++] = 0; f1[i++] = 0; f1[i++] = 0;
-    f1[i++] = 0x10; f1[i++] = 0x02; f1[i++] = 0x01;
-    f1[i++] = 0x11; f1[i++] = 0x22;
+    int     i = 0;
+    f1[i++]   = 0x76;
+    f1[i++]   = 0x08;
+    f1[i++]   = 0x26;
+    f1[i++]   = 0;
+    f1[i++]   = 0;
+    f1[i++]   = 0x02; // msgcnt=2
+    f1[i++]   = 0;
+    f1[i++]   = 0;
+    f1[i++]   = 0;
+    f1[i++]   = 0x10;
+    f1[i++]   = 0x02;
+    f1[i++]   = 0x01;
+    f1[i++]   = 0x11;
+    f1[i++]   = 0x22;
 
     // Frame 2: 76 08 [26 .. .. 02 ..] [10 02 02 33 44]
     uint8_t f2[14];
-    int j = 0;
-    f2[j++] = 0x76; f2[j++] = 0x08;
-    f2[j++] = 0x26; f2[j++] = 0; f2[j++] = 0;
-    f2[j++] = 0x02;
-    f2[j++] = 0; f2[j++] = 0; f2[j++] = 0;
-    f2[j++] = 0x10; f2[j++] = 0x02; f2[j++] = 0x02;
-    f2[j++] = 0x33; f2[j++] = 0x44;
+    int     j = 0;
+    f2[j++]   = 0x76;
+    f2[j++]   = 0x08;
+    f2[j++]   = 0x26;
+    f2[j++]   = 0;
+    f2[j++]   = 0;
+    f2[j++]   = 0x02;
+    f2[j++]   = 0;
+    f2[j++]   = 0;
+    f2[j++]   = 0;
+    f2[j++]   = 0x10;
+    f2[j++]   = 0x02;
+    f2[j++]   = 0x02;
+    f2[j++]   = 0x33;
+    f2[j++]   = 0x44;
 
     ida_decoded_t ida;
     sbd_message_t out;
@@ -144,7 +174,7 @@ static void test_multi_frame_assembly(void)
     CHECK(rc == 1, "frame 2 rc=%d (expected 1=complete)", rc);
     CHECK(out.payload_len == 4, "payload_len=%u (expected 4)", out.payload_len);
     CHECK(out.payload[0] == 0x11 && out.payload[1] == 0x22 &&
-          out.payload[2] == 0x33 && out.payload[3] == 0x44,
+              out.payload[2] == 0x33 && out.payload[3] == 0x44,
           "merged payload mismatch: %02x %02x %02x %02x",
           out.payload[0], out.payload[1], out.payload[2], out.payload[3]);
     CHECK(ctx.cnt_multi == 1, "cnt_multi=%u", ctx.cnt_multi);
@@ -160,11 +190,21 @@ static void test_session_timeout(void)
 
     // Frame 1 of a 2-frame message at t=1s.
     uint8_t f1[14];
-    int i = 0;
-    f1[i++] = 0x76; f1[i++] = 0x08;
-    f1[i++] = 0x26; f1[i++] = 0; f1[i++] = 0; f1[i++] = 0x02;
-    f1[i++] = 0; f1[i++] = 0; f1[i++] = 0;
-    f1[i++] = 0x10; f1[i++] = 0x02; f1[i++] = 0x01; f1[i++] = 0x99; f1[i++] = 0xAA;
+    int     i = 0;
+    f1[i++]   = 0x76;
+    f1[i++]   = 0x08;
+    f1[i++]   = 0x26;
+    f1[i++]   = 0;
+    f1[i++]   = 0;
+    f1[i++]   = 0x02;
+    f1[i++]   = 0;
+    f1[i++]   = 0;
+    f1[i++]   = 0;
+    f1[i++]   = 0x10;
+    f1[i++]   = 0x02;
+    f1[i++]   = 0x01;
+    f1[i++]   = 0x99;
+    f1[i++]   = 0xAA;
 
     ida_decoded_t ida;
     sbd_message_t out;

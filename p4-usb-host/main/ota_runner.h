@@ -27,7 +27,7 @@ esp_err_t ota_runner_start(void);
 typedef enum {
     OTA_IDLE = 0,
     OTA_RUNNING,
-    OTA_SUCCESS,        // staged + flipped; reboot pending
+    OTA_SUCCESS, // staged + flipped; reboot pending
     OTA_FAILED,
 } ota_state_t;
 

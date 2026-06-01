@@ -53,16 +53,16 @@
 
 static const char *TAG = "SMOKE";
 
-#define TRANSFER_BYTES   (16 * 1024)         // matches class_driver's out_block_size
+#define TRANSFER_BYTES (16 * 1024)            // matches class_driver's out_block_size
 #define TRANSFER_SAMPLES (TRANSFER_BYTES / 2) // complex samples per transfer (1 byte I + 1 byte Q)
 
 // Inject the tone at FFT bin 200 (positive frequency, well clear of DC at
 // bin 0 and Nyquist at bin 1024). After fftshift the magnitudes index is
 // (bin + 1024) % 2048 = 1224. We assert the detected peak_bin is in
 // 1200..1248 — generous to absorb spectral leakage.
-#define TONE_FFT_BIN     200
-#define EXPECTED_BIN_LO  1200
-#define EXPECTED_BIN_HI  1248
+#define TONE_FFT_BIN 200
+#define EXPECTED_BIN_LO 1200
+#define EXPECTED_BIN_HI 1248
 
 // Phases of the synthetic stream:
 //   PRIMING noise transfers — let the baseline EMA settle before injecting
@@ -80,7 +80,7 @@ static const char *TAG = "SMOKE";
 //   TRAILER noise transfer(s) — terminate the burst (detector logs
 //     BURST DETECTED only on the tone -> noise transition).
 #define PRIMING_TRANSFERS 144
-#define TONE_TRANSFERS    4
+#define TONE_TRANSFERS 4
 #define TRAILER_TRANSFERS 2
 
 // Detection callback state. The callback fires once per completed burst.
@@ -91,23 +91,23 @@ static const char *TAG = "SMOKE";
 // the production detector handles it via the burst-vs-RFI worker filter.
 // For the smoke test we assert against the strongest detection seen,
 // which the tone phase will dominate by ≥30 dB.
-static volatile int   s_bursts_detected = 0;
+static volatile int   s_bursts_detected    = 0;
 static volatile int   s_strongest_peak_bin = -1;
-static volatile float s_strongest_snr_db = 0.0f;
+static volatile float s_strongest_snr_db   = 0.0f;
 // Per-bin highest SNR seen across the whole run. Used by SMOKE_TEST_CORPUS
 // to ask "did the corpus burst land in the DC window?" rather than "was
 // the DC burst the strongest?" — the latter is brittle once the tagger
 // threshold dropped from 14 dB to 10 dB (#77) because Phase 1 noise
 // false-positives now produce ~12-13 dB SNR detections at random bins,
 // out-ranking the corpus's own ~12.6 dB carrier.
-#define BIN_PEAK_TRACK_N  2048
+#define BIN_PEAK_TRACK_N 2048
 static volatile float s_per_bin_max_snr[BIN_PEAK_TRACK_N];
 
 static void on_burst(const detected_burst_t *burst)
 {
     s_bursts_detected++;
     if (burst->peak_snr_db > s_strongest_snr_db) {
-        s_strongest_snr_db = burst->peak_snr_db;
+        s_strongest_snr_db   = burst->peak_snr_db;
         s_strongest_peak_bin = burst->peak_bin;
     }
     if (burst->peak_bin >= 0 && burst->peak_bin < BIN_PEAK_TRACK_N) {
@@ -149,8 +149,8 @@ static void fill_noise(uint8_t *out)
         uint32_t r = esp_random();
         // Low amplitude: ±8 around 128 — keeps the baseline well below
         // the tone's energy so SNR is large.
-        out[i + 0] = 128 + (int8_t)((r >>  0) & 0x0f) - 8;
-        out[i + 1] = 128 + (int8_t)((r >>  8) & 0x0f) - 8;
+        out[i + 0] = 128 + (int8_t)((r >> 0) & 0x0f) - 8;
+        out[i + 1] = 128 + (int8_t)((r >> 8) & 0x0f) - 8;
         out[i + 2] = 128 + (int8_t)((r >> 16) & 0x0f) - 8;
         out[i + 3] = 128 + (int8_t)((r >> 24) & 0x0f) - 8;
     }
@@ -162,9 +162,9 @@ static void fill_noise(uint8_t *out)
 // so multiple consecutive transfers form one coherent tone.
 static void fill_tone(uint8_t *out, int tone_bin)
 {
-    static double phase = 0.0;
-    const double dphase = 2.0 * M_PI * (double)tone_bin / (double)FFT_SIZE;
-    const double amplitude = 100.0;  // out of ±127 range
+    static double phase     = 0.0;
+    const double  dphase    = 2.0 * M_PI * (double)tone_bin / (double)FFT_SIZE;
+    const double  amplitude = 100.0; // out of ±127 range
     for (int s = 0; s < TRANSFER_SAMPLES; s++) {
         double i_v = amplitude * cos(phase);
         double q_v = amplitude * sin(phase);
@@ -178,8 +178,16 @@ static void fill_tone(uint8_t *out, int tone_bin)
         q_v += ((int8_t)((r >> 8) & 0x0f) - 8) * 0.5;
         int iv = (int)(i_v + 128.5);
         int qv = (int)(q_v + 128.5);
-        if (iv < 0) { iv = 0; } else if (iv > 255) { iv = 255; }
-        if (qv < 0) { qv = 0; } else if (qv > 255) { qv = 255; }
+        if (iv < 0) {
+            iv = 0;
+        } else if (iv > 255) {
+            iv = 255;
+        }
+        if (qv < 0) {
+            qv = 0;
+        } else if (qv > 255) {
+            qv = 255;
+        }
         out[s * 2 + 0] = (uint8_t)iv;
         out[s * 2 + 1] = (uint8_t)qv;
     }
@@ -191,13 +199,13 @@ static void fill_tone(uint8_t *out, int tone_bin)
 // prev_slot.
 static int drive_transfer(uint8_t *src, int prev_slot)
 {
-    int slot;
+    int      slot;
     uint8_t *raw = ingest_core1_acquire_raw(&slot);
     memcpy(raw, src, TRANSFER_BYTES);
     ingest_core1_dispatch(slot, TRANSFER_BYTES);
 
     if (prev_slot >= 0) {
-        size_t n_int16 = 0;
+        size_t   n_int16   = 0;
         int16_t *converted = ingest_core1_take_converted(prev_slot, &n_int16);
         // n_int16 is bytes_filled; complex sample count is /2.
         dsp_processor_feed(converted, n_int16 / 2);
@@ -231,7 +239,8 @@ static void smoke_test_run_frame_decoder(void)
         // corpus are classified with the right UW (matches host
         // test_iridium_frame_corpus 100% agreement).
         ir_direction_t qdir = (e->expected_direction == IR_FRM_DIR_UPLINK)
-                              ? DIR_UPLINK : DIR_DOWNLINK;
+                                  ? DIR_UPLINK
+                                  : DIR_DOWNLINK;
         // Retry-on-drop with bounded backoff. The decoder task runs at
         // ~10 ms/frame (one tick of vTaskDelay + classify), so we wait
         // at most a few ticks per push. Up to 100 attempts = 1 s
@@ -241,32 +250,33 @@ static void smoke_test_run_frame_decoder(void)
             ok = frame_decoder_push(e->bits, e->n_bits, qdir,
                                     e->freq_hz, 0, e->snr_db);
             if (ok) break;
-            vTaskDelay(1);   // one tick = drain a bit, then retry
+            vTaskDelay(1); // one tick = drain a bit, then retry
         }
-        if (ok) pushed_ok++;
-        else    push_drops++;
+        if (ok)
+            pushed_ok++;
+        else
+            push_drops++;
     }
     // Wait for the decoder task to drain. 100 ms × 30 = up to 3 s.
     for (int i = 0; i < 30 && frame_decoder_queue_count() > 0; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     frame_decoder_get_class_counts(&after);
-    uint64_t got_unknown  = after.unknown  - before.unknown;
-    uint64_t got_ms       = after.ms       - before.ms;
-    uint64_t got_tl       = after.tl       - before.tl;
-    uint64_t got_bc       = after.bc       - before.bc;
-    uint64_t got_lw_da    = after.lw_da    - before.lw_da;
+    uint64_t got_unknown  = after.unknown - before.unknown;
+    uint64_t got_ms       = after.ms - before.ms;
+    uint64_t got_tl       = after.tl - before.tl;
+    uint64_t got_bc       = after.bc - before.bc;
+    uint64_t got_lw_da    = after.lw_da - before.lw_da;
     uint64_t got_lw_other = after.lw_other - before.lw_other;
-    uint64_t got_total    = got_unknown + got_ms + got_tl + got_bc
-                          + got_lw_da + got_lw_other;
+    uint64_t got_total    = got_unknown + got_ms + got_tl + got_bc + got_lw_da + got_lw_other;
 
     ESP_LOGI(TAG, "Pushed: %d ok / %d dropped (corpus size %u)",
              pushed_ok, push_drops, ALBQ_FRAME_CORPUS_LEN);
     ESP_LOGI(TAG, "Decoder counts: UNKNOWN=%llu MS=%llu TL=%llu BC=%llu "
-             "LW.DA=%llu LW.other=%llu (total processed=%llu)",
+                  "LW.DA=%llu LW.other=%llu (total processed=%llu)",
              (unsigned long long)got_unknown, (unsigned long long)got_ms,
-             (unsigned long long)got_tl,      (unsigned long long)got_bc,
-             (unsigned long long)got_lw_da,   (unsigned long long)got_lw_other,
+             (unsigned long long)got_tl, (unsigned long long)got_bc,
+             (unsigned long long)got_lw_da, (unsigned long long)got_lw_other,
              (unsigned long long)got_total);
 
     bool pass = true;
@@ -286,7 +296,7 @@ static void smoke_test_run_frame_decoder(void)
     // any classifier-tuning drift between host (gcc) and target (riscv32).
     const int EXP_TL       = 1;
     const int EXP_BC       = 11;
-    const int EXP_LW_TOTAL = 61;   // matches host: 14 BC + 61 LW + 1 TL etc.
+    const int EXP_LW_TOTAL = 61; // matches host: 14 BC + 61 LW + 1 TL etc.
     if ((int)got_tl < EXP_TL - 2 || (int)got_tl > EXP_TL + 2) {
         ESP_LOGE(TAG, "  TL count %llu out of range [%d..%d]",
                  (unsigned long long)got_tl, EXP_TL - 2, EXP_TL + 2);
@@ -303,8 +313,10 @@ static void smoke_test_run_frame_decoder(void)
                  lw_total, EXP_LW_TOTAL - 2, EXP_LW_TOTAL + 2);
         pass = false;
     }
-    if (pass) ESP_LOGI(TAG, "===== SMOKE_PASS =====");
-    else      ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
+    if (pass)
+        ESP_LOGI(TAG, "===== SMOKE_PASS =====");
+    else
+        ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
 
     // Park here — smoke task is supposed to never return.
     // (The frame_decoder task on Core 1 stays running so we can keep
@@ -324,7 +336,7 @@ static void smoke_test_run_frame_decoder(void)
 // Does NOT assert on Iridium frame decode -- the antenna may be
 // missing or the sky may be quiet, and the point of this variant is
 // to validate the USB/SDR/ingest/DSP path, not the demodulator.
-#define SMOKE_LIVE_DURATION_S      10
+#define SMOKE_LIVE_DURATION_S 10
 
 #include "worker_core1.h"
 #include "signal_buffer.h"
@@ -360,33 +372,33 @@ static void smoke_test_run_live_sdr(void)
     vTaskDelay(pdMS_TO_TICKS(1500));
 
     worker_stats_t s0;
-    worker_core1_get_stats(&s0);   // baseline (counters monotonically up)
+    worker_core1_get_stats(&s0); // baseline (counters monotonically up)
 
-    int64_t t_start = esp_timer_get_time();
+    int64_t t_start  = esp_timer_get_time();
     int64_t deadline = t_start + (int64_t)SMOKE_LIVE_DURATION_S * 1000000;
     while (esp_timer_get_time() < deadline) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-    int64_t t_end = esp_timer_get_time();
-    double window_s = (double)(t_end - t_start) / 1e6;
+    int64_t t_end    = esp_timer_get_time();
+    double  window_s = (double)(t_end - t_start) / 1e6;
 
     worker_stats_t s1;
     worker_core1_get_stats(&s1);
-    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t psram_free    = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 
-    uint32_t d_queued   = s1.bursts_queued    - s0.bursts_queued;
+    uint32_t d_queued   = s1.bursts_queued - s0.bursts_queued;
     uint32_t d_proc     = s1.bursts_processed - s0.bursts_processed;
     uint32_t d_bch_ok   = s1.bursts_bch_decoded - s0.bursts_bch_decoded;
     uint32_t d_bch_unk  = s1.bursts_bch_unknown - s0.bursts_bch_unknown;
-    uint32_t d_bch_fail = s1.bursts_bch_failed  - s0.bursts_bch_failed;
-    uint32_t d_drop     = s1.bursts_dropped   - s0.bursts_dropped;
-    uint32_t d_skip     = s1.bursts_skipped   - s0.bursts_skipped;
+    uint32_t d_bch_fail = s1.bursts_bch_failed - s0.bursts_bch_failed;
+    uint32_t d_drop     = s1.bursts_dropped - s0.bursts_dropped;
+    uint32_t d_skip     = s1.bursts_skipped - s0.bursts_skipped;
 
     ESP_LOGI(TAG, "Live-SDR window done after %.1f s", window_s);
     ESP_LOGI(TAG, "  Worker delta: queued=%u processed=%u "
-                   "bch_decoded=%u bch_unknown=%u bch_failed=%u "
-                   "dropped=%u skipped=%u",
+                  "bch_decoded=%u bch_unknown=%u bch_failed=%u "
+                  "dropped=%u skipped=%u",
              (unsigned)d_queued, (unsigned)d_proc,
              (unsigned)d_bch_ok, (unsigned)d_bch_unk, (unsigned)d_bch_fail,
              (unsigned)d_drop, (unsigned)d_skip);
@@ -402,13 +414,15 @@ static void smoke_test_run_live_sdr(void)
     }
     if (d_queued == 0) {
         ESP_LOGE(TAG, "  FAIL: zero bursts tagged over %.1f s -- USB SDR not "
-                       "enumerated, or signal floor below detector threshold",
+                      "enumerated, or signal floor below detector threshold",
                  window_s);
         pass = false;
     }
 
-    if (pass) ESP_LOGI(TAG, "===== SMOKE_LIVE_SDR_PASS =====");
-    else      ESP_LOGE(TAG, "===== SMOKE_LIVE_SDR_FAIL =====");
+    if (pass)
+        ESP_LOGI(TAG, "===== SMOKE_LIVE_SDR_PASS =====");
+    else
+        ESP_LOGE(TAG, "===== SMOKE_LIVE_SDR_FAIL =====");
 }
 #endif
 
@@ -461,23 +475,24 @@ void smoke_test_run(void)
     }
 
     ESP_LOGI(TAG, "Injecting tone at FFT bin %d (post-shift bin %d), "
-             "expecting detection in [%d..%d]",
+                  "expecting detection in [%d..%d]",
              TONE_FFT_BIN, (TONE_FFT_BIN + FFT_SIZE / 2) % FFT_SIZE,
              EXPECTED_BIN_LO, EXPECTED_BIN_HI);
 
-    // Bring up the production DSP path. Order matches action_start_stream
-    // in class_driver.c.
-    // Per-phase heap diagnostic: tracks how internal-SRAM fragmentation
-    // evolves through init. Prints total + largest-contiguous free for
-    // MALLOC_CAP_INTERNAL (all internal) and MALLOC_CAP_INTERNAL|DMA
-    // (DMA-capable subset, used by s_raw / USB pool).
-    #define HEAP_LOG(where) do { \
-        size_t fi  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL); \
-        size_t li  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL); \
-        size_t fid = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA); \
+// Bring up the production DSP path. Order matches action_start_stream
+// in class_driver.c.
+// Per-phase heap diagnostic: tracks how internal-SRAM fragmentation
+// evolves through init. Prints total + largest-contiguous free for
+// MALLOC_CAP_INTERNAL (all internal) and MALLOC_CAP_INTERNAL|DMA
+// (DMA-capable subset, used by s_raw / USB pool).
+#define HEAP_LOG(where)                                                                      \
+    do {                                                                                     \
+        size_t fi  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);                           \
+        size_t li  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);                  \
+        size_t fid = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);          \
         size_t lid = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA); \
         ESP_LOGW("HEAP", "%-22s INT free=%6zu largest=%6zu  DMA-INT free=%6zu largest=%6zu", \
-                 where, fi, li, fid, lid); \
+                 where, fi, li, fid, lid);                                                   \
     } while (0)
 
     // CRITICAL early-alloc dance to keep PIE-asm-position-sensitive
@@ -557,7 +572,7 @@ void smoke_test_run(void)
     for (int i = 0; i < PRIMING_TRANSFERS; i++) {
         fill_noise(synth);
         prev_slot = drive_transfer(synth, prev_slot);
-        vTaskDelay(1);  // let ingest task make progress
+        vTaskDelay(1); // let ingest task make progress
     }
 #endif
 
@@ -582,7 +597,7 @@ void smoke_test_run(void)
     ESP_LOGI(TAG, "Phase 2 (DC tone, was: PRBS15 corpus): %d transfers at bin 0",
              TONE_TRANSFERS);
     for (int i = 0; i < TONE_TRANSFERS; i++) {
-        fill_tone(synth, /*tone_bin=*/0);     // FFT bin 0 → post-shift 1024 = DC
+        fill_tone(synth, /*tone_bin=*/0); // FFT bin 0 → post-shift 1024 = DC
         prev_slot = drive_transfer(synth, prev_slot);
         vTaskDelay(1);
     }
@@ -600,7 +615,7 @@ void smoke_test_run(void)
     ESP_LOGI(TAG, "Phase 2 (raw-mode @ %u Hz): %u× %u-byte transfers "
                   "(~%u ms, %u expected bursts in subband)",
              ALBQ_RAW_LO_HZ, n_xfers, TRANSFER_BYTES,
-             (n_xfers * TRANSFER_BYTES) / (2u * 2560u),  // ms at 2.56 MSPS
+             (n_xfers * TRANSFER_BYTES) / (2u * 2560u), // ms at 2.56 MSPS
              ALBQ_RAW_EXPECTED_BURSTS);
     // Register the smoke task with the task watchdog and reset it
     // every loop iteration. Without this the smoke task can starve
@@ -656,7 +671,7 @@ void smoke_test_run(void)
         worker_stats_t ws;
         worker_core1_get_stats(&ws);
         ESP_LOGI(TAG, "Worker stats: queued=%u processed=%u dropped=%u "
-                 "skipped=%u high_water=%u avg=%.0f us",
+                      "skipped=%u high_water=%u avg=%.0f us",
                  (unsigned)ws.bursts_queued,
                  (unsigned)ws.bursts_processed,
                  (unsigned)ws.bursts_dropped,
@@ -666,7 +681,7 @@ void smoke_test_run(void)
         // Per-stage cost so we can see WHERE the worker spends its time —
         // critical for choosing the right PIE/SIMD optimisation target.
         ESP_LOGI(TAG, "  per-stage avg us: extract=%.0f rotate=%.0f "
-                       "decim=%.0f pipeline=%.0f bch=%.0f",
+                      "decim=%.0f pipeline=%.0f bch=%.0f",
                  (double)ws.extract_us,
                  (double)ws.freq_center_us,
                  (double)ws.fir_decim_us,
@@ -692,16 +707,16 @@ void smoke_test_run(void)
         extern volatile uint32_t g_pie_fft_calls;
         extern volatile uint64_t g_uw_specmul_us;
         extern volatile uint64_t g_uw_magsearch_us;
-        uint64_t pi_inner = g_pie_fft_inner_us;
-        uint64_t pi_outer = g_pie_fft_outer_us;
-        uint32_t pi_calls = g_pie_fft_calls;
-        uint64_t uw_sm   = g_uw_specmul_us;
-        uint64_t uw_ms   = g_uw_magsearch_us;
-        g_pie_fft_inner_us = 0;
-        g_pie_fft_outer_us = 0;
-        g_pie_fft_calls    = 0;
-        g_uw_specmul_us    = 0;
-        g_uw_magsearch_us  = 0;
+        uint64_t                 pi_inner = g_pie_fft_inner_us;
+        uint64_t                 pi_outer = g_pie_fft_outer_us;
+        uint32_t                 pi_calls = g_pie_fft_calls;
+        uint64_t                 uw_sm    = g_uw_specmul_us;
+        uint64_t                 uw_ms    = g_uw_magsearch_us;
+        g_pie_fft_inner_us                = 0;
+        g_pie_fft_outer_us                = 0;
+        g_pie_fft_calls                   = 0;
+        g_uw_specmul_us                   = 0;
+        g_uw_magsearch_us                 = 0;
         ESP_LOGI(TAG, "  pie_fft: calls=%lu inner=%llu us outer=%llu us "
                       "(per-call: inner=%.0f us outer=%.0f us)",
                  (unsigned long)pi_calls,
@@ -718,7 +733,7 @@ void smoke_test_run(void)
         frame_decoder_class_counts_t fc;
         frame_decoder_get_class_counts(&fc);
         ESP_LOGI(TAG, "Frame-decoder counts: UNKNOWN=%llu MS=%llu TL=%llu "
-                 "BC=%llu LW.DA=%llu LW.other=%llu",
+                      "BC=%llu LW.DA=%llu LW.other=%llu",
                  (unsigned long long)fc.unknown, (unsigned long long)fc.ms,
                  (unsigned long long)fc.tl, (unsigned long long)fc.bc,
                  (unsigned long long)fc.lw_da, (unsigned long long)fc.lw_other);
@@ -729,11 +744,11 @@ void smoke_test_run(void)
     // 2.56 MSPS uint8 IQ. Per stripe: PRIMING_TRANSFERS noise → 3 stripe
     // transfers → TRAILER_TRANSFERS noise (let any active burst end and
     // baseline EMA re-settle for the next stripe).
-    int per_stripe_bursts[ALBQ_NUM_STRIPES] = { 0 };
-    int total_bursts_after = 0;
+    int per_stripe_bursts[ALBQ_NUM_STRIPES] = {0};
+    int total_bursts_after                  = 0;
     for (int sidx = 0; sidx < ALBQ_NUM_STRIPES; sidx++) {
-        const albq_stripe_t *st = &ALBQ_STRIPES[sidx];
-        int bursts_before = s_bursts_detected;
+        const albq_stripe_t *st            = &ALBQ_STRIPES[sidx];
+        int                  bursts_before = s_bursts_detected;
 
         // Don't repeat priming for stripe 0 — it ran before this loop.
         if (sidx > 0) {
@@ -795,7 +810,7 @@ void smoke_test_run(void)
 
     // Drain the last in-flight slot so its DSP feed runs.
     if (prev_slot >= 0) {
-        size_t n_int16 = 0;
+        size_t   n_int16   = 0;
         int16_t *converted = ingest_core1_take_converted(prev_slot, &n_int16);
         dsp_processor_feed(converted, n_int16 / 2);
         ingest_core1_release(prev_slot);
@@ -805,9 +820,9 @@ void smoke_test_run(void)
     // still being processed when we get here.
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    int bursts = s_bursts_detected;
-    int peak_bin = s_strongest_peak_bin;
-    float snr_db = s_strongest_snr_db;
+    int   bursts   = s_bursts_detected;
+    int   peak_bin = s_strongest_peak_bin;
+    float snr_db   = s_strongest_snr_db;
 
     ESP_LOGI(TAG, "Result: bursts=%d strongest peak_bin=%d snr=%.2f dB",
              bursts, peak_bin, snr_db);
@@ -837,13 +852,12 @@ void smoke_test_run(void)
     }
     frame_decoder_class_counts_t fc;
     frame_decoder_get_class_counts(&fc);
-    uint64_t total_classified = fc.unknown + fc.ms + fc.tl + fc.bc
-                              + fc.lw_da + fc.lw_other;
+    uint64_t total_classified = fc.unknown + fc.ms + fc.tl + fc.bc + fc.lw_da + fc.lw_other;
     ESP_LOGI(TAG, "Frame-decoder counts: UNKNOWN=%llu MS=%llu TL=%llu BC=%llu "
-             "LW.DA=%llu LW.other=%llu (total=%llu, expected=%d)",
+                  "LW.DA=%llu LW.other=%llu (total=%llu, expected=%d)",
              (unsigned long long)fc.unknown, (unsigned long long)fc.ms,
-             (unsigned long long)fc.tl,      (unsigned long long)fc.bc,
-             (unsigned long long)fc.lw_da,   (unsigned long long)fc.lw_other,
+             (unsigned long long)fc.tl, (unsigned long long)fc.bc,
+             (unsigned long long)fc.lw_da, (unsigned long long)fc.lw_other,
              (unsigned long long)total_classified, ALBQ_RAW_EXPECTED_BURSTS);
     if (total_classified < 1) {
         ESP_LOGE(TAG, "  no bursts reached the classifier — worker chain broken");
@@ -869,10 +883,10 @@ void smoke_test_run(void)
     // 25 dB nor sustain detections near DC across frames, so a hit
     // near DC at high SNR is the right signal that the front end
     // detected the injected signal.
-    const int CORPUS_BIN_LO = 994;     // 1024 - 30: spectral-leakage band
-    const int CORPUS_BIN_HI = 1054;    // 1024 + 30
-    float dc_window_peak_snr = 0.0f;
-    int   dc_window_peak_bin = -1;
+    const int CORPUS_BIN_LO      = 994;  // 1024 - 30: spectral-leakage band
+    const int CORPUS_BIN_HI      = 1054; // 1024 + 30
+    float     dc_window_peak_snr = 0.0f;
+    int       dc_window_peak_bin = -1;
     for (int b = CORPUS_BIN_LO; b <= CORPUS_BIN_HI; b++) {
         if (s_per_bin_max_snr[b] > dc_window_peak_snr) {
             dc_window_peak_snr = s_per_bin_max_snr[b];
@@ -881,7 +895,7 @@ void smoke_test_run(void)
     }
     if (dc_window_peak_bin < 0) {
         ESP_LOGE(TAG, "  no detection landed in corpus DC window [%d..%d] "
-                 "(strongest was peak_bin=%d snr=%.2f dB)",
+                      "(strongest was peak_bin=%d snr=%.2f dB)",
                  CORPUS_BIN_LO, CORPUS_BIN_HI, peak_bin, snr_db);
         pass = false;
     } else {
@@ -910,14 +924,14 @@ void smoke_test_run(void)
     const int ALBQ_MIN_TOTAL_BURSTS = 5;
     if (bursts < ALBQ_MIN_TOTAL_BURSTS) {
         ESP_LOGE(TAG, "  total %d bursts is below threshold %d "
-                 "(across %d/%d stripes)",
+                      "(across %d/%d stripes)",
                  bursts, ALBQ_MIN_TOTAL_BURSTS,
                  stripes_with_bursts, ALBQ_NUM_STRIPES);
         pass = false;
     }
     if (stripes_with_bursts < 3) {
         ESP_LOGE(TAG, "  only %d stripes detected ≥1 burst (expected ≥3 "
-                 "of the 5 stripes with non-zero expected bursts)",
+                      "of the 5 stripes with non-zero expected bursts)",
                  stripes_with_bursts);
         pass = false;
     }
@@ -926,7 +940,8 @@ void smoke_test_run(void)
     if (peak_bin < ALBQ_BIN_EDGE_REJECT ||
         peak_bin > FFT_SIZE - ALBQ_BIN_EDGE_REJECT) {
         ESP_LOGE(TAG, "  strongest peak_bin %d in edge-reject window "
-                 "(likely DC/Nyquist artefact, not a real burst)", peak_bin);
+                      "(likely DC/Nyquist artefact, not a real burst)",
+                 peak_bin);
         pass = false;
     }
     if (snr_db < 10.0f) {
@@ -962,10 +977,10 @@ void smoke_test_run(void)
     frame_decoder_class_counts_t fc;
     frame_decoder_get_class_counts(&fc);
     ESP_LOGI(TAG, "Frame-decoder counts: UNKNOWN=%llu MS=%llu TL=%llu BC=%llu "
-             "LW.DA=%llu LW.other=%llu",
+                  "LW.DA=%llu LW.other=%llu",
              (unsigned long long)fc.unknown, (unsigned long long)fc.ms,
-             (unsigned long long)fc.tl,      (unsigned long long)fc.bc,
-             (unsigned long long)fc.lw_da,   (unsigned long long)fc.lw_other);
+             (unsigned long long)fc.tl, (unsigned long long)fc.bc,
+             (unsigned long long)fc.lw_da, (unsigned long long)fc.lw_other);
     ESP_LOGI(TAG, "Frame-decoder queue: pushed=%llu popped=%llu dropped=%llu",
              (unsigned long long)frame_decoder_pushed(),
              (unsigned long long)frame_decoder_popped(),
@@ -979,7 +994,8 @@ void smoke_test_run(void)
     }
     if (snr_db < 30.0f) {
         ESP_LOGE(TAG, "  SNR %.2f dB lower than expected (>30 dB) — could be"
-                 " a noise-floor spike rather than the tone", snr_db);
+                      " a noise-floor spike rather than the tone",
+                 snr_db);
         pass = false;
     }
 #endif
@@ -1017,7 +1033,7 @@ void smoke_test_run(void)
 
     ESP_LOGI(TAG, "Perf check (averaged over %lu DSP frames):", dsp_st.frames);
     ESP_LOGI(TAG, "  DSP/frame: total=%.0f wind=%.0f fft=%.0f mag=%.0f "
-             "detect=%.0f base=%.0f us",
+                  "detect=%.0f base=%.0f us",
              dsp_st.total_us, dsp_st.wind_us, dsp_st.fft_us,
              dsp_st.mag_us, dsp_st.detect_us, dsp_st.baseline_us);
     if (ing_st.dispatches > 0) {
@@ -1049,13 +1065,17 @@ void smoke_test_run(void)
     // check. Real-time throughput is gated by `resample` (currently
     // 3.8 ms/dispatch, the dominant cost — see task #58).
 #if !CONFIG_SMOKE_TEST_REAL_IRIDIUM
-    struct { const char *name; float actual; float bar; } checks[] = {
-        { "DSP total/frame",   dsp_st.total_us,    900.0f },
-        { "DSP wind/frame",    dsp_st.wind_us,     100.0f },  // current ~76, scalar Q15 (no PIE yet)
-        { "DSP fft/frame",     dsp_st.fft_us,      320.0f },  // current ~256
-        { "DSP mag/frame",     dsp_st.mag_us,       80.0f },  // current ~46
-        { "DSP detect/frame",  dsp_st.detect_us,   220.0f },  // current ~94-177
-        { "DSP base/frame",    dsp_st.baseline_us, 500.0f },
+    struct {
+        const char *name;
+        float       actual;
+        float       bar;
+    } checks[] = {
+        {"DSP total/frame", dsp_st.total_us, 900.0f},
+        {"DSP wind/frame", dsp_st.wind_us, 100.0f},     // current ~76, scalar Q15 (no PIE yet)
+        {"DSP fft/frame", dsp_st.fft_us, 320.0f},       // current ~256
+        {"DSP mag/frame", dsp_st.mag_us, 80.0f},        // current ~46
+        {"DSP detect/frame", dsp_st.detect_us, 220.0f}, // current ~94-177
+        {"DSP base/frame", dsp_st.baseline_us, 500.0f},
     };
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
         if (checks[i].actual > checks[i].bar) {
@@ -1068,7 +1088,7 @@ void smoke_test_run(void)
 #if !CONFIG_SMOKE_TEST_REAL_IRIDIUM
     if (ing_st.dispatches > 0) {
         float convert_avg = (float)ing_st.convert_us_total / ing_st.dispatches;
-        float push_avg    = (float)ing_st.push_us_total    / ing_st.dispatches;
+        float push_avg    = (float)ing_st.push_us_total / ing_st.dispatches;
         // push = resample (~3.8 ms) + sbpush (~0.2 ms). Resample dominates
         // and is the next real-time lever; sbpush stays sub-ms.
         if (convert_avg > 500.0f) {
@@ -1090,5 +1110,6 @@ void smoke_test_run(void)
         ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
     }
 
-    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+    while (1)
+        vTaskDelay(pdMS_TO_TICKS(1000));
 }

@@ -3,20 +3,29 @@
 #include "sbd_reassembler.h"
 #include <string.h>
 
-#define SBD_TIMEOUT_US  (5ULL * 1000000ULL)   // 5 s
+#define SBD_TIMEOUT_US (5ULL * 1000000ULL) // 5 s
 
 const char *sbd_type_wire_name(sbd_type_t t)
 {
     switch (t) {
-    case SBD_TYPE_UNKNOWN:       return "????";
-    case SBD_TYPE_HELLO_0600:    return "0600";
-    case SBD_TYPE_DATA_DL_7608:  return "7608";
-    case SBD_TYPE_DATA_DL_7609:  return "7609";
-    case SBD_TYPE_DATA_DL_760A:  return "760a";
-    case SBD_TYPE_DATA_DL_760B:  return "760b";
-    case SBD_TYPE_DATA_UL_760C:  return "760c";
-    case SBD_TYPE_DATA_UL_760D:  return "760d";
-    case SBD_TYPE_DATA_UL_760E:  return "760e";
+    case SBD_TYPE_UNKNOWN:
+        return "????";
+    case SBD_TYPE_HELLO_0600:
+        return "0600";
+    case SBD_TYPE_DATA_DL_7608:
+        return "7608";
+    case SBD_TYPE_DATA_DL_7609:
+        return "7609";
+    case SBD_TYPE_DATA_DL_760A:
+        return "760a";
+    case SBD_TYPE_DATA_DL_760B:
+        return "760b";
+    case SBD_TYPE_DATA_UL_760C:
+        return "760c";
+    case SBD_TYPE_DATA_UL_760D:
+        return "760d";
+    case SBD_TYPE_DATA_UL_760E:
+        return "760e";
     }
     return "????";
 }
@@ -32,7 +41,7 @@ void sbd_reassembler_init(sbd_reassembler_t *ctx)
 static sbd_type_t classify(const uint8_t *p, int len, bool uplink)
 {
     if (len < 2) return SBD_TYPE_UNKNOWN;
-    if (p[0] == 0x06 && p[1] == 0x00)        return SBD_TYPE_HELLO_0600;
+    if (p[0] == 0x06 && p[1] == 0x00) return SBD_TYPE_HELLO_0600;
     if (p[0] == 0x76) {
         if (uplink) {
             if (p[1] == 0x0c) return SBD_TYPE_DATA_UL_760C;
@@ -83,11 +92,11 @@ void sbd_reassembler_tick(sbd_reassembler_t *ctx, uint64_t now_us)
     }
 }
 
-int sbd_reassembler_feed(sbd_reassembler_t *ctx,
+int sbd_reassembler_feed(sbd_reassembler_t   *ctx,
                          const ida_decoded_t *ida,
-                         bool uplink,
-                         uint64_t now_us,
-                         sbd_message_t *out_msg)
+                         bool                 uplink,
+                         uint64_t             now_us,
+                         sbd_message_t       *out_msg)
 {
     if (!ctx || !ida) return -1;
     if (ida->payload_len < 5) {
@@ -102,14 +111,14 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
 
     // Consume the 2-byte type prefix.
     const uint8_t *p = ida->payload + 2;
-    int n = ida->payload_len - 2;
+    int            n = ida->payload_len - 2;
 
     // Parse prehdr + extract msg_count / msg_no per upstream sbd.py.
-    int msg_cnt = -1;     // unknown / single-frame
-    int msg_no  = 0;
-    const uint8_t *prehdr = p;
-    int prehdr_len = 0;
-    int hdr_payload_len = -1;   // -1 = use rest of payload
+    int            msg_cnt         = -1; // unknown / single-frame
+    int            msg_no          = 0;
+    const uint8_t *prehdr          = p;
+    int            prehdr_len      = 0;
+    int            hdr_payload_len = -1; // -1 = use rest of payload
 
     if (typ == SBD_TYPE_HELLO_0600) {
         // 0x06 0x00 path: data[0] must be 0x20.
@@ -125,8 +134,8 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
             return -1;
         }
         prehdr_len = (n < 29) ? n : 29;
-        msg_cnt = prehdr[15];
-        msg_no = (msg_cnt == 0) ? 0 : 1;
+        msg_cnt    = prehdr[15];
+        msg_no     = (msg_cnt == 0) ? 0 : 1;
         p += prehdr_len;
         n -= prehdr_len;
     } else {
@@ -137,7 +146,7 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
             } else if (n >= 1 && p[0] == 0x20) {
                 prehdr_len = 5;
             } else {
-                prehdr_len = 7;     // upstream falls through with this
+                prehdr_len = 7; // upstream falls through with this
             }
             if (n >= prehdr_len) {
                 msg_cnt = prehdr[3];
@@ -159,7 +168,7 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
             msg_no = 0;
         } else if (n > 3 && p[0] == 0x10) {
             hdr_payload_len = p[1];
-            msg_no = p[2];
+            msg_no          = p[2];
             p += 3;
             n -= 3;
             if (n < hdr_payload_len) {
@@ -207,8 +216,8 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
             out_msg->timestamp_us = now_us;
             out_msg->payload_len  = (uint16_t)n;
             memcpy(out_msg->payload, p, n);
-            out_msg->msg_count    = 1;
-            out_msg->msg_no       = 1;
+            out_msg->msg_count = 1;
+            out_msg->msg_no    = 1;
         }
         return 1;
     }
@@ -218,15 +227,15 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
         int idx = find_free_session(ctx);
         if (idx < 0) {
             ctx->cnt_broken++;
-            return 0;       // table full — drop quietly
+            return 0; // table full — drop quietly
         }
-        sbd_session_t *s = &ctx->sessions[idx];
-        s->active        = true;
-        s->type          = typ;
-        s->uplink        = uplink;
-        s->msg_no_next   = 2;          // expect frame #2 next
-        s->msg_cnt       = (uint8_t)msg_cnt;
-        s->last_update_us = now_us;
+        sbd_session_t *s    = &ctx->sessions[idx];
+        s->active           = true;
+        s->type             = typ;
+        s->uplink           = uplink;
+        s->msg_no_next      = 2; // expect frame #2 next
+        s->msg_cnt          = (uint8_t)msg_cnt;
+        s->last_update_us   = now_us;
         s->msg.type         = typ;
         s->msg.uplink       = uplink;
         s->msg.timestamp_us = now_us;
@@ -252,8 +261,8 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
             memcpy(s->msg.payload + s->msg.payload_len, p, copy);
             s->msg.payload_len = (uint16_t)(s->msg.payload_len + copy);
         }
-        s->msg.msg_no = (uint8_t)msg_no;
-        s->msg_no_next = (uint8_t)(msg_no + 1);
+        s->msg.msg_no     = (uint8_t)msg_no;
+        s->msg_no_next    = (uint8_t)(msg_no + 1);
         s->last_update_us = now_us;
         ctx->cnt_assembled++;
 

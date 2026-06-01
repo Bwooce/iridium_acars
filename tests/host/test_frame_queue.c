@@ -18,12 +18,16 @@
 
 static int passed = 0, failed = 0;
 
-#define CHECK(cond, fmt, ...) do {                                        \
-    if (!(cond)) {                                                        \
-        printf("  FAIL line %d: " fmt "\n", __LINE__, ##__VA_ARGS__);     \
-        failed++; return;                                                 \
-    } else { passed++; }                                                  \
-} while (0)
+#define CHECK(cond, fmt, ...)                                             \
+    do {                                                                  \
+        if (!(cond)) {                                                    \
+            printf("  FAIL line %d: " fmt "\n", __LINE__, ##__VA_ARGS__); \
+            failed++;                                                     \
+            return;                                                       \
+        } else {                                                          \
+            passed++;                                                     \
+        }                                                                 \
+    } while (0)
 
 static void make_item(frame_queue_item_t *it, uint32_t id)
 {
@@ -34,13 +38,15 @@ static void make_item(frame_queue_item_t *it, uint32_t id)
     it->direction    = 0;
     // Encode `id` into the bit stream so the consumer can verify
     // ordering. First 32 bits are the LSB-first id.
-    for (int b = 0; b < 32; b++) it->bits[b] = (uint8_t)((id >> b) & 1);
+    for (int b = 0; b < 32; b++)
+        it->bits[b] = (uint8_t)((id >> b) & 1);
 }
 
 static uint32_t recover_id(const frame_queue_item_t *it)
 {
     uint32_t id = 0;
-    for (int b = 0; b < 32; b++) id |= ((uint32_t)(it->bits[b] & 1)) << b;
+    for (int b = 0; b < 32; b++)
+        id |= ((uint32_t)(it->bits[b] & 1)) << b;
     return id;
 }
 
@@ -48,7 +54,7 @@ static uint32_t recover_id(const frame_queue_item_t *it)
 static void test_basic_push_pop(void)
 {
     printf("Test: push/pop in a single thread\n");
-    frame_queue_t *q = frame_queue_create(8);  // capacity = 7
+    frame_queue_t *q = frame_queue_create(8); // capacity = 7
     CHECK(q != NULL, "create");
     CHECK(frame_queue_capacity(q) == 7, "capacity=%zu", frame_queue_capacity(q));
     CHECK(frame_queue_count(q) == 0, "count after create");
@@ -82,7 +88,7 @@ static void test_basic_push_pop(void)
 static void test_wraparound(void)
 {
     printf("Test: wraparound across the ringbuffer end\n");
-    frame_queue_t *q = frame_queue_create(4);  // capacity = 3
+    frame_queue_t *q = frame_queue_create(4); // capacity = 3
 
     // Push 3, pop 2, push 3 more, pop 4. Tail wraps.
     frame_queue_item_t it, out;
@@ -99,7 +105,7 @@ static void test_wraparound(void)
         CHECK(frame_queue_push(q, &it), "second push %u", i);
     }
     // Order should be: 102, 200, 201 still in the queue.
-    uint32_t expected[3] = { 102, 200, 201 };
+    uint32_t expected[3] = {102, 200, 201};
     for (uint32_t i = 0; i < 3; i++) {
         CHECK(frame_queue_pop(q, &out), "second pop %u", i);
         CHECK(recover_id(&out) == expected[i], "second pop id mismatch");
@@ -128,12 +134,12 @@ static void test_invalid_create(void)
 //   - pushed + dropped == total attempts
 //   - popped == pushed
 //   - queue drains to empty
-#define MT_TOTAL  100000
-#define MT_QSIZE  64
+#define MT_TOTAL 100000
+#define MT_QSIZE 64
 
 static void *mt_producer(void *arg)
 {
-    frame_queue_t *q = (frame_queue_t *)arg;
+    frame_queue_t     *q = (frame_queue_t *)arg;
     frame_queue_item_t it;
     for (uint32_t i = 0; i < MT_TOTAL; i++) {
         make_item(&it, i);
@@ -144,14 +150,14 @@ static void *mt_producer(void *arg)
     return NULL;
 }
 
-static int mt_ordering_errors = 0;
-static volatile int mt_producer_done = 0;
+static int          mt_ordering_errors = 0;
+static volatile int mt_producer_done   = 0;
 
 static void *mt_consumer(void *arg)
 {
-    frame_queue_t *q = (frame_queue_t *)arg;
+    frame_queue_t     *q = (frame_queue_t *)arg;
     frame_queue_item_t out;
-    int64_t prev_id = -1;
+    int64_t            prev_id = -1;
     while (1) {
         if (frame_queue_pop(q, &out)) {
             int64_t got = (int64_t)recover_id(&out);
@@ -163,7 +169,8 @@ static void *mt_consumer(void *arg)
             // Producer is done and queue is empty — exit.
             break;
         } else {
-            for (volatile int k = 0; k < 100; k++) ;
+            for (volatile int k = 0; k < 100; k++)
+                ;
         }
     }
     return NULL;
@@ -174,8 +181,8 @@ static void test_pthread_producer_consumer(void)
     printf("Test: pthread 1P-1C, single-attempt push, %d items, %d-slot queue\n",
            MT_TOTAL, MT_QSIZE);
     mt_ordering_errors = 0;
-    mt_producer_done = 0;
-    frame_queue_t *q = frame_queue_create(MT_QSIZE);
+    mt_producer_done   = 0;
+    frame_queue_t *q   = frame_queue_create(MT_QSIZE);
     CHECK(q != NULL, "create");
 
     pthread_t prod_thr, cons_thr;

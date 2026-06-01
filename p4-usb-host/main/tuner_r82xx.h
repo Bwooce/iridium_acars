@@ -47,8 +47,7 @@
 
 #define VER_NUM 49
 
-enum r82xx_chip
-{
+enum r82xx_chip {
     CHIP_R820T,
     CHIP_R620D,
     CHIP_R828D,
@@ -57,15 +56,13 @@ enum r82xx_chip
     CHIP_R820C,
 };
 
-enum r82xx_tuner_type
-{
+enum r82xx_tuner_type {
     TUNER_RADIO = 1,
     TUNER_ANALOG_TV,
     TUNER_DIGITAL_TV
 };
 
-enum r82xx_xtal_cap_value
-{
+enum r82xx_xtal_cap_value {
     XTAL_LOW_CAP_30P = 0,
     XTAL_LOW_CAP_20P,
     XTAL_LOW_CAP_10P,
@@ -73,31 +70,29 @@ enum r82xx_xtal_cap_value
     XTAL_HIGH_CAP_0P
 };
 
-struct r82xx_config
-{
-    uint8_t i2c_addr;
-    uint32_t xtal;
+struct r82xx_config {
+    uint8_t         i2c_addr;
+    uint32_t        xtal;
     enum r82xx_chip rafael_chip;
-    unsigned int max_i2c_msg_len;
-    int use_predetect;
+    unsigned int    max_i2c_msg_len;
+    int             use_predetect;
 };
 
-struct r82xx_priv
-{
+struct r82xx_priv {
     struct r82xx_config *cfg;
 
-    uint8_t regs[NUM_REGS];
-    uint8_t buf[NUM_REGS + 1];
+    uint8_t                   regs[NUM_REGS];
+    uint8_t                   buf[NUM_REGS + 1];
     enum r82xx_xtal_cap_value xtal_cap_sel;
-    uint16_t pll; /* kHz */
-    uint32_t int_freq;
-    uint8_t fil_cal_code;
-    uint8_t input;
-    int has_lock;
-    int init_done;
+    uint16_t                  pll; /* kHz */
+    uint32_t                  int_freq;
+    uint8_t                   fil_cal_code;
+    uint8_t                   input;
+    int                       has_lock;
+    int                       init_done;
 
     /* Store current mode */
-    uint32_t delsys;
+    uint32_t              delsys;
     enum r82xx_tuner_type type;
 
     uint32_t bw; /* in MHz */
@@ -105,19 +100,17 @@ struct r82xx_priv
     void *rtl_dev;
 };
 
-struct r82xx_freq_range
-{
+struct r82xx_freq_range {
     uint32_t freq;
-    uint8_t open_d;
-    uint8_t rf_mux_ploy;
-    uint8_t tf_c;
-    uint8_t xtal_cap20p;
-    uint8_t xtal_cap10p;
-    uint8_t xtal_cap0p;
+    uint8_t  open_d;
+    uint8_t  rf_mux_ploy;
+    uint8_t  tf_c;
+    uint8_t  xtal_cap20p;
+    uint8_t  xtal_cap10p;
+    uint8_t  xtal_cap0p;
 };
 
-enum r82xx_delivery_system
-{
+enum r82xx_delivery_system {
     SYS_UNDEFINED,
     SYS_DVBT,
     SYS_DVBT2,

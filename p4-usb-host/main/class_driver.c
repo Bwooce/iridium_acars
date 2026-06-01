@@ -41,22 +41,29 @@
 #define ACTION_EXIT 0x40
 #define ACTION_START_STREAM 0x80
 
-static const char *TAG = "CLASS";
-static rtlsdr_dev_t *rtldev = NULL;
-static volatile int s_last_gain_dbx10 = -1;
+static const char   *TAG               = "CLASS";
+static rtlsdr_dev_t *rtldev            = NULL;
+static volatile int  s_last_gain_dbx10 = -1;
 
 // Stall-forensics breadcrumb: the consumer loop sets this to its current
 // stage; the health watchdog dumps it (class_driver_dump_stall_diag) right
 // before rebooting a wedged stream, so we can see WHICH call the loop was
 // stuck on (#105 root-cause). Stages are ordered by loop position.
-enum { CS_TOP=0, CS_HANDLE_EVENTS, CS_ACQUIRE, CS_READ, CS_DISPATCH,
-       CS_TAKE_CONVERTED, CS_FEED, CS_RELEASE, CS_REPORT };
+enum { CS_TOP = 0,
+       CS_HANDLE_EVENTS,
+       CS_ACQUIRE,
+       CS_READ,
+       CS_DISPATCH,
+       CS_TAKE_CONVERTED,
+       CS_FEED,
+       CS_RELEASE,
+       CS_REPORT };
 static const char *const k_class_stage_name[] = {
     "top", "handle_events", "acquire_raw", "read_stream", "dispatch",
-    "take_converted", "dsp_feed", "release", "report" };
-static volatile uint8_t  s_class_stage      = CS_TOP;
-static volatile uint64_t s_class_iter       = 0;     // loop iterations
-static volatile int64_t  s_class_stage_us   = 0;     // when the stage was entered
+    "take_converted", "dsp_feed", "release", "report"};
+static volatile uint8_t  s_class_stage    = CS_TOP;
+static volatile uint64_t s_class_iter     = 0; // loop iterations
+static volatile int64_t  s_class_stage_us = 0; // when the stage was entered
 
 static inline void class_stage(uint8_t s)
 {
@@ -84,7 +91,7 @@ void class_driver_dump_stall_diag(void)
              (unsigned long long)ut.completed, (unsigned long long)ut.status_errors,
              (unsigned long long)ut.short_xfers, (unsigned long long)ut.rb_full_drops);
 
-    UBaseType_t n = uxTaskGetNumberOfTasks();
+    UBaseType_t   n  = uxTaskGetNumberOfTasks();
     TaskStatus_t *ts = malloc(n * sizeof(TaskStatus_t));
     if (ts) {
         n = uxTaskGetSystemState(ts, n, NULL);
@@ -118,20 +125,17 @@ static class_driver_t s_driver_obj = {0};
 static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg)
 {
     class_driver_t *driver_obj = &s_driver_obj;
-    switch (event_msg->event)
-    {
+    switch (event_msg->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
         ESP_LOGI(TAG, "New USB device connected at address %d", event_msg->new_dev.address);
-        if (driver_obj->dev_addr == 0)
-        {
+        if (driver_obj->dev_addr == 0) {
             driver_obj->dev_addr = event_msg->new_dev.address;
             driver_obj->actions |= ACTION_OPEN_DEV;
         }
         break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
         ESP_LOGI(TAG, "USB device gone");
-        if (driver_obj->dev_hdl != NULL)
-        {
+        if (driver_obj->dev_hdl != NULL) {
             driver_obj->actions |= ACTION_CLOSE_DEV;
         }
         break;
@@ -149,10 +153,10 @@ static void action_open_dev(class_driver_t *driver_obj)
         ESP_LOGE(TAG, "Failed to open RTL-SDR: %d", err);
         return;
     }
-    
+
     driver_obj->dev_hdl = esp_libusb_get_dev_hdl();
     ESP_LOGI(TAG, "Device opened, handle: %p", driver_obj->dev_hdl);
-    
+
     driver_obj->actions &= ~ACTION_OPEN_DEV;
     driver_obj->actions |= ACTION_START_STREAM;
 }
@@ -195,7 +199,7 @@ static void action_start_stream(class_driver_t *driver_obj)
     bch_decoder_init();
     if (frame_decoder_init() != ESP_OK) {
         ESP_LOGW(TAG, "frame_decoder_init failed; higher-layer "
-                 "classification will be silently skipped");
+                      "classification will be silently skipped");
     }
 
     ESP_LOGI(TAG, "Initializing DSP...");
@@ -212,7 +216,7 @@ static void action_start_stream(class_driver_t *driver_obj)
     // returns; URB recycling churn ramps up over the next seconds
     // so allocating right here gives us the cleanest window.
     sd_capture_alloc_writer_buf();
-    
+
     driver_obj->actions &= ~ACTION_START_STREAM;
 }
 
@@ -223,7 +227,7 @@ static void action_close_dev(class_driver_t *driver_obj)
         rtlsdr_close(rtldev);
         rtldev = NULL;
     }
-    driver_obj->dev_hdl = NULL;
+    driver_obj->dev_hdl  = NULL;
     driver_obj->dev_addr = 0;
     driver_obj->actions &= ~ACTION_CLOSE_DEV;
     driver_obj->actions |= ACTION_EXIT;
@@ -244,11 +248,11 @@ void class_driver_task(void *arg)
 
     ESP_LOGI(TAG, "Registering Client");
     usb_host_client_config_t client_config = {
-        .is_synchronous = false,
+        .is_synchronous    = false,
         .max_num_event_msg = CLIENT_NUM_EVENT_MSG,
-        .async = {
-            .client_event_callback = client_event_cb,
-            .callback_arg = (void *)&s_driver_obj,
+        .async             = {
+                        .client_event_callback = client_event_cb,
+                        .callback_arg          = (void *)&s_driver_obj,
         },
     };
     ESP_ERROR_CHECK(usb_host_client_register(&client_config, &s_driver_obj.client_hdl));
@@ -276,41 +280,40 @@ void class_driver_task(void *arg)
     // dispatched (one-cycle pipeline). prev_dsp_slot tracks which slot the
     // DSP should next consume; it's -1 on the very first iteration.
     int prev_dsp_slot = -1;
-    
+
     uint64_t total_bytes = 0;
-    int64_t start_time = esp_timer_get_time();
-    int64_t last_report = start_time;
+    int64_t  start_time  = esp_timer_get_time();
+    int64_t  last_report = start_time;
 
     // Per-window counters for diagnostic reporting (reset each 1s window).
-    uint64_t bytes_window = 0;          // USB bytes received in this window
-    uint32_t feed_calls_window = 0;     // dsp_processor_feed calls in this window
-    uint64_t dsp_total_time_us = 0;     // sum of dsp_processor_feed wall time
-    uint32_t dsp_frame_count = 0;       // FFT frames processed in this window
+    uint64_t bytes_window      = 0; // USB bytes received in this window
+    uint32_t feed_calls_window = 0; // dsp_processor_feed calls in this window
+    uint64_t dsp_total_time_us = 0; // sum of dsp_processor_feed wall time
+    uint32_t dsp_frame_count   = 0; // FFT frames processed in this window
     // Core 0 cycle stage breakdown. Convert and push happen on Core 1
     // (ingest task) post-Step 5; only read and feed live here now.
-    uint64_t cycle_read_us = 0;
-    uint64_t cycle_handle_events_us = 0;  // time blocked in usb_host_client_handle_events
-    uint64_t cycle_take_converted_us = 0; // time blocked in ingest_core1_take_converted
-    uint32_t cycle_iterations = 0;
-    int64_t last_idle_log = esp_timer_get_time();
-    int64_t last_taskdump = esp_timer_get_time();
-    int64_t last_recovery_us = esp_timer_get_time();
-    int recovery_attempts = 0;
-    const int MAX_RECOVERY_ATTEMPTS = 3;
-    const int64_t RECOVERY_INTERVAL_US = 6 * 1000000;
+    uint64_t      cycle_read_us           = 0;
+    uint64_t      cycle_handle_events_us  = 0; // time blocked in usb_host_client_handle_events
+    uint64_t      cycle_take_converted_us = 0; // time blocked in ingest_core1_take_converted
+    uint32_t      cycle_iterations        = 0;
+    int64_t       last_idle_log           = esp_timer_get_time();
+    int64_t       last_taskdump           = esp_timer_get_time();
+    int64_t       last_recovery_us        = esp_timer_get_time();
+    int           recovery_attempts       = 0;
+    const int     MAX_RECOVERY_ATTEMPTS   = 3;
+    const int64_t RECOVERY_INTERVAL_US    = 6 * 1000000;
 
     // Stream-stall watchdog (task #72): when a device IS enumerated but
     // USB bytes_window stays effectively zero across several seconds,
     // the controller / endpoint has wedged. Cycle the root port power
     // to force re-attach (same recovery as the no-device path above).
-    int stall_seconds = 0;
-    const int STALL_TRIGGER_SECONDS    = 5;        // tolerate brief noise dips
-    const uint64_t STALL_BYTES_FLOOR   = 100*1024; // <100 KB/s is "stuck", not "quiet"
-    int stall_recoveries = 0;
-    const int MAX_STALL_RECOVERIES     = 3;
+    int            stall_seconds         = 0;
+    const int      STALL_TRIGGER_SECONDS = 5;          // tolerate brief noise dips
+    const uint64_t STALL_BYTES_FLOOR     = 100 * 1024; // <100 KB/s is "stuck", not "quiet"
+    int            stall_recoveries      = 0;
+    const int      MAX_STALL_RECOVERIES  = 3;
 
-    while (1)
-    {
+    while (1) {
         // Reset task watchdog. The loop runs hot (no vTaskDelay) because the
         // ringbuffer is constantly draining; without this reset the IDLE0
         // task would never get to run and TWDT would trigger every 5 s.
@@ -352,7 +355,7 @@ void class_driver_task(void *arg)
             // Reset the recovery counter on successful enumeration so we can
             // recover again from a future hot-disconnect.
             recovery_attempts = 0;
-            last_recovery_us = esp_timer_get_time();
+            last_recovery_us  = esp_timer_get_time();
         }
 
         if (s_driver_obj.actions & ACTION_OPEN_DEV) action_open_dev(&s_driver_obj);
@@ -377,10 +380,10 @@ void class_driver_task(void *arg)
         class_stage(CS_ACQUIRE);
         uint8_t *raw = ingest_core1_acquire_raw(&slot_for_read);
 
-        size_t n_read = 0;
+        size_t  n_read       = 0;
         int64_t t_read_start = esp_timer_get_time();
         class_stage(CS_READ);
-        int read_ok = esp_libusb_read_stream(raw, out_block_size, &n_read, 0);
+        int     read_ok    = esp_libusb_read_stream(raw, out_block_size, &n_read, 0);
         int64_t t_read_end = esp_timer_get_time();
 
         if (read_ok == 0) {
@@ -404,8 +407,8 @@ void class_driver_task(void *arg)
             // — ingest is faster than feed, so by the time we need the data
             // it's already been converted + signal_buffer_pushed).
             if (prev_dsp_slot >= 0) {
-                size_t n_int16 = 0;
-                int64_t t_tc0 = esp_timer_get_time();
+                size_t  n_int16 = 0;
+                int64_t t_tc0   = esp_timer_get_time();
                 class_stage(CS_TAKE_CONVERTED);
                 int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
                 cycle_take_converted_us += (uint64_t)(esp_timer_get_time() - t_tc0);
@@ -449,19 +452,19 @@ void class_driver_task(void *arg)
             // which let the 512 KB USB ringbuffer fill past 480 KB and
             // produced exactly 7 rb_full_drops/sec. With the offload,
             // drops go to 0.
-            status_snapshot_t snap = {0};
-            snap.window_us         = now - last_report;
-            snap.elapsed_us        = now - start_time;
-            snap.bytes_window      = bytes_window;
-            snap.total_bytes       = total_bytes;
-            snap.feed_calls_window = feed_calls_window;
-            snap.dsp_total_time_us = dsp_total_time_us;
-            snap.dsp_frame_count   = dsp_frame_count;
-            snap.cycle_read_us     = cycle_read_us;
-            snap.cycle_handle_events_us = cycle_handle_events_us;
+            status_snapshot_t snap       = {0};
+            snap.window_us               = now - last_report;
+            snap.elapsed_us              = now - start_time;
+            snap.bytes_window            = bytes_window;
+            snap.total_bytes             = total_bytes;
+            snap.feed_calls_window       = feed_calls_window;
+            snap.dsp_total_time_us       = dsp_total_time_us;
+            snap.dsp_frame_count         = dsp_frame_count;
+            snap.cycle_read_us           = cycle_read_us;
+            snap.cycle_handle_events_us  = cycle_handle_events_us;
             snap.cycle_take_converted_us = cycle_take_converted_us;
-            snap.cycle_iterations  = cycle_iterations;
-            snap.psram_free_bytes  = (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            snap.cycle_iterations        = cycle_iterations;
+            snap.psram_free_bytes        = (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
             esp_libusb_get_stream_stats(&snap.us);
             dsp_processor_get_stage_stats(&snap.dsp);
             ingest_core1_get_stats(&snap.ingest);
@@ -474,17 +477,17 @@ void class_driver_task(void *arg)
             // behind CONFIG_DIAG_TASK_DUMP (default off); enable via
             // menuconfig when actively debugging task-affinity issues.
             if (now - last_taskdump >= 5 * 1000000) {
-                last_taskdump = now;
-                UBaseType_t n = uxTaskGetNumberOfTasks();
+                last_taskdump    = now;
+                UBaseType_t   n  = uxTaskGetNumberOfTasks();
                 TaskStatus_t *ts = malloc(n * sizeof(TaskStatus_t));
                 if (ts) {
                     uint32_t total_run = 0;
-                    n = uxTaskGetSystemState(ts, n, &total_run);
+                    n                  = uxTaskGetSystemState(ts, n, &total_run);
                     ESP_LOGI(TAG, "Tasks (run-time since boot, %% of total):");
                     for (UBaseType_t i = 0; i < n; i++) {
                         uint32_t pct = (total_run > 0)
-                            ? (uint32_t)((100ULL * ts[i].ulRunTimeCounter) / total_run)
-                            : 0;
+                                           ? (uint32_t)((100ULL * ts[i].ulRunTimeCounter) / total_run)
+                                           : 0;
                         ESP_LOGI(TAG, "  %-16s pri=%u state=%d run=%lu (%lu%%) stack_hwm=%lu",
                                  ts[i].pcTaskName, (unsigned)ts[i].uxCurrentPriority,
                                  (int)ts[i].eCurrentState,
@@ -533,21 +536,21 @@ void class_driver_task(void *arg)
                 // loop. The cheap root-port cycle above stays as an in-loop
                 // first-try for the loop-still-alive case (#103/#105).
             } else {
-                stall_seconds   = 0;
+                stall_seconds = 0;
                 // Re-arm the stall watchdog when a device re-enumerates
                 // — covers the "USB cable yanked and replugged" path.
                 if (s_driver_obj.dev_addr != 0) stall_recoveries = 0;
             }
 
-            last_report = now;
-            bytes_window = 0;
-            feed_calls_window = 0;
-            dsp_total_time_us = 0;
-            dsp_frame_count = 0;
-            cycle_read_us = 0;
-            cycle_handle_events_us = 0;
+            last_report             = now;
+            bytes_window            = 0;
+            feed_calls_window       = 0;
+            dsp_total_time_us       = 0;
+            dsp_frame_count         = 0;
+            cycle_read_us           = 0;
+            cycle_handle_events_us  = 0;
             cycle_take_converted_us = 0;
-            cycle_iterations = 0;
+            cycle_iterations        = 0;
         }
     }
 

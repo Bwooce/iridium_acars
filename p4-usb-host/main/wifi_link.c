@@ -9,17 +9,17 @@
 #include "esp_event.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
-#include "esp_system.h"           // esp_restart() — link-loss watchdog (#104)
-#include "ping/ping_sock.h"       // gateway-ping reachability watchdog
+#include "esp_system.h"     // esp_restart() — link-loss watchdog (#104)
+#include "ping/ping_sock.h" // gateway-ping reachability watchdog
 #include "lwip/ip_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/idf_additions.h"   // xTaskCreatePinnedToCoreWithCaps
+#include "freertos/idf_additions.h" // xTaskCreatePinnedToCoreWithCaps
 #include "freertos/semphr.h"
 
 #include "app_config.h"
-#include "esp_libusb.h"               // usb.completed liveness for the health wdt
-#include "class_driver.h"             // class_driver_dump_stall_diag()
+#include "esp_libusb.h"   // usb.completed liveness for the health wdt
+#include "class_driver.h" // class_driver_dump_stall_diag()
 
 static const char *TAG = "WIFI";
 
@@ -30,20 +30,20 @@ typedef enum {
 } link_mode_t;
 
 static volatile link_mode_t s_mode = LINK_OFF;
-static volatile bool        s_up   = false;     // STA: got IP; AP: started
-static char                 s_ssid[33];         // active SSID (STA target, or AP self-SSID)
-static esp_ip4_addr_t       s_ip   = {0};
+static volatile bool        s_up   = false; // STA: got IP; AP: started
+static char                 s_ssid[33];     // active SSID (STA target, or AP self-SSID)
+static esp_ip4_addr_t       s_ip = {0};
 
 // WiFi link-loss watchdog (#104) state.
-static volatile uint32_t    s_gw_addr      = 0;     // STA gateway IPv4 (ping target)
-static volatile bool        s_ever_got_ip  = false; // gate: don't reboot pre-first-IP
-static volatile bool        s_ping_ever_ok = false; // gate: gateway answered ICMP once
-static SemaphoreHandle_t    s_ping_done    = NULL;
-static volatile uint32_t    s_ping_replies = 0;
-static volatile int         s_wdt_fails    = 0;     // consecutive failed gw-ping cycles
+static volatile uint32_t s_gw_addr      = 0;     // STA gateway IPv4 (ping target)
+static volatile bool     s_ever_got_ip  = false; // gate: don't reboot pre-first-IP
+static volatile bool     s_ping_ever_ok = false; // gate: gateway answered ICMP once
+static SemaphoreHandle_t s_ping_done    = NULL;
+static volatile uint32_t s_ping_replies = 0;
+static volatile int      s_wdt_fails    = 0; // consecutive failed gw-ping cycles
 // USB stream liveness (folded into the same health watchdog, #105).
-static volatile bool        s_stream_live   = false; // usb.completed advanced at least once
-static volatile int         s_stream_stalls = 0;     // consecutive frozen cycles
+static volatile bool s_stream_live   = false; // usb.completed advanced at least once
+static volatile int  s_stream_stalls = 0;     // consecutive frozen cycles
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -58,7 +58,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             ESP_LOGI(TAG, "STA_CONNECTED to '%s'", s_ssid);
             break;
         case WIFI_EVENT_STA_DISCONNECTED: {
-            s_up = false;
+            s_up                             = false;
             wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
             ESP_LOGW(TAG, "STA_DISCONNECTED reason=%d → reconnect in 5s",
                      e ? e->reason : -1);
@@ -87,11 +87,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
-        s_ip = e->ip_info.ip;
+        s_ip                 = e->ip_info.ip;
         ESP_LOGI(TAG, "STA_GOT_IP " IPSTR " gw=" IPSTR,
                  IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
-        s_up = true;
-        s_gw_addr = e->ip_info.gw.addr;   // ping target for the link-wdt
+        s_up          = true;
+        s_gw_addr     = e->ip_info.gw.addr; // ping target for the link-wdt
         s_ever_got_ip = true;
     }
 }
@@ -117,24 +117,24 @@ static bool ping_gateway_once(void)
     uint32_t gw = s_gw_addr;
     if (gw == 0 || !s_ping_done) return false;
 
-    ip_addr_t target = {0};
-    target.type = IPADDR_TYPE_V4;
+    ip_addr_t target       = {0};
+    target.type            = IPADDR_TYPE_V4;
     target.u_addr.ip4.addr = gw;
 
     esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
-    cfg.target_addr = target;
-    cfg.count       = 3;
-    cfg.interval_ms = 500;
-    cfg.timeout_ms  = 1000;
+    cfg.target_addr       = target;
+    cfg.count             = 3;
+    cfg.interval_ms       = 500;
+    cfg.timeout_ms        = 1000;
 
     esp_ping_callbacks_t cbs = {0};
-    cbs.on_ping_end = ping_end_cb;
+    cbs.on_ping_end          = ping_end_cb;
 
     esp_ping_handle_t h = NULL;
     if (esp_ping_new_session(&cfg, &cbs, &h) != ESP_OK || !h) return false;
 
     s_ping_replies = 0;
-    xSemaphoreTake(s_ping_done, 0);          // drain any stale signal
+    xSemaphoreTake(s_ping_done, 0); // drain any stale signal
     bool ok = false;
     if (esp_ping_start(h) == ESP_OK) {
         // 3 × (500 ms interval + ≤1000 ms timeout) ≈ 4.5 s worst case.
@@ -156,16 +156,16 @@ static bool ping_gateway_once(void)
 static void health_wdt_task(void *arg)
 {
     (void)arg;
-    const int        GW_FAIL_LIMIT      = 6;   // ~3 min gateway unreachable
-    const int        STREAM_STALL_LIMIT = 3;   // ~90 s USB stream frozen
+    const int        GW_FAIL_LIMIT      = 6; // ~3 min gateway unreachable
+    const int        STREAM_STALL_LIMIT = 3; // ~90 s USB stream frozen
     const TickType_t CYCLE              = pdMS_TO_TICKS(30000);
-    uint64_t last_completed = 0;
+    uint64_t         last_completed     = 0;
     for (;;) {
         vTaskDelay(CYCLE);
         // Only in STA mode and only after we've held an IP, so a never-
         // associating boot or AP config mode can't reboot-loop.
         if (s_mode != LINK_STA || !s_ever_got_ip) {
-            s_wdt_fails = 0;
+            s_wdt_fails     = 0;
             s_stream_stalls = 0;
             continue;
         }
@@ -190,7 +190,7 @@ static void health_wdt_task(void *arg)
             if (s_stream_stalls >= STREAM_STALL_LIMIT) {
                 ESP_LOGE(TAG, "health-wdt: USB stream frozen %d cycles — dumping diag then esp_restart() [#105]",
                          s_stream_stalls);
-                class_driver_dump_stall_diag();   // forensics → serial before reboot
+                class_driver_dump_stall_diag(); // forensics → serial before reboot
                 fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
@@ -202,7 +202,7 @@ static void health_wdt_task(void *arg)
         // here) — guards against a non-pingable gateway looping the device.
         if (ping_gateway_once()) {
             s_ping_ever_ok = true;
-            s_wdt_fails = 0;
+            s_wdt_fails    = 0;
         } else {
             s_wdt_fails++;
             ESP_LOGW(TAG, "health-wdt: gateway unreachable (%d/%d)", s_wdt_fails, GW_FAIL_LIMIT);
@@ -223,10 +223,10 @@ static void health_wdt_task(void *arg)
 void wifi_link_wdt_status(uint32_t *gw_addr, bool *gw_armed, int *gw_fails,
                           bool *stream_live, int *stream_stalls)
 {
-    if (gw_addr)       *gw_addr       = s_gw_addr;
-    if (gw_armed)      *gw_armed      = s_ping_ever_ok;
-    if (gw_fails)      *gw_fails      = s_wdt_fails;
-    if (stream_live)   *stream_live   = s_stream_live;
+    if (gw_addr) *gw_addr = s_gw_addr;
+    if (gw_armed) *gw_armed = s_ping_ever_ok;
+    if (gw_fails) *gw_fails = s_wdt_fails;
+    if (stream_live) *stream_live = s_stream_live;
     if (stream_stalls) *stream_stalls = s_stream_stalls;
 }
 
@@ -248,8 +248,8 @@ static void start_sta(const app_config_t *cfg)
     }
 
     wifi_config_t wc = {0};
-    strlcpy((char *)wc.sta.ssid,     cfg->wifi_ssid, sizeof(wc.sta.ssid));
-    strlcpy((char *)wc.sta.password, cfg->wifi_psk,  sizeof(wc.sta.password));
+    strlcpy((char *)wc.sta.ssid, cfg->wifi_ssid, sizeof(wc.sta.ssid));
+    strlcpy((char *)wc.sta.password, cfg->wifi_psk, sizeof(wc.sta.password));
     wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -264,8 +264,8 @@ static void start_ap(void)
     // distinctive enough on a typical desk; the prefix tells the user
     // what device they're looking at.
     uint8_t mac[6] = {0};
-    esp_wifi_get_mac(WIFI_IF_AP, mac);     // safe to call before mode set; returns
-                                            // factory MAC if not yet up.
+    esp_wifi_get_mac(WIFI_IF_AP, mac); // safe to call before mode set; returns
+                                       // factory MAC if not yet up.
     snprintf(s_ssid, sizeof(s_ssid), "iridium-%02X%02X%02X",
              mac[3], mac[4], mac[5]);
 
@@ -273,10 +273,10 @@ static void start_ap(void)
 
     wifi_config_t wc = {0};
     strlcpy((char *)wc.ap.ssid, s_ssid, sizeof(wc.ap.ssid));
-    wc.ap.ssid_len      = (uint8_t)strlen(s_ssid);
-    wc.ap.channel       = 6;
+    wc.ap.ssid_len       = (uint8_t)strlen(s_ssid);
+    wc.ap.channel        = 6;
     wc.ap.max_connection = 4;
-    wc.ap.authmode      = WIFI_AUTH_OPEN;    // open AP for frictionless config
+    wc.ap.authmode       = WIFI_AUTH_OPEN; // open AP for frictionless config
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));

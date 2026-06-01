@@ -24,13 +24,14 @@
 #include <stdint.h>
 #include <sys/time.h>
 
-#include <libacars/libacars.h>   /* la_msg_dir, la_proto_node */
-#include <libacars/acars.h>      /* la_acars_parse, la_acars_extract_sublabel_and_mfi */
-#include <libacars/crc.h>        /* la_crc16_ccitt */
+#include <libacars/libacars.h> /* la_msg_dir, la_proto_node */
+#include <libacars/acars.h>    /* la_acars_parse, la_acars_extract_sublabel_and_mfi */
+#include <libacars/crc.h>      /* la_crc16_ccitt */
 
 // --- helper: walk a la_proto_node tree to find the la_acars_msg payload.
 extern la_type_descriptor const la_DEF_acars_message;
-static la_acars_msg *find_acars_msg(la_proto_node *node) {
+static la_acars_msg            *find_acars_msg(la_proto_node *node)
+{
     while (node) {
         if (node->td == &la_DEF_acars_message && node->data) {
             return (la_acars_msg *)node->data;
@@ -40,7 +41,8 @@ static la_acars_msg *find_acars_msg(la_proto_node *node) {
     return NULL;
 }
 
-int main(void) {
+int main(void)
+{
     int failures = 0;
 
     /* 1. NULL buffer should return NULL without parsing. */
@@ -55,9 +57,9 @@ int main(void) {
 
     /* 2. la_acars_extract_sublabel_and_mfi rejects NULL inputs. */
     {
-        char sublabel[3] = { 0 }, mfi[3] = { 0 };
-        int r = la_acars_extract_sublabel_and_mfi(NULL, LA_MSG_DIR_AIR2GND,
-                NULL, 0, sublabel, mfi);
+        char sublabel[3] = {0}, mfi[3] = {0};
+        int  r = la_acars_extract_sublabel_and_mfi(NULL, LA_MSG_DIR_AIR2GND,
+                                                   NULL, 0, sublabel, mfi);
         if (r != -1) {
             fprintf(stderr, "FAIL: la_acars_extract_sublabel_and_mfi(NULL,...) = %d (expected -1)\n", r);
             failures++;
@@ -68,11 +70,11 @@ int main(void) {
      *    We use a fake 4-byte buffer; LA_ACARS_PREAMBLE_LEN is 16, so this
      *    triggers the "Preamble too short" path inside acars.c. */
     {
-        uint8_t fake[4] = { 0x42, 0x42, 0x42, 0x7f };
-        la_proto_node *node = la_acars_parse(fake, 4, LA_MSG_DIR_AIR2GND);
+        uint8_t        fake[4] = {0x42, 0x42, 0x42, 0x7f};
+        la_proto_node *node    = la_acars_parse(fake, 4, LA_MSG_DIR_AIR2GND);
         if (node == NULL) {
             fprintf(stderr, "FAIL: la_acars_parse on too-short buf returned NULL "
-                    "(expected node with err=true)\n");
+                            "(expected node with err=true)\n");
             failures++;
         }
         /* Don't free — see file-header note. */
@@ -105,29 +107,32 @@ int main(void) {
      */
     {
         uint8_t buf[64];
-        size_t i = 0;
+        size_t  i = 0;
 
         buf[i++] = '2';
-        memcpy(buf + i, "ABCDEFG", 7); i += 7;
-        buf[i++] = 0x15;                /* ACK byte; 0x15 = NAK */
+        memcpy(buf + i, "ABCDEFG", 7);
+        i += 7;
+        buf[i++] = 0x15; /* ACK byte; 0x15 = NAK */
         buf[i++] = 'H';
         buf[i++] = '1';
-        buf[i++] = '5';                 /* block_id = digit -> downlink */
-        buf[i++] = 0x02;                /* STX */
-        memcpy(buf + i, "M001", 4);   i += 4;
-        memcpy(buf + i, "FLT123", 6); i += 6;
+        buf[i++] = '5';  /* block_id = digit -> downlink */
+        buf[i++] = 0x02; /* STX */
+        memcpy(buf + i, "M001", 4);
+        i += 4;
+        memcpy(buf + i, "FLT123", 6);
+        i += 6;
         const char *txt = "DOWNLINK MSG OK";
         memcpy(buf + i, txt, strlen(txt));
         i += strlen(txt);
-        buf[i++] = 0x03;                /* ETX */
+        buf[i++] = 0x03; /* ETX */
 
         /* CRC covers from start of buf through ETX inclusive.
          * la_crc16_ccitt's init value is 0; matches what libacars's
          * own internal acars-frame validator uses. */
         uint16_t crc = la_crc16_ccitt(buf, i, 0);
-        buf[i++] = (uint8_t)(crc & 0xff);
-        buf[i++] = (uint8_t)((crc >> 8) & 0xff);
-        buf[i++] = 0x7f;                /* DEL terminator */
+        buf[i++]     = (uint8_t)(crc & 0xff);
+        buf[i++]     = (uint8_t)((crc >> 8) & 0xff);
+        buf[i++]     = 0x7f; /* DEL terminator */
 
         la_proto_node *node = la_acars_parse(buf, i, LA_MSG_DIR_AIR2GND);
         if (node == NULL) {
@@ -188,15 +193,19 @@ int main(void) {
      */
     {
         uint8_t buf[64];
-        size_t i = 0;
-        buf[i++] = '2';
-        memcpy(buf + i, "BADCRC ", 7); i += 7;
+        size_t  i = 0;
+        buf[i++]  = '2';
+        memcpy(buf + i, "BADCRC ", 7);
+        i += 7;
         buf[i++] = 0x15;
-        memcpy(buf + i, "H1", 2);     i += 2;
+        memcpy(buf + i, "H1", 2);
+        i += 2;
         buf[i++] = 'A';
         buf[i++] = 0x02;
-        memcpy(buf + i, "X007", 4);   i += 4;
-        memcpy(buf + i, "BADCRC", 6); i += 6;
+        memcpy(buf + i, "X007", 4);
+        i += 4;
+        memcpy(buf + i, "BADCRC", 6);
+        i += 6;
         const char *txt = "BAD CRC";
         memcpy(buf + i, txt, strlen(txt));
         i += strlen(txt);
@@ -207,7 +216,7 @@ int main(void) {
         buf[i++] = 0x7f;
 
         la_proto_node *node = la_acars_parse(buf, i, LA_MSG_DIR_AIR2GND);
-        la_acars_msg *m = (node != NULL) ? find_acars_msg(node) : NULL;
+        la_acars_msg  *m    = (node != NULL) ? find_acars_msg(node) : NULL;
         if (m == NULL) {
             fprintf(stderr, "FAIL bad-crc: no la_acars_msg returned\n");
             failures++;

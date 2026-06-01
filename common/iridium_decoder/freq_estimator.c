@@ -28,15 +28,15 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define N      FREQ_EST_FFT_N      // 512
-#define LOG2N  9                    // log2(512)
+#define N FREQ_EST_FFT_N // 512
+#define LOG2N 9          // log2(512)
 
 // Bit-reversal table for N=512, 9-bit reverse.
 static uint16_t s_brev[N];
-static float   s_tw_re[N / 2];      // exp(-j 2π k / N) for k ∈ [0, N/2)
-static float   s_tw_im[N / 2];
-static float   s_window[N];         // Hann window
-static bool    s_tables_inited = false;
+static float    s_tw_re[N / 2]; // exp(-j 2π k / N) for k ∈ [0, N/2)
+static float    s_tw_im[N / 2];
+static float    s_window[N]; // Hann window
+static bool     s_tables_inited = false;
 
 static void init_tables(void)
 {
@@ -75,8 +75,12 @@ static void fft_n256(float *re, float *im)
     for (int i = 0; i < N; i++) {
         int j = s_brev[i];
         if (j > i) {
-            float tr = re[i]; re[i] = re[j]; re[j] = tr;
-            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+            float tr = re[i];
+            re[i]    = re[j];
+            re[j]    = tr;
+            float ti = im[i];
+            im[i]    = im[j];
+            im[j]    = ti;
         }
     }
     // Cooley-Tukey butterflies.
@@ -91,8 +95,8 @@ static void fft_n256(float *re, float *im)
                 float xr = re[i + half];
                 float xi = im[i + half];
                 // t = w * x
-                float tr = wr * xr - wi * xi;
-                float ti = wr * xi + wi * xr;
+                float tr     = wr * xr - wi * xi;
+                float ti     = wr * xi + wi * xr;
                 re[i + half] = re[i] - tr;
                 im[i + half] = im[i] - ti;
                 re[i]        = re[i] + tr;
@@ -110,12 +114,12 @@ int32_t freq_estimator_run(const int16_t *iq, size_t n_complex,
     init_tables();
 
     // 1. Convert int16 IQ → float (windowed), separate real / imag arrays.
-    float re[N], im[N];
+    float       re[N], im[N];
     const float inv_full = 1.0f / 32768.0f;
     for (int i = 0; i < N; i++) {
         float w = s_window[i];
-        re[i] = (float)iq[2 * i + 0] * inv_full * w;
-        im[i] = (float)iq[2 * i + 1] * inv_full * w;
+        re[i]   = (float)iq[2 * i + 0] * inv_full * w;
+        im[i]   = (float)iq[2 * i + 1] * inv_full * w;
     }
 
     // 2. FFT.
@@ -134,12 +138,18 @@ int32_t freq_estimator_run(const int16_t *iq, size_t n_complex,
     // Positive half: bins [0..bin_radius] (k=0 = DC).
     for (int k = 0; k <= bin_radius; k++) {
         float m = re[k] * re[k] + im[k] * im[k];
-        if (m > peak_mag) { peak_mag = m; peak_k = k; }
+        if (m > peak_mag) {
+            peak_mag = m;
+            peak_k   = k;
+        }
     }
     // Negative half: bins [N-bin_radius..N-1].
     for (int k = N - bin_radius; k < N; k++) {
         float m = re[k] * re[k] + im[k] * im[k];
-        if (m > peak_mag) { peak_mag = m; peak_k = k; }
+        if (m > peak_mag) {
+            peak_mag = m;
+            peak_k   = k;
+        }
     }
 
     // Artefact guard: bail if no peak found OR if the peak magnitude
@@ -151,29 +161,29 @@ int32_t freq_estimator_run(const int16_t *iq, size_t n_complex,
     // 4. Quadratic peak interpolation. Compute mag at peak_k±1
     // (with wrap-around mod N). All three magnitudes for the
     // parabola.
-    int km1 = (peak_k - 1 + N) % N;
-    int kp1 = (peak_k + 1) % N;
-    float m0 = re[km1] * re[km1] + im[km1] * im[km1];
-    float m1 = peak_mag;
-    float m2 = re[kp1] * re[kp1] + im[kp1] * im[kp1];
+    int   km1 = (peak_k - 1 + N) % N;
+    int   kp1 = (peak_k + 1) % N;
+    float m0  = re[km1] * re[km1] + im[km1] * im[km1];
+    float m1  = peak_mag;
+    float m2  = re[kp1] * re[kp1] + im[kp1] * im[kp1];
 
     float denom = m0 - 2.0f * m1 + m2;
     float delta = 0.0f;
-    if (denom < -1e-12f) {  // proper parabola opens downward
+    if (denom < -1e-12f) { // proper parabola opens downward
         delta = 0.5f * (m0 - m2) / denom;
-        if (delta >  0.5f) delta =  0.5f;
+        if (delta > 0.5f) delta = 0.5f;
         if (delta < -0.5f) delta = -0.5f;
     }
 
     // 5. Map fractional bin → Hz (signed).
     float kf = (float)peak_k + delta;
-    if (peak_k > N / 2) kf -= (float)N;     // wrap to signed half
+    if (peak_k > N / 2) kf -= (float)N; // wrap to signed half
     float est_hz = kf * bin_width_hz;
 
     // Clamp to ±search_hz (interpolation can't push outside the
     // sampled bins, but be defensive).
     float lim = (float)search_hz;
-    if (est_hz >  lim) est_hz =  lim;
+    if (est_hz > lim) est_hz = lim;
     if (est_hz < -lim) est_hz = -lim;
 
     return (int32_t)lrintf(est_hz);

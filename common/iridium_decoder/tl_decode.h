@@ -18,11 +18,11 @@
 #include "iridium_frame.h"
 
 typedef struct {
-    int8_t  version;        // 0..2; -1 if PRS header doesn't match any known version
-    int8_t  plane;          // 0..5 within the active version's MAP_PLANE; -1 if no match
-    uint8_t header_ok;      // 1 iff the 96-bit "11+94 zeros" header matched (always 1
-                            // here since iridium_frame.c already gated on it; included
-                            // for symmetry with ibc_decode_t)
+    int8_t  version;   // 0..2; -1 if PRS header doesn't match any known version
+    int8_t  plane;     // 0..5 within the active version's MAP_PLANE; -1 if no match
+    uint8_t header_ok; // 1 iff the 96-bit "11+94 zeros" header matched (always 1
+                       // here since iridium_frame.c already gated on it; included
+                       // for symmetry with ibc_decode_t)
 } tl_decoded_t;
 
 // Decode a TL frame's version + plane. Sets out->version = -1 / out->plane

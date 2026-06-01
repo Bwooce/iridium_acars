@@ -14,10 +14,10 @@
 static const char *TAG = "INGEST";
 
 // Per-slot state. Two slots alternated per consumer cycle.
-static uint8_t *s_raw[INGEST_NUM_SLOTS];     // raw uint8 USB ingress, internal SRAM, DMA-aligned
-static int16_t *s_conv[INGEST_NUM_SLOTS];    // PSRAM heap-alloc'd
-static int16_t *s_resamp[INGEST_NUM_SLOTS];  // resampled int16 Q15 @ 2.5 MSPS (downstream feed, internal SRAM)
-static size_t   s_resamp_n_int16[INGEST_NUM_SLOTS];  // int16 element count in s_resamp
+static uint8_t *s_raw[INGEST_NUM_SLOTS];            // raw uint8 USB ingress, internal SRAM, DMA-aligned
+static int16_t *s_conv[INGEST_NUM_SLOTS];           // PSRAM heap-alloc'd
+static int16_t *s_resamp[INGEST_NUM_SLOTS];         // resampled int16 Q15 @ 2.5 MSPS (downstream feed, internal SRAM)
+static size_t   s_resamp_n_int16[INGEST_NUM_SLOTS]; // int16 element count in s_resamp
 
 // 125/128 polyphase rational resampler state. Caller-managed —
 // process_explicit() reads/updates these in place each dispatch.
@@ -37,7 +37,7 @@ static int     s_persist_wpos      = 0;
 // Fraction (0–50%) of each dispatch's input handed to Worker A on
 // Core 0. 0 = single-thread inline path on Core 1 (default).
 // Tunable at runtime via ingest_core1_set_split_pct().
-static volatile uint8_t s_split_pct = 0;     /* default OFF — Worker A on Core 0 still slows FFT even with pipelined tagger (sweep 2026-05-23). See docs/split-resample-sweep-2026-05-22.md. Re-confirmed 2026-05-24 after task #58 wpos change: FFT 258→412 µs (+60%) at split=25; lighter wrapper doesn't change the L2 contention. */
+static volatile uint8_t s_split_pct = 0; /* default OFF — Worker A on Core 0 still slows FFT even with pipelined tagger (sweep 2026-05-23). See docs/split-resample-sweep-2026-05-22.md. Re-confirmed 2026-05-24 after task #58 wpos change: FFT 258→412 µs (+60%) at split=25; lighter wrapper doesn't change the L2 contention. */
 
 // 125/128 polyphase: number of outputs emitted by processing `k`
 // inputs starting from phase counter `S0`. Derivation: pre_(i+1) =
@@ -47,8 +47,8 @@ static volatile uint8_t s_split_pct = 0;     /* default OFF — Worker A on Core
 // remainder r ≤ 127 is counted scalar (under 1 µs).
 static inline int rs_n_emits(int S0, int k)
 {
-    int m = k / 128;
-    int r = k - m * 128;
+    int m       = k / 128;
+    int r       = k - m * 128;
     int n_emits = 125 * m;
     for (int i = 0; i < r; i++) {
         int pre = (S0 + 3 * i) & 127;
@@ -105,7 +105,7 @@ static resample_worker_t s_worker_b;
 // slot (8 KB int16) which is more than Worker A produces at any
 // split ratio. Static .bss broke the DMA pool reserve at 32 KB so
 // we runtime-alloc instead.
-#define WORKER_OUT_SCRATCH_INT16  4096
+#define WORKER_OUT_SCRATCH_INT16 4096
 static int16_t *s_worker_out_scratch = NULL;
 #endif
 
@@ -115,10 +115,10 @@ static void resample_worker_task(void *arg)
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 #if WORKER_OUT_TO_INTERNAL_SCRATCH
-        int16_t *out_target = s_worker_out_scratch;
+        int16_t *out_target     = s_worker_out_scratch;
         int      max_out_target = WORKER_OUT_SCRATCH_INT16 / 2;
 #else
-        int16_t *out_target = w->out_iq;
+        int16_t *out_target     = w->out_iq;
         int      max_out_target = w->max_out;
 #endif
         // Workers run on PSRAM-backed stacks, so a stack-local
@@ -129,7 +129,7 @@ static void resample_worker_task(void *arg)
             w->delay_i, w->delay_q, &w->wpos, &w->start_pos,
             w->in_iq, w->n_in_complex,
             out_target, max_out_target,
-            /*batch_scratch=*/ NULL);
+            /*batch_scratch=*/NULL);
         // Ensure output buffer writes are globally visible before
         // the coord (possibly on another core) reads them / kicks
         // signal_buffer_push (AXI-GDMA reading from PSRAM).
@@ -137,7 +137,6 @@ static void resample_worker_task(void *arg)
         xTaskNotifyGive(w->coord_task);
     }
 }
-
 
 // Semaphores per slot. ready[i]: given by ingest task when conversion +
 // signal_buffer_push for slot i are complete; taken by class_driver before
@@ -168,21 +167,21 @@ static volatile uint64_t s_acc_convert_us = 0;
 // saturating. peak_dev=127 means a sample was at 0 or 255 (full
 // saturation). peak_dev > ~100 generally means the gain is set
 // too high for the current signal.
-static volatile uint8_t  s_agc_peak_dev = 0;
+static volatile uint8_t  s_agc_peak_dev   = 0;
 static volatile uint32_t s_agc_dispatches = 0;
 
 void ingest_core1_agc_sample(uint8_t *out_peak_dev, uint32_t *out_dispatches)
 {
-    if (out_peak_dev)   *out_peak_dev   = s_agc_peak_dev;
+    if (out_peak_dev) *out_peak_dev = s_agc_peak_dev;
     if (out_dispatches) *out_dispatches = s_agc_dispatches;
-    s_agc_peak_dev    = 0;
-    s_agc_dispatches  = 0;
+    s_agc_peak_dev   = 0;
+    s_agc_dispatches = 0;
 }
-static volatile uint64_t s_acc_push_us = 0;      // == resample + signal_buffer_push total
-static volatile uint64_t s_acc_resample_us = 0;  // resample step only
-static volatile uint64_t s_acc_sbpush_us = 0;    // signal_buffer_push (AXI DMA wait) only
-static volatile uint32_t s_acc_dispatches = 0;
-static volatile uint32_t s_acc_slot_wait_us = 0;
+static volatile uint64_t s_acc_push_us        = 0; // == resample + signal_buffer_push total
+static volatile uint64_t s_acc_resample_us    = 0; // resample step only
+static volatile uint64_t s_acc_sbpush_us      = 0; // signal_buffer_push (AXI DMA wait) only
+static volatile uint32_t s_acc_dispatches     = 0;
+static volatile uint32_t s_acc_slot_wait_us   = 0;
 static volatile uint32_t s_acc_consumer_waits = 0;
 
 static void ingest_task(void *arg)
@@ -207,10 +206,10 @@ static void ingest_task(void *arg)
         //   out[i] = (int16_t)((b[i] << 8) ^ 0x8000)
         // Same formula as the in-class_driver path before this offload.
         // 4x unrolled with 32-bit input loads. Buffers are 64-byte aligned.
-        int64_t t0 = esp_timer_get_time();
+        int64_t t0                    = esp_timer_get_time();
         const uint8_t *__restrict src = s_raw[msg.slot];
-        int16_t *__restrict dst = s_conv[msg.slot];
-        size_t n = msg.bytes;
+        int16_t *__restrict dst       = s_conv[msg.slot];
+        size_t n                      = msg.bytes;
 
         // AGC sampling (D16): scan the first 256 bytes for the
         // maximum deviation from the mid-point (uint8 127). One
@@ -218,7 +217,7 @@ static void ingest_task(void *arg)
         // estimate for the AGC task to decide whether the tuner
         // is saturating. Doesn't change the convert math — just
         // observes.
-        size_t agc_n = n < 256 ? n : 256;
+        size_t  agc_n   = n < 256 ? n : 256;
         uint8_t agc_max = 0;
         for (size_t k = 0; k < agc_n; k++) {
             int d = (int)src[k] - 127;
@@ -231,13 +230,13 @@ static void ingest_task(void *arg)
         s_agc_dispatches++;
 
         size_t n4 = n & ~(size_t)3;
-        size_t i = 0;
+        size_t i  = 0;
         for (; i < n4; i += 4) {
             uint32_t b4 = *(const uint32_t *)(src + i);
-            dst[i + 0] = (int16_t)((((b4 >>  0) & 0xff) << 8) ^ 0x8000);
-            dst[i + 1] = (int16_t)((((b4 >>  8) & 0xff) << 8) ^ 0x8000);
-            dst[i + 2] = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
-            dst[i + 3] = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
+            dst[i + 0]  = (int16_t)((((b4 >> 0) & 0xff) << 8) ^ 0x8000);
+            dst[i + 1]  = (int16_t)((((b4 >> 8) & 0xff) << 8) ^ 0x8000);
+            dst[i + 2]  = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
+            dst[i + 3]  = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
         }
         for (; i < n; i++) {
             dst[i] = (int16_t)(((src[i] << 8) ^ 0x8000));
@@ -254,9 +253,9 @@ static void ingest_task(void *arg)
         int n_in_complex = (int)(n / 2);
         int split_pct    = s_split_pct;
         int mid          = (n_in_complex * split_pct) / 100;
-        if (mid < 9) mid = 0;     // need ≥ 9 samples to seed Worker B's delay
-        int16_t *out     = s_resamp[msg.slot];
-        int n_out_complex;
+        if (mid < 9) mid = 0; // need ≥ 9 samples to seed Worker B's delay
+        int16_t *out = s_resamp[msg.slot];
+        int      n_out_complex;
 
         if (mid == 0) {
             // Inline single-thread path on Core 1 (split=0 default).
@@ -297,9 +296,9 @@ static void ingest_task(void *arg)
             // delay[wpos+1..wpos+8] after the wpos decrement.
             int n_emits_a = rs_n_emits(s_persist_start_pos, mid);
             for (int k = 0; k < 9; k++) {
-                int src_idx = mid - 1 - k;
-                int16_t i_s = dst[2 * src_idx + 0];
-                int16_t q_s = dst[2 * src_idx + 1];
+                int     src_idx            = mid - 1 - k;
+                int16_t i_s                = dst[2 * src_idx + 0];
+                int16_t q_s                = dst[2 * src_idx + 1];
                 s_worker_b.delay_i[k]      = i_s;
                 s_worker_b.delay_i[k + 16] = i_s;
                 s_worker_b.delay_q[k]      = q_s;
@@ -334,9 +333,9 @@ static void ingest_task(void *arg)
             s_persist_start_pos = s_worker_b.start_pos;
             s_persist_wpos      = s_worker_b.wpos;
         }
-        int n_out_int16 = n_out_complex * 2;
+        int n_out_int16            = n_out_complex * 2;
         s_resamp_n_int16[msg.slot] = (size_t)n_out_int16;
-        int64_t t1b = esp_timer_get_time();
+        int64_t t1b                = esp_timer_get_time();
         s_acc_resample_us += (uint64_t)(t1b - t1);
 
         // 3. Push resampled samples into the PSRAM circular buffer.
@@ -390,14 +389,14 @@ esp_err_t ingest_core1_init(void)
         // sbpush. Net regression. Sticking with PSRAM s_conv.
         s_conv[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        s_raw[i] = heap_caps_aligned_alloc(64, 16 * 1024,
-                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        s_raw[i]  = heap_caps_aligned_alloc(64, 16 * 1024,
+                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         ESP_LOGW("HEAP", "slot %d s_raw=%p  DMA-INT now free=%zu largest=%zu",
                  i, s_raw[i],
                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
         s_resamp[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
-                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         if (!s_raw[i] || !s_conv[i] || !s_resamp[i]) {
             ESP_LOGE(TAG, "Slot %d alloc failed (raw=%p conv=%p resamp=%p)",
                      i, s_raw[i], s_conv[i], s_resamp[i]);
@@ -422,7 +421,7 @@ esp_err_t ingest_core1_init(void)
     s_persist_wpos      = 0;
 #if WORKER_OUT_TO_INTERNAL_SCRATCH
     s_worker_out_scratch = heap_caps_aligned_alloc(64,
-        WORKER_OUT_SCRATCH_INT16 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+                                                   WORKER_OUT_SCRATCH_INT16 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
     if (!s_worker_out_scratch) {
         ESP_LOGE(TAG, "iso: worker_out_scratch alloc failed");
         return ESP_ERR_NO_MEM;
@@ -480,17 +479,17 @@ esp_err_t ingest_core1_init(void)
     // dispatch through L2 cache misses — negligible vs the 2.5 ms
     // resample cost.
     ok = xTaskCreatePinnedToCoreWithCaps(resample_worker_task, "rs_worker_a",
-                                          4096, &s_worker_a, 7, &s_worker_a.task,
-                                          /*core=*/ 0,
-                                          MALLOC_CAP_SPIRAM);
+                                         4096, &s_worker_a, 7, &s_worker_a.task,
+                                         /*core=*/0,
+                                         MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "rs_worker_a spawn failed");
         return ESP_FAIL;
     }
     ok = xTaskCreatePinnedToCoreWithCaps(resample_worker_task, "rs_worker_b",
-                                          4096, &s_worker_b, 7, &s_worker_b.task,
-                                          /*core=*/ 1,
-                                          MALLOC_CAP_SPIRAM);
+                                         4096, &s_worker_b, 7, &s_worker_b.task,
+                                         /*core=*/1,
+                                         MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "rs_worker_b spawn failed");
         return ESP_FAIL;
@@ -514,17 +513,20 @@ uint8_t *ingest_core1_acquire_raw(int *out_slot)
     int64_t t_wait = esp_timer_get_time();
     xSemaphoreTake(s_free[slot], portMAX_DELAY);
     uint32_t waited = (uint32_t)(esp_timer_get_time() - t_wait);
-    if (waited > 100) {  // skip noise; only count meaningful waits
+    if (waited > 100) { // skip noise; only count meaningful waits
         s_acc_slot_wait_us += waited;
         s_acc_consumer_waits++;
     }
-    *out_slot = slot;
+    *out_slot           = slot;
     s_next_acquire_slot = (slot + 1) % INGEST_NUM_SLOTS;
     return s_raw[slot];
 }
 
 static volatile uint32_t s_dispatch_drops = 0;
-uint32_t ingest_core1_dispatch_drops(void) { return s_dispatch_drops; }
+uint32_t                 ingest_core1_dispatch_drops(void)
+{
+    return s_dispatch_drops;
+}
 
 // Count of take_converted iterations that exceeded one 500 ms tick
 // without s_ready being given — i.e. ingest_task hasn't yet processed
@@ -532,11 +534,14 @@ uint32_t ingest_core1_dispatch_drops(void) { return s_dispatch_drops; }
 // (just a slow ingest cycle); a sustained climb means ingest is
 // wedged and health_wdt will reboot once class can't progress (#110).
 static volatile uint32_t s_take_converted_slow_waits = 0;
-uint32_t ingest_core1_take_converted_slow_waits(void) { return s_take_converted_slow_waits; }
+uint32_t                 ingest_core1_take_converted_slow_waits(void)
+{
+    return s_take_converted_slow_waits;
+}
 
 void ingest_core1_dispatch(int slot, size_t bytes_filled)
 {
-    dispatch_msg_t msg = { .slot = slot, .bytes = bytes_filled };
+    dispatch_msg_t msg = {.slot = slot, .bytes = bytes_filled};
     // Non-blocking send. The queue depth (4) exceeds the slot count (2),
     // so a successful acquire always implies space — this should never fail.
     // But if it ever did, ingest would never process this slot and never give
@@ -574,7 +579,8 @@ int16_t *ingest_core1_take_converted(int slot, size_t *out_n_int16)
         if (waited_ms == 500 || (waited_ms % 10000) == 0) {
             ESP_LOGW(TAG, "take_converted slot=%d waited %dms — ingest "
                           "may be wedged; health_wdt will reboot if class "
-                          "stops progressing", slot, waited_ms);
+                          "stops progressing",
+                     slot, waited_ms);
         }
     }
     if (out_n_int16) *out_n_int16 = s_resamp_n_int16[slot];
@@ -595,11 +601,11 @@ void ingest_core1_get_stats(ingest_stats_t *out)
     out->dispatches         = s_acc_dispatches;
     out->slot_wait_total_us = s_acc_slot_wait_us;
     out->consumer_waits     = s_acc_consumer_waits;
-    s_acc_convert_us = 0;
-    s_acc_push_us = 0;
-    s_acc_resample_us = 0;
-    s_acc_sbpush_us = 0;
-    s_acc_dispatches = 0;
-    s_acc_slot_wait_us = 0;
-    s_acc_consumer_waits = 0;
+    s_acc_convert_us        = 0;
+    s_acc_push_us           = 0;
+    s_acc_resample_us       = 0;
+    s_acc_sbpush_us         = 0;
+    s_acc_dispatches        = 0;
+    s_acc_slot_wait_us      = 0;
+    s_acc_consumer_waits    = 0;
 }

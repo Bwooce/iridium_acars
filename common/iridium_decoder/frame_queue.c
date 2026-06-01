@@ -8,28 +8,41 @@
 // On target use heap_caps_malloc with MALLOC_CAP_SPIRAM. On host fall
 // back to calloc.
 #if defined(ESP_PLATFORM)
-  #include "esp_heap_caps.h"
-  static void *fq_alloc(size_t bytes) {
-      return heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  }
-  static void  fq_free(void *p) { heap_caps_free(p); }
+#include "esp_heap_caps.h"
+static void *fq_alloc(size_t bytes)
+{
+    return heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+static void fq_free(void *p)
+{
+    heap_caps_free(p);
+}
 #else
-  static void *fq_alloc(size_t bytes) { return calloc(1, bytes); }
-  static void  fq_free(void *p) { free(p); }
+static void *fq_alloc(size_t bytes)
+{
+    return calloc(1, bytes);
+}
+static void fq_free(void *p)
+{
+    free(p);
+}
 #endif
 
 struct frame_queue {
-    size_t                n_slots;
-    size_t                mask;        // n_slots - 1 (n_slots is a power of two)
-    _Atomic size_t        head;        // consumer index (next to read)
-    _Atomic size_t        tail;        // producer index (next to write)
-    _Atomic uint64_t      pushed;
-    _Atomic uint64_t      popped;
-    _Atomic uint64_t      dropped;
-    frame_queue_item_t   *slots;       // n_slots entries
+    size_t              n_slots;
+    size_t              mask; // n_slots - 1 (n_slots is a power of two)
+    _Atomic size_t      head; // consumer index (next to read)
+    _Atomic size_t      tail; // producer index (next to write)
+    _Atomic uint64_t    pushed;
+    _Atomic uint64_t    popped;
+    _Atomic uint64_t    dropped;
+    frame_queue_item_t *slots; // n_slots entries
 };
 
-static int is_power_of_two(size_t n) { return n != 0 && (n & (n - 1)) == 0; }
+static int is_power_of_two(size_t n)
+{
+    return n != 0 && (n & (n - 1)) == 0;
+}
 
 frame_queue_t *frame_queue_create(size_t n_slots)
 {
@@ -46,10 +59,10 @@ frame_queue_t *frame_queue_create(size_t n_slots)
 
     q->n_slots = n_slots;
     q->mask    = n_slots - 1;
-    atomic_store_explicit(&q->head,    0, memory_order_relaxed);
-    atomic_store_explicit(&q->tail,    0, memory_order_relaxed);
-    atomic_store_explicit(&q->pushed,  0, memory_order_relaxed);
-    atomic_store_explicit(&q->popped,  0, memory_order_relaxed);
+    atomic_store_explicit(&q->head, 0, memory_order_relaxed);
+    atomic_store_explicit(&q->tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&q->pushed, 0, memory_order_relaxed);
+    atomic_store_explicit(&q->popped, 0, memory_order_relaxed);
     atomic_store_explicit(&q->dropped, 0, memory_order_relaxed);
     return q;
 }
@@ -65,8 +78,8 @@ bool frame_queue_push(frame_queue_t *q, const frame_queue_item_t *item)
 {
     if (!q || !item) return false;
 
-    size_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
-    size_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+    size_t tail      = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    size_t head      = atomic_load_explicit(&q->head, memory_order_acquire);
     size_t next_tail = (tail + 1) & q->mask;
     if (next_tail == head) {
         // Full — record the drop and return.
@@ -92,7 +105,7 @@ bool frame_queue_pop(frame_queue_t *q, frame_queue_item_t *out)
     size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
     size_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
     if (head == tail) {
-        return false;  // empty
+        return false; // empty
     }
 
     memcpy(out, &q->slots[head], sizeof(*out));

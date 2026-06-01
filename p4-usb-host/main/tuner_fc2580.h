@@ -9,22 +9,19 @@
 #define FC2580_CHECK_ADDR 0x01
 #define FC2580_CHECK_VAL 0x56
 
-typedef enum
-{
+typedef enum {
     FC2580_UHF_BAND,
     FC2580_L_BAND,
     FC2580_VHF_BAND,
     FC2580_NO_BAND
 } fc2580_band_type;
 
-typedef enum
-{
+typedef enum {
     FC2580_FCI_FAIL,
     FC2580_FCI_SUCCESS
 } fc2580_fci_result_type;
 
-enum FUNCTION_STATUS
-{
+enum FUNCTION_STATUS {
     FUNCTION_SUCCESS,
     FUNCTION_ERROR,
 };
@@ -90,15 +87,13 @@ fc2580_fci_result_type fc2580_set_filter(void *pTuner, unsigned char filter_bw, 
 // Definitions
 
 // AGC mode
-enum FC2580_AGC_MODE
-{
+enum FC2580_AGC_MODE {
     FC2580_AGC_INTERNAL = 1,
     FC2580_AGC_EXTERNAL = 2,
 };
 
 // Bandwidth mode
-enum FC2580_BANDWIDTH_MODE
-{
+enum FC2580_BANDWIDTH_MODE {
     FC2580_BANDWIDTH_1530000HZ = 1,
     FC2580_BANDWIDTH_6000000HZ = 6,
     FC2580_BANDWIDTH_7000000HZ = 7,
@@ -110,12 +105,12 @@ int fc2580_Initialize(
     void *pTuner);
 
 int fc2580_SetRfFreqHz(
-    void *pTuner,
+    void         *pTuner,
     unsigned long RfFreqHz);
 
 // Extra manipulaing functions
 int fc2580_SetBandwidthMode(
     void *pTuner,
-    int BandwidthMode);
+    int   BandwidthMode);
 
 #endif

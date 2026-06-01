@@ -27,7 +27,10 @@ int main(int argc, char **argv)
     sym_timing_set_trace(&st, &trace);
 
     int16_t *corrected = malloc(CORPUS_2SPS_LEN * sizeof(int16_t));
-    if (!corrected) { fprintf(stderr, "malloc fail\n"); return 1; }
+    if (!corrected) {
+        fprintf(stderr, "malloc fail\n");
+        return 1;
+    }
 
     sym_timing_correct_2sps(&st, CORPUS_2SPS, (int)CORPUS_2SPS_LEN,
                             corrected);
@@ -40,7 +43,7 @@ int main(int argc, char **argv)
     // Mean & RMS of e — to spot bias.
     double sum_e = 0, sum_e2 = 0;
     for (int i = 0; i < trace.n; i++) {
-        sum_e  += trace.e[i];
+        sum_e += trace.e[i];
         sum_e2 += (double)trace.e[i] * trace.e[i];
     }
     double mean_e = trace.n > 0 ? sum_e / trace.n : 0;

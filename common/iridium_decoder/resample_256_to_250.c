@@ -40,7 +40,7 @@
 #if defined(ESP_PLATFORM)
 static int16_t *s_coeffs_pp = NULL;
 #else
-static int16_t  s_coeffs_pp_storage[RS25_PADDED_TAPS * RS25_INTERP]
+static int16_t s_coeffs_pp_storage[RS25_PADDED_TAPS * RS25_INTERP]
     __attribute__((aligned(16)));
 static int16_t *s_coeffs_pp = s_coeffs_pp_storage;
 #endif
@@ -56,10 +56,10 @@ static int s_coeffs_pp_ready = 0;
 // __riscv && SOC_CPU_HAS_PIE in the .S file.
 #if defined(__riscv) && defined(SOC_CPU_HAS_PIE) && !defined(RS25_DISABLE_PIE_ASM)
 extern void resample_125_128_mac_arp4(const int16_t *pc,
-                                       const int16_t *di,
-                                       const int16_t *dq,
-                                       int16_t *out_i,
-                                       int16_t *out_q);
+                                      const int16_t *di,
+                                      const int16_t *dq,
+                                      int16_t       *out_i,
+                                      int16_t       *out_q);
 // Hoisted out of the per-emit MAC kernel — caller invokes once per
 // process_explicit call. See comment in resample_arp4.S.
 extern void resample_125_128_enable_pie_cfg(void);
@@ -67,7 +67,6 @@ extern void resample_125_128_enable_pie_cfg(void);
 #else
 #define RS25_USE_PIE_ASM 0
 #endif
-
 
 // Modified Bessel I0, for Kaiser window. Copy of the same function in
 // direct_if_decim.c — could be deduped, but the two modules are
@@ -117,18 +116,18 @@ static double bessel_i0(double x)
 // per-phase DC gain is unity (= integral of the LPF response at DC).
 static void make_resample_coeffs(int16_t *coeffs)
 {
-    const int      INTERP    = RS25_INTERP;
-    const int      DSIZE     = RS25_DELAY_SIZE;
-    const int      NPROTO    = DSIZE * INTERP;            // 1125
-    const double   PI        = 3.14159265358979323846;
-    const double   beta      = 8.0;
+    const int    INTERP = RS25_INTERP;
+    const int    DSIZE  = RS25_DELAY_SIZE;
+    const int    NPROTO = DSIZE * INTERP; // 1125
+    const double PI     = 3.14159265358979323846;
+    const double beta   = 8.0;
     // Filter cutoff in cycles/sample at the virtual interp×fs rate.
     // We pick 0.4 × (1/interp) so the passband covers ±0.4 × fs_in/2
     // = ±0.4 × 1.28 MHz = ±512 kHz at 2.56 MSPS input. Way more than
     // we need for Iridium (channel grid spans ±400 kHz around LO).
-    const double   fc_norm   = 0.4 / (double)INTERP;
-    const double   inv_i0    = 1.0 / bessel_i0(beta);
-    const int      center    = NPROTO / 2;
+    const double fc_norm = 0.4 / (double)INTERP;
+    const double inv_i0  = 1.0 / bessel_i0(beta);
+    const int    center  = NPROTO / 2;
 
     // 1125 doubles = 9000 bytes — too large to live on this task's stack
     // (class_driver_task is 4 KB and would overflow before bessel_i0
@@ -137,17 +136,18 @@ static void make_resample_coeffs(int16_t *coeffs)
     double *w = (double *)malloc(sizeof(double) * RS25_DELAY_SIZE * RS25_INTERP);
     if (!w) return;
     double sum_phase[RS25_INTERP];
-    for (int p = 0; p < INTERP; p++) sum_phase[p] = 0.0;
+    for (int p = 0; p < INTERP; p++)
+        sum_phase[p] = 0.0;
 
     for (int k = 0; k < NPROTO; k++) {
-        double t = (double)(k - center);
+        double t    = (double)(k - center);
         double sinc = (t == 0.0)
-                      ? 2.0 * fc_norm
-                      : sin(2.0 * PI * fc_norm * t) / (PI * t);
-        double u = 2.0 * (double)k / (double)(NPROTO - 1) - 1.0;
-        double arg = beta * sqrt(1.0 - u * u);
-        double kw  = bessel_i0(arg) * inv_i0;
-        w[k] = sinc * kw;
+                          ? 2.0 * fc_norm
+                          : sin(2.0 * PI * fc_norm * t) / (PI * t);
+        double u    = 2.0 * (double)k / (double)(NPROTO - 1) - 1.0;
+        double arg  = beta * sqrt(1.0 - u * u);
+        double kw   = bessel_i0(arg) * inv_i0;
+        w[k]        = sinc * kw;
         sum_phase[k % INTERP] += w[k];
     }
     // Normalise each phase to DC gain = 1 / INTERP (gri convention:
@@ -169,7 +169,7 @@ static void make_resample_coeffs(int16_t *coeffs)
     // within int16. Layout matches firmr_s16: coeffs[tap × interp + phase].
     for (int k = 0; k < NPROTO; k++) {
         double v = w[k] * (double)INT16_MAX;
-        if (v >  (double)INT16_MAX) v =  (double)INT16_MAX;
+        if (v > (double)INT16_MAX) v = (double)INT16_MAX;
         if (v < -(double)INT16_MAX) v = -(double)INT16_MAX;
         coeffs[k] = (int16_t)lrint(v);
     }
@@ -216,7 +216,7 @@ void resample_256_to_250_init(resample_256_to_250_t *r)
     resample_256_to_250_alloc_coeffs();
 #if defined(ESP_PLATFORM)
     if (s_coeffs_pp == NULL) {
-        return;   // fatal; downstream PIE asm will crash
+        return; // fatal; downstream PIE asm will crash
     }
 #endif
 
@@ -242,10 +242,10 @@ void resample_256_to_250_init(resample_256_to_250_t *r)
     // the production path no longer routes through it.
     firmr_s16_init(&r->fir_i, r->coeffs, r->delay_i,
                    RS25_DELAY_SIZE, RS25_INTERP, RS25_DECIM,
-                   /*start_pos=*/ 0, /*shift=*/ 0);
+                   /*start_pos=*/0, /*shift=*/0);
     firmr_s16_init(&r->fir_q, r->coeffs, r->delay_q,
                    RS25_DELAY_SIZE, RS25_INTERP, RS25_DECIM,
-                   /*start_pos=*/ 0, /*shift=*/ 0);
+                   /*start_pos=*/0, /*shift=*/0);
 }
 
 // Caller-managed-state core. Same Q15 math as the legacy entry below
@@ -278,19 +278,19 @@ void resample_256_to_250_init(resample_256_to_250_t *r)
 #define RS25_BATCH_COMPLEX 8
 
 RS25_HOT int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *delay_q,
-                                          int *wpos_io,
-                                          int *start_pos_io,
-                                          const int16_t *in_iq, int n_in_complex,
-                                          int16_t *out_iq, int max_out,
-                                          int16_t *batch_scratch)
+                                                  int           *wpos_io,
+                                                  int           *start_pos_io,
+                                                  const int16_t *in_iq, int n_in_complex,
+                                                  int16_t *out_iq, int max_out,
+                                                  int16_t *batch_scratch)
 {
-    int16_t *__restrict di = delay_i;
-    int16_t *__restrict dq = delay_q;
+    int16_t *__restrict di              = delay_i;
+    int16_t *__restrict dq              = delay_q;
     const int16_t *__restrict coeffs_pp = s_coeffs_pp;
-    int wpos      = *wpos_io;
-    int start_pos = *start_pos_io;
-    int n_out = 0;
-    int batch_n = 0;     // 0..RS25_BATCH_COMPLEX (only used when batch_scratch != NULL)
+    int wpos                            = *wpos_io;
+    int start_pos                       = *start_pos_io;
+    int n_out                           = 0;
+    int batch_n                         = 0; // 0..RS25_BATCH_COMPLEX (only used when batch_scratch != NULL)
     (void)s_coeffs_pp_ready;
 
 #if RS25_USE_PIE_ASM
@@ -304,11 +304,13 @@ RS25_HOT int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *del
         // backwards (newest sample at delay[wpos]). The mirror at
         // delay[wpos+16] keeps a contiguous 9-tap window readable
         // at &delay[wpos] regardless of how wpos wraps.
-        wpos = (wpos + 15) & 15;
-        int16_t i_s = in_iq[2 * i + 0];
-        int16_t q_s = in_iq[2 * i + 1];
-        di[wpos] = i_s; di[wpos + 16] = i_s;
-        dq[wpos] = q_s; dq[wpos + 16] = q_s;
+        wpos          = (wpos + 15) & 15;
+        int16_t i_s   = in_iq[2 * i + 0];
+        int16_t q_s   = in_iq[2 * i + 1];
+        di[wpos]      = i_s;
+        di[wpos + 16] = i_s;
+        dq[wpos]      = q_s;
+        dq[wpos + 16] = q_s;
 
         if (start_pos < RS25_INTERP) {
             if (n_out < max_out) {
@@ -320,14 +322,14 @@ RS25_HOT int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *del
                 // bursts; without, we write straight to out_iq in
                 // PSRAM as before.
                 int16_t *out_i = batch_scratch
-                    ? &batch_scratch[2 * batch_n + 0]
-                    : &out_iq[2 * n_out + 0];
+                                     ? &batch_scratch[2 * batch_n + 0]
+                                     : &out_iq[2 * n_out + 0];
                 int16_t *out_q = batch_scratch
-                    ? &batch_scratch[2 * batch_n + 1]
-                    : &out_iq[2 * n_out + 1];
+                                     ? &batch_scratch[2 * batch_n + 1]
+                                     : &out_iq[2 * n_out + 1];
 #if RS25_USE_PIE_ASM
                 resample_125_128_mac_arp4(pc, &di[wpos], &dq[wpos],
-                                           out_i, out_q);
+                                          out_i, out_q);
 #else
                 int64_t acc_i = 0x7fff;
                 int64_t acc_q = 0x7fff;
@@ -374,21 +376,23 @@ RS25_HOT int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *del
 // while Worker A processes the first half concurrently. Same write
 // pattern as _process_explicit so the resulting state is identical.
 void resample_256_to_250_advance(int16_t *delay_i, int16_t *delay_q,
-                                  int *wpos_io,
-                                  int *start_pos_io,
-                                  const int16_t *in_iq, int n_in_complex)
+                                 int           *wpos_io,
+                                 int           *start_pos_io,
+                                 const int16_t *in_iq, int n_in_complex)
 {
     int16_t *__restrict di = delay_i;
     int16_t *__restrict dq = delay_q;
-    int wpos      = *wpos_io;
-    int start_pos = *start_pos_io;
+    int wpos               = *wpos_io;
+    int start_pos          = *start_pos_io;
 
     for (int i = 0; i < n_in_complex; i++) {
-        wpos = (wpos + 15) & 15;
-        int16_t i_s = in_iq[2 * i + 0];
-        int16_t q_s = in_iq[2 * i + 1];
-        di[wpos] = i_s; di[wpos + 16] = i_s;
-        dq[wpos] = q_s; dq[wpos + 16] = q_s;
+        wpos          = (wpos + 15) & 15;
+        int16_t i_s   = in_iq[2 * i + 0];
+        int16_t q_s   = in_iq[2 * i + 1];
+        di[wpos]      = i_s;
+        di[wpos + 16] = i_s;
+        dq[wpos]      = q_s;
+        dq[wpos + 16] = q_s;
 
         if (start_pos < RS25_INTERP) {
             start_pos += RS25_DECIM;
@@ -401,16 +405,16 @@ void resample_256_to_250_advance(int16_t *delay_i, int16_t *delay_q,
 }
 
 int resample_256_to_250_process(resample_256_to_250_t *r,
-                                 const int16_t *in_iq, int n_in_complex,
-                                 int16_t *out_iq)
+                                const int16_t *in_iq, int n_in_complex,
+                                int16_t *out_iq)
 {
     // Legacy entry point: delegates to the caller-managed-state core.
     // n_in_complex is an upper bound on emitted outputs (the 125/128
     // ratio guarantees out_count <= in_count), so max_out = n_in.
     return resample_256_to_250_process_explicit(r->delay_i, r->delay_q,
-                                                 &r->wpos,
-                                                 &r->start_pos,
-                                                 in_iq, n_in_complex,
-                                                 out_iq, n_in_complex,
-                                                 /*batch_scratch=*/ NULL);
+                                                &r->wpos,
+                                                &r->start_pos,
+                                                in_iq, n_in_complex,
+                                                out_iq, n_in_complex,
+                                                /*batch_scratch=*/NULL);
 }

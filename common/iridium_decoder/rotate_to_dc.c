@@ -20,16 +20,16 @@ void rotate_to_dc(int16_t *iq, int n_complex, double phase_step)
     // step rebuild — see tests/host/test_pipeline_wideband_albq.
     const float dphi_f = (float)phase_step;
     for (int k = 0; k < n_complex; k++) {
-        float phase = dphi_f * (float)k;
-        float cs = cosf(phase);
-        float ss = sinf(phase);
-        int32_t r = iq[k * 2 + 0];
-        int32_t v = iq[k * 2 + 1];
-        float nr = (float)r * cs - (float)v * ss;
-        float ni = (float)r * ss + (float)v * cs;
-        if (nr >  32767.0f) nr =  32767.0f;
+        float   phase = dphi_f * (float)k;
+        float   cs    = cosf(phase);
+        float   ss    = sinf(phase);
+        int32_t r     = iq[k * 2 + 0];
+        int32_t v     = iq[k * 2 + 1];
+        float   nr    = (float)r * cs - (float)v * ss;
+        float   ni    = (float)r * ss + (float)v * cs;
+        if (nr > 32767.0f) nr = 32767.0f;
         if (nr < -32768.0f) nr = -32768.0f;
-        if (ni >  32767.0f) ni =  32767.0f;
+        if (ni > 32767.0f) ni = 32767.0f;
         if (ni < -32768.0f) ni = -32768.0f;
         iq[k * 2 + 0] = (int16_t)lrintf(nr);
         iq[k * 2 + 1] = (int16_t)lrintf(ni);
@@ -38,8 +38,7 @@ void rotate_to_dc(int16_t *iq, int n_complex, double phase_step)
 
 double rotate_to_dc_phase_step_from_bin(int center_bin, int fft_size)
 {
-    double rel_f = ((double)center_bin - (double)fft_size / 2.0)
-                   / (double)fft_size;
+    double rel_f = ((double)center_bin - (double)fft_size / 2.0) / (double)fft_size;
     return -2.0 * M_PI * rel_f;
 }
 
@@ -72,7 +71,7 @@ static inline int32_t q15_mul_round(int32_t a, int32_t b)
 
 static inline int16_t q15_sat(int32_t x)
 {
-    if (x >  32767) return  32767;
+    if (x > 32767) return 32767;
     if (x < -32768) return -32768;
     return (int16_t)x;
 }
@@ -97,18 +96,18 @@ static inline int16_t q15_sat(int32_t x)
 // processed scalar at the end via the existing q15_inc per-sample
 // path so the boundary doesn't need extra masking in the asm.
 void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
-                                   double phase_step, int sample_offset)
+                                  double phase_step, int sample_offset)
 {
-    double cs_d = cos(phase_step);
-    double ss_d = sin(phase_step);
+    double  cs_d = cos(phase_step);
+    double  ss_d = sin(phase_step);
     int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
     int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
 
-    int16_t pr_q = 32767;
-    int16_t pi_q = 0;
-    int n_chunks_to_renorm = 0;
+    int16_t pr_q               = 32767;
+    int16_t pi_q               = 0;
+    int     n_chunks_to_renorm = 0;
 
-    int n_chunks = n_complex / ROT_SIMD_LANES;
+    int n_chunks   = n_complex / ROT_SIMD_LANES;
     int tail_start = n_chunks * ROT_SIMD_LANES;
 
     int16_t cs_lane[ROT_SIMD_LANES];
@@ -123,10 +122,9 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
         // ROT_RENORM_PERIOD/ROT_SIMD_LANES chunks) matches q15_inc's
         // ROT_RENORM_PERIOD samples.
         if (n_chunks_to_renorm == 0) {
-            double phase = phase_step * (double)(sample_offset
-                                                  + c * ROT_SIMD_LANES);
-            pr_q = (int16_t)lrint(cos(phase) * 32767.0);
-            pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+            double phase       = phase_step * (double)(sample_offset + c * ROT_SIMD_LANES);
+            pr_q               = (int16_t)lrint(cos(phase) * 32767.0);
+            pi_q               = (int16_t)lrint(sin(phase) * 32767.0);
             n_chunks_to_renorm = ROT_RENORM_PERIOD / ROT_SIMD_LANES;
         }
         n_chunks_to_renorm--;
@@ -134,12 +132,12 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
         // Build the per-lane phasor table by incrementing the
         // accumulator 8 steps. Same Q15 incremental as q15_inc.
         for (int k = 0; k < ROT_SIMD_LANES; k++) {
-            cs_lane[k] = pr_q;
-            ss_lane[k] = pi_q;
+            cs_lane[k]  = pr_q;
+            ss_lane[k]  = pi_q;
             int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
             int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
-            pr_q = q15_sat(npr);
-            pi_q = q15_sat(npi);
+            pr_q        = q15_sat(npr);
+            pi_q        = q15_sat(npi);
         }
 
         // SIMD-style complex multiply across the 8 lanes. The asm
@@ -147,12 +145,10 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
         // we just unroll it scalar so the test stays portable.
         int16_t *p = iq + (size_t)(c * ROT_SIMD_LANES) * 2;
         for (int k = 0; k < ROT_SIMD_LANES; k++) {
-            int32_t r = p[k * 2 + 0];
-            int32_t v = p[k * 2 + 1];
-            int32_t nr = q15_mul_round(r, cs_lane[k])
-                       - q15_mul_round(v, ss_lane[k]);
-            int32_t ni = q15_mul_round(r, ss_lane[k])
-                       + q15_mul_round(v, cs_lane[k]);
+            int32_t r    = p[k * 2 + 0];
+            int32_t v    = p[k * 2 + 1];
+            int32_t nr   = q15_mul_round(r, cs_lane[k]) - q15_mul_round(v, ss_lane[k]);
+            int32_t ni   = q15_mul_round(r, ss_lane[k]) + q15_mul_round(v, cs_lane[k]);
             p[k * 2 + 0] = q15_sat(nr);
             p[k * 2 + 1] = q15_sat(ni);
         }
@@ -165,19 +161,19 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
     // so chunk-loop callers stay consistent across chunks.
     if (tail_start < n_complex) {
         double phase = phase_step * (double)(sample_offset + tail_start);
-        pr_q = (int16_t)lrint(cos(phase) * 32767.0);
-        pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+        pr_q         = (int16_t)lrint(cos(phase) * 32767.0);
+        pi_q         = (int16_t)lrint(sin(phase) * 32767.0);
         for (int k = tail_start; k < n_complex; k++) {
-            int32_t r = iq[k * 2 + 0];
-            int32_t v = iq[k * 2 + 1];
-            int32_t nr = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
-            int32_t ni = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
+            int32_t r     = iq[k * 2 + 0];
+            int32_t v     = iq[k * 2 + 1];
+            int32_t nr    = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
+            int32_t ni    = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
             iq[k * 2 + 0] = q15_sat(nr);
             iq[k * 2 + 1] = q15_sat(ni);
-            int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
-            int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
-            pr_q = q15_sat(npr);
-            pi_q = q15_sat(npi);
+            int32_t npr   = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
+            int32_t npi   = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
+            pr_q          = q15_sat(npr);
+            pi_q          = q15_sat(npi);
         }
     }
 }
@@ -193,22 +189,22 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
 #define ROT_SIMD_ARP4_AVAILABLE 1
 
 extern void rotate_q15_chunk_arp4(const int16_t *I, const int16_t *Q,
-                                   const int16_t *cs, const int16_t *ss,
-                                   int16_t *nI, int16_t *nQ);
+                                  const int16_t *cs, const int16_t *ss,
+                                  int16_t *nI, int16_t *nQ);
 
 void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
-                                    double phase_step, int sample_offset)
+                                   double phase_step, int sample_offset)
 {
-    double cs_d = cos(phase_step);
-    double ss_d = sin(phase_step);
+    double  cs_d = cos(phase_step);
+    double  ss_d = sin(phase_step);
     int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
     int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
 
-    int16_t pr_q = 32767;
-    int16_t pi_q = 0;
-    int n_chunks_to_renorm = 0;
+    int16_t pr_q               = 32767;
+    int16_t pi_q               = 0;
+    int     n_chunks_to_renorm = 0;
 
-    int n_chunks = n_complex / ROT_SIMD_LANES;
+    int n_chunks   = n_complex / ROT_SIMD_LANES;
     int tail_start = n_chunks * ROT_SIMD_LANES;
 
     // Stack-resident, 16-byte aligned scratch — PIE vld.128 needs
@@ -216,19 +212,18 @@ void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
     // net (see rotate_to_dc_arp4.S). The deinterleave + interleave
     // cost is ~16 cycles/chunk vs the ~8-lane SIMD inner kernel's
     // ~12 cycles/chunk; net per-chunk ~30 cycles vs scalar ~210.
-    int16_t I_lane[ROT_SIMD_LANES]   __attribute__((aligned(16)));
-    int16_t Q_lane[ROT_SIMD_LANES]   __attribute__((aligned(16)));
-    int16_t cs_lane[ROT_SIMD_LANES]  __attribute__((aligned(16)));
-    int16_t ss_lane[ROT_SIMD_LANES]  __attribute__((aligned(16)));
-    int16_t nI[ROT_SIMD_LANES]       __attribute__((aligned(16)));
-    int16_t nQ[ROT_SIMD_LANES]       __attribute__((aligned(16)));
+    int16_t I_lane[ROT_SIMD_LANES] __attribute__((aligned(16)));
+    int16_t Q_lane[ROT_SIMD_LANES] __attribute__((aligned(16)));
+    int16_t cs_lane[ROT_SIMD_LANES] __attribute__((aligned(16)));
+    int16_t ss_lane[ROT_SIMD_LANES] __attribute__((aligned(16)));
+    int16_t nI[ROT_SIMD_LANES] __attribute__((aligned(16)));
+    int16_t nQ[ROT_SIMD_LANES] __attribute__((aligned(16)));
 
     for (int c = 0; c < n_chunks; c++) {
         if (n_chunks_to_renorm == 0) {
-            double phase = phase_step * (double)(sample_offset
-                                                  + c * ROT_SIMD_LANES);
-            pr_q = (int16_t)lrint(cos(phase) * 32767.0);
-            pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+            double phase       = phase_step * (double)(sample_offset + c * ROT_SIMD_LANES);
+            pr_q               = (int16_t)lrint(cos(phase) * 32767.0);
+            pi_q               = (int16_t)lrint(sin(phase) * 32767.0);
             n_chunks_to_renorm = ROT_RENORM_PERIOD / ROT_SIMD_LANES;
         }
         n_chunks_to_renorm--;
@@ -237,12 +232,12 @@ void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
         // advance — same exact arithmetic as the scalar reference so
         // a phasor-mismatch can't be the source of any output diff.
         for (int k = 0; k < ROT_SIMD_LANES; k++) {
-            cs_lane[k] = pr_q;
-            ss_lane[k] = pi_q;
+            cs_lane[k]  = pr_q;
+            ss_lane[k]  = pi_q;
             int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
             int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
-            pr_q = q15_sat(npr);
-            pi_q = q15_sat(npi);
+            pr_q        = q15_sat(npr);
+            pi_q        = q15_sat(npi);
         }
 
         // Deinterleave the 8 IQ pairs into split I/Q lanes for the
@@ -266,19 +261,19 @@ void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
     // per-sample, identical to _simd_ref_at's tail.
     if (tail_start < n_complex) {
         double phase = phase_step * (double)(sample_offset + tail_start);
-        pr_q = (int16_t)lrint(cos(phase) * 32767.0);
-        pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+        pr_q         = (int16_t)lrint(cos(phase) * 32767.0);
+        pi_q         = (int16_t)lrint(sin(phase) * 32767.0);
         for (int k = tail_start; k < n_complex; k++) {
-            int32_t r = iq[k * 2 + 0];
-            int32_t v = iq[k * 2 + 1];
-            int32_t nr = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
-            int32_t ni = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
+            int32_t r     = iq[k * 2 + 0];
+            int32_t v     = iq[k * 2 + 1];
+            int32_t nr    = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
+            int32_t ni    = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
             iq[k * 2 + 0] = q15_sat(nr);
             iq[k * 2 + 1] = q15_sat(ni);
-            int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
-            int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
-            pr_q = q15_sat(npr);
-            pi_q = q15_sat(npi);
+            int32_t npr   = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
+            int32_t npi   = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
+            pr_q          = q15_sat(npr);
+            pi_q          = q15_sat(npi);
         }
     }
 }
@@ -290,7 +285,7 @@ void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
 // on host and target. Same input/output contract, including
 // sample_offset semantics — see rotate_to_dc.h.
 void rotate_to_dc_q15_simd_at(int16_t *iq, int n_complex,
-                               double phase_step, int sample_offset)
+                              double phase_step, int sample_offset)
 {
 #if defined(ESP_PLATFORM) && defined(ROT_SIMD_ARP4_AVAILABLE)
     rotate_to_dc_q15_simd_arp4_at(iq, n_complex, phase_step, sample_offset);
@@ -302,37 +297,37 @@ void rotate_to_dc_q15_simd_at(int16_t *iq, int n_complex,
 void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step)
 {
     // Per-step phasor multiplier: exp(j·phase_step). Quantise to Q15.
-    double cs_d = cos(phase_step);
-    double ss_d = sin(phase_step);
+    double  cs_d = cos(phase_step);
+    double  ss_d = sin(phase_step);
     int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
     int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
 
     // Running phasor, starts at (1, 0) ≡ exp(j·0).
-    int16_t pr_q = 32767;
-    int16_t pi_q = 0;
-    int n_to_renorm = ROT_RENORM_PERIOD;   // force first iteration to set
-                                            // pr/pi from the absolute phase
-                                            // at k=0 (which is just (1,0),
-                                            // but the same code path covers
-                                            // start-from-nonzero callers if
-                                            // we ever extend that)
+    int16_t pr_q        = 32767;
+    int16_t pi_q        = 0;
+    int     n_to_renorm = ROT_RENORM_PERIOD; // force first iteration to set
+                                             // pr/pi from the absolute phase
+                                             // at k=0 (which is just (1,0),
+                                             // but the same code path covers
+                                             // start-from-nonzero callers if
+                                             // we ever extend that)
 
     for (int k = 0; k < n_complex; k++) {
         // Renormalise periodically: replace the drifting Q15 phasor
         // with a fresh quantisation of cos(k·dphi), sin(k·dphi).
         if (n_to_renorm >= ROT_RENORM_PERIOD) {
-            n_to_renorm = 0;
+            n_to_renorm  = 0;
             double phase = phase_step * (double)k;
-            pr_q = (int16_t)lrint(cos(phase) * 32767.0);
-            pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+            pr_q         = (int16_t)lrint(cos(phase) * 32767.0);
+            pi_q         = (int16_t)lrint(sin(phase) * 32767.0);
         }
 
         // Multiply input sample by phasor: out = in × (pr + j·pi) / 32768
         // Rounded Q15 × Q15: (a·b + 2^14) >> 15.
-        int32_t r = iq[k * 2 + 0];
-        int32_t v = iq[k * 2 + 1];
-        int32_t nr = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
-        int32_t ni = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
+        int32_t r     = iq[k * 2 + 0];
+        int32_t v     = iq[k * 2 + 1];
+        int32_t nr    = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
+        int32_t ni    = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
         iq[k * 2 + 0] = q15_sat(nr);
         iq[k * 2 + 1] = q15_sat(ni);
 
@@ -342,15 +337,15 @@ void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step)
         // at ROT_RENORM_PERIOD restores |p| = 1.
         int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
         int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
-        pr_q = q15_sat(npr);
-        pi_q = q15_sat(npi);
+        pr_q        = q15_sat(npr);
+        pi_q        = q15_sat(npi);
 
         n_to_renorm++;
     }
 }
 
 void rotate_to_dc_q15_inc_at(int16_t *iq, int n_complex,
-                              double phase_step, int sample_offset)
+                             double phase_step, int sample_offset)
 {
     // Same algorithm as rotate_to_dc_q15_inc but the absolute-phase
     // renorm uses (sample_offset + k) instead of k, so a burst rotated
@@ -360,32 +355,32 @@ void rotate_to_dc_q15_inc_at(int16_t *iq, int n_complex,
     // n_to_renorm = ROT_RENORM_PERIOD on entry — no inter-chunk state
     // is carried in the running phasor, the cos/sin reference fully
     // re-establishes it.
-    double cs_d = cos(phase_step);
-    double ss_d = sin(phase_step);
+    double  cs_d = cos(phase_step);
+    double  ss_d = sin(phase_step);
     int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
     int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
 
-    int16_t pr_q = 32767;
-    int16_t pi_q = 0;
-    int n_to_renorm = ROT_RENORM_PERIOD;
+    int16_t pr_q        = 32767;
+    int16_t pi_q        = 0;
+    int     n_to_renorm = ROT_RENORM_PERIOD;
 
     for (int k = 0; k < n_complex; k++) {
         if (n_to_renorm >= ROT_RENORM_PERIOD) {
-            n_to_renorm = 0;
+            n_to_renorm  = 0;
             double phase = phase_step * (double)(sample_offset + k);
-            pr_q = (int16_t)lrint(cos(phase) * 32767.0);
-            pi_q = (int16_t)lrint(sin(phase) * 32767.0);
+            pr_q         = (int16_t)lrint(cos(phase) * 32767.0);
+            pi_q         = (int16_t)lrint(sin(phase) * 32767.0);
         }
-        int32_t r = iq[k * 2 + 0];
-        int32_t v = iq[k * 2 + 1];
-        int32_t nr = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
-        int32_t ni = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
+        int32_t r     = iq[k * 2 + 0];
+        int32_t v     = iq[k * 2 + 1];
+        int32_t nr    = q15_mul_round(r, pr_q) - q15_mul_round(v, pi_q);
+        int32_t ni    = q15_mul_round(r, pi_q) + q15_mul_round(v, pr_q);
         iq[k * 2 + 0] = q15_sat(nr);
         iq[k * 2 + 1] = q15_sat(ni);
-        int32_t npr = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
-        int32_t npi = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
-        pr_q = q15_sat(npr);
-        pi_q = q15_sat(npi);
+        int32_t npr   = q15_mul_round(pr_q, cs_q) - q15_mul_round(pi_q, ss_q);
+        int32_t npi   = q15_mul_round(pr_q, ss_q) + q15_mul_round(pi_q, cs_q);
+        pr_q          = q15_sat(npr);
+        pi_q          = q15_sat(npi);
         n_to_renorm++;
     }
 }

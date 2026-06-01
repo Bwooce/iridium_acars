@@ -35,8 +35,8 @@ typedef struct {
     uint32_t messages_written;
     uint32_t write_errors;
     uint64_t bytes_written;
-    char     log_path[64];        // empty if no log open
-    char     mount_error[64];     // empty on success
+    char     log_path[64];    // empty if no log open
+    char     mount_error[64]; // empty on success
 } sd_log_stats_t;
 
 #if CONFIG_ENABLE_SD_LOG
@@ -66,13 +66,25 @@ esp_err_t sd_log_force_format(void);
 
 void sd_log_get_stats(sd_log_stats_t *out);
 
-#else  /* !CONFIG_ENABLE_SD_LOG — provide inline no-op stubs. */
+#else /* !CONFIG_ENABLE_SD_LOG — provide inline no-op stubs. */
 
-static inline esp_err_t sd_log_init(void) { return ESP_OK; }
-static inline void      sd_log_emit(const acars_msg_t *m) { (void)m; }
-static inline esp_err_t sd_log_force_mount(void) { return ESP_ERR_NOT_SUPPORTED; }
-static inline esp_err_t sd_log_force_format(void) { return ESP_ERR_NOT_SUPPORTED; }
-static inline void      sd_log_get_stats(sd_log_stats_t *out)
+static inline esp_err_t sd_log_init(void)
+{
+    return ESP_OK;
+}
+static inline void sd_log_emit(const acars_msg_t *m)
+{
+    (void)m;
+}
+static inline esp_err_t sd_log_force_mount(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+static inline esp_err_t sd_log_force_format(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+static inline void sd_log_get_stats(sd_log_stats_t *out)
 {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -82,4 +94,4 @@ static inline void      sd_log_get_stats(sd_log_stats_t *out)
              "disabled (CONFIG_ENABLE_SD_LOG=n)");
 }
 
-#endif  /* CONFIG_ENABLE_SD_LOG */
+#endif /* CONFIG_ENABLE_SD_LOG */

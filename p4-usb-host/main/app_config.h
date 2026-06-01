@@ -21,37 +21,37 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-#define APP_CONFIG_STATION_ID_LEN  32
-#define APP_CONFIG_WIFI_SSID_LEN   32
-#define APP_CONFIG_WIFI_PSK_LEN    64
-#define APP_CONFIG_OUT_HOST_LEN    64    // UDP push target (hostname or IP); empty = disabled
-#define APP_CONFIG_OTA_URL_LEN    128    // D19 OTA pull URL (http://… or https://…); empty = disabled
+#define APP_CONFIG_STATION_ID_LEN 32
+#define APP_CONFIG_WIFI_SSID_LEN 32
+#define APP_CONFIG_WIFI_PSK_LEN 64
+#define APP_CONFIG_OUT_HOST_LEN 64 // UDP push target (hostname or IP); empty = disabled
+#define APP_CONFIG_OTA_URL_LEN 128 // D19 OTA pull URL (http://… or https://…); empty = disabled
 
 typedef enum {
-    GAIN_MODE_TUNER_AGC      = 0,   // R820T/R828D internal AGC. Default
-                                    // for indoor/no-antenna development.
-    GAIN_MODE_MANUAL         = 1,   // Caller picks a fixed gain_db_x10.
-                                    // Recommended for live Iridium: ~35 dB.
-    GAIN_MODE_SOFTWARE_AGC   = 2,   // D16 software AGC adjusts gain based
-                                    // on noise-floor / saturation signals.
+    GAIN_MODE_TUNER_AGC = 0,    // R820T/R828D internal AGC. Default
+                                // for indoor/no-antenna development.
+    GAIN_MODE_MANUAL = 1,       // Caller picks a fixed gain_db_x10.
+                                // Recommended for live Iridium: ~35 dB.
+    GAIN_MODE_SOFTWARE_AGC = 2, // D16 software AGC adjusts gain based
+                                // on noise-floor / saturation signals.
 } gain_mode_t;
 
 typedef struct {
-    uint32_t   lo_freq_hz;            // RTL-SDR tuner LO frequency
-    uint32_t   sample_rate_hz;        // RTL-SDR sample rate
+    uint32_t    lo_freq_hz;     // RTL-SDR tuner LO frequency
+    uint32_t    sample_rate_hz; // RTL-SDR sample rate
     gain_mode_t gain_mode;
-    int16_t    gain_db_x10;           // tenths of dB; e.g. 350 = 35.0 dB.
-                                      // -1 = closest available gain step.
-                                      // Only used when gain_mode != TUNER_AGC.
-    bool       bias_tee;              // RTL-SDR v4 bias tee on/off
-    float      tagger_threshold_db;   // FFT burst tagger SNR threshold
+    int16_t     gain_db_x10;   // tenths of dB; e.g. 350 = 35.0 dB.
+                               // -1 = closest available gain step.
+                               // Only used when gain_mode != TUNER_AGC.
+    bool  bias_tee;            // RTL-SDR v4 bias tee on/off
+    float tagger_threshold_db; // FFT burst tagger SNR threshold
 
-    char       station_id[APP_CONFIG_STATION_ID_LEN];   // for upstream/log identification
-    char       wifi_ssid[APP_CONFIG_WIFI_SSID_LEN];     // for D17 C6 wireless
-    char       wifi_psk[APP_CONFIG_WIFI_PSK_LEN];       // for D17 C6 wireless
-    char       out_host[APP_CONFIG_OUT_HOST_LEN];       // UDP push target host; empty = no push
-    uint16_t   out_port;                                 // UDP push target port; 0 = no push
-    char       ota_url[APP_CONFIG_OTA_URL_LEN];          // D19 OTA pull URL; empty = disabled
+    char     station_id[APP_CONFIG_STATION_ID_LEN]; // for upstream/log identification
+    char     wifi_ssid[APP_CONFIG_WIFI_SSID_LEN];   // for D17 C6 wireless
+    char     wifi_psk[APP_CONFIG_WIFI_PSK_LEN];     // for D17 C6 wireless
+    char     out_host[APP_CONFIG_OUT_HOST_LEN];     // UDP push target host; empty = no push
+    uint16_t out_port;                              // UDP push target port; 0 = no push
+    char     ota_url[APP_CONFIG_OTA_URL_LEN];       // D19 OTA pull URL; empty = disabled
 } app_config_t;
 
 // Initialise from NVS. Missing keys get compile-time defaults.
@@ -67,7 +67,7 @@ void app_config_snapshot(app_config_t *out);
 // a single field without copying the whole struct. Keep critical
 // sections SHORT — under 1 microsecond.
 const app_config_t *app_config_get_locked(void);
-void app_config_unlock(void);
+void                app_config_unlock(void);
 
 // Setters. Each writes the struct field AND commits to NVS.
 // Returns ESP_OK on NVS success; the in-memory struct is updated

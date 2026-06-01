@@ -9,8 +9,8 @@
 #define SIGNAL_BUF_SIZE (4 * 1024 * 1024)
 
 esp_err_t signal_buffer_init();
-void signal_buffer_push(const int16_t *samples, size_t n_samples);
-void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest);
+void      signal_buffer_push(const int16_t *samples, size_t n_samples);
+void      signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest);
 
 // Invalidate L2 cache lines covering [start_idx, start_idx + length) of the
 // circular buffer (modulo wrap). Call once per burst before reading chunks

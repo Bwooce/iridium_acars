@@ -29,15 +29,15 @@ struct sym_timing_trace;
 
 typedef struct {
     // Loop state.
-    float mu;            // fractional strobe offset ∈ [0, 1)
-    float w;             // PI loop integrator output
+    float mu; // fractional strobe offset ∈ [0, 1)
+    float w;  // PI loop integrator output
     // Carry-over history needed for the Gardner TED. The TED needs the
     // current strobe, the half-symbol-prior midpoint, and the previous
     // strobe; we keep the previous strobe + midpoint between calls so a
     // burst can be fed in chunks.
     float complex prev_strobe;
     float complex prev_midpoint;
-    int   have_history;  // 0 until first two strobes have been produced
+    int           have_history; // 0 until first two strobes have been produced
     // Gains. PI loop filter. Caller may override after init for tuning.
     float Kp;
     float Ki;
@@ -57,7 +57,7 @@ void sym_timing_init(sym_timing_t *st);
 //
 // out_cap is the capacity of out_syms in complex samples. The caller
 // is responsible for sizing it ≥ n_int16/4.
-int sym_timing_process(sym_timing_t *st,
+int sym_timing_process(sym_timing_t  *st,
                        const int16_t *in_2sps, int n_int16,
                        float complex *out_syms, int out_cap);
 
@@ -76,7 +76,7 @@ int sym_timing_process(sym_timing_t *st,
 //
 // in_2sps : interleaved I/Q at 2 sps, n_int16 = 2 × n_complex int16.
 // out_2sps: must be at least n_int16 in size (same length as input).
-void sym_timing_correct_2sps(sym_timing_t *st,
+void sym_timing_correct_2sps(sym_timing_t  *st,
                              const int16_t *in_2sps, int n_int16,
                              int16_t *out_2sps);
 
@@ -86,10 +86,10 @@ void sym_timing_correct_2sps(sym_timing_t *st,
 // inspect the loop's behaviour on a known burst and tune Kp/Ki.
 #define SYM_TIMING_TRACE_CAP 1024
 struct sym_timing_trace {
-    float e [SYM_TIMING_TRACE_CAP];
+    float e[SYM_TIMING_TRACE_CAP];
     float mu[SYM_TIMING_TRACE_CAP];
-    float w [SYM_TIMING_TRACE_CAP];
-    int   n;     // number of valid entries
+    float w[SYM_TIMING_TRACE_CAP];
+    int   n; // number of valid entries
 };
 typedef struct sym_timing_trace sym_timing_trace_t;
 

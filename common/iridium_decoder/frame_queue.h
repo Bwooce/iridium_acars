@@ -43,15 +43,15 @@ extern "C" {
 #define FRAME_QUEUE_MAX_BITS 2048
 
 typedef struct {
-    uint32_t timestamp_us;   // host timestamp at enqueue (esp_timer_get_time / gettimeofday)
-    uint32_t freq_hz;        // burst center frequency from worker
-    int32_t  peak_bin;       // FFT bin reported by detector (post-fftshift)
-    float    snr_db;         // detection SNR
-    uint16_t n_bits;         // valid count in bits[]
-    uint8_t  direction;      // 0 = downlink (matches qpsk_demod's DIR_DOWNLINK),
-                             // 1 = uplink   (DIR_UPLINK)
-    uint8_t  pad;
-    uint8_t  bits[FRAME_QUEUE_MAX_BITS];   // 0/1-per-byte demod output
+    uint32_t timestamp_us; // host timestamp at enqueue (esp_timer_get_time / gettimeofday)
+    uint32_t freq_hz;      // burst center frequency from worker
+    int32_t  peak_bin;     // FFT bin reported by detector (post-fftshift)
+    float    snr_db;       // detection SNR
+    uint16_t n_bits;       // valid count in bits[]
+    uint8_t  direction;    // 0 = downlink (matches qpsk_demod's DIR_DOWNLINK),
+                           // 1 = uplink   (DIR_UPLINK)
+    uint8_t pad;
+    uint8_t bits[FRAME_QUEUE_MAX_BITS]; // 0/1-per-byte demod output
 } frame_queue_item_t;
 
 typedef struct frame_queue frame_queue_t;
@@ -74,11 +74,11 @@ bool frame_queue_push(frame_queue_t *q, const frame_queue_item_t *item);
 bool frame_queue_pop(frame_queue_t *q, frame_queue_item_t *out);
 
 // Stats accessors (read-only from any task; values are atomic loads).
-size_t frame_queue_count(const frame_queue_t *q);     // current items in flight
-size_t frame_queue_capacity(const frame_queue_t *q);  // n_slots - 1 (one slot reserved)
-uint64_t frame_queue_pushed(const frame_queue_t *q);  // total successful pushes
-uint64_t frame_queue_dropped(const frame_queue_t *q); // total drops (queue full)
-uint64_t frame_queue_popped(const frame_queue_t *q);  // total successful pops
+size_t   frame_queue_count(const frame_queue_t *q);    // current items in flight
+size_t   frame_queue_capacity(const frame_queue_t *q); // n_slots - 1 (one slot reserved)
+uint64_t frame_queue_pushed(const frame_queue_t *q);   // total successful pushes
+uint64_t frame_queue_dropped(const frame_queue_t *q);  // total drops (queue full)
+uint64_t frame_queue_popped(const frame_queue_t *q);   // total successful pops
 
 #ifdef __cplusplus
 }

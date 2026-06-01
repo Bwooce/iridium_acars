@@ -21,7 +21,10 @@ static uint32_t bits_to_u32(const uint8_t *bits, size_t n_bits)
 static int u32_bit_length(uint32_t x)
 {
     int n = 0;
-    while (x) { n++; x >>= 1; }
+    while (x) {
+        n++;
+        x >>= 1;
+    }
     return n;
 }
 
@@ -31,10 +34,10 @@ uint32_t iridium_bch_ndivide(uint32_t poly, const uint8_t *bits, size_t n_bits)
     uint32_t num = bits_to_u32(bits, n_bits);
     if (num == 0) return 0;
 
-    int num_len = u32_bit_length(num);
-    int poly_len = u32_bit_length(poly);
-    int shift = num_len - poly_len;
-    uint32_t pow = (uint32_t)1 << (num_len - 1);
+    int      num_len  = u32_bit_length(num);
+    int      poly_len = u32_bit_length(poly);
+    int      shift    = num_len - poly_len;
+    uint32_t pow      = (uint32_t)1 << (num_len - 1);
 
     while (shift >= 0) {
         if (num >= pow) {
@@ -51,16 +54,16 @@ int iridium_bch_repair1(uint32_t poly, uint8_t *bits, size_t n_bits)
     if (!bits || n_bits == 0) return -1;
 
     if (iridium_bch_ndivide(poly, bits, n_bits) == 0) {
-        return 0;  // already clean
+        return 0; // already clean
     }
 
     // Try flipping each bit in turn.
     for (size_t i = 0; i < n_bits; i++) {
         bits[i] ^= 1;
         if (iridium_bch_ndivide(poly, bits, n_bits) == 0) {
-            return 1;  // single-bit error corrected (flip remains)
+            return 1; // single-bit error corrected (flip remains)
         }
-        bits[i] ^= 1;  // revert and try next
+        bits[i] ^= 1; // revert and try next
     }
     return -1;
 }
@@ -70,14 +73,14 @@ int iridium_bch_repair2(uint32_t poly, uint8_t *bits, size_t n_bits)
     if (!bits || n_bits == 0) return -1;
 
     if (iridium_bch_ndivide(poly, bits, n_bits) == 0) {
-        return 0;  // already clean
+        return 0; // already clean
     }
 
     // Single-bit pass first.
     for (size_t i = 0; i < n_bits; i++) {
         bits[i] ^= 1;
         if (iridium_bch_ndivide(poly, bits, n_bits) == 0) {
-            return 1;  // 1-bit error
+            return 1; // 1-bit error
         }
         bits[i] ^= 1;
     }
@@ -89,7 +92,7 @@ int iridium_bch_repair2(uint32_t poly, uint8_t *bits, size_t n_bits)
         for (size_t j = i + 1; j < n_bits; j++) {
             bits[j] ^= 1;
             if (iridium_bch_ndivide(poly, bits, n_bits) == 0) {
-                return 2;  // 2-bit error corrected (both flips remain)
+                return 2; // 2-bit error corrected (both flips remain)
             }
             bits[j] ^= 1;
         }

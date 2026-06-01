@@ -10,8 +10,8 @@
 // 16 KB USB transfer. Sized for the same out_block_size (16 KB) the
 // class_driver currently uses, expressed in int16 units (8192 elements
 // = 32 KB per slot).
-#define INGEST_NUM_SLOTS    2
-#define INGEST_SLOT_ELEMS   (16 * 1024)   /* int16 elements per slot (32 KB each) */
+#define INGEST_NUM_SLOTS 2
+#define INGEST_SLOT_ELEMS (16 * 1024) /* int16 elements per slot (32 KB each) */
 
 // Initialise the ingest task on Core 1 plus the ping-pong infrastructure.
 // Allocates raw + converted buffers in DMA-capable internal SRAM, creates

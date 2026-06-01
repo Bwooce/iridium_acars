@@ -12,10 +12,10 @@
 // after the next process_250khz call consumes it, it's auto-cleared so
 // only one burst gets dumped.
 static char s_dump_dir[256] = {0};
-static int  s_dump_pending = 0;
+static int  s_dump_pending  = 0;
 
 // One-shot D13 override. -1 = use D13 normally.
-static int  s_force_burst_start = -1;
+static int s_force_burst_start = -1;
 
 void burst_pipeline_force_start_once(int sample_idx)
 {
@@ -27,9 +27,9 @@ void burst_pipeline_set_dump_once(const char *dir)
     if (dir) {
         strncpy(s_dump_dir, dir, sizeof(s_dump_dir) - 1);
         s_dump_dir[sizeof(s_dump_dir) - 1] = 0;
-        s_dump_pending = 1;
+        s_dump_pending                     = 1;
     } else {
-        s_dump_dir[0] = 0;
+        s_dump_dir[0]  = 0;
         s_dump_pending = 0;
     }
 }
@@ -56,7 +56,7 @@ static void dump_iq_cf32(const char *fname, const int16_t *iq, int n_complex)
 // Tests/host stubs don't always pull the same UW_SPS source as the
 // production headers; keep a local copy synchronised with
 // uw_correlator.h.
-#define UW_SPS  10
+#define UW_SPS 10
 #endif
 
 #define POST_CORR_DECIM 5
@@ -79,34 +79,34 @@ static inline int16_t q15_from_float(float f)
 // and (with peak-phase initial value + sub-sample interp) for the
 // final post-UW pre-rotation step.
 static void q15_freq_shift_inplace(int16_t *iq, int n_complex,
-                                    int16_t pr_q_init, int16_t pi_q_init,
-                                    int16_t cs_q, int16_t ss_q)
+                                   int16_t pr_q_init, int16_t pi_q_init,
+                                   int16_t cs_q, int16_t ss_q)
 {
     int16_t pr_q = pr_q_init;
     int16_t pi_q = pi_q_init;
     for (int i = 0; i < n_complex; i++) {
-        int32_t r = iq[i * 2 + 0];
-        int32_t v = iq[i * 2 + 1];
-        int32_t nr = ((int32_t)r * pr_q - (int32_t)v * pi_q) >> 15;
-        int32_t ni = ((int32_t)r * pi_q + (int32_t)v * pr_q) >> 15;
+        int32_t r     = iq[i * 2 + 0];
+        int32_t v     = iq[i * 2 + 1];
+        int32_t nr    = ((int32_t)r * pr_q - (int32_t)v * pi_q) >> 15;
+        int32_t ni    = ((int32_t)r * pi_q + (int32_t)v * pr_q) >> 15;
         iq[i * 2 + 0] = q15_saturate(nr);
         iq[i * 2 + 1] = q15_saturate(ni);
         // Advance phasor: p ← p · (cs_q + j·ss_q) = p · exp(j·dphi).
         int32_t npr = ((int32_t)pr_q * cs_q - (int32_t)pi_q * ss_q) >> 15;
         int32_t npi = ((int32_t)pr_q * ss_q + (int32_t)pi_q * cs_q) >> 15;
-        pr_q = q15_saturate(npr);
-        pi_q = q15_saturate(npi);
+        pr_q        = q15_saturate(npr);
+        pi_q        = q15_saturate(npi);
     }
 }
 
-#define SYNC_RRC_LEN_GUARD     280   // SYNC_LENGTH × sps — minimum slice
-                                      //   that the matched filter can
-                                      //   operate on without running off
-                                      //   the end of the buffer.
-#define SYNC_SEARCH_LEN_GUARD  300   // a few-symbol margin past
-                                      //   SYNC_RRC_LEN_GUARD so the
-                                      //   matched-filter peak isn't at
-                                      //   the very last possible bin.
+#define SYNC_RRC_LEN_GUARD 280    // SYNC_LENGTH × sps — minimum slice
+                                  //   that the matched filter can
+                                  //   operate on without running off
+                                  //   the end of the buffer.
+#define SYNC_SEARCH_LEN_GUARD 300 // a few-symbol margin past
+                                  //   SYNC_RRC_LEN_GUARD so the
+                                  //   matched-filter peak isn't at
+                                  //   the very last possible bin.
 
 // Per-frame matched-filter + pre-rotation + decim + demod. Mirrors the
 // inside of gr-iridium's process_next_frame() so the multi-frame loop
@@ -129,33 +129,46 @@ static void q15_freq_shift_inplace(int16_t *iq, int n_complex,
 // (which is declared above the outer driver).
 #ifdef ESP_PLATFORM
 #include "esp_timer.h"
-#define PROFILE_T0()           int64_t _pt0 = esp_timer_get_time()
-#define PROFILE_NOW()          esp_timer_get_time()
-#define PROFILE_LOG(name)      do { \
-    int64_t _pt_now = esp_timer_get_time(); \
-    s_profile_us[BP_##name] += (uint32_t)(_pt_now - _pt0); \
-    _pt0 = _pt_now; \
-} while (0)
+#define PROFILE_T0() int64_t _pt0 = esp_timer_get_time()
+#define PROFILE_NOW() esp_timer_get_time()
+#define PROFILE_LOG(name)                                      \
+    do {                                                       \
+        int64_t _pt_now = esp_timer_get_time();                \
+        s_profile_us[BP_##name] += (uint32_t)(_pt_now - _pt0); \
+        _pt0 = _pt_now;                                        \
+    } while (0)
 #else
-#define PROFILE_T0()           do { } while (0)
-#define PROFILE_LOG(name)      do { } while (0)
+#define PROFILE_T0() \
+    do {             \
+    } while (0)
+#define PROFILE_LOG(name) \
+    do {                  \
+    } while (0)
 #endif
 
 enum {
-    BP_D13, BP_CFO, BP_PREROT, BP_RRC, BP_LOOP_FIRST, BP_LOOP_RETRY,
+    BP_D13,
+    BP_CFO,
+    BP_PREROT,
+    BP_RRC,
+    BP_LOOP_FIRST,
+    BP_LOOP_RETRY,
     // try_decode_frame substages (accumulated across all calls — first +
     // retries — within the run). Lets us see what dominates the 35.5 ms
     // first-call cost vs the 11.8 ms retry cost.
-    BP_TDF_UW, BP_TDF_PREROT, BP_TDF_DECIM, BP_TDF_QPSK,
+    BP_TDF_UW,
+    BP_TDF_PREROT,
+    BP_TDF_DECIM,
+    BP_TDF_QPSK,
     BP_N
 };
-static volatile uint32_t s_profile_us[BP_N] = { 0 };
+static volatile uint32_t s_profile_us[BP_N]    = {0};
 static volatile uint32_t s_profile_loops_first = 0;
 static volatile uint32_t s_profile_loops_retry = 0;
 
 static bool try_decode_frame(int16_t *adj_burst, int adj_n,
-                              int search_start,
-                              burst_pipeline_result_t *result, bool dump)
+                             int                      search_start,
+                             burst_pipeline_result_t *result, bool dump)
 {
     // Search range = just under one frame (191 sym × 10 sps - 1 = 1909).
     //
@@ -175,8 +188,8 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     //
     // Long-term, task #70 fix (tighten the tagger gone-event window)
     // would let this revert to 840 to match gri exactly.
-    const int SYNC_SEARCH_LEN = 191 * UW_SPS - 1;          // 1909
-    int remaining = adj_n - search_start;
+    const int SYNC_SEARCH_LEN = 191 * UW_SPS - 1; // 1909
+    int       remaining       = adj_n - search_start;
     if (remaining < SYNC_RRC_LEN_GUARD) return false;
     int search_complex = SYNC_SEARCH_LEN;
     if (search_complex > remaining - 24) search_complex = remaining - 24;
@@ -206,15 +219,15 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     // (lines 692-694) — equivalent to in-place on our slice.
     float pmag = sqrtf(tmp.peak_re * tmp.peak_re + tmp.peak_im * tmp.peak_im);
     if (pmag > 1e-3f) {
-        float rot_re = tmp.peak_re / pmag;
-        float rot_im = tmp.peak_im / pmag;
-        int16_t pr_q = q15_from_float(rot_re);
-        int16_t pi_q = q15_from_float(rot_im);
+        float   rot_re = tmp.peak_re / pmag;
+        float   rot_im = tmp.peak_im / pmag;
+        int16_t pr_q   = q15_from_float(rot_re);
+        int16_t pi_q   = q15_from_float(rot_im);
         for (int i = search_start; i < adj_n; i++) {
-            int32_t re = adj_burst[i * 2 + 0];
-            int32_t im = adj_burst[i * 2 + 1];
-            int32_t nr = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
-            int32_t ni = ((int32_t)re * pi_q + (int32_t)im * pr_q) >> 15;
+            int32_t re           = adj_burst[i * 2 + 0];
+            int32_t im           = adj_burst[i * 2 + 1];
+            int32_t nr           = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
+            int32_t ni           = ((int32_t)re * pi_q + (int32_t)im * pr_q) >> 15;
             adj_burst[i * 2 + 0] = q15_saturate(nr);
             adj_burst[i * 2 + 1] = q15_saturate(ni);
         }
@@ -226,26 +239,27 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     PROFILE_LOG(TDF_PREROT);
 
     // Sub-sample interp + UW-start trim.
-    float true_pos = (float)tmp.uw_offset + tmp.correction;
-    int   int_base = (int)floorf(true_pos);
+    float true_pos    = (float)tmp.uw_offset + tmp.correction;
+    int   int_base    = (int)floorf(true_pos);
     float interp_frac = true_pos - (float)int_base;
-    if (int_base < 0) { int_base = 0; interp_frac = 0.0f; }
-    int16_t *src = adj_burst + (search_start + int_base) * 2;
-    int n_rot = remaining - int_base;
-    const int MAX_FRAME_LEN_NORMAL_10SPS = 191 * UW_SPS;     // 1910
+    if (int_base < 0) {
+        int_base    = 0;
+        interp_frac = 0.0f;
+    }
+    int16_t  *src                        = adj_burst + (search_start + int_base) * 2;
+    int       n_rot                      = remaining - int_base;
+    const int MAX_FRAME_LEN_NORMAL_10SPS = 191 * UW_SPS; // 1910
     if (n_rot > MAX_FRAME_LEN_NORMAL_10SPS) {
         n_rot = MAX_FRAME_LEN_NORMAL_10SPS;
     }
     if (interp_frac != 0.0f) {
-        int16_t a_q = q15_from_float(1.0f - interp_frac);
-        int16_t b_q = q15_from_float(interp_frac);
-        int n_rot_cplx_interp = n_rot - 1;
+        int16_t a_q               = q15_from_float(1.0f - interp_frac);
+        int16_t b_q               = q15_from_float(interp_frac);
+        int     n_rot_cplx_interp = n_rot - 1;
         if (n_rot_cplx_interp < 0) n_rot_cplx_interp = 0;
         for (int i = 0; i < n_rot_cplx_interp; i++) {
-            int32_t re = ((int32_t)a_q * src[i * 2 + 0]
-                        + (int32_t)b_q * src[(i + 1) * 2 + 0]) >> 15;
-            int32_t im = ((int32_t)a_q * src[i * 2 + 1]
-                        + (int32_t)b_q * src[(i + 1) * 2 + 1]) >> 15;
+            int32_t re     = ((int32_t)a_q * src[i * 2 + 0] + (int32_t)b_q * src[(i + 1) * 2 + 0]) >> 15;
+            int32_t im     = ((int32_t)a_q * src[i * 2 + 1] + (int32_t)b_q * src[(i + 1) * 2 + 1]) >> 15;
             src[i * 2 + 0] = q15_saturate(re);
             src[i * 2 + 1] = q15_saturate(im);
         }
@@ -257,7 +271,7 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
 
     int n_post_cplx = n_rot / POST_CORR_DECIM;
     for (int i = 0; i < n_post_cplx; i++) {
-        int j = i * POST_CORR_DECIM;
+        int j          = i * POST_CORR_DECIM;
         src[i * 2 + 0] = src[j * 2 + 0];
         src[i * 2 + 1] = src[j * 2 + 1];
     }
@@ -277,8 +291,8 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     // omega_per_sym / 2.
     if (tmp.omega_per_sym != 0.0f) {
         rotate_to_dc_q15_simd_at(src, n_post_cplx,
-                                  (double)tmp.omega_per_sym * 0.5,
-                                  0);
+                                 (double)tmp.omega_per_sym * 0.5,
+                                 0);
     }
     if (dump) dump_iq_cf32("08b_post_uwcfo_2sps", src, n_post_cplx);
 
@@ -292,20 +306,26 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
 }
 
 void burst_pipeline_get_stage_us(uint32_t out[10], uint32_t *first_calls,
-                                  uint32_t *retry_calls)
+                                 uint32_t *retry_calls)
 {
     for (int i = 0; i < BP_N; i++) {
-        out[i] = s_profile_us[i];
+        out[i]          = s_profile_us[i];
         s_profile_us[i] = 0;
     }
-    if (first_calls) { *first_calls = s_profile_loops_first; s_profile_loops_first = 0; }
-    if (retry_calls) { *retry_calls = s_profile_loops_retry; s_profile_loops_retry = 0; }
+    if (first_calls) {
+        *first_calls          = s_profile_loops_first;
+        s_profile_loops_first = 0;
+    }
+    if (retry_calls) {
+        *retry_calls          = s_profile_loops_retry;
+        s_profile_loops_retry = 0;
+    }
 }
 
 // Internal helper for the legacy single-frame wrapper.
 typedef struct {
     burst_pipeline_result_t *out;
-    int n_seen;
+    int                      n_seen;
 } legacy_first_frame_ctx_t;
 
 static void legacy_first_frame_cb(burst_pipeline_result_t *res, void *ctx)
@@ -317,25 +337,25 @@ static void legacy_first_frame_cb(burst_pipeline_result_t *res, void *ctx)
     } else {
         // Extra frames -- caller of legacy API doesn't take them.
         free(res->frame.bits);
-        free(res->frame.soft_bits);   // #112
+        free(res->frame.soft_bits); // #112
     }
     lc->n_seen++;
 }
 
 bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
-                                    burst_pipeline_result_t *result)
+                                   burst_pipeline_result_t *result)
 {
     memset(result, 0, sizeof(*result));
-    legacy_first_frame_ctx_t lc = { .out = result, .n_seen = 0 };
+    legacy_first_frame_ctx_t lc = {.out = result, .n_seen = 0};
     burst_pipeline_process_burst(iq250, n_complex,
-                                  legacy_first_frame_cb, &lc);
+                                 legacy_first_frame_cb, &lc);
     // Match the historical return contract: true means "pipeline ran end-
     // to-end". The caller checks result->demod_ok separately.
     return true;
 }
 
 int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
-                                  burst_pipeline_frame_cb cb, void *ctx)
+                                 burst_pipeline_frame_cb cb, void *ctx)
 {
     PROFILE_T0();
 
@@ -388,13 +408,13 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
         s_force_burst_start = -1;
     } else {
         const int SEARCH_DEPTH_SAMPLES = 1750;
-        int search_depth = SEARCH_DEPTH_SAMPLES;
+        int       search_depth         = SEARCH_DEPTH_SAMPLES;
         if (search_depth > n_complex) search_depth = n_complex;
         burst_start = uw_correlator_find_burst_start(
-                          iq250, n_complex, /*search_max=*/search_depth);
+            iq250, n_complex, /*search_max=*/search_depth);
     }
     int16_t *adj_burst = iq250 + burst_start * 2;
-    int adj_n = n_complex - burst_start;
+    int      adj_n     = n_complex - burst_start;
     if (adj_n < UW_SPS * 28) {
         // Less than one full sync word worth — can't even run the
         // matched filter; bail out cleanly.
@@ -423,7 +443,7 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
     if (omega_coarse != 0.0f) {
         float dphi = omega_coarse / (float)UW_SPS;
         rotate_to_dc_q15_simd_at(adj_burst, adj_n,
-                                  (double)dphi, 0);
+                                 (double)dphi, 0);
     }
     PROFILE_LOG(PREROT);
 
@@ -451,11 +471,11 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
     //
     // Each successful frame fires the callback with its result and
     // freshly malloc'd frame.bits. The callback owns the bits.
-    const int FRAME_LEN_SAMPLES = 191 * UW_SPS;             // 1910
-    const int RETRY_STEP_10SPS  = (131 * UW_SPS) / 2;       // 655
+    const int FRAME_LEN_SAMPLES = 191 * UW_SPS;       // 1910
+    const int RETRY_STEP_10SPS  = (131 * UW_SPS) / 2; // 655
 
-    int n_emitted        = 0;
-    int next_search_start = -1;    // -1 = haven't found first frame yet
+    int n_emitted         = 0;
+    int next_search_start = -1; // -1 = haven't found first frame yet
 
     burst_pipeline_result_t res;
     memset(&res, 0, sizeof(res));
@@ -464,7 +484,7 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
 
     // First frame: try at 0, then retry on failure.
     bool found = try_decode_frame(adj_burst, adj_n, 0, &res,
-                                   /*dump=*/true);
+                                  /*dump=*/true);
     s_profile_loops_first++;
     int first_used_search_start = 0;
     if (!found) {
@@ -473,8 +493,8 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
              retry_start += RETRY_STEP_10SPS) {
             s_profile_loops_retry++;
             if (try_decode_frame(adj_burst, adj_n, retry_start,
-                                  &res, /*dump=*/false)) {
-                found = true;
+                                 &res, /*dump=*/false)) {
+                found                   = true;
                 first_used_search_start = retry_start;
                 break;
             }
@@ -488,9 +508,8 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
         // uw_res.uw_offset is relative to first_used_search_start; convert
         // to an absolute position within adj_burst so the multi-frame
         // step can advance by FRAME_LEN_SAMPLES correctly.
-        int first_uw_abs = first_used_search_start
-                         + (int)res.uw_res.uw_offset;
-        cb(&res, ctx);   // ownership of res.frame.bits transfers
+        int first_uw_abs = first_used_search_start + (int)res.uw_res.uw_offset;
+        cb(&res, ctx); // ownership of res.frame.bits transfers
         n_emitted++;
         next_search_start = first_uw_abs + FRAME_LEN_SAMPLES;
     }
@@ -503,7 +522,7 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
     // padding for single-frame bursts -- wasted try_decode_frame work
     // at ~18 ms each. 1310 matches gri's bound and saves ~45 ms per
     // single-frame burst.
-    const int MIN_FRAME_LEN_REMAINING = 131 * UW_SPS;       // 1310
+    const int MIN_FRAME_LEN_REMAINING = 131 * UW_SPS; // 1310
     while (found && next_search_start >= 0 &&
            next_search_start + MIN_FRAME_LEN_REMAINING <= adj_n) {
         memset(&res, 0, sizeof(res));
@@ -511,7 +530,7 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
         res.omega_coarse = omega_coarse;
         s_profile_loops_retry++;
         bool ok = try_decode_frame(adj_burst, adj_n, next_search_start,
-                                    &res, /*dump=*/false);
+                                   &res, /*dump=*/false);
         if (ok) {
             int uw_abs = next_search_start + (int)res.uw_res.uw_offset;
             cb(&res, ctx);

@@ -51,8 +51,8 @@ static void ref_fft_init(void)
     if (s_ref_inited) return;
     if (!s_ref_brev) {
         s_ref_brev  = (uint16_t *)heap_caps_malloc(FFTN * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-        s_ref_tw_re = (float    *)heap_caps_malloc((FFTN / 2) * sizeof(float), MALLOC_CAP_SPIRAM);
-        s_ref_tw_im = (float    *)heap_caps_malloc((FFTN / 2) * sizeof(float), MALLOC_CAP_SPIRAM);
+        s_ref_tw_re = (float *)heap_caps_malloc((FFTN / 2) * sizeof(float), MALLOC_CAP_SPIRAM);
+        s_ref_tw_im = (float *)heap_caps_malloc((FFTN / 2) * sizeof(float), MALLOC_CAP_SPIRAM);
         if (!s_ref_brev || !s_ref_tw_re || !s_ref_tw_im) {
             ESP_LOGE(TAG, "ref FFT table alloc failed");
             return;
@@ -70,7 +70,7 @@ static void ref_fft_init(void)
     }
     // Twiddles: w[k] = exp(-j·2π·k / N).
     for (int k = 0; k < FFTN / 2; k++) {
-        double ang = -2.0 * M_PI * (double)k / (double)FFTN;
+        double ang     = -2.0 * M_PI * (double)k / (double)FFTN;
         s_ref_tw_re[k] = (float)cos(ang);
         s_ref_tw_im[k] = (float)sin(ang);
     }
@@ -85,8 +85,12 @@ static void ref_radix2_fft(float *re, float *im)
         int j = s_ref_brev[i];
         if (j > i) {
             float t;
-            t = re[i]; re[i] = re[j]; re[j] = t;
-            t = im[i]; im[i] = im[j]; im[j] = t;
+            t     = re[i];
+            re[i] = re[j];
+            re[j] = t;
+            t     = im[i];
+            im[i] = im[j];
+            im[j] = t;
         }
     }
     // DIT butterflies.
@@ -97,10 +101,10 @@ static void ref_radix2_fft(float *re, float *im)
             float wr = s_ref_tw_re[k * step];
             float wi = s_ref_tw_im[k * step];
             for (int i = k; i < FFTN; i += span) {
-                float xr = re[i + stride];
-                float xi = im[i + stride];
-                float tr = wr * xr - wi * xi;
-                float ti = wr * xi + wi * xr;
+                float xr       = re[i + stride];
+                float xi       = im[i + stride];
+                float tr       = wr * xr - wi * xi;
+                float ti       = wr * xi + wi * xr;
                 re[i + stride] = re[i] - tr;
                 im[i + stride] = im[i] - ti;
                 re[i]          = re[i] + tr;
@@ -112,27 +116,27 @@ static void ref_radix2_fft(float *re, float *im)
 
 typedef struct {
     const char *name;
-    int   peak_ref;
-    int   peak_pie;
-    float peak_mag2_ref;
-    float peak_mag2_pie;
-    float max_abs_diff;
-    int   max_abs_diff_bin;
-    float rms_diff;
-    int   bins_over_tol;
-    float tol;
+    int         peak_ref;
+    int         peak_pie;
+    float       peak_mag2_ref;
+    float       peak_mag2_pie;
+    float       max_abs_diff;
+    int         max_abs_diff_bin;
+    float       rms_diff;
+    int         bins_over_tol;
+    float       tol;
 } pie_fft_diff_result_t;
 
 // PIE float FFT scratch + twiddle table, lazy-init.
 static float *s_pie_w_table = NULL;
 static bool   s_pie_inited  = false;
-static void pie_fft_init(void)
+static void   pie_fft_init(void)
 {
     if (s_pie_inited) return;
     // dsps_fft2r_init_fc32(NULL, N) uses internal heap; supply our own
     // so we control placement (internal SRAM for PIE access).
     s_pie_w_table = (float *)heap_caps_aligned_alloc(
-                        16, FFTN * sizeof(float), MALLOC_CAP_INTERNAL);
+        16, FFTN * sizeof(float), MALLOC_CAP_INTERNAL);
     if (!s_pie_w_table) {
         ESP_LOGE(TAG, "PIE FFT w_table alloc failed");
         return;
@@ -213,27 +217,35 @@ static void run_diff_case(const char *name, const float *in_re,
     }
 
     // Compare and find both peaks.
-    float max_abs = 0;
-    int   max_bin = 0;
-    double sum_sq = 0;
-    int    over_tol = 0;
+    float  max_abs     = 0;
+    int    max_bin     = 0;
+    double sum_sq      = 0;
+    int    over_tol    = 0;
     float  peak_ref_m2 = 0;
     int    peak_ref_b  = 0;
     float  peak_pie_m2 = 0;
     int    peak_pie_b  = 0;
     for (int i = 0; i < FFTN; i++) {
-        float dre = fabsf(ref_re[i] - pie_buf[2 * i + 0]);
-        float dim = fabsf(ref_im[i] - pie_buf[2 * i + 1]);
+        float dre  = fabsf(ref_re[i] - pie_buf[2 * i + 0]);
+        float dim  = fabsf(ref_im[i] - pie_buf[2 * i + 1]);
         float dmax = dre > dim ? dre : dim;
-        if (dmax > max_abs) { max_abs = dmax; max_bin = i; }
+        if (dmax > max_abs) {
+            max_abs = dmax;
+            max_bin = i;
+        }
         sum_sq += (double)dre * dre + (double)dim * dim;
         if (dmax > tol) over_tol++;
 
         float m_ref = ref_re[i] * ref_re[i] + ref_im[i] * ref_im[i];
-        if (m_ref > peak_ref_m2) { peak_ref_m2 = m_ref; peak_ref_b = i; }
-        float m_pie = pie_buf[2 * i + 0] * pie_buf[2 * i + 0]
-                    + pie_buf[2 * i + 1] * pie_buf[2 * i + 1];
-        if (m_pie > peak_pie_m2) { peak_pie_m2 = m_pie; peak_pie_b = i; }
+        if (m_ref > peak_ref_m2) {
+            peak_ref_m2 = m_ref;
+            peak_ref_b  = i;
+        }
+        float m_pie = pie_buf[2 * i + 0] * pie_buf[2 * i + 0] + pie_buf[2 * i + 1] * pie_buf[2 * i + 1];
+        if (m_pie > peak_pie_m2) {
+            peak_pie_m2 = m_pie;
+            peak_pie_b  = i;
+        }
     }
 
     out->name             = name;
@@ -265,14 +277,14 @@ void pie_fft_diff_run(void)
 {
     ESP_LOGI(TAG, "=== PIE FFT diff harness vs scalar reference (N=%d) ===", FFTN);
 
-    static float in_re[FFTN], in_im[FFTN];
+    static float          in_re[FFTN], in_im[FFTN];
     pie_fft_diff_result_t r;
 
     // Case 1: complex tone at bin 100. Both FFTs must spike at bin 100.
     for (int i = 0; i < FFTN; i++) {
         double ph = 2.0 * M_PI * 100.0 * (double)i / (double)FFTN;
-        in_re[i] = (float)cos(ph);
-        in_im[i] = (float)sin(ph);
+        in_re[i]  = (float)cos(ph);
+        in_im[i]  = (float)sin(ph);
     }
     run_diff_case("tone@100", in_re, in_im, 1e-3f, &r);
     log_result(&r);
@@ -287,9 +299,9 @@ void pie_fft_diff_run(void)
     // Case 3: random Q15-ish noise. Realistic spectrum-shape input.
     uint32_t st = 0xC0FFEEu;
     for (int i = 0; i < FFTN; i++) {
-        st = st * 1103515245u + 12345u;
+        st       = st * 1103515245u + 12345u;
         in_re[i] = (float)((int16_t)(st & 0xFFFF)) / 32768.0f;
-        st = st * 1103515245u + 12345u;
+        st       = st * 1103515245u + 12345u;
         in_im[i] = (float)((int16_t)(st & 0xFFFF)) / 32768.0f;
     }
     run_diff_case("noise", in_re, in_im, 1e-3f, &r);

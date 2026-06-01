@@ -7,14 +7,14 @@
 #include "iridium_bch.h"
 #include <string.h>
 
-#define UW_BITS         24
-#define IBC_HDR_BITS     6
-#define IBC_BLOCK_BITS  64
-#define IBC_N_BLOCKS     4    // IBC has exactly 4 BCH blocks
-#define IBC_DATA_PER_BLK 42   // 2 × BCH(31,21) data bits per 64-bit block
+#define UW_BITS 24
+#define IBC_HDR_BITS 6
+#define IBC_BLOCK_BITS 64
+#define IBC_N_BLOCKS 4      // IBC has exactly 4 BCH blocks
+#define IBC_DATA_PER_BLK 42 // 2 × BCH(31,21) data bits per 64-bit block
 
-#define IBC_HDR_POLY    29u   // BCH(6, 2)
-#define IBC_BLK_POLY  1207u   // BCH(31, 21), ringalert poly
+#define IBC_HDR_POLY 29u   // BCH(6, 2)
+#define IBC_BLK_POLY 1207u // BCH(31, 21), ringalert poly
 
 // Decode a 64-bit IBC block into 42 corrected data bits.
 //
@@ -35,7 +35,7 @@ static int decode_ibc_block(const uint8_t *in64, uint8_t *out_data)
     // 32-bit codewords by walking symbol indices high-to-low in steps
     // of 2.
     uint8_t odd[32], even[32];
-    int odd_n = 0, even_n = 0;
+    int     odd_n = 0, even_n = 0;
     for (int s = 31; s >= 0; s -= 2) {
         // symbol s = (in[2s+1], in[2s])
         odd[odd_n++] = in64[2 * s + 1] & 1;
@@ -47,7 +47,7 @@ static int decode_ibc_block(const uint8_t *in64, uint8_t *out_data)
     }
     // odd and even are now 32 bits each. Take bits[0..30] as the BCH
     // codeword and try to repair.
-    int e_odd  = iridium_bch_repair2(IBC_BLK_POLY, odd,  31);
+    int e_odd  = iridium_bch_repair2(IBC_BLK_POLY, odd, 31);
     int e_even = iridium_bch_repair2(IBC_BLK_POLY, even, 31);
     if (e_odd < 0 && e_even < 0) return 0;
     int ok = 0;
@@ -118,19 +118,19 @@ int ibc_decode(const iridium_frame_t *frame, ibc_decoded_t *out)
         }
 
         if (blk == 0 && out->bc_type == 0) {
-            out->block0_ok    = true;
-            out->sv_id        = (int)pick_bits(block_data,  0, 7);
-            out->beam_id      = (int)pick_bits(block_data,  7, 6);
+            out->block0_ok = true;
+            out->sv_id     = (int)pick_bits(block_data, 0, 7);
+            out->beam_id   = (int)pick_bits(block_data, 7, 6);
             // bit 13 unknown01
-            out->slot         = (int)pick_bits(block_data, 14, 1);
-            out->sv_blocking  = (int)pick_bits(block_data, 15, 1);
+            out->slot        = (int)pick_bits(block_data, 14, 1);
+            out->sv_blocking = (int)pick_bits(block_data, 15, 1);
             // bits 16-31  acqu_classes (16-bit) — left for the verbose
             // path; the slot+sv_blocking+sv_id+beam_id give us the key
             // "which satellite/cell" identification.
         } else if (blk == 1 && out->bc_type == 0) {
-            out->block1_ok       = true;
-            int subtype          = (int)pick_bits(block_data, 0, 6);
-            out->block1_subtype  = subtype;
+            out->block1_ok      = true;
+            int subtype         = (int)pick_bits(block_data, 0, 6);
+            out->block1_subtype = subtype;
             if (subtype == 1) {
                 out->iri_time = pick_bits(block_data, 10, 32);
             } else if (subtype == 2) {

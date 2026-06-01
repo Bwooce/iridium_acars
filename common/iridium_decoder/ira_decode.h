@@ -29,19 +29,19 @@
 // IridiumRAMessage: ra_alt = sqrt(x²+y²+z²)*4).
 
 typedef struct {
-    bool      bch_ok;          // all 3 BCH codewords decoded cleanly
-    int       sv_id;           // satellite vehicle id (1..66 nominal)
-    int       beam_id;         // cell id (1..48 nominal)
-    int       pos_x;           // 12-bit signed satellite X in 4-km units
-    int       pos_y;           // 12-bit signed Y
-    int       pos_z;           // 12-bit signed Z
-    int       ra_int;          // 90 ms ring-alert interval
-    int       ra_ts;           // slot
-    int       ra_eip;          // EPI flag
-    int       ra_bc_sb;        // BC sub-band
-    float     lat_deg;         // geocentric latitude derived from x,y,z
-    float     lon_deg;         // longitude
-    float     alt_km;          // distance from origin in km (= 4 × |v|)
+    bool  bch_ok;   // all 3 BCH codewords decoded cleanly
+    int   sv_id;    // satellite vehicle id (1..66 nominal)
+    int   beam_id;  // cell id (1..48 nominal)
+    int   pos_x;    // 12-bit signed satellite X in 4-km units
+    int   pos_y;    // 12-bit signed Y
+    int   pos_z;    // 12-bit signed Z
+    int   ra_int;   // 90 ms ring-alert interval
+    int   ra_ts;    // slot
+    int   ra_eip;   // EPI flag
+    int   ra_bc_sb; // BC sub-band
+    float lat_deg;  // geocentric latitude derived from x,y,z
+    float lon_deg;  // longitude
+    float alt_km;   // distance from origin in km (= 4 × |v|)
 } ira_decoded_t;
 
 // Decode an Iridium Ring Alert frame's fixed header.

@@ -23,8 +23,8 @@
 #include <string.h>
 
 #include "qpsk_demod.h"
-#include "fixture_corpus_2sps_lowsnr.h"   // CORPUS_2SPS_LOWSNR, *_LEN
-#include "fixture_ground_truth.h"          // GROUND_TRUTH_BITS, *_LEN, *_DIRECTION
+#include "fixture_corpus_2sps_lowsnr.h" // CORPUS_2SPS_LOWSNR, *_LEN
+#include "fixture_ground_truth.h"       // GROUND_TRUTH_BITS, *_LEN, *_DIRECTION
 
 static int compare_bits(const uint8_t *demod, int demod_n,
                         const uint8_t *truth, int truth_n,
@@ -50,11 +50,11 @@ int main(void)
            GROUND_TRUTH_BITS_LEN, GROUND_TRUTH_BITS_DIRECTION);
 
     // Slide UW alignment offset (same approach as test_demod_corpus.c).
-    decoded_frame_t frame = { 0 };
-    int rc = 0;
-    int alignment_offset = -1;
-    const int STEP_INT16 = 4;
-    const int MAX_SYMBOLS_OFFSET = 200;
+    decoded_frame_t frame              = {0};
+    int             rc                 = 0;
+    int             alignment_offset   = -1;
+    const int       STEP_INT16         = 4;
+    const int       MAX_SYMBOLS_OFFSET = 200;
     for (int sym_off = 0; sym_off < MAX_SYMBOLS_OFFSET; sym_off++) {
         int int16_off = sym_off * STEP_INT16;
         if ((int)CORPUS_2SPS_LOWSNR_LEN - int16_off < 24 * STEP_INT16) break;
@@ -74,8 +74,8 @@ int main(void)
         failed++;
     } else {
         const char *dir =
-            (frame.direction == DIR_DOWNLINK) ? "DL" :
-            (frame.direction == DIR_UPLINK) ? "UL" : "UNKNOWN";
+            (frame.direction == DIR_DOWNLINK) ? "DL" : (frame.direction == DIR_UPLINK) ? "UL"
+                                                                                       : "UNKNOWN";
         printf("  UW found after %d-symbol offset; direction=%s, n_bits=%d\n",
                alignment_offset, dir, frame.n_bits);
 
@@ -84,12 +84,13 @@ int main(void)
                    dir, GROUND_TRUTH_BITS_DIRECTION);
             failed++;
         } else {
-            int diffs = compare_bits(frame.bits, frame.n_bits,
-                                     GROUND_TRUTH_BITS, GROUND_TRUTH_BITS_LEN,
-                                     GROUND_TRUTH_BITS_LEN);
-            int compared = (frame.n_bits < (int)GROUND_TRUTH_BITS_LEN
-                            ? frame.n_bits : (int)GROUND_TRUTH_BITS_LEN);
-            float ber = compared > 0 ? 100.0f * diffs / (float)compared : 0;
+            int   diffs    = compare_bits(frame.bits, frame.n_bits,
+                                          GROUND_TRUTH_BITS, GROUND_TRUTH_BITS_LEN,
+                                          GROUND_TRUTH_BITS_LEN);
+            int   compared = (frame.n_bits < (int)GROUND_TRUTH_BITS_LEN
+                                  ? frame.n_bits
+                                  : (int)GROUND_TRUTH_BITS_LEN);
+            float ber      = compared > 0 ? 100.0f * diffs / (float)compared : 0;
             printf("  bit comparison: %d differences across %d bits (BER %.2f%%)\n",
                    diffs, compared, ber);
 

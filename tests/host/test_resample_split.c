@@ -26,7 +26,7 @@
 
 #include "resample_256_to_250.h"
 
-#define MAX_IN  16384
+#define MAX_IN 16384
 #define MAX_OUT (MAX_IN + 16)
 
 static int16_t g_in[MAX_IN * 2];
@@ -36,24 +36,24 @@ static int16_t g_out_split[MAX_OUT * 2];
 // Reference: pure sequential — one persistent (delay, wpos, start_pos),
 // process the whole chunk straight through.
 static int run_sequential(int16_t *delay_i, int16_t *delay_q,
-                           int *wpos, int *start_pos,
-                           const int16_t *in_iq, int n_in_complex,
-                           int16_t *out_iq)
+                          int *wpos, int *start_pos,
+                          const int16_t *in_iq, int n_in_complex,
+                          int16_t *out_iq)
 {
     return resample_256_to_250_process_explicit(delay_i, delay_q,
-                                                 wpos, start_pos,
-                                                 in_iq, n_in_complex,
-                                                 out_iq, n_in_complex,
-                                                 /*batch_scratch=*/ NULL);
+                                                wpos, start_pos,
+                                                in_iq, n_in_complex,
+                                                out_iq, n_in_complex,
+                                                /*batch_scratch=*/NULL);
 }
 
 // Split: pre-compute Worker B's initial state from closed-form, run
 // both halves serially (in the test — production runs them in
 // parallel, but the math is identical).
 static int run_split(int16_t *delay_persist_i, int16_t *delay_persist_q,
-                      int *wpos_persist, int *start_pos_persist,
-                      const int16_t *in_iq, int n_in_complex,
-                      int16_t *out_iq)
+                     int *wpos_persist, int *start_pos_persist,
+                     const int16_t *in_iq, int n_in_complex,
+                     int16_t *out_iq)
 {
     int mid = n_in_complex / 2;
 
@@ -64,14 +64,14 @@ static int run_split(int16_t *delay_persist_i, int16_t *delay_persist_q,
     memcpy(da_q, delay_persist_q, sizeof(da_q));
     int wp_a = *wpos_persist;
     int sp_a = *start_pos_persist;
-    int n_a = resample_256_to_250_process_explicit(da_i, da_q, &wp_a, &sp_a,
+    int n_a  = resample_256_to_250_process_explicit(da_i, da_q, &wp_a, &sp_a,
                                                     in_iq, mid,
                                                     out_iq, mid,
-                                                    /*batch_scratch=*/ NULL);
+                                                    /*batch_scratch=*/NULL);
 
     // Worker B initial state — same closed-form as production.
-    int m = mid / 128;
-    int r = mid - m * 128;
+    int m                = mid / 128;
+    int r                = mid - m * 128;
     int n_emits_a_closed = 125 * m;
     for (int i = 0; i < r; i++) {
         int pre = (*start_pos_persist + 3 * i) & 127;
@@ -107,11 +107,11 @@ static int run_split(int16_t *delay_persist_i, int16_t *delay_persist_q,
 
     // Worker B processes the second half.
     int n_b_max = n_in_complex - mid;
-    int n_b = resample_256_to_250_process_explicit(db_i, db_q, &wp_b, &sp_b,
-                                                    in_iq + 2 * mid, n_b_max,
-                                                    out_iq + 2 * n_a,
-                                                    n_b_max,
-                                                    /*batch_scratch=*/ NULL);
+    int n_b     = resample_256_to_250_process_explicit(db_i, db_q, &wp_b, &sp_b,
+                                                       in_iq + 2 * mid, n_b_max,
+                                                       out_iq + 2 * n_a,
+                                                       n_b_max,
+                                                       /*batch_scratch=*/NULL);
 
     // Persist Worker B's end-state.
     memcpy(delay_persist_i, db_i, sizeof(db_i));
@@ -134,8 +134,8 @@ static void fill_pseudorandom(uint32_t seed)
 
 static int compare_outputs(int n_complex, const char *label)
 {
-    int n_int16 = n_complex * 2;
-    int errs = 0;
+    int n_int16   = n_complex * 2;
+    int errs      = 0;
     int first_err = -1;
     for (int i = 0; i < n_int16; i++) {
         if (g_out_ref[i] != g_out_split[i]) {
@@ -170,16 +170,16 @@ int main(void)
     {
         int16_t da_i[32] = {0}, da_q[32] = {0};
         int16_t db_i[32] = {0}, db_q[32] = {0};
-        int wp_seq = 0, wp_split = 0;
-        int sp_seq = 0, sp_split = 0;
+        int     wp_seq = 0, wp_split = 0;
+        int     sp_seq = 0, sp_split = 0;
 
         fill_pseudorandom(0xC0FFEE01);
         int n_in = 4096;
 
         int n_ref = run_sequential(da_i, da_q, &wp_seq, &sp_seq,
-                                    g_in, n_in, g_out_ref);
+                                   g_in, n_in, g_out_ref);
         int n_spl = run_split(db_i, db_q, &wp_split, &sp_split,
-                               g_in, n_in, g_out_split);
+                              g_in, n_in, g_out_split);
 
         if (n_ref != n_spl) {
             fprintf(stderr, "FAIL [case1]: n_ref=%d n_spl=%d\n", n_ref, n_spl);
@@ -205,19 +205,19 @@ int main(void)
     {
         int16_t da_i[32] = {0}, da_q[32] = {0};
         int16_t db_i[32] = {0}, db_q[32] = {0};
-        int wp_seq = 0, wp_split = 0;
-        int sp_seq = 0, sp_split = 0;
+        int     wp_seq = 0, wp_split = 0;
+        int     sp_seq = 0, sp_split = 0;
 
         fill_pseudorandom(0xDEADBEEF);
-        int n_chunk = 2048;
-        int n_chunks = 5;
+        int n_chunk     = 2048;
+        int n_chunks    = 5;
         int chunk_fails = 0;
         for (int c = 0; c < n_chunks; c++) {
-            const int16_t *in = g_in + c * 2 * n_chunk;
-            int n_ref = run_sequential(da_i, da_q, &wp_seq, &sp_seq,
-                                        in, n_chunk, g_out_ref);
-            int n_spl = run_split(db_i, db_q, &wp_split, &sp_split,
-                                   in, n_chunk, g_out_split);
+            const int16_t *in    = g_in + c * 2 * n_chunk;
+            int            n_ref = run_sequential(da_i, da_q, &wp_seq, &sp_seq,
+                                                  in, n_chunk, g_out_ref);
+            int            n_spl = run_split(db_i, db_q, &wp_split, &sp_split,
+                                             in, n_chunk, g_out_split);
             if (n_ref != n_spl) {
                 fprintf(stderr, "FAIL [case2.c%d]: n_ref=%d n_spl=%d\n",
                         c, n_ref, n_spl);
@@ -245,8 +245,8 @@ int main(void)
 
     // --- Case 3: adversarial start_pos values ---
     {
-        int adv_start_positions[] = { 0, 1, 62, 124, 125, 127 };
-        int n_pos = sizeof(adv_start_positions) / sizeof(adv_start_positions[0]);
+        int adv_start_positions[] = {0, 1, 62, 124, 125, 127};
+        int n_pos                 = sizeof(adv_start_positions) / sizeof(adv_start_positions[0]);
         for (int p = 0; p < n_pos; p++) {
             int16_t da_i[32] = {0}, da_q[32] = {0};
             int16_t db_i[32] = {0}, db_q[32] = {0};
@@ -254,14 +254,14 @@ int main(void)
             // initial delay. We feed a few samples first to populate
             // it deterministically.
             fill_pseudorandom(0xA5A5 + p);
-            int wp_seq = 0, wp_split = 0;
-            int sp_seq = adv_start_positions[p];
-            int sp_split = sp_seq;
-            int n_in = 8192;
-            int n_ref = run_sequential(da_i, da_q, &wp_seq, &sp_seq,
-                                        g_in, n_in, g_out_ref);
-            int n_spl = run_split(db_i, db_q, &wp_split, &sp_split,
-                                   g_in, n_in, g_out_split);
+            int  wp_seq = 0, wp_split = 0;
+            int  sp_seq   = adv_start_positions[p];
+            int  sp_split = sp_seq;
+            int  n_in     = 8192;
+            int  n_ref    = run_sequential(da_i, da_q, &wp_seq, &sp_seq,
+                                           g_in, n_in, g_out_ref);
+            int  n_spl    = run_split(db_i, db_q, &wp_split, &sp_split,
+                                      g_in, n_in, g_out_split);
             char label[64];
             snprintf(label, sizeof(label), "case3 start_pos=%d", adv_start_positions[p]);
             if (n_ref != n_spl) {
@@ -279,14 +279,14 @@ int main(void)
     // 32-byte memcpy bursts; the resulting out_iq must be byte-
     // identical to the unbatched path for every input.
     {
-        int adv_lengths[] = { 1, 7, 8, 9, 16, 17, 4096, 8192 };
-        int n_lens = sizeof(adv_lengths) / sizeof(adv_lengths[0]);
+        int adv_lengths[] = {1, 7, 8, 9, 16, 17, 4096, 8192};
+        int n_lens        = sizeof(adv_lengths) / sizeof(adv_lengths[0]);
         for (int li = 0; li < n_lens; li++) {
-            int n_in = adv_lengths[li];
+            int     n_in     = adv_lengths[li];
             int16_t da_i[32] = {0}, da_q[32] = {0};
             int16_t db_i[32] = {0}, db_q[32] = {0};
-            int wp_a = 0, wp_b = 0;
-            int sp_a = 0, sp_b = 0;
+            int     wp_a = 0, wp_b = 0;
+            int     sp_a = 0, sp_b = 0;
 
             fill_pseudorandom(0xBA7CED00 + li);
 
@@ -295,7 +295,7 @@ int main(void)
                 g_in, n_in, g_out_ref, n_in, /*batch=*/NULL);
 
             int16_t scratch[RS25_BATCH_COMPLEX * 2] __attribute__((aligned(16)));
-            int n_bat = resample_256_to_250_process_explicit(
+            int     n_bat = resample_256_to_250_process_explicit(
                 db_i, db_q, &wp_b, &sp_b,
                 g_in, n_in, g_out_split, n_in, scratch);
 

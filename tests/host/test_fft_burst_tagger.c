@@ -25,23 +25,27 @@
 #define ALBQ_RAW_UINT8_LEN_DECL
 #include "fixture_albq_raw.h"
 
-#define FS_RAW   2500000
-#define LO_HZ    ALBQ_RAW_LO_HZ
+#define FS_RAW 2500000
+#define LO_HZ ALBQ_RAW_LO_HZ
 
 // 4 MB baseline history — caller-owned, would be PSRAM on P4.
 static int32_t s_baseline_history[FBT_HISTORY_SIZE * FBT_FFT_SIZE];
 
-int main(void) {
+int main(void)
+{
     // 1) Convert uint8 IQ → int16 IQ at 2.56 MSPS (the fixture's
     // native rate). For this smoke test we accept the slight rate
     // mismatch vs gri's 2.5 MSPS pipeline — the burst rate is the
     // same physical bursts; we're just sanity-checking that the
     // detector triggers at reasonable counts on real RF energy.
-    size_t n_complex = ALBQ_RAW_UINT8_LEN / 2;
-    int16_t *iq = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
-    if (!iq) { fprintf(stderr, "malloc failed\n"); return 2; }
+    size_t   n_complex = ALBQ_RAW_UINT8_LEN / 2;
+    int16_t *iq        = (int16_t *)malloc(2 * n_complex * sizeof(int16_t));
+    if (!iq) {
+        fprintf(stderr, "malloc failed\n");
+        return 2;
+    }
     for (size_t i = 0; i < 2 * n_complex; i++) {
-        iq[i] = ((int16_t)ALBQ_RAW_UINT8[i] - 128) << 8;   // u8 → s16
+        iq[i] = ((int16_t)ALBQ_RAW_UINT8[i] - 128) << 8; // u8 → s16
     }
     printf("Loaded fixture: %zu complex samples (~%.2f ms at 2.56 MSPS)\n",
            n_complex, (double)n_complex / 2560000.0 * 1000.0);
@@ -52,32 +56,35 @@ int main(void) {
     //   burst_width    = 32 bins                (= 40 kHz / 1.22 kHz/bin at N=2048, fs=2.5M)
     //   threshold      = 10 dB above noise EMA
     fft_burst_tagger_t *t = fft_burst_tagger_init(
-        /*burst_pre_len =*/ 2 * FBT_FFT_SIZE,
-        /*burst_post_len=*/ (int)(2500000.0 * 16e-3),
-        /*burst_width   =*/ 32,
-        /*threshold_db  =*/ 10.0f,
+        /*burst_pre_len =*/2 * FBT_FFT_SIZE,
+        /*burst_post_len=*/(int)(2500000.0 * 16e-3),
+        /*burst_width   =*/32,
+        /*threshold_db  =*/10.0f,
         s_baseline_history);
-    if (!t) { fprintf(stderr, "tagger init failed\n"); return 2; }
+    if (!t) {
+        fprintf(stderr, "tagger init failed\n");
+        return 2;
+    }
     fft_burst_tagger_set_start(t, 0);
 
     // 3) Process the fixture in 2048-sample chunks.
     fbt_burst_t new_bursts[FBT_MAX_BURSTS];
     fbt_burst_t gone_bursts[FBT_MAX_BURSTS];
-    int total_new = 0;
-    int total_gone = 0;
-    int n_steps = 0;
-    int n_primed_steps = 0;
-    int min_bin = 99999, max_bin = -1;
+    int         total_new      = 0;
+    int         total_gone     = 0;
+    int         n_steps        = 0;
+    int         n_primed_steps = 0;
+    int         min_bin = 99999, max_bin = -1;
 
     for (size_t off = 0; off + FBT_FFT_SIZE <= n_complex;
          off += FBT_FFT_SIZE) {
-        int n_new = FBT_MAX_BURSTS;
-        int n_gone = FBT_MAX_BURSTS;
+        int  n_new  = FBT_MAX_BURSTS;
+        int  n_gone = FBT_MAX_BURSTS;
         bool primed = fft_burst_tagger_step(t,
-                                             iq + off * 2,
-                                             /*lookback=*/NULL,
-                                             new_bursts,  &n_new,
-                                             gone_bursts, &n_gone);
+                                            iq + off * 2,
+                                            /*lookback=*/NULL,
+                                            new_bursts, &n_new,
+                                            gone_bursts, &n_gone);
         n_steps++;
         if (primed) {
             n_primed_steps++;
@@ -103,7 +110,7 @@ int main(void) {
     fft_burst_tagger_destroy(t);
     free(iq);
 
-    int ok = 1;
+    int  ok       = 1;
     char msg[128] = "";
     if (n_primed_steps < FBT_HISTORY_SIZE) {
         snprintf(msg, sizeof(msg),

@@ -49,21 +49,21 @@ static const char *TAG = "DSP_PROC";
 // worker has a backlog. With those in place, live USB rate at
 // 10 dB measured higher than at 14 dB (4.5 vs 4.0 MB/s) because
 // Core 1 spends less time worker-monopolised.
-#define FBT_THRESHOLD_DB    10.0f
+#define FBT_THRESHOLD_DB 10.0f
 
 // Burst window padding in INPUT samples (at FS_DETECT_HZ). gri's
 // defaults: pre = 2*fft_size = 4096, post = sample_rate * 16e-3 =
 // 40000. Same numbers work here because FS_DETECT_HZ matches gri's
 // nominal 2.5 MSPS.
-#define FBT_BURST_PRE_LEN   (2 * FBT_FFT_SIZE)
-#define FBT_BURST_POST_LEN  40000
+#define FBT_BURST_PRE_LEN (2 * FBT_FFT_SIZE)
+#define FBT_BURST_POST_LEN 40000
 
 // Burst width in FFT bins (= half an Iridium channel). 40 kHz /
 // (2.5 MSPS / 2048) ≈ 32 bins.
-#define FBT_BURST_WIDTH     32
+#define FBT_BURST_WIDTH 32
 
-static fft_burst_tagger_t *s_tagger = NULL;
-static int32_t            *s_baseline_history = NULL;   // PSRAM, 4 MB
+static fft_burst_tagger_t *s_tagger           = NULL;
+static int32_t            *s_baseline_history = NULL; // PSRAM, 4 MB
 // (lookback argument to fft_burst_tagger_step is currently unused in
 // the detection math — the header documents it as reserved for a
 // future PDU-cut step, and the host test passes NULL. We pass NULL
@@ -75,9 +75,9 @@ static burst_detected_cb_t s_user_cb = NULL;
 // dsp_processor_feed receives variable-length buffers from class_driver
 // (typically ~8000 complex after the 125/128 resample of a 16 KB USB
 // transfer), so we batch into FFT_SIZE-aligned chunks.
-static int16_t  s_accum[2 * FBT_FFT_SIZE]
+static int16_t s_accum[2 * FBT_FFT_SIZE]
     __attribute__((aligned(16)));
-static int      s_accum_n = 0;     // complex samples currently in s_accum
+static int s_accum_n = 0; // complex samples currently in s_accum
 
 // Absolute sample index of the NEXT chunk we'll feed to the tagger.
 // Matches signal_buffer's head modulo SIGNAL_BUF cap — the worker
@@ -97,8 +97,8 @@ static uint64_t s_next_sample_idx = 0;
 // record before processing. Step 4 (false-positive reduction) can
 // switch to gone-record-triggered processing if the early-publish
 // model produces too many wasted worker cycles.
-#define FBT_NEW_BUF_SIZE   16
-#define FBT_GONE_BUF_SIZE  16
+#define FBT_NEW_BUF_SIZE 16
+#define FBT_GONE_BUF_SIZE 16
 
 // Diagnostic accumulators.
 static volatile uint64_t s_acc_step_us       = 0;
@@ -129,15 +129,15 @@ static void dispatch_gone_burst(const fbt_burst_t *b)
 {
     if (!s_user_cb) return;
 
-    int signed_bin = b->center_bin - FBT_FFT_SIZE / 2;
-    float rel_freq_hz = (float)signed_bin * (float)FS_DETECT_HZ
-                         / (float)FBT_FFT_SIZE;
+    int   signed_bin  = b->center_bin - FBT_FFT_SIZE / 2;
+    float rel_freq_hz = (float)signed_bin * (float)FS_DETECT_HZ / (float)FBT_FFT_SIZE;
 
     // length = stop - start, variable per burst. Clamp at uint32 max
     // to be safe; the worker further clamps to WB_EXTRACT_MAX.
-    uint64_t length = b->stop - b->start;
+    uint64_t length     = b->stop - b->start;
     uint32_t length_u32 = length > 0xFFFFFFFFu
-                          ? 0xFFFFFFFFu : (uint32_t)length;
+                              ? 0xFFFFFFFFu
+                              : (uint32_t)length;
 
     // fft_burst_tagger's magnitude_db is ALREADY the SNR
     // (10·log10(mag² · HISTORY / baseline_sum) — see
@@ -158,21 +158,22 @@ static void dispatch_gone_burst(const fbt_burst_t *b)
 // sample index, dispatch gone-burst events.
 static void process_chunk(const int16_t *chunk_iq)
 {
-    fbt_burst_t new_bursts [FBT_NEW_BUF_SIZE];
+    fbt_burst_t new_bursts[FBT_NEW_BUF_SIZE];
     fbt_burst_t gone_bursts[FBT_GONE_BUF_SIZE];
-    int n_new  = FBT_NEW_BUF_SIZE;
-    int n_gone = FBT_GONE_BUF_SIZE;
+    int         n_new  = FBT_NEW_BUF_SIZE;
+    int         n_gone = FBT_GONE_BUF_SIZE;
 
     int64_t t0 = esp_timer_get_time();
-    bool ok = fft_burst_tagger_step(s_tagger, chunk_iq, NULL,
-                                     new_bursts,  &n_new,
-                                     gone_bursts, &n_gone);
+    bool    ok = fft_burst_tagger_step(s_tagger, chunk_iq, NULL,
+                                       new_bursts, &n_new,
+                                       gone_bursts, &n_gone);
     int64_t t1 = esp_timer_get_time();
     s_acc_step_us += (uint64_t)(t1 - t0);
 
     if (ok) {
-        for (int i = 0; i < n_gone; i++) dispatch_gone_burst(&gone_bursts[i]);
-        s_acc_new_bursts  += (uint32_t)n_new;
+        for (int i = 0; i < n_gone; i++)
+            dispatch_gone_burst(&gone_bursts[i]);
+        s_acc_new_bursts += (uint32_t)n_new;
         s_acc_gone_bursts += (uint32_t)n_gone;
     }
 
@@ -188,9 +189,10 @@ void dsp_processor_flush(void)
 {
     if (!s_tagger) return;
     fbt_burst_t flushed[FBT_GONE_BUF_SIZE];
-    int n = FBT_GONE_BUF_SIZE;
+    int         n = FBT_GONE_BUF_SIZE;
     fft_burst_tagger_flush(s_tagger, flushed, &n);
-    for (int i = 0; i < n; i++) dispatch_gone_burst(&flushed[i]);
+    for (int i = 0; i < n; i++)
+        dispatch_gone_burst(&flushed[i]);
     s_acc_gone_bursts += (uint32_t)n;
     ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
@@ -202,7 +204,7 @@ esp_err_t dsp_processor_init(burst_detected_cb_t cb)
     app_config_t cfg;
     app_config_snapshot(&cfg);
     float thr = cfg.tagger_threshold_db;
-    if (thr <= 0.0f || thr > 30.0f) thr = FBT_THRESHOLD_DB;   // sanity
+    if (thr <= 0.0f || thr > 30.0f) thr = FBT_THRESHOLD_DB; // sanity
     ESP_LOGI(TAG,
              "Initializing wideband fft_burst_tagger (N=%d, fs=%u Hz, thr=%.1f dB)",
              FBT_FFT_SIZE, (unsigned)FS_DETECT_HZ, (double)thr);
@@ -216,10 +218,9 @@ esp_err_t dsp_processor_init(burst_detected_cb_t cb)
     // 4 MB baseline_history in PSRAM. Internal SRAM doesn't have room
     // (each int32 × FFT_SIZE × HISTORY_SIZE = 2048 × 512 × 4 = 4 MB).
     if (!s_baseline_history) {
-        size_t bytes = (size_t)FBT_FFT_SIZE * FBT_HISTORY_SIZE
-                       * sizeof(int32_t);
+        size_t bytes       = (size_t)FBT_FFT_SIZE * FBT_HISTORY_SIZE * sizeof(int32_t);
         s_baseline_history = (int32_t *)heap_caps_malloc(bytes,
-                                                          MALLOC_CAP_SPIRAM);
+                                                         MALLOC_CAP_SPIRAM);
         if (!s_baseline_history) {
             ESP_LOGE(TAG, "baseline_history alloc %zu bytes (PSRAM) failed",
                      bytes);
@@ -228,15 +229,15 @@ esp_err_t dsp_processor_init(burst_detected_cb_t cb)
     }
 
     s_tagger = fft_burst_tagger_init(FBT_BURST_PRE_LEN, FBT_BURST_POST_LEN,
-                                      FBT_BURST_WIDTH, thr,
-                                      s_baseline_history);
+                                     FBT_BURST_WIDTH, thr,
+                                     s_baseline_history);
     if (!s_tagger) {
         ESP_LOGE(TAG, "fft_burst_tagger_init failed");
         return ESP_ERR_NO_MEM;
     }
 
-    s_next_sample_idx   = 0;
-    s_accum_n           = 0;
+    s_next_sample_idx = 0;
+    s_accum_n         = 0;
     fft_burst_tagger_set_start(s_tagger, 0);
 
     s_acc_step_us       = 0;
@@ -254,7 +255,7 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
     if (!s_tagger) return;
 
     s_acc_input_samples += (uint32_t)n_samples;
-    s_total_input_samples += (uint64_t)n_samples;   // #127, never reset
+    s_total_input_samples += (uint64_t)n_samples; // #127, never reset
 
     size_t off = 0;
     while (off < n_samples) {
@@ -266,7 +267,7 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
                samples + off * 2,
                to_copy * 2 * sizeof(int16_t));
         s_accum_n += (int)to_copy;
-        off       += to_copy;
+        off += to_copy;
 
         if (s_accum_n == FBT_FFT_SIZE) {
             process_chunk(s_accum);
@@ -277,16 +278,16 @@ void dsp_processor_feed(const int16_t *samples, size_t n_samples)
 
 void dsp_processor_get_stage_stats(dsp_stage_stats_t *out)
 {
-    uint32_t frames = s_acc_input_samples / FBT_FFT_SIZE;
+    uint32_t frames          = s_acc_input_samples / FBT_FFT_SIZE;
     uint64_t tag_stage_us[5] = {0};
-    uint32_t tag_steps = 0;
+    uint32_t tag_steps       = 0;
     fft_burst_tagger_get_stage_us(tag_stage_us, &tag_steps);
 
     if (frames == 0) {
         memset(out, 0, sizeof(*out));
     } else {
-        float fn = (float)frames;
-        float ts = (tag_steps > 0) ? (float)tag_steps : 1.0f;
+        float fn         = (float)frames;
+        float ts         = (tag_steps > 0) ? (float)tag_steps : 1.0f;
         out->frames      = frames;
         out->wind_us     = (float)tag_stage_us[0] / ts;
         out->fft_us      = (float)tag_stage_us[1] / ts;

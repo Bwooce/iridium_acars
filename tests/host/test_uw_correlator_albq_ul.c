@@ -18,32 +18,31 @@
 static int s_passed = 0;
 static int s_failed = 0;
 
-#define CHECK(cond, ...) do {                              \
-    if (!(cond)) {                                         \
-        fprintf(stderr, "  FAIL line %d: ", __LINE__);     \
-        fprintf(stderr, __VA_ARGS__);                      \
-        fprintf(stderr, "\n");                             \
-        s_failed++;                                        \
-    } else {                                               \
-        s_passed++;                                        \
-    }                                                      \
-} while (0)
+#define CHECK(cond, ...)                                   \
+    do {                                                   \
+        if (!(cond)) {                                     \
+            fprintf(stderr, "  FAIL line %d: ", __LINE__); \
+            fprintf(stderr, __VA_ARGS__);                  \
+            fprintf(stderr, "\n");                         \
+            s_failed++;                                    \
+        } else {                                           \
+            s_passed++;                                    \
+        }                                                  \
+    } while (0)
 
 int main(void)
 {
     // Upsample 2 sps -> 10 sps via linear interp (uw_correlator now
     // expects 10 sps internally, matches gr-iridium burst_downmix).
-    int n_complex_2sps = (int)(ALBQ_UL_2SPS_LEN / 2);
-    int n_complex = n_complex_2sps * 5;
-    int16_t *burst = malloc(n_complex * 2 * sizeof(int16_t));
+    int      n_complex_2sps = (int)(ALBQ_UL_2SPS_LEN / 2);
+    int      n_complex      = n_complex_2sps * 5;
+    int16_t *burst          = malloc(n_complex * 2 * sizeof(int16_t));
     for (int n = 0; n < n_complex; n++) {
-        int n2 = n / 5;
-        int n2p = (n2 + 1 < n_complex_2sps) ? n2 + 1 : n2;
-        float frac = (n % 5) / 5.0f;
-        float re = (1.0f - frac) * (float)ALBQ_UL_2SPS[2 * n2]
-                 +         frac  * (float)ALBQ_UL_2SPS[2 * n2p];
-        float im = (1.0f - frac) * (float)ALBQ_UL_2SPS[2 * n2 + 1]
-                 +         frac  * (float)ALBQ_UL_2SPS[2 * n2p + 1];
+        int   n2         = n / 5;
+        int   n2p        = (n2 + 1 < n_complex_2sps) ? n2 + 1 : n2;
+        float frac       = (n % 5) / 5.0f;
+        float re         = (1.0f - frac) * (float)ALBQ_UL_2SPS[2 * n2] + frac * (float)ALBQ_UL_2SPS[2 * n2p];
+        float im         = (1.0f - frac) * (float)ALBQ_UL_2SPS[2 * n2 + 1] + frac * (float)ALBQ_UL_2SPS[2 * n2p + 1];
         burst[2 * n + 0] = (int16_t)re;
         burst[2 * n + 1] = (int16_t)im;
     }
@@ -53,13 +52,13 @@ int main(void)
     printf("Truth direction: %s\n", ALBQ_UL_2SPS_DIRECTION);
 
     int burst_start = uw_correlator_find_burst_start(burst, n_complex,
-                                                      /*search_max=*/n_complex);
+                                                     /*search_max=*/n_complex);
     printf("D13 burst start: %d (of %d samples)\n", burst_start, n_complex);
     CHECK(burst_start >= 0 && burst_start < n_complex - 64,
           "D13 burst start in plausible range (got %d)", burst_start);
 
     int16_t *adj_burst = burst + burst_start * 2;
-    int adj_n = n_complex - burst_start;
+    int      adj_n     = n_complex - burst_start;
 
     uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
 
@@ -68,7 +67,8 @@ int main(void)
 
     printf("UW corr: dir=%s offset=%d corr=%.3f SNR=%.1f dB peak=%.2e omega=%.3f\n",
            res.direction == UW_DIR_DOWNLINK ? "DL"
-           : res.direction == UW_DIR_UPLINK ? "UL" : "UNKNOWN",
+           : res.direction == UW_DIR_UPLINK ? "UL"
+                                            : "UNKNOWN",
            res.uw_offset, (double)res.correction,
            (double)res.snr_estimate_db, (double)res.peak_value,
            (double)res.omega_per_sym);
@@ -85,7 +85,7 @@ int main(void)
 
     // CFO bounded (D8 clamp at ±π).
     float abs_omega = res.omega_per_sym < 0 ? -res.omega_per_sym : res.omega_per_sym;
-    CHECK(abs_omega < 6.30f,   /* clamp widened to ±2π for edge bursts */
+    CHECK(abs_omega < 6.30f, /* clamp widened to ±2π for edge bursts */
           "CFO magnitude inside clamp (got %.3f)",
           (double)res.omega_per_sym);
 

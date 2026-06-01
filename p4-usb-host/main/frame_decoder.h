@@ -14,7 +14,7 @@
 #include "esp_err.h"
 #include <stdint.h>
 #include <stddef.h>
-#include "qpsk_demod.h"           // ir_direction_t
+#include "qpsk_demod.h" // ir_direction_t
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,9 +40,9 @@ bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
                         uint32_t freq_hz, int peak_bin, float snr_db);
 
 // Stats accessors for the per-second status block.
-uint64_t frame_decoder_pushed(void);    // total bursts the worker handed off
-uint64_t frame_decoder_popped(void);    // total bursts the decoder processed
-uint64_t frame_decoder_dropped(void);   // total dropped (queue full)
+uint64_t frame_decoder_pushed(void);  // total bursts the worker handed off
+uint64_t frame_decoder_popped(void);  // total bursts the decoder processed
+uint64_t frame_decoder_dropped(void); // total dropped (queue full)
 size_t   frame_decoder_queue_count(void);
 
 // Per-frame-class counts since boot. Useful for the status block.
@@ -51,8 +51,8 @@ typedef struct {
     uint64_t ms;
     uint64_t tl;
     uint64_t bc;
-    uint64_t lw_da;       // LW with subtype DA — these are SBD/ACARS-bearing
-    uint64_t lw_other;    // LW with any other subtype (VO/IP/SY/U3/U6/...)
+    uint64_t lw_da;    // LW with subtype DA — these are SBD/ACARS-bearing
+    uint64_t lw_other; // LW with any other subtype (VO/IP/SY/U3/U6/...)
 } frame_decoder_class_counts_t;
 void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out);
 

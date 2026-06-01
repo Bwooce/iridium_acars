@@ -58,7 +58,7 @@ void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step);
 // with what a single all-in-one rotate_to_dc_q15_inc would have
 // produced (within Q15 saturation rounding).
 void rotate_to_dc_q15_inc_at(int16_t *iq, int n_complex,
-                              double phase_step, int sample_offset);
+                             double phase_step, int sample_offset);
 
 // Chunked scalar reference for the PIE int16 SIMD path. Same
 // numerics as rotate_to_dc_q15_inc but structured in 8-sample
@@ -83,11 +83,11 @@ void rotate_to_dc_q15_inc_at(int16_t *iq, int n_complex,
 // isn't available. The P4 firmware swaps to the PIE asm via a
 // thin wrapper (see rotate_to_dc_q15_simd_at below).
 void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
-                                   double phase_step, int sample_offset);
+                                  double phase_step, int sample_offset);
 
 // Backwards-compat wrapper: sample_offset = 0.
 static inline void rotate_to_dc_q15_simd_ref(int16_t *iq, int n_complex,
-                                              double phase_step)
+                                             double phase_step)
 {
     rotate_to_dc_q15_simd_ref_at(iq, n_complex, phase_step, 0);
 }
@@ -97,11 +97,11 @@ static inline void rotate_to_dc_q15_simd_ref(int16_t *iq, int n_complex,
 // reference. Same input/output contract; `sample_offset` semantics
 // as above. This is what worker_core1's chunk loop calls.
 void rotate_to_dc_q15_simd_at(int16_t *iq, int n_complex,
-                               double phase_step, int sample_offset);
+                              double phase_step, int sample_offset);
 
 // Backwards-compat wrapper: sample_offset = 0.
 static inline void rotate_to_dc_q15_simd(int16_t *iq, int n_complex,
-                                          double phase_step)
+                                         double phase_step)
 {
     rotate_to_dc_q15_simd_at(iq, n_complex, phase_step, 0);
 }

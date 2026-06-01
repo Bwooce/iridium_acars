@@ -32,28 +32,28 @@
 
 static const char *TAG = "FRMDEC";
 
-#define FRAME_QUEUE_SLOTS  64        // 64 × 432 B ≈ 27 KB in PSRAM
-#define DECODER_STACK      6144
-#define DECODER_PRIO       4         // Core 0: < class_driver (6), < httpd (5),
-                                     // > sd_log (2), > logger (1)
-                                     // Decoder is bursty (only wakes when a
-                                     // frame arrives, ms-scale compute) so
-                                     // its CPU cost doesn't displace the
-                                     // USB consumer or httpd in practice.
-#define DECODER_CORE       0         // Moved from Core 1 → Core 0 (#123,
-                                     // 2026-05-31). Core 1's worker (prio
-                                     // 5) was being preempted by anything
-                                     // else at ≥4; relocating the per-
-                                     // frame decode work to Core 0 (which
-                                     // is bursty too — only class_driver
-                                     // is steady-state heavy) dissolves
-                                     // the Core-1 priority equilibrium
-                                     // documented in
-                                     // project_core1_cpu_budget_scheduling.
+#define FRAME_QUEUE_SLOTS 64 // 64 × 432 B ≈ 27 KB in PSRAM
+#define DECODER_STACK 6144
+#define DECODER_PRIO 4 // Core 0: < class_driver (6), < httpd (5),
+                       // > sd_log (2), > logger (1)
+                       // Decoder is bursty (only wakes when a
+                       // frame arrives, ms-scale compute) so
+                       // its CPU cost doesn't displace the
+                       // USB consumer or httpd in practice.
+#define DECODER_CORE 0 // Moved from Core 1 → Core 0 (#123,
+                       // 2026-05-31). Core 1's worker (prio
+                       // 5) was being preempted by anything
+                       // else at ≥4; relocating the per-
+                       // frame decode work to Core 0 (which
+                       // is bursty too — only class_driver
+                       // is steady-state heavy) dissolves
+                       // the Core-1 priority equilibrium
+                       // documented in
+                       // project_core1_cpu_budget_scheduling.
 
-static frame_queue_t  *s_queue       = NULL;
-static TaskHandle_t    s_task        = NULL;
-static volatile bool   s_initialised = false;
+static frame_queue_t *s_queue       = NULL;
+static TaskHandle_t   s_task        = NULL;
+static volatile bool  s_initialised = false;
 
 static _Atomic uint64_t s_class_unknown  = 0;
 static _Atomic uint64_t s_class_ms       = 0;
@@ -65,9 +65,9 @@ static _Atomic uint64_t s_class_lw_other = 0;
 // SBD reassembler instance — single global, not thread-safe (only the
 // decoder task touches it). 8 sessions × ~330 B ≈ 2.6 KB in BSS.
 static sbd_reassembler_t s_sbd;
-static _Atomic uint64_t  s_sbd_complete = 0;     // SBD messages reassembled
-static _Atomic uint64_t  s_acars_decoded = 0;    // ACARS messages successfully parsed
-static _Atomic uint64_t  s_acars_fragments = 0;  // ACARS fragments awaiting reassembly
+static _Atomic uint64_t  s_sbd_complete    = 0; // SBD messages reassembled
+static _Atomic uint64_t  s_acars_decoded   = 0; // ACARS messages successfully parsed
+static _Atomic uint64_t  s_acars_fragments = 0; // ACARS fragments awaiting reassembly
 
 // D14: libacars reassembly context. Maintains per-flight-id session
 // state so multi-block ACARS messages (block_id > 0, more_blocks_follow)
@@ -82,53 +82,52 @@ static la_reasm_ctx *s_reasm_ctx = NULL;
 // known-type frames (anything other than UNKNOWN), rolled by a 1-min
 // esp_timer. Warn-on-decline fires when 24h > 10 && 1h == 0 = "we
 // used to work, we no longer do" (an OTA regression / antenna change).
-#define DRATE_MIN_BUCKETS  60   // per-minute, 1 h coverage
-#define DRATE_HR_BUCKETS   24   // per-hour, 24 h coverage
-static volatile uint32_t s_drate_min[DRATE_MIN_BUCKETS];
-static volatile uint32_t s_drate_hr [DRATE_HR_BUCKETS];
-static volatile uint64_t s_drate_classified_at_last_roll = 0;   // s_class_*-sum snapshot
-static volatile uint8_t  s_drate_min_head = 0;
-static volatile uint8_t  s_drate_hr_head  = 0;
-static volatile uint8_t  s_drate_min_in_hr = 0;                 // 0..59
-static esp_timer_handle_t s_drate_timer = NULL;
+#define DRATE_MIN_BUCKETS 60 // per-minute, 1 h coverage
+#define DRATE_HR_BUCKETS 24  // per-hour, 24 h coverage
+static volatile uint32_t  s_drate_min[DRATE_MIN_BUCKETS];
+static volatile uint32_t  s_drate_hr[DRATE_HR_BUCKETS];
+static volatile uint64_t  s_drate_classified_at_last_roll = 0; // s_class_*-sum snapshot
+static volatile uint8_t   s_drate_min_head                = 0;
+static volatile uint8_t   s_drate_hr_head                 = 0;
+static volatile uint8_t   s_drate_min_in_hr               = 0; // 0..59
+static esp_timer_handle_t s_drate_timer                   = NULL;
 
 static uint64_t drate_classified_sum(void)
 {
-    return atomic_load_explicit(&s_class_ms,       memory_order_relaxed)
-         + atomic_load_explicit(&s_class_tl,       memory_order_relaxed)
-         + atomic_load_explicit(&s_class_bc,       memory_order_relaxed)
-         + atomic_load_explicit(&s_class_lw_da,    memory_order_relaxed)
-         + atomic_load_explicit(&s_class_lw_other, memory_order_relaxed);
+    return atomic_load_explicit(&s_class_ms, memory_order_relaxed) + atomic_load_explicit(&s_class_tl, memory_order_relaxed) + atomic_load_explicit(&s_class_bc, memory_order_relaxed) + atomic_load_explicit(&s_class_lw_da, memory_order_relaxed) + atomic_load_explicit(&s_class_lw_other, memory_order_relaxed);
 }
 
 static void drate_tick(void *arg)
 {
     (void)arg;
-    uint64_t now_total = drate_classified_sum();
-    uint32_t delta = (uint32_t)(now_total - s_drate_classified_at_last_roll);
+    uint64_t now_total              = drate_classified_sum();
+    uint32_t delta                  = (uint32_t)(now_total - s_drate_classified_at_last_roll);
     s_drate_classified_at_last_roll = now_total;
 
     // Advance the minute bucket; write the delta into the new head.
-    s_drate_min_head = (s_drate_min_head + 1) % DRATE_MIN_BUCKETS;
+    s_drate_min_head              = (s_drate_min_head + 1) % DRATE_MIN_BUCKETS;
     s_drate_min[s_drate_min_head] = delta;
 
     // Every 60 ticks, roll a fresh hour: write the hour's sum, advance.
     s_drate_min_in_hr++;
     if (s_drate_min_in_hr >= 60) {
         s_drate_min_in_hr = 0;
-        uint32_t hr_sum = 0;
-        for (int i = 0; i < DRATE_MIN_BUCKETS; i++) hr_sum += s_drate_min[i];
-        s_drate_hr_head = (s_drate_hr_head + 1) % DRATE_HR_BUCKETS;
+        uint32_t hr_sum   = 0;
+        for (int i = 0; i < DRATE_MIN_BUCKETS; i++)
+            hr_sum += s_drate_min[i];
+        s_drate_hr_head             = (s_drate_hr_head + 1) % DRATE_HR_BUCKETS;
         s_drate_hr[s_drate_hr_head] = hr_sum;
 
         // Warn-on-decline: 1h is the buckets above; 24h is the hours.
-        uint32_t sum_1h = hr_sum;
+        uint32_t sum_1h  = hr_sum;
         uint32_t sum_24h = 0;
-        for (int i = 0; i < DRATE_HR_BUCKETS; i++) sum_24h += s_drate_hr[i];
+        for (int i = 0; i < DRATE_HR_BUCKETS; i++)
+            sum_24h += s_drate_hr[i];
         if (sum_24h > 10 && sum_1h == 0) {
             ESP_LOGW(TAG, "decode-rate decline: 24h=%u classified frames "
                           "but last 1h=0 — possible DSP regression / "
-                          "antenna change / OTA broke decode", sum_24h);
+                          "antenna change / OTA broke decode",
+                     sum_24h);
         }
     }
 }
@@ -136,18 +135,20 @@ static void drate_tick(void *arg)
 void frame_decoder_get_rolling_rates(uint32_t *out_1h, uint32_t *out_24h)
 {
     uint32_t sum_1h = 0, sum_24h = 0;
-    for (int i = 0; i < DRATE_MIN_BUCKETS; i++) sum_1h  += s_drate_min[i];
-    for (int i = 0; i < DRATE_HR_BUCKETS;  i++) sum_24h += s_drate_hr[i];
+    for (int i = 0; i < DRATE_MIN_BUCKETS; i++)
+        sum_1h += s_drate_min[i];
+    for (int i = 0; i < DRATE_HR_BUCKETS; i++)
+        sum_24h += s_drate_hr[i];
     // 24h totals don't include the in-progress hour — include the 1h
     // buckets to give the caller the actual last-24h coverage.
     sum_24h += sum_1h;
-    if (out_1h)  *out_1h  = sum_1h;
+    if (out_1h) *out_1h = sum_1h;
     if (out_24h) *out_24h = sum_24h;
 }
 
 // Walk a la_proto_node tree to find the la_acars_msg payload.
 extern la_type_descriptor const la_DEF_acars_message;
-static la_acars_msg *find_acars_msg(la_proto_node *node)
+static la_acars_msg            *find_acars_msg(la_proto_node *node)
 {
     while (node) {
         if (node->td == &la_DEF_acars_message && node->data) {
@@ -161,7 +162,7 @@ static la_acars_msg *find_acars_msg(la_proto_node *node)
 // Try to parse the reassembled SBD payload as ACARS. Logs the
 // decoded fields if a recognisable ACARS frame is found.
 static void try_acars(const sbd_message_t *msg,
-                       int32_t peak_bin, float snr_db)
+                      int32_t peak_bin, float snr_db)
 {
     if (!msg || msg->payload_len < 8) return;
     la_msg_dir dir = msg->uplink ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
@@ -187,7 +188,7 @@ static void try_acars(const sbd_message_t *msg,
             a->reasm_status == LA_REASM_SKIPPED) {
             atomic_fetch_add_explicit(&s_acars_decoded, 1, memory_order_relaxed);
             ESP_LOGI(TAG, "ACARS: %s mode=%c label='%.2s' block=%c msgnum='%.4s' "
-                     "flight='%.6s' crc=%s txt=\"%s\"",
+                          "flight='%.6s' crc=%s txt=\"%s\"",
                      msg->uplink ? "UL" : "DL",
                      a->mode ? a->mode : '?',
                      a->label, a->block_id ? a->block_id : '?',
@@ -196,18 +197,18 @@ static void try_acars(const sbd_message_t *msg,
                      a->txt ? a->txt : "");
 
             // Push to /messages-visible ring.
-            acars_msg_t out = {0};
+            acars_msg_t out  = {0};
             out.timestamp_us = (uint64_t)msg->timestamp_us;
             out.uplink       = msg->uplink;
             out.mode         = a->mode ? a->mode : '?';
             out.label[0]     = a->label[0];
             out.label[1]     = a->label[1];
             out.block_id     = a->block_id ? a->block_id : '?';
-            memcpy(out.msg_num,   a->msg_num,   4);
+            memcpy(out.msg_num, a->msg_num, 4);
             memcpy(out.flight_id, a->flight_id, 6);
-            out.crc_ok       = a->crc_ok;
-            out.peak_bin     = peak_bin;
-            out.snr_db       = snr_db;
+            out.crc_ok   = a->crc_ok;
+            out.peak_bin = peak_bin;
+            out.snr_db   = snr_db;
             if (a->txt) {
                 strlcpy(out.txt, a->txt, sizeof(out.txt));
             }
@@ -217,7 +218,7 @@ static void try_acars(const sbd_message_t *msg,
         } else if (a->reasm_status == LA_REASM_IN_PROGRESS) {
             atomic_fetch_add_explicit(&s_acars_fragments, 1, memory_order_relaxed);
             ESP_LOGD(TAG, "ACARS fragment buffered: label='%.2s' block=%c "
-                     "msgnum='%.4s' flight='%.6s'",
+                          "msgnum='%.4s' flight='%.6s'",
                      a->label, a->block_id ? a->block_id : '?',
                      a->msg_num, a->flight_id);
         }
@@ -228,11 +229,11 @@ static void try_acars(const sbd_message_t *msg,
 
 static void process_one(const frame_queue_item_t *it)
 {
-    iridium_frame_t classified = { 0 };
-    ir_frame_direction_t dir = (it->direction == DIR_DOWNLINK)
-                               ? IR_FRM_DIR_DOWNLINK
-                               : IR_FRM_DIR_UPLINK;
-    int rc = iridium_frame_classify(it->bits, it->n_bits, dir, &classified);
+    iridium_frame_t      classified = {0};
+    ir_frame_direction_t dir        = (it->direction == DIR_DOWNLINK)
+                                          ? IR_FRM_DIR_DOWNLINK
+                                          : IR_FRM_DIR_UPLINK;
+    int                  rc         = iridium_frame_classify(it->bits, it->n_bits, dir, &classified);
     if (rc != 0) {
         ESP_LOGW(TAG, "classify rc=%d (n_bits=%u dir=%u)",
                  rc, it->n_bits, it->direction);
@@ -247,13 +248,13 @@ static void process_one(const frame_queue_item_t *it)
         // parsing (paging/alphanumeric) is out of scope -- complex
         // tables and not on ACARS critical path. Header tells us the
         // super-frame coordinates and message length.
-        ims_decoded_t ims = { 0 };
+        ims_decoded_t ims = {0};
         ims_decode(&classified, &ims);
         if (ims.bch_ok) {
-            const char *grp = (ims.ms_type == 1) ? "Acq" :
-                              (ims.group == 0) ? "B"  :
-                              (ims.group == 1) ? "C"  :
-                              (ims.group == 2) ? "D"  : "E";
+            const char *grp = (ims.ms_type == 1) ? "Acq" : (ims.group == 0) ? "B"
+                                                       : (ims.group == 1)   ? "C"
+                                                       : (ims.group == 2)   ? "D"
+                                                                            : "E";
             ESP_LOGI(TAG, "FRAME: IMS block=%d frame=%d grp=%s len=%d "
                           "bin=%ld snr=%.1f",
                      ims.block, ims.frame, grp, ims.bch_blocks,
@@ -266,7 +267,7 @@ static void process_one(const frame_queue_item_t *it)
     }
     case IR_FRAME_TL: {
         atomic_fetch_add_explicit(&s_class_tl, 1, memory_order_relaxed);
-        tl_decoded_t tl = { 0 };
+        tl_decoded_t tl = {0};
         tl_decode(&classified, &tl);
         if (tl.version >= 1 && tl.plane >= 0) {
             ESP_LOGI(TAG, "FRAME: TL V%d plane=%d bin=%ld snr=%.1f freq=%lu",
@@ -287,7 +288,7 @@ static void process_one(const frame_queue_item_t *it)
         // post-BCH 168-bit payload tells us which satellite/cell sent
         // the broadcast and (for bc_type=0 sub=1) the L-band frame
         // counter timestamp.
-        ibc_decoded_t ibc = { 0 };
+        ibc_decoded_t ibc = {0};
         ibc_decode(&classified, &ibc);
         if (ibc.header_ok && ibc.bc_type == 0 && ibc.block0_ok) {
             if (ibc.block1_subtype == 1 && ibc.iri_time > 0) {
@@ -318,8 +319,8 @@ static void process_one(const frame_queue_item_t *it)
             // Run the IDA -> SBD -> ACARS chain. Log the IDA header
             // fields up front so we can see what kind of DA content is
             // in the stream (CRC pass/fail, payload length, flags).
-            ida_decoded_t ida = { 0 };
-            int rc_ida = ida_decode(&classified, &ida);
+            ida_decoded_t ida    = {0};
+            int           rc_ida = ida_decode(&classified, &ida);
             ESP_LOGI(TAG, "FRAME: LW.DA bin=%ld snr=%.1f "
                           "bch_ok=%d blocks=%d/%d errs=%d "
                           "hdr_ok=%d ctr=%d len=%u crc=%s",
@@ -329,10 +330,10 @@ static void process_one(const frame_queue_item_t *it)
                      ida.crc_ok ? "OK" : "BAD");
             if (rc_ida == 0 && ida.ok && ida.header_ok) {
                 sbd_message_t sbd;
-                int rc_sbd = sbd_reassembler_feed(&s_sbd, &ida,
-                                                  it->direction == 1,
-                                                  (uint64_t)it->timestamp_us,
-                                                  &sbd);
+                int           rc_sbd = sbd_reassembler_feed(&s_sbd, &ida,
+                                                            it->direction == 1,
+                                                            (uint64_t)it->timestamp_us,
+                                                            &sbd);
                 if (rc_sbd == 1) {
                     atomic_fetch_add_explicit(&s_sbd_complete, 1,
                                               memory_order_relaxed);
@@ -357,7 +358,7 @@ static void process_one(const frame_queue_item_t *it)
         // Counted in the "BC" bucket for now (the smoke test's
         // expected counts predate RA classification).
         atomic_fetch_add_explicit(&s_class_bc, 1, memory_order_relaxed);
-        ira_decoded_t ira = { 0 };
+        ira_decoded_t ira = {0};
         ira_decode(&classified, &ira);
         if (ira.bch_ok) {
             ESP_LOGI(TAG, "FRAME: IRA sv=%d beam=%d pos=(%+d, %+d, %+d) "
@@ -396,7 +397,7 @@ static void decoder_task(void *arg)
     }
 
     frame_queue_item_t item;
-    uint64_t last_tick = (uint64_t)esp_timer_get_time();
+    uint64_t           last_tick = (uint64_t)esp_timer_get_time();
     while (1) {
         bool got = frame_queue_pop(s_queue, &item);
         // Tick the SBD reassembler periodically (~1 Hz) so stale
@@ -479,7 +480,7 @@ esp_err_t frame_decoder_init(void)
 
     s_initialised = true;
     ESP_LOGI(TAG, "frame_decoder ready: %d-slot queue (~%u KB PSRAM), "
-             "task on Core %d prio %d",
+                  "task on Core %d prio %d",
              FRAME_QUEUE_SLOTS,
              (unsigned)(FRAME_QUEUE_SLOTS * sizeof(frame_queue_item_t) / 1024),
              DECODER_CORE, DECODER_PRIO);
@@ -531,11 +532,11 @@ size_t frame_decoder_queue_count(void)
 void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out)
 {
     if (!out) return;
-    out->unknown  = atomic_load_explicit(&s_class_unknown,  memory_order_relaxed);
-    out->ms       = atomic_load_explicit(&s_class_ms,       memory_order_relaxed);
-    out->tl       = atomic_load_explicit(&s_class_tl,       memory_order_relaxed);
-    out->bc       = atomic_load_explicit(&s_class_bc,       memory_order_relaxed);
-    out->lw_da    = atomic_load_explicit(&s_class_lw_da,    memory_order_relaxed);
+    out->unknown  = atomic_load_explicit(&s_class_unknown, memory_order_relaxed);
+    out->ms       = atomic_load_explicit(&s_class_ms, memory_order_relaxed);
+    out->tl       = atomic_load_explicit(&s_class_tl, memory_order_relaxed);
+    out->bc       = atomic_load_explicit(&s_class_bc, memory_order_relaxed);
+    out->lw_da    = atomic_load_explicit(&s_class_lw_da, memory_order_relaxed);
     out->lw_other = atomic_load_explicit(&s_class_lw_other, memory_order_relaxed);
 }
 

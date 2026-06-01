@@ -25,10 +25,10 @@
 #include <stdint.h>
 
 #ifdef ESP_PLATFORM
-#include "dsps_fir.h"     // fir_s16_t — esp-dsp PIE FIR state
+#include "dsps_fir.h" // fir_s16_t — esp-dsp PIE FIR state
 #endif
 
-#define DIDECIM_DECIM        10        // 10× decim (2.5M → 250k)
+#define DIDECIM_DECIM 10 // 10× decim (2.5M → 250k)
 // 144 taps = 141 from gri's firdes.low_pass_2 design + 3 zero taps for
 // alignment.  Gri calls
 //   firdes.low_pass_2(gain=1, fs=2.5e6, cutoff=20e3,
@@ -43,7 +43,7 @@
 // dsps_fird_s16_arp4 (P4 PIE) requires coeffs_len divisible by 8; we
 // pad 141 → 144 with three zero taps. Zero padding preserves the
 // frequency response exactly.
-#define DIDECIM_NTAPS        144       // gri firdes.low_pass_2 (141) + 3 zero
+#define DIDECIM_NTAPS 144 // gri firdes.low_pass_2 (141) + 3 zero
 
 // Per-channel FIR state for the split (deinterleaved) path on host.
 // Mirrors the inner-loop semantics of esp-dsp's fir_s16_t / dsps_fird
@@ -57,11 +57,11 @@ typedef struct {
 
 typedef struct {
     int16_t taps[DIDECIM_NTAPS] __attribute__((aligned(16)));
-                                       // Q15 taps, DC-gain-normalised.
-                                       // 16-byte aligned for the PIE
-                                       // path's coeffs pointer.
-    didecim_fir_state_t fir_i;         // host I-channel FIR state
-    didecim_fir_state_t fir_q;         // host Q-channel FIR state
+    // Q15 taps, DC-gain-normalised.
+    // 16-byte aligned for the PIE
+    // path's coeffs pointer.
+    didecim_fir_state_t fir_i; // host I-channel FIR state
+    didecim_fir_state_t fir_q; // host Q-channel FIR state
 #ifdef ESP_PLATFORM
     // Target PIE state. dsps_fird_init_s16 (under arp4) ignores any
     // delay buffer we pass and allocates its own internal one — these
@@ -94,8 +94,8 @@ void direct_if_decim_reset_state(direct_if_decim_t *d);
 //
 // `n_in` must be ≥ DIDECIM_DECIM (else zero outputs).
 int direct_if_decim_process(const direct_if_decim_t *d,
-                             const int16_t *input, int n_in,
-                             int16_t *out);
+                            const int16_t *input, int n_in,
+                            int16_t *out);
 
 // Split (deinterleaved) variant: separates input IQ into two real
 // streams, runs a real-FIR + decim on each, then re-interleaves.
@@ -120,7 +120,7 @@ int direct_if_decim_process(const direct_if_decim_t *d,
 // Modifies the persistent FIR state inside `d` (delay lines). Calls
 // must be sequential per direct_if_decim_t instance.
 int direct_if_decim_process_split(direct_if_decim_t *d,
-                                   const int16_t *input, int n_in,
-                                   int16_t *out,
-                                   int16_t *scratch_in_i, int16_t *scratch_in_q,
-                                   int16_t *scratch_out_i, int16_t *scratch_out_q);
+                                  const int16_t *input, int n_in,
+                                  int16_t *out,
+                                  int16_t *scratch_in_i, int16_t *scratch_in_q,
+                                  int16_t *scratch_out_i, int16_t *scratch_out_q);
