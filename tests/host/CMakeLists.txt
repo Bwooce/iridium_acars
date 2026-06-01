@@ -315,7 +315,11 @@ target_link_libraries(test_pipeline_wideband_albq PRIVATE m)
 # only re-runs the script when its inputs change. Requires
 # `iridium-extractor` on PATH (tests/scripts/direct_if_dump.py also
 # generates per-burst dumps + manifest.csv along the way).
+# Guarded by find_program so CI builds (without iridium-extractor) skip
+# the fixture target entirely and don't fail during cmake --build.
+find_program(IRIDIUM_EXTRACTOR iridium-extractor)
 set(ALBQ_25K_CF32 /tmp/host_direct_if/fixture_albq_raw_2500k.cf32)
+if(IRIDIUM_EXTRACTOR)
 add_custom_command(
     OUTPUT  ${ALBQ_25K_CF32}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/direct_if_dump.py
@@ -493,6 +497,7 @@ target_include_directories(test_pipeline_direct_if_albq PRIVATE
 )
 target_link_libraries(test_pipeline_direct_if_albq PRIVATE m)
 add_dependencies(test_pipeline_direct_if_albq albq_25k_cf32_fixture)
+endif() # IRIDIUM_EXTRACTOR
 
 # (test_snr_gap_measurement removed with the channelizer — was a
 # diagnostic instrument for the channelizer-vs-gri SNR gap that
