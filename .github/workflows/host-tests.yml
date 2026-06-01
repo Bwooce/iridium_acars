@@ -1,0 +1,26 @@
+name: Host tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y cmake gcc libm-dev
+
+      - name: Configure
+        run: cmake -B tests/host/build -S tests/host -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build tests/host/build --parallel
+
+      - name: Run tests
+        run: ctest --test-dir tests/host/build --output-on-failure

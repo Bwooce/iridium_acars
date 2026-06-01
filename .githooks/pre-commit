@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# pre-commit: auto-format staged C/H files with clang-format.
+# Only activates when a .clang-format exists at the repo root — inert
+# until you add one. Reformatted files are re-staged automatically so
+# the commit picks up the fixed version (no need to re-run git add).
+#
+# Enable per-clone with:
+#   git config core.hooksPath .githooks
+
+set -e
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+[ -f "$REPO_ROOT/.clang-format" ] || exit 0
+command -v clang-format >/dev/null 2>&1 || exit 0
+
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(c|h)$' || true)
+[ -z "$staged" ] && exit 0
+
+changed=0
+for f in $staged; do
+    before=$(git show ":$f" 2>/dev/null) || continue
+    after=$(echo "$before" | clang-format --style=file --assume-filename="$f")
+    if [ "$before" != "$after" ]; then
+        echo "$after" > "$REPO_ROOT/$f"
+        git add "$REPO_ROOT/$f"
+        echo "  clang-format: reformatted $f"
+        changed=1
+    fi
+done
+
+[ "$changed" -eq 1 ] && echo "Formatting fixes staged — commit now includes them."
+exit 0
