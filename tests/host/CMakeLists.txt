@@ -335,6 +335,7 @@ add_custom_target(albq_25k_cf32_fixture DEPENDS ${ALBQ_25K_CF32})
 # either install it (apt: gr-iridium) or run the wideband_resampled
 # variant which is fixture-self-contained.
 add_dependencies(test_pipeline_wideband_albq albq_25k_cf32_fixture)
+endif() # IRIDIUM_EXTRACTOR (fixture + wideband_albq dep)
 # Note: test_pipeline_direct_if_albq's add_dependencies lives next to
 # its add_executable below — it's defined after this point so we can't
 # forward-reference it here.
@@ -496,8 +497,9 @@ target_include_directories(test_pipeline_direct_if_albq PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
 )
 target_link_libraries(test_pipeline_direct_if_albq PRIVATE m)
+if(IRIDIUM_EXTRACTOR)
 add_dependencies(test_pipeline_direct_if_albq albq_25k_cf32_fixture)
-endif() # IRIDIUM_EXTRACTOR
+endif()
 
 # (test_snr_gap_measurement removed with the channelizer — was a
 # diagnostic instrument for the channelizer-vs-gri SNR gap that
