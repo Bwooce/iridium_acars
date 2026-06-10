@@ -8,11 +8,12 @@
 > This doc is the **wideband-single-SDR companion** to
 > [`multi-receiver-spi-aggregator-design.md`](./multi-receiver-spi-aggregator-design.md).
 > That doc covers N independent **RTL-SDR receivers fanning frames IN**
-> to an aggregator. This one covers the inverse: **one wideband SDR
-> fanning IQ OUT** to worker P4s. They are different topologies with
-> different binding constraints; read that doc first — most of the
-> physical-layer, PDU, and aggregator analysis there is reused here and
-> not repeated.
+> to an aggregator (Topology B). This one adds **one wideband SDR fanning
+> IQ OUT** (Topology A) and, after a follow-up question, **a hybrid where
+> the ingest P4 processes some bursts locally and offloads the overflow
+> to adjunct P4s** (Topology C, §4.4 — the most pragmatic of the three).
+> Read the multi-receiver doc first; its physical-layer, PDU, and
+> aggregator analysis is reused here and not repeated.
 >
 > Nothing here is a commitment to build. It exists to decide whether the
 > HydraSDR path is worth pursuing and, if so, under what conditions.
@@ -155,6 +156,81 @@ its place when its **single coherent wideband capture** matters:
 
 If none of those apply, prefer Topology B and don't buy a HydraSDR.
 
+### 4.4 Topology C: hybrid local + adjunct worker offload (deepen one band)
+
+A third option, raised after the fan-out/fan-in framing: **the ingest P4
+processes what it can locally and offloads the overflow to one or more
+adjunct P4s.** This is not about widening the band — it's about
+*deepening* the processing of a single band that one P4's worker can't
+keep up with.
+
+**The motivation is measured, not hypothetical.** Under a bench-RF flood
+the tagger emits ~140 bursts/sec but the per-burst worker (the
+`burst_pipeline` UW-correlation + demod + BCH chain, ~50 ms wall) can
+only drain ~20/sec — so `worker_core1.c:869-871` records
+`worker_dropped=130/s indefinitely`. The worker, **not** ingest, is the
+bottleneck for decode depth on one band. Adding worker capacity is
+exactly what an adjunct P4 provides.
+
+**Why the split point is ideal.** The split is at the **burst queue**
+(post-tagger / post-decimation, pre-`burst_pipeline`):
+
+```
+ [ingest P4]  USB ─▶ resample ─▶ tagger ─▶ extract+decim ─┬─▶ LOCAL burst_pipeline ─▶ frame_decoder ─▶ msg_ring
+                                                          │                                    ▲
+                                              overflow ───┘                                    │ frames back
+                                                          ▼ 8 KB burst PDU (SPI)               │ (280 B)
+ [adjunct P4]                                   burst_pipeline (rotate/UW/demod/BCH) ───────────┘
+```
+
+- **What crosses the wire is the *decimated* 250 ksps burst window**, not
+  raw IQ. A typical single-slot burst is ~8 ms × 250 ksps × 4 B ≈ **8 KB**
+  (worst-case multi-frame up to ~250 KB, rare). The ingest P4 keeps the
+  cheap stages (extract + the PIE-FIR 10× decim) and offloads the
+  expensive stage (the UW correlator's multiple 2048-pt FFTs, which
+  dominate the ~50 ms/burst).
+- **Flow-controlled to adjunct capacity.** You ship only as fast as the
+  adjunct's queue drains (~20 bursts/sec), so each adjunct SPI link
+  carries ~20 × 8 KB = **~160 KB/s** — trivially within the ~5 MB/s SPI
+  budget, and *self-throttling* (no risk of flooding the link). This is
+  the decisive difference from Topology A's 5 MB/s continuous IQ stream.
+- **The ingest P4 doubles as aggregator.** It already runs
+  `frame_decoder` + `msg_ring` + `acars_push`. The adjunct returns the
+  same 280 B post-BCH frame PDU as Topology B, which the ingest P4 feeds
+  into its own `frame_decoder`. No separate aggregator node needed for a
+  small cluster.
+- **Offloading *reduces* the ingest P4's Core 1 load** — it sheds the
+  expensive worker bursts it can't process anyway. Core 0 (~35% idle)
+  hosts the SPI-master offload as a DMA-driven low-priority task; the
+  burst is already in PSRAM, so shipping it adds ~160 KB/s of PSRAM read
+  per adjunct (negligible vs the ~50–70 MB/s already flowing).
+
+**QoS refinement (recommended).** The tagger gives an SNR per burst.
+Process the **highest-SNR bursts locally** (most likely real) and ship
+the marginal ones to adjuncts. Then even if an adjunct is slow or absent,
+the high-value bursts are never the ones dropped — graceful degradation
+instead of FIFO loss.
+
+**Why the existing multi-receiver doc discarded this and why it's wrong
+to here.** That doc's "Option B-2: ship tagged bursts" was rejected
+because it assumed *one aggregator runs every receiver's worker*
+(N × 150/s × 50 ms = doesn't fit). Topology C is the opposite shape: each
+adjunct is a **1:1 (or 1:few) co-processor for one ingest node's
+overflow**, not a central aggregator for N receivers. Per-adjunct load is
+bounded by the adjunct's own throughput; you scale decode depth by adding
+adjuncts (1 ingest + k adjuncts ≈ (k+1)× worker capacity on one band).
+
+**This is the right answer to "process some locally, some on an adjunct."**
+It is more SPI-friendly than Topology A (bursty 160 KB/s vs continuous
+5 MB/s), needs **no channelizer** and **no second SDR**, attacks the
+actual measured bottleneck (`worker_dropped`), and reuses the existing
+single-P4 firmware almost verbatim — the adjunct *is* the current worker
+pipeline behind an SPI-slave burst intake, and the ingest P4 is the
+current firmware plus an overflow-shipping branch on the burst queue.
+
+It composes with the others: Topology C deepens each band; run it under a
+Topology B array to get both wider coverage *and* deeper per-band decode.
+
 ## 5. What v3.1 silicon changes
 
 v3.1 (400 MHz cores; MSPI-750 / APM-560 fixed) materially improves the
@@ -199,20 +275,35 @@ between chips.
 
 ## 7. Recommendation
 
-1. **Default to Topology B** ([`multi-receiver-spi-aggregator-design.md`](./multi-receiver-spi-aggregator-design.md)):
-   N RTL-SDR-per-P4 workers fanning decoded-frame PDUs into an
-   aggregator. It is cheaper, the interconnect is trivial, and it
-   reuses the existing single-P4 firmware almost unchanged. For "see
-   more of the band / decode more," this is the answer.
+The three topologies answer different goals — they are not competing for
+the same job:
 
-2. **Reserve the HydraSDR (Topology A) for coherence-driven goals** —
+| Goal | Topology | Why |
+|---|---|---|
+| Decode **more of one band** (beat `worker_dropped`) | **C — local + adjunct offload** | Attacks the measured worker bottleneck; bursty 160 KB/s/adjunct SPI; one SDR; reuses current firmware |
+| **Wider** coverage, cheaply | **B — RTL-per-worker, fan frames in** | Trivial interconnect; cheap SDRs; existing doc |
+| **Coherent** wideband (DF, seamless, one RF chain) | **A — HydraSDR, fan IQ out** | Only option for coherence, but fights the interconnect |
+
+1. **For "process some locally, some on an adjunct" → Topology C (§4.4).**
+   This is the most pragmatic multi-P4 option and the only one that
+   targets the *measured* limit (the worker, not ingest). Start here if
+   the goal is decode depth on a band one P4 can't fully drain. It needs
+   no HydraSDR and no channelizer — the adjunct is the current worker
+   pipeline behind an SPI-slave burst intake; the ingest P4 is current
+   firmware plus an overflow branch on the burst queue (+ optional
+   SNR-priority QoS).
+
+2. **For wider coverage cheaply → Topology B** ([`multi-receiver-spi-aggregator-design.md`](./multi-receiver-spi-aggregator-design.md)):
+   N RTL-SDR-per-P4 workers fanning decoded-frame PDUs into an
+   aggregator. Compose it with C (B widens, C deepens each band).
+
+3. **Reserve the HydraSDR (Topology A) for coherence-driven goals** —
    seamless coverage, phase-coherent wideband, single RF chain. It is
    not a throughput win on its own and it fights the P4's interconnect.
-
-3. **If Topology A is pursued, gate it on v3.1 silicon** for the
-   ingest/channelizer node (400 MHz + USB-DMA-to-PSRAM), accept a
-   dedicated channelizer node, and budget a **faster-than-GPSPI**
-   IQ-distribution fabric — one ~2.5 MHz subband per high-speed link.
+   If pursued, gate it on v3.1 silicon for the ingest/channelizer node
+   (400 MHz + USB-DMA-to-PSRAM), accept a dedicated channelizer node, and
+   budget a **faster-than-GPSPI** IQ-distribution fabric — one ~2.5 MHz
+   subband per high-speed link.
 
 4. **The firmware port is real regardless of topology choice for
    HydraSDR:** a `libhydrasdr` command layer + a real→complex
@@ -230,7 +321,27 @@ between chips.
 
 ## 8. Open questions to resolve before any code
 
-1. **Real measured Core 0 processing ceiling** — the ~2.5–3 MSPS wall is
+### Topology C (try first — it's the closest to shippable)
+
+1. **SPI-slave burst intake on the adjunct** — the adjunct must accept an
+   8 KB burst PDU over SPI and feed it into the existing `burst_pipeline`.
+   Which core hosts the SPI-slave task (multi-receiver doc open risk #1
+   applies)? On the adjunct Core 1 is the worker; the SPI-slave intake
+   likely lives on Core 0. Needs a budget check.
+2. **Overflow decision + SNR-priority on the ingest P4** — where on the
+   burst-queue path does the keep-local-vs-ship choice go, and does the
+   SNR-priority variant cost enough Core 0 to matter? Cheap on paper;
+   confirm.
+3. **Burst-PDU shape and worst case** — fix the wire format (descriptor +
+   decimated 250 ksps window). Typical ~8 KB; cap or fragment the rare
+   multi-frame burst (up to ~250 KB) so it can't stall the SPI link.
+4. **Round-trip latency budget** — burst out + decode + frame back adds
+   an SPI hop to the ~60–200 ms worker latency. Fine for ACARS;
+   measure it.
+
+### Topologies A / B
+
+5. **Real measured Core 0 processing ceiling** — the ~2.5–3 MSPS wall is
    estimated from the FFT budget. Confirm with a bench sweep of
    `FBT_FFT_SIZE` / sample-rate against real-time before sizing any
    multi-board split.
