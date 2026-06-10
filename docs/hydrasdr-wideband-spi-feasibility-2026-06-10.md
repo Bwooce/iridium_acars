@@ -231,6 +231,80 @@ current firmware plus an overflow-shipping branch on the burst queue.
 It composes with the others: Topology C deepens each band; run it under a
 Topology B array to get both wider coverage *and* deeper per-band decode.
 
+### 4.5 "Process all channels at once" — detection is the wall, not decode
+
+The motivating goal for the HydraSDR is to **process the entire ~10 MHz
+Iridium band in real-time from one coherent capture and hand off frames**.
+The reason this is hard is *not* the frame handoff (Topology C makes that
+trivial). It's that "process all channels" splits into two problems that
+distribute very differently:
+
+- **Detection (the tagger):** find bursts against the noise floor across
+  the whole band. **Must run on the raw sample stream.** Cost scales with
+  *bandwidth* — the full ~10 MHz is ~4× the 2.5 MHz one P4's Core 0
+  already nearly fills (the tagger FFT + per-bin EMA baseline is the
+  documented Core 0 real-time bottleneck). A wideband tagger over 10 MHz
+  is **~4–5× one P4's tagger budget** — one chip cannot run it in
+  real-time, on v1 *or* v3.1.
+- **Decode (the worker):** turn a *detected* burst into a frame. Cost
+  scales with *burst rate*, and a burst is ~1% of the stream. This is
+  what Topology C ships as 8 KB PDUs and distributes linearly. **This part
+  is solved.**
+
+So the binding constraint is **wideband detection**, and it creates a
+trap specific to a single wide SDR:
+
+1. **You can't run the full-band tagger on the one ingest chip** — it's
+   4–5× over Core 0 budget. (And on v1 you can't even *ingest* 10 MSPS:
+   ~20 MB/s exceeds the ~8–15 MB/s firmware ingest ceiling. v3.1's
+   USB-DMA-to-PSRAM is required just to capture the stream — see §5.)
+2. **You can't distribute the detection without moving the firehose.**
+   Splitting detection across N nodes means fanning the ~20 MB/s wideband
+   stream (or its channelized subbands) out to them — and one ingest chip
+   **cannot push 20 MB/s over its 2–3 free SPI links at ~5 MB/s each**
+   (§4.1–4.2). Channelization is itself the same per-sample DSP the chip
+   has no spare cycles for.
+
+In short: **a single wide SDR funnels all the samples through one chip's
+I/O — and that is exactly the chip that can neither run full-band
+detection nor redistribute the stream fast enough to offload it.** The
+per-burst decode handoff you asked about is the easy half; the half that
+doesn't close is getting *detection* done across the whole band.
+
+(Note also that one HydraSDR at its 10 MSPS max yields ~9 MHz usable —
+most of the 10.5 MHz Iridium allocation, not quite all of it. A second
+capture or a slightly narrower goal closes that, but it's a side issue
+next to the detection wall.)
+
+**What actually closes "process all channels in real-time":**
+
+- **Split the SDR, not the stream (Topology B is the real answer).** Give
+  each P4 its own RTL-SDR tuned to its own ~2.5 MHz slice. Each chip
+  detects *and* decodes only the samples it captured — **no wideband data
+  ever has to be redistributed.** Four RTL-SDRs on four P4s cover the band
+  and each runs comfortably within its own budget. This is precisely why
+  the P4's interconnect model "wants" the SDR split across the processing
+  nodes. The coherence you'd get from one HydraSDR is the price.
+- **Or use a bigger host for the wideband node.** If a single coherent
+  capture is non-negotiable, the ingest+detect+distribute node should be
+  something with real I/O bandwidth — a Linux SBC (Pi-class) that runs the
+  wideband channelizer/tagger and fans *detected bursts* out over Ethernet
+  to P4 decode workers (the workers stay useful as cheap Topology-C-style
+  decode nodes). At that point the P4 is the *worker*, not the wideband
+  brain.
+- **Or accept a narrower coherent band.** A v3.1 P4 might ingest and
+  detect ~2.5–3 MHz coherently from a HydraSDR (a slice, not the whole
+  band) and deepen it with Topology C adjuncts. That buys HydraSDR
+  coherence over a fraction of the band, not "all channels."
+
+**Bottom line for the HydraSDR-everything goal:** the frame handoff is
+fine; the wideband **burst detection** is what a P4 cluster can't do from
+a single SDR, because detection needs every sample and the samples are
+trapped on the one chip that can't process or redistribute them at full
+band. To process all channels in real-time, either split the capture
+across the processing nodes (N SDRs, Topology B) or put a more capable
+host on the wideband front end.
+
 ## 5. What v3.1 silicon changes
 
 v3.1 (400 MHz cores; MSPI-750 / APM-560 fixed) materially improves the
@@ -281,8 +355,8 @@ the same job:
 | Goal | Topology | Why |
 |---|---|---|
 | Decode **more of one band** (beat `worker_dropped`) | **C — local + adjunct offload** | Attacks the measured worker bottleneck; bursty 160 KB/s/adjunct SPI; one SDR; reuses current firmware |
-| **Wider** coverage, cheaply | **B — RTL-per-worker, fan frames in** | Trivial interconnect; cheap SDRs; existing doc |
-| **Coherent** wideband (DF, seamless, one RF chain) | **A — HydraSDR, fan IQ out** | Only option for coherence, but fights the interconnect |
+| **All channels at once**, real-time (the stated goal) | **B — RTL-per-worker, fan frames in** | Detection must run on the samples; split the SDR so each P4 detects+decodes its own slice — no firehose to redistribute (§4.5) |
+| **Coherent** wideband (DF, seamless, one RF chain) | **A — HydraSDR**, but **not on a P4 cluster** | One SDR funnels all samples through one chip that can't run full-band detection or fan the stream out (§4.5); needs a bigger wideband host |
 
 1. **For "process some locally, some on an adjunct" → Topology C (§4.4).**
    This is the most pragmatic multi-P4 option and the only one that
