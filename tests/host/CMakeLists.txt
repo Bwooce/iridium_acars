@@ -260,6 +260,12 @@ target_include_directories(test_pipeline_wideband_resampled PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 target_link_libraries(test_pipeline_wideband_resampled PRIVATE m)
+# Self-contained (baked fixture_albq_raw.h, no iridium-extractor), so
+# unlike test_pipeline_wideband_albq it CAN run in CI. It's the most
+# complete end-to-end path we have — register it with its decode-count
+# floor. (The gri-golden _albq variant stays build-only; it needs
+# iridium-extractor to generate its cf32 input.)
+add_test(NAME pipeline_wideband_resampled COMMAND test_pipeline_wideband_resampled)
 
 # Drift + AWGN parameter-sweep regression (#121). Same wideband pipeline
 # as test_pipeline_wideband_resampled, but each cell applies a synthetic

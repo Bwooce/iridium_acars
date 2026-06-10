@@ -190,5 +190,20 @@ int main(void)
     free(window_25);
     free(iq25);
     free(iq256);
+
+    // Regression floor. This is the most complete self-contained
+    // end-to-end test (tagger → decim → resample → rotate → UW →
+    // demod → BCH, all on a baked fixture, no external tools) so it's
+    // wired into ctest as a decode-count gate. Steady state decodes 63
+    // on the ALBQ fixture; gri-equivalent is 56. Floor of 55 leaves
+    // run-to-run margin while still catching a pipeline regression
+    // (anything that knocks several frames out of the chain).
+    const int DECODE_FLOOR = 55;
+    if (decoded < DECODE_FLOOR) {
+        printf("\nFAIL: decoded %d < floor %d — pipeline regressed\n",
+               decoded, DECODE_FLOOR);
+        return 1;
+    }
+    printf("\nPASS: decoded %d (floor %d)\n", decoded, DECODE_FLOOR);
     return 0;
 }
