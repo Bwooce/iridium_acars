@@ -360,29 +360,44 @@ project requirement. The current single-RTL firmware and Topologies B and
 C all run fine on **v1**. v3.1 is required for **one thing only: a single
 node ingesting the full-band ~20 MB/s HydraSDR USB stream.** The rationale:
 
-**The binding v1 limit is structural, not clock speed.** On v1 the
-MSPI-750 / APM-560 errata force every USB-DMA buffer into **internal
-SRAM**, followed by a **mandatory AXI-GDMA copy into the PSRAM ring**
-(this is exactly what `CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n` and
-`signal_buffer_push`'s GDMA path *are*). Two consequences make 20 MB/s
-infeasible on v1:
+**The binding v1 limit is structural — but, correcting an earlier
+overstatement, it is *not* errata-forced.** MSPI-750 (the USB/SDMMC
+unaligned-DMA-into-PSRAM stale-read bug) is **v3.0-only — it does not
+affect v1.x** (confirmed against the ESP-Chip-Errata v1.0 tag; the only
+v1 errata are APM-560, I2C-308, RMT-176, none a USB/PSRAM-DMA correctness
+bug). So on v1 the **internal-SRAM-stage + AXI-GDMA-copy ingest path**
+(`CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n` + `signal_buffer_push`'s
+GDMA path) is the **IDF default plus a deliberate performance/forward-
+compat choice**, not an erratum mandate. The structural cost is still
+real, though, and is what caps v1 at full-band rates:
 
 1. **The copy doubles PSRAM traffic on the ingest leg.** Every USB byte is
    written to PSRAM by GDMA (a read of the internal staging buffer + a
    write to the ring) *on top of* the convert/resample passes. At the
    ~10–14× write-amplification of the full path, 20 MB/s input → ~200–280
    MB/s PSRAM traffic — **at or over the measured ~185 MB/s effective
-   single-stream PSRAM bandwidth.** The GDMA copy is a large, removable
-   chunk of that.
+   single-stream PSRAM bandwidth.** The GDMA copy is a large chunk of that.
 2. **The internal-SRAM URB pool can't go deep enough.** DMA-capable
    internal SRAM is scarce (~64 KB pool today, ~70 KB free pre-stream, and
    the wideband statics already eat the budget). A 20 MB/s stream needs a
    much deeper in-flight pool to ride out consumer stalls, and there is no
    internal SRAM to grow it into.
 
+**Could v1 just drop the copy?** Since MSPI-750 doesn't apply to v1, you
+*could* flip the cap on and let the USB AHB master write PSRAM directly —
+it is not errata-blocked. But it is **Espressif-unvalidated on v1** (their
+USB-in-PSRAM CI only runs v3.1), it **adds an AHB master to the
+documented PSRAM-contention ceiling**, and the USB AHB master is **less
+efficient at PSRAM writes than the AXI-GDMA** the current path uses — so
+on v1 it is plausibly a *regression*, not a win, which is why the current
+staging+GDMA design is the right v1 choice regardless of the errata. The
+upshot is the same either way: **v1's internal pool depth and PSRAM
+contention cap it below ~20 MB/s.**
+
 **v3.1 removes both at once, and that is the whole point:**
 
-- The errata fix makes **USB-DMA-direct-to-PSRAM** safe → the DWC OTG
+- The errata fix makes **USB-DMA-direct-to-PSRAM** safe *and validated* →
+  the DWC OTG
   writes USB data straight into the PSRAM ring. The **GDMA copy
   disappears** (numerator: ~2–4× less PSRAM traffic, one fewer bus master
   contending) **and** the **URB pool can live in PSRAM** (depth no longer
@@ -391,10 +406,13 @@ infeasible on v1:
   ~400 MB/s raw class (denominator).
 
 So v3.1 attacks the 20 MB/s ingest from **both sides** — less traffic
-(no copy) and more bandwidth (bursts) — turning full-band ingest from
-over-ceiling on v1 to comfortable. **No amount of v1 tuning substitutes**,
-because the copy and the internal-pool cap are imposed by the errata
-hardening, not by our code.
+(no copy) and more bandwidth (bursts) — *and* makes the direct-to-PSRAM
+path Espressif-validated instead of a risky v1 experiment. v1 can't match
+that: dropping the copy there is unvalidated and likely a contention
+regression (above), and the internal-pool depth can't grow into the
+scarce internal SRAM. The cap is set by the **scarce internal pool +
+PSRAM contention**, not by an erratum — so the fix is the silicon's
+direct-PSRAM/INCR-burst hardware, which only v3.1 provides safely.
 
 **What v3.1 does *not* buy, and why the +11% clock is a red herring here:**
 the 360 → 400 MHz bump is real but small. It does **not** lift the

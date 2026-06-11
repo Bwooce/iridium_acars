@@ -56,16 +56,30 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 # annotations have no effect without this gate.
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
-# Disabled to harden against ESP32-P4 v1.3 silicon errata MSPI-750 +
-# APM-560 (memory/project_p4_errata_status.md). When ON, the option
-# allows usb_host_transfer_alloc(..., USB_TRANSFER_FLAG_ALLOC_DMA, ...)
-# callers to opt buffers INTO PSRAM. We never call with that flag
-# today (all our calls use flag = 0 → internal SRAM), so disabling
-# the capability is a no-op for current code. Disabling removes the
-# trip-wire: a future hub-support / large-control-transfer change that
-# sets ALLOC_DMA would otherwise silently land USB-DMA buffers in
-# PSRAM, opening MSPI-750 (USB-DMA isn't 4-byte-aware) and APM-560
-# (concurrent AHB master into PSRAM alongside our AXI-GDMA ring).
+# Kept at the IDF default (n). ERRATA ATTRIBUTION CORRECTION (2026-06):
+# MSPI-750 (USB/SDMMC unaligned DMA reads return stale PSRAM data) is a
+# v3.0-ONLY erratum — it does NOT affect our v1.x silicon. Verified
+# against the ESP-Chip-Errata v1.0 tag: the only v1 errata are APM-560,
+# I2C-308, RMT-176, none of which is a USB/PSRAM-DMA correctness bug.
+# (MSPI-749/750/751 are introduced in v3.0 and fixed in v3.1.) So on v1
+# this setting is NOT errata-mandated. We keep it off for two reasons
+# that ARE valid:
+#   1. Performance: USB DMA lands in internal SRAM and signal_buffer_push
+#      moves it to the PSRAM ring via AXI-GDMA — the measured biggest
+#      single throughput win. Letting the USB AHB master write PSRAM
+#      directly adds a contender to the PSRAM-contention ceiling and is
+#      less efficient than AXI-GDMA for the ring write — plausibly a
+#      regression on v1, not a win.
+#   2. Forward-compat trip-wire: a future hub-support / large-control-
+#      transfer change that sets USB_TRANSFER_FLAG_ALLOC_DMA would
+#      silently land USB-DMA buffers in PSRAM. Harmless on v1, but on a
+#      v3.0 part it WOULD open MSPI-750 (unfixed until v3.1). Off is the
+#      safe default across every revision we might run on.
+# We never pass ALLOC_DMA today (all calls use flag = 0 → internal SRAM),
+# so this is a no-op for current code either way. APM-560 (the real v1
+# erratum) only fires on an APM permission *violation*, which a correctly
+# authorized access never triggers (IDF's default APM config handles it),
+# so it is not a reason this must be off.
 CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n
 
 # Bigger L2 cache. Default was 128 KB; baseline[] (8 KB) + magnitudes[] (8 KB)

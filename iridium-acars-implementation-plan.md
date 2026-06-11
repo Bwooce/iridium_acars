@@ -266,9 +266,11 @@ Discovered 2026-05-23 while attempting pipelined tagger. PIE asm
 `esp.vld.128.ip` produces silently wrong output when
 `s_coeffs_pp` lands at certain HP-SRAM addresses (e.g.,
 0x4ff737e0). Decode collapses matched=61→44 with no other
-symptom. Not in the official ESP32-P4 v1.3 errata list; fits the
-pattern of "silent bus/address corruption on v1.3 silicon"
-alongside MSPI-750, APM-560, and IDF #18235.
+symptom. Not in the official ESP32-P4 v1.x errata list; fits the
+pattern of "silent bus/address corruption on early P4 silicon."
+(Of the things once listed alongside it here: APM-560 IS a real v1
+erratum; MSPI-750 is NOT — it's v3.0-only, so it does not belong in a
+v1 corruption-pattern list. IDF #18235 is a separate IDF-side issue.)
 
 Workaround in commit `cfd2739`: new `resample_256_to_250_alloc_coeffs()`
 called as FIRST internal-SRAM consumer in boot, deterministically

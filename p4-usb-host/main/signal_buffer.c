@@ -11,20 +11,22 @@
 
 static const char *TAG = "SIG_BUF";
 
-// ESP32-P4 v1.3 silicon errata MSPI-750 guardrail. The PSRAM DMA path
-// requires byte-aligned bursts; our PSRAM writes here use 4-byte
-// alignment (n_samples * 4 bytes per transfer, head_bytes = head * 4
-// for the destination offset) which is enough as long as IDF GDMA
-// keeps weighted-arbitration OFF. If a future build turns on
-// CONFIG_GDMA_ENABLE_WEIGHTED_ARBITRATION, GDMA will raise the
-// required alignment to dma_burst_size (= 64 below) and our 4-byte-
-// multiple lengths could fail validation, silently dropping into a
-// slow fallback or returning an error. Catch that at compile time.
+// AXI-GDMA alignment guardrail. (NB: this is NOT an MSPI-750 guard, as
+// an earlier comment claimed — MSPI-750 is a v3.0-only erratum and does
+// not affect our v1.x silicon; it's also about USB/SDMMC unaligned reads,
+// not GDMA writes.) The real concern is purely GDMA arbitration mode: our
+// PSRAM writes use 4-byte alignment (n_samples * 4 bytes per transfer,
+// head_bytes = head * 4 for the destination offset), which GDMA accepts
+// while weighted-arbitration is OFF. If a future build turns on
+// CONFIG_GDMA_ENABLE_WEIGHTED_ARBITRATION, GDMA raises the required
+// alignment to dma_burst_size (= 64 below) and our 4-byte-multiple
+// lengths could fail validation, silently dropping into a slow fallback
+// or returning an error. Catch that at compile time.
 #ifdef CONFIG_GDMA_ENABLE_WEIGHTED_ARBITRATION
 _Static_assert(0,
-               "GDMA weighted arbitration changes alignment requirements; review "
+               "GDMA weighted arbitration raises alignment to dma_burst_size; review "
                "signal_buffer_push's 4-byte multiples vs dma_burst_size=64 before "
-               "enabling. See memory/project_p4_errata_status.md (MSPI-750).");
+               "enabling.");
 #endif
 
 // 4 MB circular buffer in PSRAM. int16 IQ pairs:
