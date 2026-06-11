@@ -353,6 +353,75 @@ Net: v3.1 makes a single P4 a *viable channelizer/ingest node* for
 Topology A (it can ingest 10 MSPS and have cycles to channelize), which
 on v1 it cannot. It does not let one P4 fully process the wide band.
 
+### 5.1 Why v3.1 is *required* (and for exactly what)
+
+"Must have v3.1" is a narrow, specific claim — it is **not** a general
+project requirement. The current single-RTL firmware and Topologies B and
+C all run fine on **v1**. v3.1 is required for **one thing only: a single
+node ingesting the full-band ~20 MB/s HydraSDR USB stream.** The rationale:
+
+**The binding v1 limit is structural, not clock speed.** On v1 the
+MSPI-750 / APM-560 errata force every USB-DMA buffer into **internal
+SRAM**, followed by a **mandatory AXI-GDMA copy into the PSRAM ring**
+(this is exactly what `CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n` and
+`signal_buffer_push`'s GDMA path *are*). Two consequences make 20 MB/s
+infeasible on v1:
+
+1. **The copy doubles PSRAM traffic on the ingest leg.** Every USB byte is
+   written to PSRAM by GDMA (a read of the internal staging buffer + a
+   write to the ring) *on top of* the convert/resample passes. At the
+   ~10–14× write-amplification of the full path, 20 MB/s input → ~200–280
+   MB/s PSRAM traffic — **at or over the measured ~185 MB/s effective
+   single-stream PSRAM bandwidth.** The GDMA copy is a large, removable
+   chunk of that.
+2. **The internal-SRAM URB pool can't go deep enough.** DMA-capable
+   internal SRAM is scarce (~64 KB pool today, ~70 KB free pre-stream, and
+   the wideband statics already eat the budget). A 20 MB/s stream needs a
+   much deeper in-flight pool to ride out consumer stalls, and there is no
+   internal SRAM to grow it into.
+
+**v3.1 removes both at once, and that is the whole point:**
+
+- The errata fix makes **USB-DMA-direct-to-PSRAM** safe → the DWC OTG
+  writes USB data straight into the PSRAM ring. The **GDMA copy
+  disappears** (numerator: ~2–4× less PSRAM traffic, one fewer bus master
+  contending) **and** the **URB pool can live in PSRAM** (depth no longer
+  capped by internal SRAM).
+- **GDMA INCR4/8/16 bursts** raise effective PSRAM bandwidth toward the
+  ~400 MB/s raw class (denominator).
+
+So v3.1 attacks the 20 MB/s ingest from **both sides** — less traffic
+(no copy) and more bandwidth (bursts) — turning full-band ingest from
+over-ceiling on v1 to comfortable. **No amount of v1 tuning substitutes**,
+because the copy and the internal-pool cap are imposed by the errata
+hardening, not by our code.
+
+**What v3.1 does *not* buy, and why the +11% clock is a red herring here:**
+the 360 → 400 MHz bump is real but small. It does **not** lift the
+~4–5× full-band detection/channelization compute cost — that still has to
+be *distributed* (§4.2, §4.5) on v3.1 just as on v1. So v3.1 is necessary
+for *ingesting* the wide band on one node; it is **not sufficient** for
+*processing* it, and the clock increase is not the reason it's required.
+
+**Corollary — when v3.1 is *not* needed:**
+- **Topology B** (N RTL-SDRs): each node ingests ~5 MB/s over its own USB
+  — well inside the v1 ceiling. No v3.1.
+- **Topology C** (burst offload): adjuncts receive 8 KB bursts over SPI,
+  not a USB firehose. No v3.1.
+- **A narrower HydraSDR capture** (~2.5–5 MHz / 5–10 MB/s): inside or near
+  the v1 ingest ceiling. v3.1 only becomes mandatory at the **full ~10 MHz
+  / ~20 MB/s** single-capture rate.
+- **Broadcast-cluster workers** that ingest over *SPI* rather than USB:
+  their USB port is idle, so the USB errata don't gate them — though SPI-DMA
+  into PSRAM at 20 MB/s wants the same INCR-burst / direct-PSRAM behaviour
+  to be comfortable, so v3.1 still helps the workers, just less decisively
+  than it helps the one USB-ingest node. (Bench-confirm.)
+
+In one line: **v3.1 is mandatory only because, on v1, the USB-DMA errata
+hardening forces an internal-SRAM stage + a GDMA PSRAM copy that together
+cap USB ingest below the full band's ~20 MB/s — and only the errata fix,
+not a faster clock, removes that cap.**
+
 ## 6. Interconnect options (Topology A's broadcast bus)
 
 §4.1 corrects the earlier "~5 MB/s per link" figure: **octal GPSPI at
