@@ -102,47 +102,76 @@ from the RTL multi-receiver doc.
             └──────────────────────────────────────────────────────────────┘
 ```
 
-### 4.1 The SPI interconnect is the deciding factor
+### 4.1 The SPI interconnect — fast enough with quad/octal, but it's not the real wall
 
-From the multi-receiver doc: a P4 SPI link runs **~40 MHz reliable for
-PSRAM-backed transfers ≈ 5 MB/s per CS**. That number governs both
-topologies and it is small relative to raw IQ:
+The multi-receiver doc cited **~40 MHz reliable ≈ 5 MB/s per CS**. That is
+a conservative **single-line** figure and it is the wrong number to plan
+the wideband case around. GPSPI2/3 on the P4 support 1/2/4/8-bit modes:
 
-- **Topology A (fan-out IQ):** each worker needs its ~2.5 MHz subband =
-  **5 MB/s over SPI** — i.e. **one worker saturates one SPI link.** To
-  cover the 10 MHz band you need ~4 workers = 4 high-rate SPI fan-out
-  links off P4 #0. The P4 has only **2–3 free SPI peripherals** (the
-  rest are committed to the C6 wireless co-processor / PSRAM), so one
-  ingest node **cannot cleanly drive 4 saturated fan-out links.** This
-  is the same wall the multi-receiver doc hit when it discarded "Option
-  B-1: ship raw IQ" — shipping IQ over SPI doesn't scale.
+| SPI mode @ 80 MHz | Raw | Sustained (after DMA/txn overhead) |
+|---|---|---|
+| Single-line | 10 MB/s | ~7–9 MB/s |
+| Quad (4-line) | 40 MB/s | ~25–35 MB/s |
+| Octal (8-line) | 80 MB/s | ~50–60 MB/s |
 
-- **Topology B (fan-in frames):** a decoded-frame PDU is ~280 B; even a
-  100×-real-RF flood is <1 Mbps per link (see the multi-receiver doc's
-  Option B-3). The heavy IQ **never crosses the wire** — each worker
-  decodes its own RTL-SDR locally. SPI is trivially adequate.
+(Caveats: slave-side clock limits, signal integrity at 80 MHz over real
+wiring, and DMA pipelining — bench-validate before relying on the top of
+the range.) And SPI is a **shared bus with per-slave CS**, so one octal
+bus carries its aggregate (~50–60 MB/s) across several workers — you do
+**not** need one peripheral per worker. So:
 
-### 4.2 Topology A also needs channelization CPU the ingest node lacks
+- **Topology A fan-out is bandwidth-feasible after all.** Four ~2.5 MHz
+  subbands = ~20 MB/s of channelized distribution fits on a single octal
+  bus (4 CS lines), or you can broadcast the whole ~20 MB/s wideband
+  stream to all workers on one bus and let each pick its slice. The "2–3
+  SPI peripherals can't drive 4 links" objection was wrong — it assumed
+  single-line point-to-point links, not a shared octal bus.
 
-Topology A's P4 #0 must **split the wideband capture into per-worker
-subbands** before fan-out (you can't ship the full 20 MB/s wideband
-stream over any one SPI link). That's a polyphase/FFT channelizer —
-exactly the kind of per-sample DSP that Core 0 has **no spare cycles
-for** (it's already at ~60% of budget just ingesting, and the prior
-channelizer was removed in Phase 3.6.M). So Topology A needs *either*:
+- **Topology B (fan-in frames)** is, as before, trivial — 280 B PDUs, the
+  heavy IQ never crosses the wire.
 
-- a **dedicated channelizer P4** between the SDR host and the workers
-  (now 1 ingest + 1 channelizer + N workers + 1 aggregator), or
-- **v3.1 silicon** on the ingest node (400 MHz + USB-DMA-direct-to-PSRAM
-  removing the GDMA copy and the internal-pool limit — see §5), which
-  frees enough headroom to channelize while ingesting.
+**So the link is not the binding constraint.** Correcting that moves the
+wall to where it actually is — the *compute* (§4.2, §4.5): someone still
+has to channelize/detect 10 MHz of samples, and faster SPI does nothing
+for that.
+
+### 4.2 The real wall: channelization/detection CPU, not the link
+
+With fast SPI (§4.1) the data *can* move; the question is who does the
+per-sample DSP to turn 10 MHz of samples into per-channel bursts. There
+are two shapes, and each has a compute cost the link speed doesn't touch:
+
+- **Centralized channelize + fan-out.** One node runs a polyphase/FFT
+  channelizer, splitting all ~4 subbands in one pass (~1.2× one tagger —
+  efficient), and fans the subbands out over an octal bus. But that node
+  is *also* the USB ingest node, and on v1 Core 0 is already ~60% busy
+  just ingesting (and can't ingest 20 MB/s at all — §2). It needs
+  **v3.1** (400 MHz + USB-DMA-to-PSRAM frees the ingest cost) to have any
+  hope of ingest + channelize on one chip, or a **dedicated channelizer
+  node** between the SDR host and the workers.
+- **Broadcast + per-worker DDC.** Skip central channelization: broadcast
+  the full ~20 MB/s wideband stream to all workers on one octal bus; each
+  worker digitally down-converts and decimates *its own* ~2.5 MHz slice,
+  then runs its normal tagger + worker. The catch: every worker now pays
+  a **DDC over the full 10 MSPS input** (≈ tagger-scale work, done ×4
+  redundantly across the cluster) *plus* SPI-ingesting 20 MB/s — roughly
+  **2× a normal worker P4's load**. Whether that fits is a **v3.1 per-chip
+  budget question**, not a link question.
+
+Either way the binding constraint is **compute**: the full-band
+channelize/detect is ~4–5× one P4's tagger budget (§4.5), and the only
+way to distribute it without one chip running all of it is the broadcast
+shape — which trades the central bottleneck for redundant per-worker DDC.
+Faster SPI is what makes that trade *possible*; it doesn't make it *free*.
 
 ### 4.3 When is Topology A (HydraSDR) actually worth it?
 
 On pure "more channels" grounds, **Topology B wins**: N cheap RTL-SDRs
-fanning 280 B frames in is cheaper and far easier on the interconnect
-than one HydraSDR fanning 5 MB/s IQ slices out. The HydraSDR only earns
-its place when its **single coherent wideband capture** matters:
+fanning 280 B frames in is cheaper and avoids paying the full-band
+channelize/detect cost entirely — each chip only ever touches its own
+slice. One HydraSDR has to channelize/detect the whole band somewhere
+(§4.2), even though octal SPI can carry the data. The HydraSDR only earns
+that extra cost when its **single coherent wideband capture** matters:
 
 - **Seamless coverage / no seam gaps.** N independent RTL-SDRs have N
   independent LOs and clocks; subband edges have to overlap-with-margin
@@ -190,10 +219,11 @@ exactly what an adjunct P4 provides.
   expensive stage (the UW correlator's multiple 2048-pt FFTs, which
   dominate the ~50 ms/burst).
 - **Flow-controlled to adjunct capacity.** You ship only as fast as the
-  adjunct's queue drains (~20 bursts/sec), so each adjunct SPI link
-  carries ~20 × 8 KB = **~160 KB/s** — trivially within the ~5 MB/s SPI
-  budget, and *self-throttling* (no risk of flooding the link). This is
-  the decisive difference from Topology A's 5 MB/s continuous IQ stream.
+  adjunct's queue drains (~20 bursts/sec), so each adjunct link carries
+  ~20 × 8 KB = **~160 KB/s** — a rounding error on any SPI mode, and
+  *self-throttling* (no risk of flooding the link). It needs no wideband
+  channelization and no continuous high-rate stream — the cheapest
+  inter-chip shape of all three topologies.
 - **The ingest P4 doubles as aggregator.** It already runs
   `frame_decoder` + `msg_ring` + `acars_push`. The adjunct returns the
   same 280 B post-BCH frame PDU as Topology B, which the ingest P4 feeds
@@ -221,8 +251,9 @@ bounded by the adjunct's own throughput; you scale decode depth by adding
 adjuncts (1 ingest + k adjuncts ≈ (k+1)× worker capacity on one band).
 
 **This is the right answer to "process some locally, some on an adjunct."**
-It is more SPI-friendly than Topology A (bursty 160 KB/s vs continuous
-5 MB/s), needs **no channelizer** and **no second SDR**, attacks the
+It is gentler on the link than Topology A (bursty, self-throttled
+160 KB/s/adjunct vs continuous wideband), needs **no channelizer** and
+**no second SDR**, attacks the
 actual measured bottleneck (`worker_dropped`), and reuses the existing
 single-P4 firmware almost verbatim — the adjunct *is* the current worker
 pipeline behind an SPI-slave burst intake, and the ingest P4 is the
@@ -251,59 +282,56 @@ distribute very differently:
   what Topology C ships as 8 KB PDUs and distributes linearly. **This part
   is solved.**
 
-So the binding constraint is **wideband detection**, and it creates a
-trap specific to a single wide SDR:
+So the binding constraint is **wideband detection compute** (not the
+link — §4.1 fixed that). Detection needs every sample, and the full-band
+channelize/detect is ~4–5× one P4's tagger budget. With fast SPI there
+are now two ways to distribute it (§4.2), each gated on compute:
 
-1. **You can't run the full-band tagger on the one ingest chip** — it's
-   4–5× over Core 0 budget. (And on v1 you can't even *ingest* 10 MSPS:
-   ~20 MB/s exceeds the ~8–15 MB/s firmware ingest ceiling. v3.1's
-   USB-DMA-to-PSRAM is required just to capture the stream — see §5.)
-2. **You can't distribute the detection without moving the firehose.**
-   Splitting detection across N nodes means fanning the ~20 MB/s wideband
-   stream (or its channelized subbands) out to them — and one ingest chip
-   **cannot push 20 MB/s over its 2–3 free SPI links at ~5 MB/s each**
-   (§4.1–4.2). Channelization is itself the same per-sample DSP the chip
-   has no spare cycles for.
+1. **Centralized channelize + octal-bus fan-out.** Needs **v3.1** (one
+   chip can't ingest 20 MB/s *and* channelize on v1). Plausible on v3.1
+   if ingest+channelize fits one chip — a bench question.
+2. **Broadcast the wideband stream + per-worker DDC.** The octal bus can
+   carry it; each worker DDCs its own slice. Costs each worker ~2× a
+   normal load (full-rate DDC + SPI-ingest + tagger + worker) — also a
+   v3.1 per-chip budget question.
 
-In short: **a single wide SDR funnels all the samples through one chip's
-I/O — and that is exactly the chip that can neither run full-band
-detection nor redistribute the stream fast enough to offload it.** The
-per-burst decode handoff you asked about is the easy half; the half that
-doesn't close is getting *detection* done across the whole band.
+So this is **no longer a flat "no."** It's "plausible on v3.1, gated on
+whether the channelization compute fits per-chip" — bench-measurable, not
+ruled out. What stays true: **on v1 it doesn't close** (can't even ingest
+20 MB/s; no Core 0 cycles to channelize), and **even on v3.1 someone pays
+the ~4–5× full-band detection cost** — you're trading a central
+bottleneck for redundant per-worker DDC, and the cluster has to be sized
+for it.
 
 (Note also that one HydraSDR at its 10 MSPS max yields ~9 MHz usable —
 most of the 10.5 MHz Iridium allocation, not quite all of it. A second
-capture or a slightly narrower goal closes that, but it's a side issue
-next to the detection wall.)
+capture or a slightly narrower goal closes that.)
 
-**What actually closes "process all channels in real-time":**
+**Three ways to "process all channels in real-time," cheapest-first:**
 
-- **Split the SDR, not the stream (Topology B is the real answer).** Give
-  each P4 its own RTL-SDR tuned to its own ~2.5 MHz slice. Each chip
-  detects *and* decodes only the samples it captured — **no wideband data
-  ever has to be redistributed.** Four RTL-SDRs on four P4s cover the band
-  and each runs comfortably within its own budget. This is precisely why
-  the P4's interconnect model "wants" the SDR split across the processing
-  nodes. The coherence you'd get from one HydraSDR is the price.
-- **Or use a bigger host for the wideband node.** If a single coherent
-  capture is non-negotiable, the ingest+detect+distribute node should be
-  something with real I/O bandwidth — a Linux SBC (Pi-class) that runs the
-  wideband channelizer/tagger and fans *detected bursts* out over Ethernet
-  to P4 decode workers (the workers stay useful as cheap Topology-C-style
-  decode nodes). At that point the P4 is the *worker*, not the wideband
-  brain.
-- **Or accept a narrower coherent band.** A v3.1 P4 might ingest and
-  detect ~2.5–3 MHz coherently from a HydraSDR (a slice, not the whole
-  band) and deepen it with Topology C adjuncts. That buys HydraSDR
-  coherence over a fraction of the band, not "all channels."
+- **Split the SDR, not the stream (Topology B — still the simplest).** N
+  RTL-SDRs, each P4 detects *and* decodes its own ~2.5 MHz slice; **no
+  wideband data is ever redistributed** and no chip pays the full-band
+  detection cost. Cheapest and lowest-risk; the price is losing the
+  HydraSDR's coherent single capture.
+- **HydraSDR + v3.1 broadcast cluster (now on the table thanks to octal
+  SPI).** One HydraSDR → v3.1 ingest node broadcasts the wideband stream
+  over an octal bus → v3.1 workers each DDC + detect + decode their slice.
+  Keeps coherence; costs ~2× per-worker load and v3.1 hardware; needs the
+  `libhydrasdr` port (§3). The viability hinges on the per-chip DDC budget
+  — the open question to settle on the bench.
+- **Or a bigger wideband host.** If even the v3.1 cluster doesn't budget
+  out, a Linux SBC (Pi-class) runs the channelizer/tagger and fans
+  *detected bursts* to P4 decode workers (Topology-C style) over Ethernet.
+  P4s stay useful as cheap decode nodes; the SBC is the wideband brain.
 
 **Bottom line for the HydraSDR-everything goal:** the frame handoff is
-fine; the wideband **burst detection** is what a P4 cluster can't do from
-a single SDR, because detection needs every sample and the samples are
-trapped on the one chip that can't process or redistribute them at full
-band. To process all channels in real-time, either split the capture
-across the processing nodes (N SDRs, Topology B) or put a more capable
-host on the wideband front end.
+the easy half. Faster SPI removes the link objection, so the remaining
+question is purely **compute** — can a v3.1 cluster absorb the ~4–5×
+full-band detection cost (centralized on one chip, or as redundant
+per-worker DDC off a broadcast bus)? On v1, no. On v3.1, plausibly yes
+but the cluster must be sized for it and it needs the HydraSDR port —
+worth a bench prototype rather than a dismissal.
 
 ## 5. What v3.1 silicon changes
 
@@ -325,27 +353,29 @@ Net: v3.1 makes a single P4 a *viable channelizer/ingest node* for
 Topology A (it can ingest 10 MSPS and have cycles to channelize), which
 on v1 it cannot. It does not let one P4 fully process the wide band.
 
-## 6. Interconnect alternatives to SPI (if Topology A is pursued)
+## 6. Interconnect options (Topology A's broadcast bus)
 
-The user framing assumes SPI, and §4.1 shows SPI caps Topology A at
-~1 worker per link. If coherent-wideband (Topology A) is genuinely
-needed, the IQ-distribution leg likely wants a **faster interconnect**
-than GPSPI:
+§4.1 corrects the earlier "~5 MB/s per link" figure: **octal GPSPI at
+80 MHz sustains ~50–60 MB/s on one shared bus**, which carries the
+~20 MB/s wideband broadcast (or ~4 channelized subbands) with headroom.
+So the interconnect is **adequate**, not the wall. Options, best-first:
 
-- **OSPI / octal SPI** at higher clocks (the P4's PSRAM-grade MSPI runs
-  at 200 MHz) — but those controllers are committed to PSRAM/flash.
-- **The SDIO link** already used for the C6 (ESP-Hosted) runs ~50 MB/s —
-  enough for a couple of subbands, but it's a host↔single-slave link,
-  not a fan-out bus.
-- **Parallel / I80 LCD-cam interfaces** can move tens of MB/s but are
-  awkward as a multi-drop fabric.
+- **Octal GPSPI broadcast bus** (recommended for Topology A): one MOSI
+  octal bus, all workers clocked in parallel, each reads the full stream
+  and picks its slice. One shared bus, not N point-to-point links — the
+  "2–3 free peripherals" count is irrelevant for a broadcast.
+- **SDIO** (the link already used for the C6, ~50 MB/s) — fine for a
+  point-to-point hop but it's host↔single-slave, not a fan-out bus.
+- **Parallel / I80 LCD-cam** interfaces move tens of MB/s but are awkward
+  as a multi-drop fabric.
 
-None is a clean N-way fan-out. This is the strongest structural argument
-that **a single-wideband-SDR + on-board distribution does not fit the
-P4's interconnect model well**, and that the frame-fan-in topology
-(Topology B) is the architecture the P4 actually wants — it keeps the
-high-bandwidth IQ on-chip with its SDR and only ever ships tiny frames
-between chips.
+The earlier claim that "no clean N-way fan-out exists" was wrong — an
+octal broadcast bus *is* one. The structural argument now is narrower and
+**compute-side**: the bus can move the samples, but someone still pays
+the ~4–5× full-band channelize/detect (§4.2). Topology B remains the
+architecture that *avoids* paying it at all (each chip only ever touches
+its own slice); Topology A *pays* it (centralized or as redundant
+per-worker DDC) in exchange for coherence.
 
 ## 7. Recommendation
 
@@ -355,8 +385,9 @@ the same job:
 | Goal | Topology | Why |
 |---|---|---|
 | Decode **more of one band** (beat `worker_dropped`) | **C — local + adjunct offload** | Attacks the measured worker bottleneck; bursty 160 KB/s/adjunct SPI; one SDR; reuses current firmware |
-| **All channels at once**, real-time (the stated goal) | **B — RTL-per-worker, fan frames in** | Detection must run on the samples; split the SDR so each P4 detects+decodes its own slice — no firehose to redistribute (§4.5) |
-| **Coherent** wideband (DF, seamless, one RF chain) | **A — HydraSDR**, but **not on a P4 cluster** | One SDR funnels all samples through one chip that can't run full-band detection or fan the stream out (§4.5); needs a bigger wideband host |
+| **All channels at once**, real-time, **cheapest** | **B — RTL-per-worker, fan frames in** | No firehose to redistribute; no chip pays full-band detection; lowest risk (§4.5). Price: no coherent capture |
+| **All channels** *coherently*, real-time | **A — HydraSDR + v3.1 broadcast cluster** | Octal SPI carries the broadcast; v3.1 workers DDC their own slice. Viable iff the ~2× per-chip DDC budget fits — bench it (§4.2, §4.5). Needs `libhydrasdr` port |
+| Coherent wideband if the v3.1 cluster won't budget out | **Bigger wideband host (Linux SBC) + P4 decode workers** | SBC runs channelizer/tagger, fans detected bursts to P4s; P4 is the worker, not the brain |
 
 1. **For "process some locally, some on an adjunct" → Topology C (§4.4).**
    This is the most pragmatic multi-P4 option and the only one that
@@ -371,13 +402,13 @@ the same job:
    N RTL-SDR-per-P4 workers fanning decoded-frame PDUs into an
    aggregator. Compose it with C (B widens, C deepens each band).
 
-3. **Reserve the HydraSDR (Topology A) for coherence-driven goals** —
-   seamless coverage, phase-coherent wideband, single RF chain. It is
-   not a throughput win on its own and it fights the P4's interconnect.
-   If pursued, gate it on v3.1 silicon for the ingest/channelizer node
-   (400 MHz + USB-DMA-to-PSRAM), accept a dedicated channelizer node, and
-   budget a **faster-than-GPSPI** IQ-distribution fabric — one ~2.5 MHz
-   subband per high-speed link.
+3. **The HydraSDR (Topology A) is for coherence-driven goals** — seamless
+   coverage, phase-coherent wideband, single RF chain. With octal SPI the
+   interconnect is *adequate* (§4.1/§6), so it's no longer ruled out — but
+   it's gated on **v3.1 silicon** and on the **per-chip channelize/DDC
+   budget** fitting (§4.2/§4.5), plus the `libhydrasdr` port. Bench the
+   per-chip DDC cost before committing — that's the make-or-break number,
+   not the link.
 
 4. **The firmware port is real regardless of topology choice for
    HydraSDR:** a `libhydrasdr` command layer + a real→complex
