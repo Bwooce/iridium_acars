@@ -34,6 +34,7 @@ set -uo pipefail
 
 LOG_FILE="${LOG_FILE:-/tmp/p4_serial.log}"
 PID_FILE="${PID_FILE:-/tmp/p4_serial_logger.pid}"
+PORT_FILE="${PORT_FILE:-/tmp/p4_serial_logger.port}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-52428800}"
 LOG_KEEP="${LOG_KEEP:-3}"
 RECONNECT_S="${RECONNECT_S:-2}"
@@ -115,8 +116,12 @@ cmd_stop() {
         echo "killed pid=$pid"
     fi
     rm -f "$PID_FILE"
-    # Also clean up any orphan cat children
-    pkill -f "cat /dev/ttyACM" 2>/dev/null || true
+    # Kill any orphaned cat children on our specific port only (not other agents' monitors).
+    if [ -f "$PORT_FILE" ]; then
+        local owned_port; owned_port=$(cat "$PORT_FILE")
+        pkill -f "cat $owned_port" 2>/dev/null || true
+        rm -f "$PORT_FILE"
+    fi
     exit 0
 }
 
@@ -130,10 +135,10 @@ cmd_run() {
         fi
         rm -f "$PID_FILE"
     fi
-    # Trap on exit: clean up children + PID file.
+    # Trap on exit: clean up children + PID/port files.
     cleanup() {
         pkill -P $$ 2>/dev/null || true
-        rm -f "$PID_FILE"
+        rm -f "$PID_FILE" "$PORT_FILE"
     }
     trap cleanup EXIT INT TERM
 
@@ -150,6 +155,8 @@ cmd_run() {
             sleep "$RECONNECT_S"
             continue
         fi
+        # Record which port we own so flash.sh (and cmd_stop) can target cleanup precisely.
+        echo "$port" > "$PORT_FILE"
         # Reconfigure each connect — the device may have re-enumerated.
         stty -F "$port" 115200 raw -echo -hupcl clocal 2>/dev/null || true
         printf "[%s] CONNECT %s\n" "$(stamp)" "$port" >> "$LOG_FILE"

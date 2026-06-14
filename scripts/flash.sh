@@ -29,6 +29,7 @@ APP_DIR="${REPO_DIR}/p4-usb-host"
 
 PORT="${1:-${ESP_PORT:-}}"
 BAUD="${2:-460800}"
+SERIAL_LOGGER="${SCRIPT_DIR}/serial_logger.sh"
 
 # vendor:model pairs we recognise on the P4-NANO. The first match wins
 # during auto-detect; both are accepted (with a warning for the 2nd) when
@@ -129,5 +130,38 @@ source "${IDF_EXPORT}" > /dev/null
 
 cd "${APP_DIR}"
 
+# Stop the serial logger so it releases the port before esptool connects.
+# Port contention during a long erase causes blank-sector corruption.
+LOGGER_WAS_RUNNING=0
+if [ -x "${SERIAL_LOGGER}" ]; then
+    if "${SERIAL_LOGGER}" status &>/dev/null; then
+        LOGGER_WAS_RUNNING=1
+    fi
+    "${SERIAL_LOGGER}" stop 2>/dev/null || true
+fi
+
+# If the port is still held (e.g. orphaned cat from a SIGKILL'd logger),
+# kill the specific holder(s). We only target ${PORT} — not any other ACM port.
+if fuser "${PORT}" &>/dev/null 2>&1; then
+    echo "[flash.sh] ${PORT} still held after logger stop; killing holders ..."
+    # shellcheck disable=SC2046
+    kill -9 $(fuser "${PORT}" 2>/dev/null) 2>/dev/null || true
+    sleep 0.3
+fi
+if fuser "${PORT}" &>/dev/null 2>&1; then
+    echo "error: ${PORT} is still held; aborting flash" >&2
+    exit 1
+fi
+
 echo "[flash.sh] idf.py -p ${PORT} -b ${BAUD} flash"
-exec idf.py -p "${PORT}" -b "${BAUD}" flash
+idf.py -p "${PORT}" -b "${BAUD}" flash
+FLASH_RC=$?
+
+# Restart the logger if it was running before we stopped it.
+if [ "${LOGGER_WAS_RUNNING}" -eq 1 ] && [ -x "${SERIAL_LOGGER}" ]; then
+    nohup "${SERIAL_LOGGER}" run >> /tmp/p4_serial_logger_restart.log 2>&1 &
+    disown $!
+    echo "[flash.sh] serial logger restarted (pid=$!)"
+fi
+
+exit ${FLASH_RC}
