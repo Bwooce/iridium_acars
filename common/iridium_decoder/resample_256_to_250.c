@@ -331,6 +331,11 @@ RS25_HOT int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *del
                 resample_125_128_mac_arp4(pc, &di[wpos], &dq[wpos],
                                           out_i, out_q);
 #else
+                // 0x7fff (not the round-to-nearest 0x4000) is DELIBERATE:
+                // it matches esp-dsp's firmr_s16 pre-shift convention and
+                // the PIE asm kernel (resample_arp4.S loads the same
+                // constant into xacc), keeping scalar and PIE bit-exact.
+                // Cost: ~+0.5 LSB systematic bias — invisible at Q15 scale.
                 int64_t acc_i = 0x7fff;
                 int64_t acc_q = 0x7fff;
                 for (int k = 0; k < RS25_DELAY_SIZE; k++) {

@@ -49,7 +49,8 @@ static volatile uint32_t s_producer_samples         = 0;
 
 void init_adsb_dev()
 {
-    adsbdev          = calloc(1, sizeof(class_adsb_dev));
+    adsbdev = calloc(1, sizeof(class_adsb_dev));
+    assert(adsbdev != NULL); // boot-time, tiny: failure means heap is gone
     adsbdev->is_adsb = true;
 }
 
@@ -82,16 +83,26 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
 
     size_t          sizePacket = usb_round_up_to_mps(length, 64);
     usb_transfer_t *transfer   = NULL;
-    usb_host_transfer_alloc(sizePacket, 0, &transfer);
+    if (usb_host_transfer_alloc(sizePacket, 0, &transfer) != ESP_OK ||
+        transfer == NULL) {
+        return -1;
+    }
 
     transfer->num_bytes        = sizePacket;
     transfer->device_handle    = dev_hdl;
     transfer->bEndpointAddress = endpoint;
     transfer->callback         = bulk_transfer_read_cb;
-    transfer->context          = (void *)&driver_obj;
-    transfer->timeout_ms       = timeout;
-    adsbdev->is_done           = false;
-    adsbdev->response_buf      = calloc(sizePacket, sizeof(uint8_t));
+    // driver_obj, not &driver_obj: the latter was the address of this
+    // function's PARAMETER — dangling the moment we return. (No current
+    // callback reads context; fixed so the next one that does can.)
+    transfer->context     = (void *)driver_obj;
+    transfer->timeout_ms  = timeout;
+    adsbdev->is_done      = false;
+    adsbdev->response_buf = calloc(sizePacket, sizeof(uint8_t));
+    if (!adsbdev->response_buf) {
+        usb_host_transfer_free(transfer);
+        return -1;
+    }
 
     esp_err_t r = usb_host_transfer_submit(transfer);
     if (r != ESP_OK) {
@@ -132,12 +143,15 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     }
 
     size_t sizePacket = sizeof(usb_setup_packet_t) + wLength;
-    usb_host_transfer_alloc(sizePacket, 0, &adsbdev->transfer);
+    if (usb_host_transfer_alloc(sizePacket, 0, &adsbdev->transfer) != ESP_OK ||
+        adsbdev->transfer == NULL) {
+        return -1;
+    }
     USB_SETUP_PACKET_INIT_CONTROL((usb_setup_packet_t *)adsbdev->transfer->data_buffer, bm_req_type, b_request, wValue, wIndex, wLength);
     adsbdev->transfer->num_bytes     = sizePacket;
     adsbdev->transfer->device_handle = driver_obj->dev_hdl ? driver_obj->dev_hdl : adsbdev->dev_hdl;
     adsbdev->transfer->timeout_ms    = timeout;
-    adsbdev->transfer->context       = (void *)&driver_obj;
+    adsbdev->transfer->context       = (void *)driver_obj; // was &param: dangling
     adsbdev->transfer->callback      = transfer_read_cb;
     adsbdev->is_done                 = false;
     adsbdev->response_buf            = calloc(sizePacket, sizeof(uint8_t));
@@ -307,7 +321,7 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
     // samples corrupting downstream burst data. 4 MB is well within
     // the 32 MB PSRAM budget and turns the consumer-stall window
     // into a true elastic queue.
-    dev->ringbuf = xRingbufferCreateWithCaps(4 * 1024 * 1024,
+    dev->ringbuf = xRingbufferCreateWithCaps(STREAM_RINGBUF_BYTES,
                                              RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     if (dev->ringbuf == NULL) {
         ESP_LOGE("LIBUSB", "Failed to create stream ringbuffer in PSRAM");
@@ -357,6 +371,14 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
 
         r = usb_host_transfer_submit(dev->transfers[i]);
         if (r != ESP_OK) {
+            // KNOWN LEAK on this fatal path: the ringbuffer and the
+            // already-submitted URBs are NOT reclaimed — earlier
+            // transfers are in flight, and freeing them (or the ring
+            // their callback writes into) without an endpoint
+            // halt+flush would be a use-after-free. Start-stream
+            // failure leaves the device unusable anyway; the recovery
+            // path is a reboot. Proper unwind = halt+flush+free, only
+            // worth doing if this ever needs to be retryable.
             ESP_LOGE("LIBUSB", "Failed to submit async transfer %d: %d", i, r);
             return -1;
         }
@@ -398,7 +420,7 @@ void esp_libusb_get_ringbuffer_info(size_t *used, size_t *capacity)
         // Capacity must track the actual ringbuf allocation above
         // (was hardcoded 512 KB after the 512 KB → 4 MB upgrade —
         // every /status utilisation metric was 8× under-reported). #109
-        *capacity = 4 * 1024 * 1024;
+        *capacity = STREAM_RINGBUF_BYTES;
     } else {
         *used     = 0;
         *capacity = 0;
@@ -414,7 +436,14 @@ usb_device_handle_t esp_libusb_get_dev_hdl()
 void esp_libusb_get_string_descriptor_ascii(const usb_str_desc_t *str_desc, char *str)
 {
     if (str_desc == NULL) return;
-    for (int i = 0; i < str_desc->bLength / 2; i++) {
+    // bLength includes the 2-byte descriptor header, so the payload is
+    // (bLength - 2) / 2 UTF-16 units — the old bLength/2 count read one
+    // unit past wData. Also NUL-terminate; callers treat str as a C
+    // string.
+    int n = (str_desc->bLength - 2) / 2;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) {
         str[i] = (char)str_desc->wData[i];
     }
+    str[n] = '\0';
 }

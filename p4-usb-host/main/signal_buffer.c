@@ -93,6 +93,9 @@ static SemaphoreHandle_t s_dma_done = NULL;
 static volatile uint32_t s_stash_alloc_fails      = 0;
 static volatile uint32_t s_stash_alloc_recoveries = 0;
 static volatile uint32_t s_dma_timeouts           = 0;
+// Complex samples dropped by the oversized-push clamp in
+// signal_buffer_push (caller contract violation; should stay 0).
+static volatile uint32_t s_clamp_dropped_complex = 0;
 
 uint32_t signal_buffer_stash_alloc_fails(void)
 {
@@ -212,6 +215,14 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
         aligned_bytes   = ALIGN_SCRATCH_MAX_BYTES & ~((size_t)63);
         aligned_count   = aligned_bytes / 4;
         new_carry_count = total_avail - aligned_count;
+        // The carry buffer holds at most ALIGN_COMPLEX-1 samples and its
+        // count is a uint8_t. An oversized push would overflow both —
+        // corrupting BSS in exactly the contract-violation case this
+        // clamp exists to catch. Drop the excess instead and count it.
+        if (new_carry_count > (size_t)(ALIGN_COMPLEX - 1)) {
+            s_clamp_dropped_complex += new_carry_count - (ALIGN_COMPLEX - 1);
+            new_carry_count = ALIGN_COMPLEX - 1;
+        }
     }
 
     // Wait for the previous DMA BEFORE we overwrite s_align_scratch (which
@@ -295,6 +306,15 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
         }
         if (!wrap) {
             memcpy(dst_base + head_bytes, s_align_scratch, aligned_bytes);
+            // The memcpy went through the write-back L2 cache; the GDMA
+            // path lands data in PSRAM directly. Write the dirty lines
+            // back NOW — the worker's extract/invalidate_range does a
+            // discarding M2C+INVALIDATE over burst regions, which would
+            // silently replace still-dirty lines with stale PSRAM
+            // contents. Address and length are 64-aligned (#125), so
+            // this is a clean call.
+            esp_cache_msync(dst_base + head_bytes, aligned_bytes,
+                            ESP_CACHE_MSYNC_FLAG_DIR_C2M);
             s_stash_alloc_recoveries++;
             xSemaphoreGive(s_dma_done);
             // fall through to head + carry update — data IS in ring
@@ -338,6 +358,28 @@ bool signal_buffer_burst_valid(uint32_t start_idx, uint32_t length)
     return since_end <= (total_cap - length);
 }
 
+// Invalidate one contiguous byte range of the ring, expanded outward to
+// 64-byte cache-line boundaries. esp_cache_msync REJECTS unaligned M2C
+// invalidates (ESP_ERR_INVALID_ARG) without touching the cache — and
+// burst start/length from the tagger are NOT guaranteed multiples of 16
+// complex samples, so the unexpanded call could silently no-op and leave
+// the worker reading stale lines. Expanding is safe: the whole ring is
+// owned by this module and never holds dirty lines (GDMA writes bypass
+// the cache; the CPU-fallback path writes back immediately).
+static void invalidate_ring_segment(uint8_t *base, size_t off, size_t len)
+{
+    size_t a_off = off & ~(size_t)63;
+    size_t a_end = (off + len + 63) & ~(size_t)63;
+    if (a_end > (size_t)SIGNAL_BUF_SIZE) a_end = SIGNAL_BUF_SIZE;
+    esp_err_t r = esp_cache_msync(base + a_off, a_end - a_off,
+                                  ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                                      ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "ring invalidate failed: %s (off=%zu len=%zu)",
+                 esp_err_to_name(r), a_off, a_end - a_off);
+    }
+}
+
 void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest)
 {
     if (!circular_buf) return;
@@ -354,17 +396,10 @@ void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest)
     size_t         to_end_bytes  = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
 
     if (bytes_to_read <= to_end_bytes) {
-        esp_cache_msync(base + start_bytes, bytes_to_read,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+        invalidate_ring_segment(base, start_bytes, bytes_to_read);
     } else {
-        esp_cache_msync(base + start_bytes, to_end_bytes,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
-        size_t rem = bytes_to_read - to_end_bytes;
-        esp_cache_msync(base, rem,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+        invalidate_ring_segment(base, start_bytes, to_end_bytes);
+        invalidate_ring_segment(base, 0, bytes_to_read - to_end_bytes);
     }
 
     // Per-element copy across the wrap. Runs once per detected burst (not
@@ -388,17 +423,10 @@ void signal_buffer_invalidate_range(uint32_t start_idx, uint32_t length)
     size_t         to_end_bytes  = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
 
     if (bytes_to_read <= to_end_bytes) {
-        esp_cache_msync(base + start_bytes, bytes_to_read,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+        invalidate_ring_segment(base, start_bytes, bytes_to_read);
     } else {
-        esp_cache_msync(base + start_bytes, to_end_bytes,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
-        size_t rem = bytes_to_read - to_end_bytes;
-        esp_cache_msync(base, rem,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                            ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+        invalidate_ring_segment(base, start_bytes, to_end_bytes);
+        invalidate_ring_segment(base, 0, bytes_to_read - to_end_bytes);
     }
 }
 

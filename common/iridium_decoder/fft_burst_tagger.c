@@ -94,6 +94,13 @@ static void fbt_pipe_helper_task(void *arg)
 }
 #endif
 
+// Detected-peak record for create_new_bursts' sort. Named (not an
+// anonymous member struct) so qsort's comparator can type it.
+typedef struct {
+    int     bin;
+    int64_t sort_key; // relative_magnitude × HISTORY (gri sort order)
+} fbt_peak_t;
+
 struct fft_burst_tagger_s {
     int     burst_pre_len;
     int     burst_post_len;
@@ -125,10 +132,7 @@ struct fft_burst_tagger_s {
     // Decode collapsed (matched 61 → 44, recall 93.8% → 67.7%) for
     // reasons not fully diagnosed — possibly bubble-sort PSRAM
     // bandwidth pressure or write-pattern aliasing. Keep inline.
-    struct {
-        int     bin;
-        int64_t sort_key; // relative_magnitude × HISTORY (gri sort order)
-    } peaks[N];
+    fbt_peak_t peaks[N];
 
     float    window_enbw; // Blackman ENBW, computed at init
     uint64_t d_index;     // sample index of CURRENT FFT step's start
@@ -463,6 +467,15 @@ static void rebuild_burst_mask(fft_burst_tagger_t *t)
 //   (mag² × HISTORY_SIZE) / (baseline_sum + 1)
 // — same numerator we already form in above_threshold, so the cost
 // added by the sort-key swap is a single int64 divide per peak.
+static int peak_cmp_desc(const void *a, const void *b)
+{
+    const fbt_peak_t *pa = (const fbt_peak_t *)a;
+    const fbt_peak_t *pb = (const fbt_peak_t *)b;
+    if (pa->sort_key > pb->sort_key) return -1;
+    if (pa->sort_key < pb->sort_key) return 1;
+    return 0;
+}
+
 static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
                                               fbt_burst_t *out_new, int max_new)
 {
@@ -484,18 +497,14 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
         }
     }
 
-    // Sort peaks by relative magnitude descending. Bubble sort —
-    // n_peaks is typically small (<50), insertion would be marginal.
-    for (int i = 0; i < n_peaks - 1; i++) {
-        for (int j = i + 1; j < n_peaks; j++) {
-            if (t->peaks[j].sort_key > t->peaks[i].sort_key) {
-                int     bin_tmp      = t->peaks[i].bin;
-                int64_t key_tmp      = t->peaks[i].sort_key;
-                t->peaks[i]          = t->peaks[j];
-                t->peaks[j].bin      = bin_tmp;
-                t->peaks[j].sort_key = key_tmp;
-            }
-        }
+    // Sort peaks by relative magnitude descending. qsort, not the old
+    // O(n²) bubble: n_peaks is typically <50 in clean RF, but it is
+    // bounded only by N (2048) — a wideband interferer / AGC step can
+    // light up hundreds of bins above threshold in one step, and the
+    // bubble's ~10⁵-10⁶ int64 swap-compares then land inside the
+    // per-FFT-step budget. qsort is ~n·log n with a trivial comparator.
+    if (n_peaks > 1) {
+        qsort(t->peaks, (size_t)n_peaks, sizeof(t->peaks[0]), peak_cmp_desc);
     }
 
     int n_emitted = 0;
@@ -519,11 +528,12 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
         // a rectangular bin width — the noise per bin is wider than
         // the FFT's nominal bin spacing. Without the factor our
         // magnitude_db reads ~2.4 dB low vs gri for the same burst.
-        double rel      = (double)t->magnitude_shifted[bin] * (double)FBT_HISTORY_SIZE / ((double)t->baseline_sum[bin] + 1.0);
-        b->magnitude_db = (float)(10.0 * log10(
-                                             rel * (double)t->window_enbw + 1e-12));
-        b->noise_db     = (float)(10.0 * log10(
-                                         (double)t->baseline_sum[bin] / (double)FBT_HISTORY_SIZE + 1e-12));
+        // float math + log10f: doubles are soft-float on P4. Precision
+        // ~1e-6 dB — far inside the dB resolution anyone reads here.
+        float rel       = (float)t->magnitude_shifted[bin] * (float)FBT_HISTORY_SIZE / ((float)t->baseline_sum[bin] + 1.0f);
+        b->magnitude_db = 10.0f * log10f(rel * (float)t->window_enbw + 1e-12f);
+        b->noise_db     = 10.0f * log10f(
+                                  (float)t->baseline_sum[bin] / (float)FBT_HISTORY_SIZE + 1e-12f);
 
         mask_burst(t, bin);
 

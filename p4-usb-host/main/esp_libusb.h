@@ -48,6 +48,12 @@ typedef struct
 #define ASYNC_TRANSFER_COUNT 8
 #define ASYNC_TRANSFER_SIZE (8 * 1024)
 
+// PSRAM stream ringbuffer size. Single source of truth for both the
+// xRingbufferCreateWithCaps call and the /status capacity metric —
+// these were once separate literals and drifted 8× apart after the
+// 512 KB → 4 MB upgrade (#109).
+#define STREAM_RINGBUF_BYTES (4 * 1024 * 1024)
+
 typedef struct
 {
     bool                is_adsb;

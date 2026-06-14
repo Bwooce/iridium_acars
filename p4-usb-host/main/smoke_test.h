@@ -10,6 +10,10 @@
 // Logs SMOKE_PASS or SMOKE_FAIL at the end and parks the CPU.
 //
 // The test does NOT require any USB device to be attached.
+//
+// NOTE: smoke_test.c is compiled out entirely (#if CONFIG_SMOKE_TEST_MODE)
+// in production builds — callers must gate their call on the same symbol
+// (usb_host_lib_main.c already does).
 void smoke_test_run(void);
 
 #endif

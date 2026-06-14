@@ -43,13 +43,18 @@ extern "C" {
 #define FRAME_QUEUE_MAX_BITS 2048
 
 typedef struct {
-    uint32_t timestamp_us; // host timestamp at enqueue (esp_timer_get_time / gettimeofday)
-    uint32_t freq_hz;      // burst center frequency from worker
-    int32_t  peak_bin;     // FFT bin reported by detector (post-fftshift)
-    float    snr_db;       // detection SNR
-    uint16_t n_bits;       // valid count in bits[]
-    uint8_t  direction;    // 0 = downlink (matches qpsk_demod's DIR_DOWNLINK),
-                           // 1 = uplink   (DIR_UPLINK)
+    // Host timestamp at enqueue (esp_timer_get_time / gettimeofday).
+    // Full 64-bit: a uint32_t wrapped at ~71.6 min uptime, after which
+    // sbd_reassembler_tick (which runs on the unwrapped 64-bit clock)
+    // saw every session as expired and silently killed multi-frame
+    // reassembly.
+    uint64_t timestamp_us;
+    uint32_t freq_hz;   // burst center frequency from worker
+    int32_t  peak_bin;  // FFT bin reported by detector (post-fftshift)
+    float    snr_db;    // detection SNR
+    uint16_t n_bits;    // valid count in bits[]
+    uint8_t  direction; // 0 = downlink (matches qpsk_demod's DIR_DOWNLINK),
+                        // 1 = uplink   (DIR_UPLINK)
     uint8_t pad;
     uint8_t bits[FRAME_QUEUE_MAX_BITS]; // 0/1-per-byte demod output
 } frame_queue_item_t;

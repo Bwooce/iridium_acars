@@ -127,6 +127,21 @@ static void emit(const status_snapshot_t *s)
              s->dsp.wind_us, s->dsp.fft_us, s->dsp.mag_us,
              s->dsp.detect_us, s->dsp.baseline_us);
 
+    // fbt: tagger diagnostics. Formatted HERE (Core 1, low prio) from
+    // the raw snapshot fields — this line used to be emitted inside
+    // dsp_processor_get_stage_stats on Core 0's hot loop.
+    {
+        uint32_t ts = s->dsp.tag_steps ? s->dsp.tag_steps : 1;
+        ESP_LOGI(TAG,
+                 "fbt: new=%u gone=%u frames=%u step_us=%u "
+                 "wind=%.0f fft=%.0f mag=%.0f det=%.0f base=%.0f "
+                 "(us/step, steps=%u)",
+                 (unsigned)s->dsp.new_bursts, (unsigned)s->dsp.gone_bursts,
+                 (unsigned)s->dsp.frames, (unsigned)s->dsp.step_us,
+                 s->dsp.wind_us, s->dsp.fft_us, s->dsp.mag_us,
+                 s->dsp.detect_us, s->dsp.baseline_us, (unsigned)ts);
+    }
+
     // bch_decoded is the REAL decode rate (BCH passed AND classify
     // returned a known frame type — task #111). bch_unknown is BCH
     // passed but iridium_frame_classify => UNKNOWN, i.e. BCH random-
@@ -190,9 +205,28 @@ static void emit(const status_snapshot_t *s)
     uint32_t dma_free    = heap_caps_get_free_size(MALLOC_CAP_DMA);
     uint32_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
 
+    // Trigger on DELTAS of the cumulative accessors, not their absolute
+    // values: those counters never reset, so one residual event (e.g.
+    // the documented ~110 split-RX errors/min era) used to make the
+    // STATUS-ERR line fire every second forever, burying real events.
+    // The line still prints cumulative totals — only the trigger is
+    // delta-based. (emit() runs on the single logger task; statics are
+    // safe.)
+    static uint32_t prev_sb_fails = 0, prev_sb_dma_to = 0,
+                    prev_ic_disp_drops = 0, prev_ic_slow_waits = 0,
+                    prev_lu_pool_lost = 0;
+    bool any_recovery                 = (sb_fails != prev_sb_fails) ||
+                        (sb_dma_to != prev_sb_dma_to) ||
+                        (ic_disp_drops != prev_ic_disp_drops) ||
+                        (ic_slow_waits != prev_ic_slow_waits) ||
+                        (lu_pool_lost != prev_lu_pool_lost);
+    prev_sb_fails      = sb_fails;
+    prev_sb_dma_to     = sb_dma_to;
+    prev_ic_disp_drops = ic_disp_drops;
+    prev_ic_slow_waits = ic_slow_waits;
+    prev_lu_pool_lost  = lu_pool_lost;
+
     bool over_capacity = (dsp_pct > 80.0) || (worker_pct > 80.0);
-    bool any_recovery  = sb_fails || sb_dma_to || ic_disp_drops ||
-                        ic_slow_waits || lu_pool_lost;
     if (over_capacity || s->us.rb_full_drops || s->us.status_errors ||
         s->us.resubmit_errors || s->ws.bursts_dropped || any_recovery) {
         ESP_LOGW(TAG,

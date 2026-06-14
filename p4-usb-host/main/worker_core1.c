@@ -18,6 +18,7 @@
 
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -47,21 +48,26 @@ static const char *TAG = "WORKER1";
 static QueueHandle_t burst_queue = NULL;
 
 // Diagnostic counters. Read & reset by worker_core1_get_stats().
-static volatile uint32_t s_bursts_queued    = 0;
-static volatile uint32_t s_bursts_dropped   = 0;
-static volatile uint32_t s_bursts_processed = 0;
-static volatile uint32_t s_bursts_skipped   = 0;
-static volatile uint32_t s_queue_high_water = 0;
-static volatile uint64_t s_burst_total_us   = 0;
+// _Atomic, not volatile: push_burst increments s_bursts_queued from the
+// producer (Core 0 tagger callback) while get_stats read-and-resets from
+// class_driver — a volatile RMW on RV32 loses increments across that
+// race, and volatile 64-bit reads can tear. Relaxed ordering is plenty
+// for diagnostics; get_stats uses atomic_exchange for exact windows.
+static _Atomic uint32_t s_bursts_queued    = 0;
+static _Atomic uint32_t s_bursts_dropped   = 0;
+static _Atomic uint32_t s_bursts_processed = 0;
+static _Atomic uint32_t s_bursts_skipped   = 0;
+static _Atomic uint32_t s_queue_high_water = 0;
+static _Atomic uint64_t s_burst_total_us   = 0;
 // BCH outcome counters. processed counts qpsk_demod successes (the
 // "DEMOD SUCCESS" log). bch_decoded counts the ones that actually
 // passed BCH — the real decode rate. bch_failed counts qpsk-demod
 // successes that produced an uncorrectable frame (false-positive
 // decodes from the application's perspective).
-static volatile uint32_t s_bursts_bch_decoded         = 0; // BCH OK AND classify returned a known type
-static volatile uint32_t s_bursts_bch_unknown         = 0; // BCH OK but iridium_frame_classify => IR_FRAME_UNKNOWN (BCH false-positive — task #111)
-static volatile uint32_t s_bursts_bch_failed          = 0; // BCH itself uncorrectable
-static volatile uint32_t s_bursts_bch_chase_recovered = 0; // Chase-2 soft decoder rescued a hard-decision BCH failure (#112)
+static _Atomic uint32_t s_bursts_bch_decoded         = 0; // BCH OK AND classify returned a known type
+static _Atomic uint32_t s_bursts_bch_unknown         = 0; // BCH OK but iridium_frame_classify => IR_FRAME_UNKNOWN (BCH false-positive — task #111)
+static _Atomic uint32_t s_bursts_bch_failed          = 0; // BCH itself uncorrectable
+static _Atomic uint32_t s_bursts_bch_chase_recovered = 0; // Chase-2 soft decoder rescued a hard-decision BCH failure (#112)
 
 // Diagnostic histograms (#116). Cumulative since boot — no decay /
 // rolling window; clients compute deltas if they want a rate.
@@ -89,11 +95,11 @@ static inline void hist_bch_record(int e1, int e2)
 }
 
 // Per-stage timing accumulators, summed over processed bursts only.
-static volatile uint64_t s_t_extract_us  = 0;
-static volatile uint64_t s_t_rotate_us   = 0;
-static volatile uint64_t s_t_decim_us    = 0;
-static volatile uint64_t s_t_pipeline_us = 0;
-static volatile uint64_t s_t_bch_us      = 0;
+static _Atomic uint64_t s_t_extract_us  = 0;
+static _Atomic uint64_t s_t_rotate_us   = 0;
+static _Atomic uint64_t s_t_decim_us    = 0;
+static _Atomic uint64_t s_t_pipeline_us = 0;
+static _Atomic uint64_t s_t_bch_us      = 0;
 
 #if CONFIG_SMOKE_TEST_RAW_IRIDIUM
 // Golden-bits comparison counters (smoke build only). Each decoded
@@ -755,9 +761,12 @@ void worker_task(void *arg)
             s_burst_total_us += (uint64_t)(esp_timer_get_time() - burst_t0);
         }
 
-        // Periodic yield: worker is at prio 5; the frame_decoder at
-        // prio 4 must get scheduled. One vTaskDelay(1) every 8 bursts
-        // gives ~10 ms of frame_decoder CPU per 8 bursts processed.
+        // Periodic yield so same-prio tasks (frame_decoder, both at 4)
+        // and lower-prio tasks get scheduled. One vTaskDelay(1) every
+        // 8 bursts gives ~10 ms of ceded CPU per 8 bursts. NB: the
+        // skipped/stale-burst paths `continue` above this point, so
+        // only fully processed (or demod-attempted) bursts advance the
+        // counter — skips are cheap, that's the intended behaviour.
         static int yield_counter = 0;
         if (++yield_counter >= 8) {
             yield_counter = 0;
@@ -809,10 +818,13 @@ esp_err_t worker_core1_init(void)
     // do ~1.5 ms). Decim runs in DECIM_CHUNK_IN-sample chunks so the
     // scratch stays tiny (8 KB per I/Q channel) rather than the 100 KB
     // each that a full-burst buffer would need.
-    size_t ext_bytes      = (size_t)WB_EXTRACT_MAX * 2 * sizeof(int16_t);
-    size_t dec_bytes      = (size_t)WB_DECIM_MAX * 2 * sizeof(int16_t);
-    size_t scr_in_bytes   = (size_t)DECIM_CHUNK_IN * sizeof(int16_t);
-    size_t scr_out_bytes  = (size_t)(DECIM_CHUNK_IN / DIDECIM_DECIM) * sizeof(int16_t);
+    size_t ext_bytes = (size_t)WB_EXTRACT_MAX * 2 * sizeof(int16_t);
+    size_t dec_bytes = (size_t)WB_DECIM_MAX * 2 * sizeof(int16_t);
+    // +16 int16 trailing pad on the FIR scratch: the arp4 PIE kernels
+    // (dsps_fird_s16_arp4 inside direct_if_decim_process_split) read/
+    // write up to one 128-bit vector past the nominal buffer end.
+    size_t scr_in_bytes   = (size_t)(DECIM_CHUNK_IN + 16) * sizeof(int16_t);
+    size_t scr_out_bytes  = (size_t)(DECIM_CHUNK_IN / DIDECIM_DECIM + 16) * sizeof(int16_t);
     size_t chunk_iq_bytes = (size_t)DECIM_CHUNK_IN * 2 * sizeof(int16_t);
     // Task #64: s_extract_buf removed -- decim loop reads directly
     // from signal_buffer via signal_buffer_read_chunk(). The static
@@ -910,39 +922,52 @@ void worker_core1_get_histograms(worker_histograms_t *out)
 
 void worker_core1_get_stats(worker_stats_t *out)
 {
-    uint32_t n                      = s_bursts_processed;
-    out->bursts_queued              = s_bursts_queued;
-    out->bursts_dropped             = s_bursts_dropped;
-    out->bursts_processed           = n;
-    out->bursts_skipped             = s_bursts_skipped;
-    out->bursts_bch_decoded         = s_bursts_bch_decoded;
-    out->bursts_bch_unknown         = s_bursts_bch_unknown;
-    out->bursts_bch_failed          = s_bursts_bch_failed;
-    out->bursts_bch_chase_recovered = s_bursts_bch_chase_recovered;
-    out->queue_high_water           = s_queue_high_water;
+    // Exchange-with-zero so increments landing between "read" and
+    // "reset" are counted in the NEXT window instead of lost.
+    uint32_t n = atomic_exchange_explicit(&s_bursts_processed, 0,
+                                          memory_order_relaxed);
+    out->bursts_queued =
+        atomic_exchange_explicit(&s_bursts_queued, 0, memory_order_relaxed);
+    out->bursts_dropped =
+        atomic_exchange_explicit(&s_bursts_dropped, 0, memory_order_relaxed);
+    out->bursts_processed = n;
+    out->bursts_skipped =
+        atomic_exchange_explicit(&s_bursts_skipped, 0, memory_order_relaxed);
+    out->bursts_bch_decoded =
+        atomic_exchange_explicit(&s_bursts_bch_decoded, 0, memory_order_relaxed);
+    out->bursts_bch_unknown =
+        atomic_exchange_explicit(&s_bursts_bch_unknown, 0, memory_order_relaxed);
+    out->bursts_bch_failed =
+        atomic_exchange_explicit(&s_bursts_bch_failed, 0, memory_order_relaxed);
+    out->bursts_bch_chase_recovered =
+        atomic_exchange_explicit(&s_bursts_bch_chase_recovered, 0,
+                                 memory_order_relaxed);
+    out->queue_high_water =
+        atomic_exchange_explicit(&s_queue_high_water, 0, memory_order_relaxed);
+    uint64_t total_us =
+        atomic_exchange_explicit(&s_burst_total_us, 0, memory_order_relaxed);
+    uint64_t t_extract =
+        atomic_exchange_explicit(&s_t_extract_us, 0, memory_order_relaxed);
+    uint64_t t_rotate =
+        atomic_exchange_explicit(&s_t_rotate_us, 0, memory_order_relaxed);
+    uint64_t t_decim =
+        atomic_exchange_explicit(&s_t_decim_us, 0, memory_order_relaxed);
+    uint64_t t_pipeline =
+        atomic_exchange_explicit(&s_t_pipeline_us, 0, memory_order_relaxed);
+    uint64_t t_bch =
+        atomic_exchange_explicit(&s_t_bch_us, 0, memory_order_relaxed);
     if (n > 0) {
         float fn            = (float)n;
-        out->avg_burst_us   = (float)s_burst_total_us / fn;
-        out->extract_us     = (float)s_t_extract_us / fn;
-        out->freq_center_us = (float)s_t_rotate_us / fn;
-        out->fir_decim_us   = (float)s_t_decim_us / fn;
+        out->avg_burst_us   = (float)total_us / fn;
+        out->extract_us     = (float)t_extract / fn;
+        out->freq_center_us = (float)t_rotate / fn;
+        out->fir_decim_us   = (float)t_decim / fn;
         out->resample_us    = 0.0f;
-        out->demod_us       = (float)s_t_pipeline_us / fn;
-        out->bch_us         = (float)s_t_bch_us / fn;
+        out->demod_us       = (float)t_pipeline / fn;
+        out->bch_us         = (float)t_bch / fn;
     } else {
         out->avg_burst_us = out->extract_us = out->freq_center_us =
             out->fir_decim_us = out->resample_us = out->demod_us =
                 out->bch_us                      = 0.0f;
     }
-    s_bursts_queued              = 0;
-    s_bursts_dropped             = 0;
-    s_bursts_processed           = 0;
-    s_bursts_skipped             = 0;
-    s_bursts_bch_decoded         = 0;
-    s_bursts_bch_unknown         = 0;
-    s_bursts_bch_failed          = 0;
-    s_bursts_bch_chase_recovered = 0;
-    s_queue_high_water           = 0;
-    s_burst_total_us             = 0;
-    s_t_extract_us = s_t_rotate_us = s_t_decim_us = s_t_pipeline_us = s_t_bch_us = 0;
 }

@@ -5,6 +5,15 @@
 // of USB. Asserts that the FFT detector raises exactly one burst at a
 // non-edge bin with sensible SNR.
 
+// Compile the harness ONLY in smoke builds. Previously the whole
+// translation unit landed in production images with just the CALL
+// gated — costing ~8 KB of internal-SRAM .bss (s_per_bin_max_snr)
+// plus code in flash for nothing. The only caller (usb_host_lib_main.c)
+// gates both its #include and the smoke_test_run() call on the same
+// CONFIG symbol, so no stub is needed for the linker.
+#include "sdkconfig.h"
+#if CONFIG_SMOKE_TEST_MODE
+
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
@@ -1113,3 +1122,5 @@ void smoke_test_run(void)
     while (1)
         vTaskDelay(pdMS_TO_TICKS(1000));
 }
+
+#endif // CONFIG_SMOKE_TEST_MODE

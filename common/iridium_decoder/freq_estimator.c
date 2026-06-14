@@ -6,12 +6,12 @@
 //     for dsps_fft2r_fc32_arp4 for a ~3× speedup; the call site is
 //     bounded so an #ifdef wrap is straightforward when needed.
 //   - Twiddle tables are cached file-scope statics initialised on the
-//     first call. The bit-reversal table is fixed for N=256.
+//     first call. The bit-reversal table is fixed for N (FREQ_EST_FFT_N).
 //   - Magnitude computed per bin as r²+i² (no sqrt) since we only
 //     need peak find.
 //   - Search window: bins whose frequency is within ±search_hz are
 //     considered. Bin k's frequency is k * (fs/N) if k < N/2, else
-//     (k - N) * (fs/N). For fs=2.56 MHz, N=256, search_hz=20000:
+//     (k - N) * (fs/N). For fs=2.56 MHz, N=512, search_hz=20000:
 //     bin_width = 10 kHz, ±2 bins each side of DC.
 //   - Quadratic peak interpolation: classic 3-point formula
 //       δ = 0.5 * (m[k-1] - m[k+1]) / (m[k-1] - 2*m[k] + m[k+1])
@@ -66,7 +66,7 @@ static void init_tables(void)
     s_tables_inited = true;
 }
 
-// In-place radix-2 DIT FFT on N=256 separate real/imag arrays.
+// In-place radix-2 DIT FFT on N (FREQ_EST_FFT_N) separate real/imag arrays.
 // Twiddle access pattern matches polyphase_channelizer.c's cached
 // fft_64 — for stride s, twiddle k uses table index k * (N / (2*s)).
 static void fft_n256(float *re, float *im)
@@ -114,8 +114,12 @@ int32_t freq_estimator_run(const int16_t *iq, size_t n_complex,
     init_tables();
 
     // 1. Convert int16 IQ → float (windowed), separate real / imag arrays.
-    float       re[N], im[N];
-    const float inv_full = 1.0f / 32768.0f;
+    // Static, not stack: 2 × 512 floats = 4 KB would overflow a small
+    // FreeRTOS task stack if this (currently host-test-only) estimator
+    // is ever wired back into the worker. The module is already
+    // non-reentrant (s_window / s_brev statics), so statics cost nothing.
+    static float re[N], im[N];
+    const float  inv_full = 1.0f / 32768.0f;
     for (int i = 0; i < N; i++) {
         float w = s_window[i];
         re[i]   = (float)iq[2 * i + 0] * inv_full * w;

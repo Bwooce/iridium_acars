@@ -111,6 +111,13 @@ static volatile uint32_t s_acc_gone_bursts   = 0;
 // (s_acc_input_samples) is reset by dsp_processor_get_stage_stats() once
 // per second by status_logger, racing any other reader. This counter
 // only ever increments; readers snapshot it at t0/t1 and subtract.
+//
+// NB "reset-free" ≠ tear-free: this is a volatile uint64 on RV32, so a
+// cross-core reader can see a torn hi/lo pair once per low-word wrap
+// (~every 28 min at 2.5 MSPS). Diagnostic-only — a /diag delta is at
+// worst transiently absurd for one poll. Not worth an atomic (64-bit
+// atomics on RV32 are lock-based and this increments on Core 0's hot
+// feed path).
 static volatile uint64_t s_total_input_samples = 0;
 
 // Push one gone burst out to the user callback. Converts fbt_burst_t
@@ -296,20 +303,14 @@ void dsp_processor_get_stage_stats(dsp_stage_stats_t *out)
         out->baseline_us = (float)tag_stage_us[4] / ts;
         out->total_us    = (float)s_acc_step_us / fn;
     }
-
-    ESP_LOGI(TAG,
-             "fbt: new=%u gone=%u frames=%u step_us=%lu "
-             "wind=%lu fft=%lu mag=%lu det=%lu base=%lu (us/step, steps=%u)",
-             (unsigned)s_acc_new_bursts,
-             (unsigned)s_acc_gone_bursts,
-             (unsigned)frames,
-             (unsigned long)s_acc_step_us,
-             (unsigned long)(tag_steps ? tag_stage_us[0] / tag_steps : 0),
-             (unsigned long)(tag_steps ? tag_stage_us[1] / tag_steps : 0),
-             (unsigned long)(tag_steps ? tag_stage_us[2] / tag_steps : 0),
-             (unsigned long)(tag_steps ? tag_stage_us[3] / tag_steps : 0),
-             (unsigned long)(tag_steps ? tag_stage_us[4] / tag_steps : 0),
-             (unsigned)tag_steps);
+    // Raw accumulators for the `fbt:` line. No ESP_LOGI here: this
+    // getter runs on Core 0's hot read-feed loop (class_driver's 1 Hz
+    // snapshot) and log formatting belongs on Core 1 — status_logger
+    // emits the line from these fields.
+    out->new_bursts  = s_acc_new_bursts;
+    out->gone_bursts = s_acc_gone_bursts;
+    out->step_us     = (uint32_t)s_acc_step_us;
+    out->tag_steps   = tag_steps;
 
     s_acc_step_us       = 0;
     s_acc_input_samples = 0;

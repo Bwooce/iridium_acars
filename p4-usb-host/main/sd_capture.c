@@ -38,7 +38,8 @@ static const char *TAG = "SDCAP";
 #define STREAM_BUFFER_TRIG 4096
 
 // Writer task params. Pinned to Core 1. Priority 5 = above
-// worker_core1 (3) so the writer can drain the PSRAM stream
+// worker_core1 (4 — deliberate placement, see the priority history
+// note in worker_core1.c) so the writer can drain the PSRAM stream
 // buffer even while the tagger fires bursts continuously. The
 // blocking-in-fwrite case is harmless: SDMMC waits on an interrupt
 // semaphore, so the writer task is suspended and worker / ingest
@@ -178,7 +179,7 @@ static void writer_task(void *arg)
             // chunking to 512 bytes with vTaskDelay(0) between
             // each — that round-robined to httpd (same prio 5)
             // and cut effective throughput to ~700 B/s. Writer
-            // is now Core-1, prio 5: above worker (3) and below
+            // is now Core-1, prio 5: above worker (4) and below
             // ingest (8), so it doesn't starve Core 0 (class_
             // driver is on a different core) and doesn't need
             // per-slice yields.
@@ -463,25 +464,30 @@ esp_err_t sd_capture_stop(void)
     // its own and we tear down the stream buffer there.
     s_state = CAP_STATE_STOPPING;
 
-    // Wait for the writer to reach IDLE. A 5 MB stream buffer at
-    // ~500 KB/s takes ~10 s to drain; an old 1 s timeout was racing
-    // the writer to vStreamBufferDeleteWithCaps and (a) truncating
-    // the file (FATFS' fclose never ran) and (b) tripping the
-    // writer's xStreamBufferReceive against a freed buffer →
-    // reboot. 60 s is generous for any reasonable capture; the
-    // drain loop itself has a 512-iter safety cap so it can't
-    // hang here indefinitely.
-    for (int i = 0; i < 3000; i++) { // 60 s @ 20 ms tick
+    // Wait BRIEFLY for the writer to reach IDLE. A full 4 MB stream-
+    // buffer backlog at ~500 KB/s takes ~10 s to drain, but this
+    // function runs on the single esp_http_server serve task — blocking
+    // here made the WHOLE HTTP server unreachable for up to 60 s (the
+    // previous loop bound). Cap at 2 s: short drains finish inline and
+    // return ESP_OK; longer drains continue asynchronously in the
+    // writer task (its STOPPING branch always runs to fclose on its
+    // own, with a 512-iter safety cap) and we return ESP_ERR_TIMEOUT
+    // so the HTTP handler can report 202 stop-in-progress. Since the
+    // stream buffer is permanent (alloc'd once in sd_capture_init)
+    // there is nothing to tear down here — returning early is safe.
+    for (int i = 0; i < 100; i++) { // 2 s @ 20 ms tick
         if (s_state == CAP_STATE_IDLE) break;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+    s_burst_mode = false;
     if (s_state != CAP_STATE_IDLE) {
-        ESP_LOGW(TAG, "writer didn't reach IDLE in 60s — forcing teardown");
+        ESP_LOGI(TAG, "writer still draining after 2 s — close continues "
+                      "asynchronously (poll /capture/status)");
+        return ESP_ERR_TIMEOUT; // stop accepted, drain in progress
     }
 
     // Stream buffer is permanent (allocated once in sd_capture_init)
     // so we don't free it here. It gets reset on the next start.
-    s_burst_mode = false;
     return ESP_OK;
 }
 

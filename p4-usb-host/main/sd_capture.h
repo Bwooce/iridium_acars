@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h> // ENOENT in the SD-off open_for_read stub
 
 // On-demand raw IQ capture to SD card.
 //
@@ -192,6 +193,15 @@ static inline void sd_capture_record_burst_chunk(const int16_t *iq, size_t n_com
 }
 static inline void sd_capture_record_burst_end(void)
 {
+}
+// Missing from the original stub set — the only caller is http_server's
+// /capture/file download handler, which is registered unconditionally,
+// so SD-off builds didn't link. NULL + ENOENT maps to its 404 path.
+static inline FILE *sd_capture_open_for_read(const char *name)
+{
+    (void)name;
+    errno = ENOENT;
+    return NULL;
 }
 
 #endif /* CONFIG_ENABLE_SD_LOG */

@@ -55,18 +55,16 @@ static size_t skip_qname(const uint8_t *buf, size_t len, size_t off)
     return 0;
 }
 
-static void dns_task(void *arg)
+// Create + bind the UDP/53 socket. Factored out of dns_task so the
+// error-recovery path below can recreate a wedged socket without
+// duplicating the setup. Returns the fd, or -1 (logged) on failure.
+static int dns_open_socket(void)
 {
-    (void)arg;
-
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         ESP_LOGE(TAG, "socket() failed errno=%d", errno);
-        s_running = false;
-        vTaskDelete(NULL);
-        return;
+        return -1;
     }
-
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port   = htons(DNS_PORT),
@@ -75,6 +73,17 @@ static void dns_task(void *arg)
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         ESP_LOGE(TAG, "bind(:53) failed errno=%d", errno);
         close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+static void dns_task(void *arg)
+{
+    (void)arg;
+
+    int sock = dns_open_socket();
+    if (sock < 0) {
         s_running = false;
         vTaskDelete(NULL);
         return;
@@ -83,11 +92,39 @@ static void dns_task(void *arg)
     ESP_LOGI(TAG, "captive-portal DNS responder listening on UDP/53");
 
     uint8_t buf[MAX_DNS_PACKET];
+    int     consec_errs = 0; // consecutive recvfrom failures
     while (1) {
         struct sockaddr_in src;
         socklen_t          srclen = sizeof(src);
         int                n      = recvfrom(sock, buf, sizeof(buf), 0,
                                              (struct sockaddr *)&src, &srclen);
+        if (n < 0) {
+            // recvfrom can fail persistently (lwip netif churn, fd
+            // wedged after a stack-level reset). Without a backoff this
+            // turns the blocking loop into a 100% CPU spin at prio 3.
+            // Log the first failure only (it would otherwise flood),
+            // sleep 100 ms, and after 50 consecutive errors (~5 s)
+            // recreate the socket — the common wedge isn't transient.
+            static bool s_recv_err_logged = false;
+            if (!s_recv_err_logged) {
+                ESP_LOGW(TAG, "recvfrom failed errno=%d — backing off "
+                              "(further errors silenced)",
+                         errno);
+                s_recv_err_logged = true;
+            }
+            if (++consec_errs >= 50) {
+                ESP_LOGW(TAG, "recvfrom failed %d consecutive times — "
+                              "recreating socket",
+                         consec_errs);
+                if (sock >= 0) close(sock);
+                sock        = dns_open_socket(); // -1 on failure: next
+                consec_errs = 0;                 // recvfrom fails EBADF and
+            } // we retry in ~5 s more
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        consec_errs = 0;
+        // Short datagram (can't even hold a DNS header) — ignore.
         if (n < (int)sizeof(dns_hdr_t)) continue;
 
         dns_hdr_t *h     = (dns_hdr_t *)buf;

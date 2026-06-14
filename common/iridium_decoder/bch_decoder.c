@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <limits.h>
 #if __has_include("esp_attr.h")
 #include "esp_attr.h"
@@ -37,8 +38,17 @@ static uint32_t gf2_remainder(uint32_t poly, uint32_t val)
     return val;
 }
 
+// Init-order guard. The zeroed-BSS state of syn_ra is {errs = 0,
+// locator = 0} — indistinguishable from a real "0-error correction"
+// entry, so a bch_decode_block call BEFORE bch_decoder_init would
+// accept every syndrome < 1024 as "success, 0 errors corrected" on
+// uncorrected garbage. Init order is only a convention (class_driver /
+// smoke_test call init first); enforce it with lazy init instead.
+static bool s_bch_inited = false;
+
 void bch_decoder_init()
 {
+    s_bch_inited = true;
     for (int i = 0; i < 1024; i++) {
         syn_ra[i].errs    = -1;
         syn_ra[i].locator = 0;
@@ -77,6 +87,7 @@ static uint32_t bits_to_uint(const uint8_t *bits, int n)
 
 int bch_decode_block(const uint8_t *block31, uint8_t *out_data)
 {
+    if (!s_bch_inited) bch_decoder_init();
     uint32_t val      = bits_to_uint(block31, 31);
     uint32_t syndrome = gf2_remainder(BCH_POLY_RA, val);
 

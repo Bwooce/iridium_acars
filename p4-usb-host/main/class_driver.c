@@ -193,9 +193,21 @@ static void action_start_stream(class_driver_t *driver_obj)
     // See project_heap_position_decode_bug.md.
     resample_256_to_250_alloc_coeffs();
     fft_sc16_2048_init();
-    signal_buffer_init();
-    worker_core1_init();
-    ingest_core1_init();
+    // The pipeline inits can fail (ESP_ERR_NO_MEM). Proceeding with a
+    // half-built pipeline either crashes (acquire on a NULL semaphore)
+    // or runs silently dead (signal_buffer_push no-ops without its
+    // ring). Treat any failure as fatal for streaming: close the
+    // device path and leave the stream NOT started — the health
+    // watchdog / operator can see the error instead of a zombie.
+    esp_err_t init_rc;
+    if ((init_rc = signal_buffer_init()) != ESP_OK ||
+        (init_rc = worker_core1_init()) != ESP_OK ||
+        (init_rc = ingest_core1_init()) != ESP_OK) {
+        ESP_LOGE(TAG, "pipeline init failed (%s) — stream NOT started",
+                 esp_err_to_name(init_rc));
+        driver_obj->actions &= ~ACTION_START_STREAM;
+        return;
+    }
     bch_decoder_init();
     if (frame_decoder_init() != ESP_OK) {
         ESP_LOGW(TAG, "frame_decoder_init failed; higher-layer "
@@ -321,6 +333,12 @@ void class_driver_task(void *arg)
 
         class_stage(CS_HANDLE_EVENTS);
         int64_t t_he0 = esp_timer_get_time();
+        // NB: the timeout argument is in TICKS — 10 ticks = 100 ms at
+        // the default 100 Hz tick, not the 10 ms some older comments
+        // claimed. Deliberately kept: during streaming the client event
+        // queue wakes this far sooner, and the long cap keeps the idle
+        // loop cheap between events. Don't "fix" to pdMS_TO_TICKS(10)
+        // without re-measuring the no-device idle load.
         usb_host_client_handle_events(s_driver_obj.client_hdl, 10);
         cycle_handle_events_us += (uint64_t)(esp_timer_get_time() - t_he0);
         cycle_iterations++;
@@ -387,6 +405,20 @@ void class_driver_task(void *arg)
         int64_t t_read_end = esp_timer_get_time();
 
         if (read_ok == 0) {
+            // Tripwire: an odd-length read would silently invert I/Q
+            // pairing for the REST OF THE STREAM (ingest floors n/2;
+            // the next read then starts on a Q byte). Never observed —
+            // transfers are 16 KB multiples — but if it ever fires we
+            // want the log line, not weeks of "demod mysteriously dead".
+            if (n_read & 1) {
+                static bool s_odd_read_logged = false;
+                if (!s_odd_read_logged) {
+                    s_odd_read_logged = true;
+                    ESP_LOGE(TAG, "ODD-LENGTH USB read (%zu B) — I/Q "
+                                  "pairing now suspect until next stream restart",
+                             n_read);
+                }
+            }
             cycle_read_us += (uint64_t)(t_read_end - t_read_start);
             total_bytes += n_read;
             bytes_window += n_read;
@@ -427,8 +459,24 @@ void class_driver_task(void *arg)
 
             prev_dsp_slot = slot_for_read;
         } else {
-            // No data this iteration. Release the slot we just acquired so
-            // ingest can reuse it (we never dispatched).
+            // No data this iteration. Before releasing the slot we just
+            // acquired, drain any in-flight slot from the previous cycle.
+            // Skipping this deadlocked the loop: with prev_dsp_slot's
+            // s_free still held and the rotation pointer already advanced
+            // past the slot we're releasing, the next acquire_raw blocks
+            // forever on s_free[prev_dsp_slot] — which only this task can
+            // give, after a take_converted it can no longer reach. Armed
+            // exactly when the stream pauses (dongle hiccup / unplug /
+            // quiet ring); the #105/#106 "stuck in acquire_raw" signature.
+            if (prev_dsp_slot >= 0) {
+                size_t   n_int16   = 0;
+                int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
+                dsp_processor_feed(converted, n_int16 / 2);
+                ingest_core1_release(prev_dsp_slot);
+                prev_dsp_slot = -1;
+            }
+            // Release the slot we just acquired so ingest can reuse it
+            // (we never dispatched).
             ingest_core1_release(slot_for_read);
         }
 
@@ -557,5 +605,8 @@ void class_driver_task(void *arg)
     ESP_LOGI(TAG, "Deregistering Client");
     usb_host_client_deregister(s_driver_obj.client_hdl);
     xSemaphoreGive(signaling_sem);
-    vTaskDelete(NULL);
+    // Wait to be deleted by app_main (same pattern as the daemon task).
+    // Self-deleting here raced app_main's vTaskDelete(handle) — the idle
+    // task could free this TCB first, making that call a use-after-free.
+    vTaskSuspend(NULL);
 }

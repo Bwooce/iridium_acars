@@ -400,15 +400,37 @@ esp_err_t ingest_core1_init(void)
         if (!s_raw[i] || !s_conv[i] || !s_resamp[i]) {
             ESP_LOGE(TAG, "Slot %d alloc failed (raw=%p conv=%p resamp=%p)",
                      i, s_raw[i], s_conv[i], s_resamp[i]);
-            return ESP_ERR_NO_MEM;
+            goto slot_cleanup;
         }
         s_resamp_n_int16[i] = 0;
 
         s_ready[i] = xSemaphoreCreateBinary();
         s_free[i]  = xSemaphoreCreateBinary();
-        if (!s_ready[i] || !s_free[i]) return ESP_ERR_NO_MEM;
+        if (!s_ready[i] || !s_free[i]) goto slot_cleanup;
         // Initially: free=1 (slot available), ready=0 (no data yet).
         xSemaphoreGive(s_free[i]);
+        continue;
+
+    slot_cleanup:
+        // Free everything allocated so far (this slot and earlier ones)
+        // and null the pointers, so the caller sees a clean failure
+        // instead of half-built slots with NULL semaphores. (Deeper
+        // failure paths below — queue/task creation — don't unwind:
+        // the caller treats any failure as fatal-for-streaming and the
+        // system is headed for an operator/watchdog reboot anyway.)
+        for (int j = 0; j <= i; j++) {
+            free(s_raw[j]);
+            free(s_conv[j]);
+            free(s_resamp[j]);
+            s_raw[j]    = NULL;
+            s_conv[j]   = NULL;
+            s_resamp[j] = NULL;
+            if (s_ready[j]) vSemaphoreDelete(s_ready[j]);
+            if (s_free[j]) vSemaphoreDelete(s_free[j]);
+            s_ready[j] = NULL;
+            s_free[j]  = NULL;
+        }
+        return ESP_ERR_NO_MEM;
     }
 
     // Initialise the 125/128 resampler coeffs table (singleton

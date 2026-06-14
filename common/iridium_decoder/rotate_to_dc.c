@@ -9,6 +9,44 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// ---- Q32 fraction-of-a-turn phase --------------------------------------
+//
+// The renorm used to compute `cos(phase_step * (double)index)` with
+// double trig. P4's FPU is single-precision only, so every double op is
+// soft-float — at one renorm per 128 samples that was ~625 soft-double
+// trig pairs per 40 k-sample window and ~10 k per worst-case multi-frame
+// burst, on the hottest worker stage. Plain cosf/sinf of the raw product
+// is NOT a fix: phase reaches ~2e6 rad on long windows where float ULP
+// is ~0.25 rad.
+//
+// Instead, keep phase as a 32-bit fraction of a turn. dphi_q32 is
+// phase_step expressed in turns × 2^32; `dphi_q32 * index` then wraps
+// modulo 2^32 — i.e. modulo one turn — EXACTLY, in integer math. The
+// reduced [0,1)-turn fraction is small enough for single-precision trig
+// (float resolution 2^-24 turns ≈ 4e-7 rad, far below the Q15 floor).
+// Residual error vs the old double path: dphi quantisation ≤ 2^-33
+// turns/sample ≈ 0.5 mrad accumulated over a 625 k-sample burst —
+// irrelevant to DQPSK, which is differential.
+static inline uint32_t rot_dphi_q32(double phase_step)
+{
+    double f = phase_step * (1.0 / (2.0 * M_PI)); // turns/sample
+    f -= floor(f);                                // [0, 1)
+    // llround may yield 2^32 when f rounds up from 1-eps; the uint32_t
+    // conversion is defined modulo 2^32, wrapping that to 0 — correct.
+    return (uint32_t)(unsigned long long)llround(f * 4294967296.0);
+}
+
+// Q15 phasor at absolute sample index `index` (modular: only the low 32
+// bits of the index matter, by construction of the Q32 representation).
+static inline void rot_phasor_q15(uint32_t dphi_q32, uint32_t index,
+                                  int16_t *pr, int16_t *pi)
+{
+    uint32_t ph_q32 = dphi_q32 * index; // exact mod-one-turn
+    float    rad    = (float)ph_q32 * (6.28318530717958647692f / 4294967296.0f);
+    *pr             = (int16_t)lrintf(cosf(rad) * 32767.0f);
+    *pi             = (int16_t)lrintf(sinf(rad) * 32767.0f);
+}
+
 void rotate_to_dc(int16_t *iq, int n_complex, double phase_step)
 {
     // float (single-precision) cosf/sinf: P4 has only a single-
@@ -18,15 +56,19 @@ void rotate_to_dc(int16_t *iq, int n_complex, double phase_step)
     // numerical accuracy difference vs the host's prior double
     // implementation is negligible. NMSE re-validated against gri at
     // step rebuild — see tests/host/test_pipeline_wideband_albq.
-    const float dphi_f = (float)phase_step;
+    // Q32 turn-fraction reduction (see rot_dphi_q32): `dphi_f * k` in
+    // raw float lost precision once k·dphi exceeded a few thousand rad
+    // (float ULP at 2e6 rad is ~0.25 rad).
+    const uint32_t dphi_q32 = rot_dphi_q32(phase_step);
     for (int k = 0; k < n_complex; k++) {
-        float   phase = dphi_f * (float)k;
-        float   cs    = cosf(phase);
-        float   ss    = sinf(phase);
-        int32_t r     = iq[k * 2 + 0];
-        int32_t v     = iq[k * 2 + 1];
-        float   nr    = (float)r * cs - (float)v * ss;
-        float   ni    = (float)r * ss + (float)v * cs;
+        uint32_t ph_q32 = dphi_q32 * (uint32_t)k;
+        float    phase  = (float)ph_q32 * (6.28318530717958647692f / 4294967296.0f);
+        float    cs     = cosf(phase);
+        float    ss     = sinf(phase);
+        int32_t  r      = iq[k * 2 + 0];
+        int32_t  v      = iq[k * 2 + 1];
+        float    nr     = (float)r * cs - (float)v * ss;
+        float    ni     = (float)r * ss + (float)v * cs;
         if (nr > 32767.0f) nr = 32767.0f;
         if (nr < -32768.0f) nr = -32768.0f;
         if (ni > 32767.0f) ni = 32767.0f;
@@ -98,10 +140,13 @@ static inline int16_t q15_sat(int32_t x)
 void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
                                   double phase_step, int sample_offset)
 {
-    double  cs_d = cos(phase_step);
-    double  ss_d = sin(phase_step);
-    int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
-    int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
+    // Per-step phasor exp(j·phase_step) in Q15 via the reduced-argument
+    // float path (index 1 of the Q32 turn accumulator). No double trig:
+    // P4 soft-floats every double op, and these functions are called
+    // per chunk (~157×/burst from the worker's chunked rotate).
+    const uint32_t dphi_q32 = rot_dphi_q32(phase_step);
+    int16_t        cs_q, ss_q;
+    rot_phasor_q15(dphi_q32, 1u, &cs_q, &ss_q);
 
     int16_t pr_q               = 32767;
     int16_t pi_q               = 0;
@@ -122,9 +167,9 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
         // ROT_RENORM_PERIOD/ROT_SIMD_LANES chunks) matches q15_inc's
         // ROT_RENORM_PERIOD samples.
         if (n_chunks_to_renorm == 0) {
-            double phase       = phase_step * (double)(sample_offset + c * ROT_SIMD_LANES);
-            pr_q               = (int16_t)lrint(cos(phase) * 32767.0);
-            pi_q               = (int16_t)lrint(sin(phase) * 32767.0);
+            rot_phasor_q15(dphi_q32,
+                           (uint32_t)(sample_offset + c * ROT_SIMD_LANES),
+                           &pr_q, &pi_q);
             n_chunks_to_renorm = ROT_RENORM_PERIOD / ROT_SIMD_LANES;
         }
         n_chunks_to_renorm--;
@@ -160,9 +205,8 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
     // chunk-processed prefix. sample_offset shifts the absolute phase
     // so chunk-loop callers stay consistent across chunks.
     if (tail_start < n_complex) {
-        double phase = phase_step * (double)(sample_offset + tail_start);
-        pr_q         = (int16_t)lrint(cos(phase) * 32767.0);
-        pi_q         = (int16_t)lrint(sin(phase) * 32767.0);
+        rot_phasor_q15(dphi_q32, (uint32_t)(sample_offset + tail_start),
+                       &pr_q, &pi_q);
         for (int k = tail_start; k < n_complex; k++) {
             int32_t r     = iq[k * 2 + 0];
             int32_t v     = iq[k * 2 + 1];
@@ -195,10 +239,13 @@ extern void rotate_q15_chunk_arp4(const int16_t *I, const int16_t *Q,
 void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
                                    double phase_step, int sample_offset)
 {
-    double  cs_d = cos(phase_step);
-    double  ss_d = sin(phase_step);
-    int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
-    int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
+    // Per-step phasor exp(j·phase_step) in Q15 via the reduced-argument
+    // float path (index 1 of the Q32 turn accumulator). No double trig:
+    // P4 soft-floats every double op, and these functions are called
+    // per chunk (~157×/burst from the worker's chunked rotate).
+    const uint32_t dphi_q32 = rot_dphi_q32(phase_step);
+    int16_t        cs_q, ss_q;
+    rot_phasor_q15(dphi_q32, 1u, &cs_q, &ss_q);
 
     int16_t pr_q               = 32767;
     int16_t pi_q               = 0;
@@ -221,9 +268,9 @@ void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
 
     for (int c = 0; c < n_chunks; c++) {
         if (n_chunks_to_renorm == 0) {
-            double phase       = phase_step * (double)(sample_offset + c * ROT_SIMD_LANES);
-            pr_q               = (int16_t)lrint(cos(phase) * 32767.0);
-            pi_q               = (int16_t)lrint(sin(phase) * 32767.0);
+            rot_phasor_q15(dphi_q32,
+                           (uint32_t)(sample_offset + c * ROT_SIMD_LANES),
+                           &pr_q, &pi_q);
             n_chunks_to_renorm = ROT_RENORM_PERIOD / ROT_SIMD_LANES;
         }
         n_chunks_to_renorm--;
@@ -260,9 +307,8 @@ void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
     // Tail (fewer than ROT_SIMD_LANES remaining samples) — scalar
     // per-sample, identical to _simd_ref_at's tail.
     if (tail_start < n_complex) {
-        double phase = phase_step * (double)(sample_offset + tail_start);
-        pr_q         = (int16_t)lrint(cos(phase) * 32767.0);
-        pi_q         = (int16_t)lrint(sin(phase) * 32767.0);
+        rot_phasor_q15(dphi_q32, (uint32_t)(sample_offset + tail_start),
+                       &pr_q, &pi_q);
         for (int k = tail_start; k < n_complex; k++) {
             int32_t r     = iq[k * 2 + 0];
             int32_t v     = iq[k * 2 + 1];
@@ -297,10 +343,13 @@ void rotate_to_dc_q15_simd_at(int16_t *iq, int n_complex,
 void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step)
 {
     // Per-step phasor multiplier: exp(j·phase_step). Quantise to Q15.
-    double  cs_d = cos(phase_step);
-    double  ss_d = sin(phase_step);
-    int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
-    int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
+    // Per-step phasor exp(j·phase_step) in Q15 via the reduced-argument
+    // float path (index 1 of the Q32 turn accumulator). No double trig:
+    // P4 soft-floats every double op, and these functions are called
+    // per chunk (~157×/burst from the worker's chunked rotate).
+    const uint32_t dphi_q32 = rot_dphi_q32(phase_step);
+    int16_t        cs_q, ss_q;
+    rot_phasor_q15(dphi_q32, 1u, &cs_q, &ss_q);
 
     // Running phasor, starts at (1, 0) ≡ exp(j·0).
     int16_t pr_q        = 32767;
@@ -316,10 +365,8 @@ void rotate_to_dc_q15_inc(int16_t *iq, int n_complex, double phase_step)
         // Renormalise periodically: replace the drifting Q15 phasor
         // with a fresh quantisation of cos(k·dphi), sin(k·dphi).
         if (n_to_renorm >= ROT_RENORM_PERIOD) {
-            n_to_renorm  = 0;
-            double phase = phase_step * (double)k;
-            pr_q         = (int16_t)lrint(cos(phase) * 32767.0);
-            pi_q         = (int16_t)lrint(sin(phase) * 32767.0);
+            n_to_renorm = 0;
+            rot_phasor_q15(dphi_q32, (uint32_t)k, &pr_q, &pi_q);
         }
 
         // Multiply input sample by phasor: out = in × (pr + j·pi) / 32768
@@ -355,10 +402,13 @@ void rotate_to_dc_q15_inc_at(int16_t *iq, int n_complex,
     // n_to_renorm = ROT_RENORM_PERIOD on entry — no inter-chunk state
     // is carried in the running phasor, the cos/sin reference fully
     // re-establishes it.
-    double  cs_d = cos(phase_step);
-    double  ss_d = sin(phase_step);
-    int16_t cs_q = (int16_t)lrint(cs_d * 32767.0);
-    int16_t ss_q = (int16_t)lrint(ss_d * 32767.0);
+    // Per-step phasor exp(j·phase_step) in Q15 via the reduced-argument
+    // float path (index 1 of the Q32 turn accumulator). No double trig:
+    // P4 soft-floats every double op, and these functions are called
+    // per chunk (~157×/burst from the worker's chunked rotate).
+    const uint32_t dphi_q32 = rot_dphi_q32(phase_step);
+    int16_t        cs_q, ss_q;
+    rot_phasor_q15(dphi_q32, 1u, &cs_q, &ss_q);
 
     int16_t pr_q        = 32767;
     int16_t pi_q        = 0;
@@ -366,10 +416,9 @@ void rotate_to_dc_q15_inc_at(int16_t *iq, int n_complex,
 
     for (int k = 0; k < n_complex; k++) {
         if (n_to_renorm >= ROT_RENORM_PERIOD) {
-            n_to_renorm  = 0;
-            double phase = phase_step * (double)(sample_offset + k);
-            pr_q         = (int16_t)lrint(cos(phase) * 32767.0);
-            pi_q         = (int16_t)lrint(sin(phase) * 32767.0);
+            n_to_renorm = 0;
+            rot_phasor_q15(dphi_q32, (uint32_t)(sample_offset + k),
+                           &pr_q, &pi_q);
         }
         int32_t r     = iq[k * 2 + 0];
         int32_t v     = iq[k * 2 + 1];

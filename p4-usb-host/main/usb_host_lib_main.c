@@ -46,7 +46,8 @@ static void log_dma_int_heap(const char *tag)
 // httpd task (prio 5) so a multi-MB /capture/file download can't starve
 // the consumer and overflow the ringbuffer (rb_full_drops). It's
 // effectively event-driven (xRingbufferReceiveUpTo with timeout 0 + a
-// 10 ms usb_host_client_handle_events cap), so it yields Core 0 naturally
+// 100 ms usb_host_client_handle_events cap — 10 TICKS at the 100 Hz
+// tick), so it yields Core 0 naturally
 // every ~3-4 ms when data drains — raising its priority does not starve
 // httpd. See task #91 / #101.
 #define CLASS_TASK_PRIORITY 6

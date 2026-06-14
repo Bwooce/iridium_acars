@@ -68,6 +68,13 @@ typedef struct {
     float    detect_us;   // unused
     float    baseline_us; // unused
     float    total_us;    // total per-frame
+    // Raw window accumulators for the `fbt:` diagnostic line. Formatted
+    // and emitted by status_logger on Core 1 — the getter itself must
+    // stay log-free (it runs on Core 0's hot loop).
+    uint32_t new_bursts;  // tagger bursts started in this window
+    uint32_t gone_bursts; // tagger bursts ended in this window
+    uint32_t step_us;     // total fft_burst_tagger_step wall time
+    uint32_t tag_steps;   // tagger steps in this window
 } dsp_stage_stats_t;
 
 void dsp_processor_get_stage_stats(dsp_stage_stats_t *out);

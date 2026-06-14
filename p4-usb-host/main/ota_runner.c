@@ -181,9 +181,12 @@ esp_err_t ota_runner_start(void)
     // 8 KB of internal SRAM is fine here because the task is only
     // spawned on user-triggered OTA (not boot), so it can't fragment
     // tagger init the way a boot-time internal stack would.
+    // Pinned to Core 0: at prio 5 a no-affinity OTA task could land on
+    // Core 1 ABOVE worker_core1/frame_decoder (prio 4) and starve the
+    // decode pipeline for the whole multi-second download. Core 0 has
+    // idle headroom and already hosts httpd at the same prio.
     BaseType_t ok = xTaskCreatePinnedToCore(ota_task, "ota", 8192,
-                                            NULL, 5, NULL,
-                                            tskNO_AFFINITY);
+                                            NULL, 5, NULL, 0);
     if (ok != pdPASS) {
         s_running = false;
         set_status_error("xTaskCreate failed");

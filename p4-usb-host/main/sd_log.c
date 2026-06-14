@@ -99,54 +99,69 @@ static void update_stats_err(void)
     xSemaphoreGive(s_stats_mu);
 }
 
+// Tiny JSON string escape — intentionally duplicated from http_server.c /
+// acars_push.c pending a shared header (M17): the three copies stay
+// byte-identical so the NDJSON / UDP / HTTP emitters agree. Writes up to
+// outsz-1 chars + NUL, returns chars written (excluding the NUL).
+static size_t json_escape(char *out, size_t outsz, const char *in)
+{
+    size_t w = 0;
+    if (outsz == 0) return 0;
+    for (; *in && w + 7 < outsz; in++) {
+        unsigned char c = (unsigned char)*in;
+        switch (c) {
+        case '"':
+            out[w++] = '\\';
+            out[w++] = '"';
+            break;
+        case '\\':
+            out[w++] = '\\';
+            out[w++] = '\\';
+            break;
+        case '\n':
+            out[w++] = '\\';
+            out[w++] = 'n';
+            break;
+        case '\r':
+            out[w++] = '\\';
+            out[w++] = 'r';
+            break;
+        case '\t':
+            out[w++] = '\\';
+            out[w++] = 't';
+            break;
+        default:
+            if (c < 0x20) {
+                // \u00XX
+                static const char hex[] = "0123456789abcdef";
+                out[w++]                = '\\';
+                out[w++]                = 'u';
+                out[w++]                = '0';
+                out[w++]                = '0';
+                out[w++]                = hex[(c >> 4) & 0xf];
+                out[w++]                = hex[c & 0xf];
+            } else {
+                out[w++] = (char)c;
+            }
+        }
+    }
+    out[w] = '\0';
+    return w;
+}
+
 // Same single-line JSON shape as GET /messages and acars_push, plus a
 // trailing newline so the file is true NDJSON. Returns bytes written
 // (excluding the NUL).
 static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
 {
-    // Tiny JSON escape for the text field — copied from acars_push.c
-    // structure rather than shared because pulling them into a common
-    // helper would touch three call sites for marginal benefit.
-    char   esc[2 * MSG_RING_TXT_MAX + 8];
-    size_t w = 0;
-    for (const char *p = m->txt; *p && w + 7 < sizeof(esc); p++) {
-        unsigned char c = (unsigned char)*p;
-        switch (c) {
-        case '"':
-            esc[w++] = '\\';
-            esc[w++] = '"';
-            break;
-        case '\\':
-            esc[w++] = '\\';
-            esc[w++] = '\\';
-            break;
-        case '\n':
-            esc[w++] = '\\';
-            esc[w++] = 'n';
-            break;
-        case '\r':
-            esc[w++] = '\\';
-            esc[w++] = 'r';
-            break;
-        case '\t':
-            esc[w++] = '\\';
-            esc[w++] = 't';
-            break;
-        default:
-            if (c < 0x20) {
-                static const char hex[] = "0123456789abcdef";
-                esc[w++]                = '\\';
-                esc[w++]                = 'u';
-                esc[w++]                = '0';
-                esc[w++]                = '0';
-                esc[w++]                = hex[(c >> 4) & 0xf];
-                esc[w++]                = hex[c & 0xf];
-            } else {
-                esc[w++] = (char)c;
-            }
-        }
-    }
-    esc[w] = '\0';
+    char esc[2 * MSG_RING_TXT_MAX + 8];
+    json_escape(esc, sizeof(esc), m->txt);
+    // msg_num / flight_id come off the air too — a quote in either would
+    // break the NDJSON line just as surely as one in txt (M17).
+    char esc_msgnum[2 * sizeof(m->msg_num) + 1];
+    char esc_flight[2 * sizeof(m->flight_id) + 1];
+    json_escape(esc_msgnum, sizeof(esc_msgnum), m->msg_num);
+    json_escape(esc_flight, sizeof(esc_flight), m->flight_id);
 
     int n = snprintf(out, cap,
                      "{\"id\":%llu,\"t_us\":%llu,\"dir\":\"%s\","
@@ -160,8 +175,8 @@ static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
                      m->mode,
                      m->label,
                      m->block_id,
-                     m->msg_num,
-                     m->flight_id,
+                     esc_msgnum,
+                     esc_flight,
                      m->crc_ok ? "true" : "false",
                      (long)m->peak_bin,
                      (double)m->snr_db,
@@ -171,8 +186,11 @@ static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
     return (size_t)n;
 }
 
-// Forward decls — lazy-mount triggers these.
-static esp_err_t mount_sd(void);
+// Forward decls — lazy-mount triggers these. allow_format controls
+// .format_if_mount_failed: only the explicit operator format path
+// (sd_log_force_format / POST /sd/format) may pass true — a glitchy
+// lazy mount must never silently reformat the card (see mount_sd).
+static esp_err_t mount_sd(bool allow_format);
 static esp_err_t open_log_file(void);
 
 // Bring up the SD card (shared by sd_log + sd_capture). Sets
@@ -187,7 +205,9 @@ static esp_err_t open_log_file(void);
 static esp_err_t try_mount(void)
 {
     s_mount_attempted = true;
-    esp_err_t r       = mount_sd();
+    // Never format on the lazy/first-decode path — a transient mount
+    // glitch (marginal card, contact bounce) must not destroy data.
+    esp_err_t r = mount_sd(false);
     if (r != ESP_OK) {
         ESP_LOGW(TAG, "SD mount failed (%s) — logging stays disabled",
                  esp_err_to_name(r));
@@ -299,7 +319,7 @@ static esp_err_t sdmmc_deinit_noop(void)
     return ESP_OK;
 }
 
-static esp_err_t mount_sd(void)
+static esp_err_t mount_sd(bool allow_format)
 {
     enable_card_power();
 
@@ -359,45 +379,38 @@ static esp_err_t mount_sd(void)
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
     esp_vfs_fat_mount_config_t mount = {
-        // Format the card to FAT32 if it's blank or has a non-FAT
-        // filesystem. The card is exclusively for the device's own
-        // use (ACARS log + IQ capture) so destroying any pre-
-        // existing data is acceptable. The WDT bump below makes
-        // this safe — without it, f_mkfs on a 4 GB card runs
-        // synchronously long enough to starve frame_decoder past
-        // its 5 s watchdog.
-        .format_if_mount_failed = true,
+        // Format to FAT32 only when the EXPLICIT operator path asked
+        // for it (sd_log_force_format / POST /sd/format). The lazy /
+        // first-decode mount passes allow_format=false: a transient
+        // mount glitch (marginal card, contact bounce, brown-out)
+        // must never silently reformat a card full of captures.
+        .format_if_mount_failed = allow_format,
         .max_files              = 4,
         .allocation_unit_size   = 16 * 1024,
     };
 
-    // Mount may trigger a synchronous f_mkfs (format) that takes
-    // tens of seconds on a multi-GB card and hammers the SDMMC bus.
-    // The watched class_driver / frame_decoder tasks can starve
-    // past their 5 s WDT timeout during this. Bump the global TWDT
-    // timeout to 60 s for the duration of the mount, restore after.
-    esp_task_wdt_config_t wdt_save = {
-        .timeout_ms     = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000U,
-        .idle_core_mask = 0, // restore: leave as configured
-        .trigger_panic  = true,
-    };
-    // Format of a 4 GB card empirically took ~96 s in one bench
-    // run; 180 s gives margin for slower cards / fragmentation.
-    esp_task_wdt_config_t wdt_mount = {
-        .timeout_ms     = 180000,
-        .idle_core_mask = 0,
-        .trigger_panic  = true,
-    };
-    esp_err_t wdt_r = esp_task_wdt_reconfigure(&wdt_mount);
-    ESP_LOGI(TAG, "wdt reconfigure to %u ms -> %s",
-             (unsigned)wdt_mount.timeout_ms, esp_err_to_name(wdt_r));
+    // Mount may trigger a synchronous f_mkfs (format, allow_format
+    // path) that takes tens of seconds on a multi-GB card. Unsubscribe
+    // ONLY the calling task from the TWDT for the duration — the old
+    // esp_task_wdt_reconfigure(180 s) raised the GLOBAL timeout, which
+    // left class_driver / frame_decoder / every watched task uncovered
+    // for the whole mount. delete(NULL) returns an error if this task
+    // was never subscribed; in that case skip the re-add below.
+    esp_err_t wdt_r = esp_task_wdt_delete(NULL);
+    ESP_LOGI(TAG, "wdt delete(self) for mount -> %s", esp_err_to_name(wdt_r));
 
     esp_err_t r = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot, &mount, &s_card);
 
-    (void)esp_task_wdt_reconfigure(&wdt_save);
+    if (wdt_r == ESP_OK) (void)esp_task_wdt_add(NULL); // restore own WDT cover
     if (r != ESP_OK) {
+        // s_stats is copied concurrently by sd_log_get_stats (httpd) —
+        // hold s_stats_mu for the write. Lock order is fine: s_log_mu
+        // (held by writer_task around try_mount) → s_stats_mu matches
+        // force_format's existing nesting; we never take s_log_mu here.
+        if (s_stats_mu) xSemaphoreTake(s_stats_mu, portMAX_DELAY);
         snprintf(s_stats.mount_error, sizeof(s_stats.mount_error),
                  "%s", esp_err_to_name(r));
+        if (s_stats_mu) xSemaphoreGive(s_stats_mu);
         // Power the card rail back off so a missing-card socket isn't
         // sitting with VDD asserted.
         gpio_set_level(PIN_PWR, 1); // 1 = card power OFF
@@ -419,8 +432,11 @@ static esp_err_t mount_sd(void)
         return r;
     }
 
+    // Same mutex discipline as the failure path above.
+    if (s_stats_mu) xSemaphoreTake(s_stats_mu, portMAX_DELAY);
     s_stats.mounted        = true;
     s_stats.mount_error[0] = '\0';
+    if (s_stats_mu) xSemaphoreGive(s_stats_mu);
     sdmmc_card_print_info(stdout, s_card);
 
     // Attach the SDMMC stash buffer that sd_log_init pre-allocated.
@@ -553,20 +569,23 @@ esp_err_t sd_log_force_format(void)
         xSemaphoreGive(s_stats_mu);
     }
     if (s_log_mu) xSemaphoreGive(s_log_mu);
-    // f_mkfs takes up to ~3 min on a 4 GB card; bump the WDT so the
-    // task that called us (httpd) doesn't trip during the format.
-    // Save the current TWDT config so the restore below puts it back
-    // exactly as configured rather than assuming a hardcoded 5 s.
-    // mount_sd() (above) already follows this pattern; this branch had
-    // an unconditional 5000 ms restore that would clobber a non-default
-    // CONFIG_ESP_TASK_WDT_TIMEOUT_S (#124).
-    esp_task_wdt_config_t wdt_save = {
-        .timeout_ms     = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000U,
-        .idle_core_mask = 0,
-        .trigger_panic  = true,
-    };
-    esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
-        .timeout_ms = 240000, .idle_core_mask = 0, .trigger_panic = true});
+
+    // No card mounted? This IS the explicit operator format path, so
+    // retry the mount with formatting allowed — a blank or non-FAT card
+    // (which the lazy mount path now refuses to format, see mount_sd)
+    // can only be brought into service from here.
+    if (!s_card) {
+        ESP_LOGW(TAG, "force_format: no card mounted — mounting with format allowed");
+        (void)mount_sd(true);
+    }
+
+    // f_mkfs takes up to ~3 min on a 4 GB card. Unsubscribe ONLY this
+    // task from the TWDT for the duration — the previous global
+    // esp_task_wdt_reconfigure(240 s) dropped WDT cover for EVERY
+    // watched task (class_driver, frame_decoder, ...) during the format,
+    // not just the caller. delete(NULL) errors if this task was never
+    // subscribed (httpd usually isn't); skip the re-add in that case.
+    esp_err_t wdt_r = esp_task_wdt_delete(NULL);
 
     esp_err_t r = ESP_OK;
     if (s_card) {
@@ -583,8 +602,8 @@ esp_err_t sd_log_force_format(void)
         r = ESP_ERR_INVALID_STATE;
     }
 
-    // Restore WDT to the saved (configured) value, not a hardcoded 5 s.
-    (void)esp_task_wdt_reconfigure(&wdt_save);
+    // Restore our own WDT subscription if we were watched before.
+    if (wdt_r == ESP_OK) (void)esp_task_wdt_add(NULL);
 
     // Recreate /sdcard/acars/ for the log + capture files, then
     // re-open a fresh log file. esp_vfs_fat_sdcard_format leaves the

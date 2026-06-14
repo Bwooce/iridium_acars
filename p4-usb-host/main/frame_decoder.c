@@ -32,7 +32,7 @@
 
 static const char *TAG = "FRMDEC";
 
-#define FRAME_QUEUE_SLOTS 64 // 64 × 432 B ≈ 27 KB in PSRAM
+#define FRAME_QUEUE_SLOTS 64 // 64 × ~2064 B ≈ 132 KB in PSRAM
 #define DECODER_STACK 6144
 #define DECODER_PRIO 4 // Core 0: < class_driver (6), < httpd (5),
                        // > sd_log (2), > logger (1)
@@ -198,7 +198,7 @@ static void try_acars(const sbd_message_t *msg,
 
             // Push to /messages-visible ring.
             acars_msg_t out  = {0};
-            out.timestamp_us = (uint64_t)msg->timestamp_us;
+            out.timestamp_us = msg->timestamp_us;
             out.uplink       = msg->uplink;
             out.mode         = a->mode ? a->mode : '?';
             out.label[0]     = a->label[0];
@@ -332,7 +332,7 @@ static void process_one(const frame_queue_item_t *it)
                 sbd_message_t sbd;
                 int           rc_sbd = sbd_reassembler_feed(&s_sbd, &ida,
                                                             it->direction == 1,
-                                                            (uint64_t)it->timestamp_us,
+                                                            it->timestamp_us,
                                                             &sbd);
                 if (rc_sbd == 1) {
                     atomic_fetch_add_explicit(&s_sbd_complete, 1,
@@ -409,7 +409,16 @@ static void decoder_task(void *arg)
         }
         if (got) {
             process_one(&item);
-            // Yield once after each item so IDLE1 / lower-prio tasks
+            // Drain a small batch per wake. One-item-per-tick capped the
+            // decoder at 100 frames/s — under bench-noise load (tagger at
+            // 140 bursts/s, multi-frame bursts emitting several frames
+            // each) the 63-deep queue filled within seconds and dropped.
+            // The batch stays small so the 1-tick yield below still runs
+            // often enough for IDLE1 / status_logger.
+            for (int b = 1; b < 8 && frame_queue_pop(s_queue, &item); b++) {
+                process_one(&item);
+            }
+            // Yield once after each batch so IDLE1 / lower-prio tasks
             // (status_logger) get a slice even if bursts arrive
             // back-to-back. taskYIELD here would also work but a
             // 1-tick delay is more predictable.
@@ -495,7 +504,7 @@ bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
     if (n_bits == 0 || n_bits > FRAME_QUEUE_MAX_BITS) return false;
 
     frame_queue_item_t item;
-    item.timestamp_us = (uint32_t)esp_timer_get_time();
+    item.timestamp_us = (uint64_t)esp_timer_get_time();
     item.freq_hz      = freq_hz;
     item.peak_bin     = peak_bin;
     item.snr_db       = snr_db;

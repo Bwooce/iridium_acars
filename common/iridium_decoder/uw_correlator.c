@@ -1936,7 +1936,13 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
         free(s_rrc_scr_in_q);
         free(s_rrc_scr_out_i);
         free(s_rrc_scr_out_q);
-        size_t bytes = (size_t)fir_len * sizeof(int16_t);
+        // +16 int16 trailing pad: the arp4 PIE kernels have a vector
+        // look-ahead defect and read/write up to one 128-bit vector
+        // past the nominal end of their buffers. Exactly-sized heap
+        // blocks put that overrun in the adjacent allocation — and
+        // this scratch is reallocated at varying sizes per burst, so
+        // the neighbour changes constantly.
+        size_t bytes = ((size_t)fir_len + 16) * sizeof(int16_t);
         // dsps_fird_s16_arp4 uses `esp.vld.128.ip` for its vector
         // loads — same constraint as the front-end FFT and decim
         // path: scratch MUST be in INTERNAL SRAM for PIE to engage.

@@ -71,5 +71,12 @@ size_t msg_ring_snapshot(uint64_t since_id, acars_msg_t *out, size_t cap)
 
 uint64_t msg_ring_total(void)
 {
-    return s_last_id;
+    // s_last_id is 64-bit and this is RV32 — an unlocked read can tear
+    // against msg_ring_push's increment (two 32-bit halves). Take the
+    // same mutex the writers hold.
+    if (!s_mutex) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint64_t id = s_last_id;
+    xSemaphoreGive(s_mutex);
+    return id;
 }

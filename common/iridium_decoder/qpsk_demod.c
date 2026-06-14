@@ -107,7 +107,8 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     // caller's stack -- avoiding 3 malloc/free pairs per try_decode_frame
     // call (with multi-frame this fires ~3.5x per burst). Worker stack
     // is 16 KB on P4 (xTaskCreatePinnedToCore in worker_core1.c:638);
-    // 3.8 KB of locals here fits with headroom. On host all callers
+    // ~5.1 KB of locals here (symbols 2 KB + pll_out 2 KB +
+    // hard_decisions 1 KB) fits with headroom. On host all callers
     // run on the main thread with default 8 MB stack.
     float complex symbols[QPSK_MAX_SYMBOLS];
     float complex pll_out[QPSK_MAX_SYMBOLS];
@@ -294,6 +295,16 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     out->bits      = malloc(n_symbols * 2);
     out->soft_bits = malloc(n_symbols * 2 * sizeof(int16_t));
     out->n_bits    = n_symbols * 2;
+    if (!out->bits) {
+        // OOM (PSRAM fragmentation under load). soft_bits is optional
+        // downstream but bits is not — fail the demod cleanly instead
+        // of dereferencing NULL below.
+        free(out->soft_bits);
+        out->soft_bits = NULL;
+        out->n_bits    = 0;
+        ESP_LOGE(TAG, "demod bits alloc failed (%d symbols)", n_symbols);
+        return 0;
+    }
     for (int i = 0; i < n_symbols; i++) {
         int diff             = (hard_decisions[i] - old_sym + 4) % 4;
         old_sym              = hard_decisions[i];

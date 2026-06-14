@@ -10,6 +10,7 @@
 #include "esp_app_desc.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_attr.h" // EXT_RAM_BSS_ATTR — big static buffers go to PSRAM .bss
 
 #include "wifi_link.h"
 #include "app_config.h"
@@ -37,6 +38,11 @@
 
 static const char    *TAG      = "HTTP";
 static httpd_handle_t s_server = NULL;
+
+// Defined below (near /messages); fwd-declared so status_get / ota_get can
+// escape user-controlled strings (SSID, out_host, ota_url, error text)
+// before embedding them in JSON (M17).
+static size_t json_escape(char *out, size_t outsz, const char *in);
 
 // Pre-allocated DMA-INT read buffer for /capture/file. Allocated at
 // http_server_start (early in app_main) so it survives DMA-INT
@@ -162,6 +168,19 @@ static esp_err_t status_get(httpd_req_t *req)
     wifi_link_wdt_status(&wdt_gw, &wdt_armed, &wdt_fails,
                          &wdt_stream_live, &wdt_stream_stalls);
 
+    // JSON-escape the free-form string fields (M17): SSID, push host and
+    // OTA URL are operator input; mount_error carries errno/driver text.
+    // Any embedded quote/backslash would otherwise break the JSON. 2× the
+    // source size + 1 covers the worst case (every char escaping to two).
+    char ssid_esc[2 * 33 + 1]; // wifi_link_ssid() is a char[33] SSID
+    char host_esc[2 * sizeof(cfg.out_host) + 1];
+    char ota_esc[2 * sizeof(cfg.ota_url) + 1];
+    char mnt_err_esc[2 * sizeof(sd.mount_error) + 1];
+    json_escape(ssid_esc, sizeof(ssid_esc), wifi_link_ssid());
+    json_escape(host_esc, sizeof(host_esc), cfg.out_host);
+    json_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
+    json_escape(mnt_err_esc, sizeof(mnt_err_esc), sd.mount_error);
+
     char body[1600];
     int  n = snprintf(body, sizeof(body),
                       "{"
@@ -204,7 +223,7 @@ static esp_err_t status_get(httpd_req_t *req)
                       app->version,
                       app->date,
                      wifi_link_is_ap_mode() ? "AP" : "STA",
-                      wifi_link_ssid(),
+                      ssid_esc,
                      wifi_link_is_connected() ? "true" : "false",
                       ip_str,
                       (long long)(uptime_us / 1000000),
@@ -212,10 +231,10 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned)cfg.lo_freq_hz,
                       (unsigned)cfg.sample_rate_hz,
                      cfg.bias_tee ? "true" : "false",
-                      cfg.out_host,
+                      host_esc,
                       (unsigned)cfg.out_port,
                      (cfg.out_host[0] && cfg.out_port) ? "true" : "false",
-                      cfg.ota_url,
+                      ota_esc,
                       (unsigned long long)usbt.completed,
                       (unsigned long long)usbt.rb_full_drops,
                       (unsigned long long)usbt.status_errors,
@@ -237,7 +256,7 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned long long)sd.bytes_written,
                       (unsigned)sd.write_errors,
                       sd.log_path,
-                      sd.mount_error);
+                      mnt_err_esc);
 
     if (n < 0 || n >= (int)sizeof(body)) {
         ESP_LOGW(TAG, "status body truncated (n=%d, cap=%d)", n, (int)sizeof(body));
@@ -464,13 +483,35 @@ static esp_err_t form_field(const char *body, size_t blen,
 
 static esp_err_t config_post(httpd_req_t *req)
 {
-    char body[256];
-    int  total = 0;
-    while (total < (int)sizeof(body) - 1) {
+    // Form body buffer. static (not stack, not heap): esp_http_server
+    // runs every handler on its single serve task, so one static buffer
+    // is race-free and avoids a per-request alloc. 1024 covers the full
+    // form worst case (ssid 32 + psk 63 + out_host 63 + ota_url 127,
+    // each up to 3× expanded by %XX url-encoding, plus keys) — the old
+    // 256-byte buffer silently truncated long PSK+URL combinations.
+    static char body[1024];
+    if (req->content_len >= sizeof(body)) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "form body too large\n", HTTPD_RESP_USE_STRLEN);
+    }
+    int total    = 0;
+    int timeouts = 0;
+    while (total < (int)req->content_len) {
         int n = httpd_req_recv(req, body + total, sizeof(body) - 1 - total);
         if (n <= 0) {
-            if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
-            break;
+            if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+                // Bounded retry: the old unconditional `continue` could
+                // spin this single serve task forever against a client
+                // that stalls mid-body (recv timeout is 2 s, so 3 retries
+                // ≈ 8 s worst case before we give up).
+                if (++timeouts <= 3) continue;
+                httpd_resp_set_status(req, "408 Request Timeout");
+                httpd_resp_set_type(req, "text/plain");
+                httpd_resp_send(req, "body recv timeout\n", HTTPD_RESP_USE_STRLEN);
+                return ESP_FAIL;
+            }
+            break; // client closed / socket error — parse what we got
         }
         total += n;
     }
@@ -604,9 +645,12 @@ static esp_err_t messages_get(httpd_req_t *req)
         }
     }
 
-    static acars_msg_t s_snap[MSG_RING_CAPACITY]; // ~9 KB; fine on logger task stack? no — too big.
-    // BSS-allocated above to avoid the 6 KB http_server task stack.
-    size_t n = msg_ring_snapshot(since_id, s_snap, MSG_RING_CAPACITY);
+    // ~9 KB snapshot — too big for the 6 KB httpd task stack, so static.
+    // EXT_RAM_BSS_ATTR moves it to PSRAM .bss: internal SRAM is reserved
+    // for the USB DMA pool, and the ring copy is latency-tolerant (the
+    // file's other big buffers already live in PSRAM via heap_caps).
+    static EXT_RAM_BSS_ATTR acars_msg_t s_snap[MSG_RING_CAPACITY];
+    size_t                              n = msg_ring_snapshot(since_id, s_snap, MSG_RING_CAPACITY);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -709,10 +753,14 @@ static esp_err_t ota_get(httpd_req_t *req)
     default:
         break;
     }
-    char body[300];
+    // last_error carries free-form text (URLs, esp_err strings) — escape
+    // it so a quote/backslash can't break the JSON (M17).
+    char err_esc[2 * sizeof(s.last_error) + 1];
+    json_escape(err_esc, sizeof(err_esc), s.last_error);
+    char body[560];
     int  n = snprintf(body, sizeof(body),
                       "{\"state\":\"%s\",\"http_status\":%d,\"bytes_written\":%d,\"last_error\":\"%s\"}",
-                      state, s.http_status, s.bytes_written, s.last_error);
+                      state, s.http_status, s.bytes_written, err_esc);
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -943,20 +991,25 @@ static esp_err_t sd_mount_post(httpd_req_t *req)
 // State letters: R running, B blocked, S suspended, X deleted.
 static esp_err_t tasks_get(httpd_req_t *req)
 {
-    // vTaskList output is ~40-80 bytes per task. Allocate generously
-    // in PSRAM. Header line + ~15 tasks ≈ 1.5 KB worst case.
-    char *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    // vTaskList/vTaskGetRunTimeStats output is unbounded — it scales with
+    // the LIVE task count, not a compile-time constant, and both write
+    // with no length argument. Size from uxTaskGetNumberOfTasks():
+    // ~40-80 B per task per dump, 128 B/task is generous headroom, ×2
+    // for the two dumps, +512 for our headers. A fixed 4096 overflowed
+    // once enough tasks were running.
+    size_t cap = (size_t)uxTaskGetNumberOfTasks() * 128 * 2 + 512;
+    char  *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
     if (!buf) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "oom", HTTPD_RESP_USE_STRLEN);
     }
     // Header so the output's columns are obvious to a human reader.
-    int n = snprintf(buf, 4096,
+    int n = snprintf(buf, cap,
                      "Name             State Prio Stack Num CPU\n"
                      "-------------------------------------------\n");
     vTaskList(buf + n);
     size_t off = strlen(buf);
-    off += snprintf(buf + off, 4096 - off,
+    off += snprintf(buf + off, cap - off,
                     "\n=== CPU runtime stats (since boot) ===\n"
                     "Name             Time%%\n"
                     "----------------------\n");
@@ -1141,25 +1194,34 @@ static esp_err_t capture_start_post(httpd_req_t *req)
 }
 
 // POST /capture/stop — flushes and closes the current capture file.
-// Idempotent in spirit; returns 409 if no capture was active.
+// Idempotent in spirit; returns 409 if no capture was active. A slow
+// drain (multi-MB stream-buffer backlog) returns 202 with
+// "stopping":true — the writer task finishes the close asynchronously;
+// poll /capture/status for active:false. We must NOT block here: this
+// runs on the single httpd serve task (see task #101).
 static esp_err_t capture_stop_post(httpd_req_t *req)
 {
-    esp_err_t          r = sd_capture_stop();
+    esp_err_t r = sd_capture_stop();
+    // ESP_ERR_TIMEOUT = stop accepted, drain still in progress.
+    bool               stopping = (r == ESP_ERR_TIMEOUT);
     sd_capture_stats_t s;
     sd_capture_get_stats(&s);
-    char resp[256];
+    char resp[300];
     int  n = snprintf(resp, sizeof(resp),
-                      "{\"result\":\"%s\",\"path\":\"%s\","
+                      "{\"result\":\"%s\",\"stopping\":%s,\"path\":\"%s\","
                        "\"bytes_captured\":%llu,\"bytes_dropped\":%lu,"
                        "\"write_errors\":%lu}",
                       esp_err_to_name(r),
+                     stopping ? "true" : "false",
                       s.path,
                       (unsigned long long)s.bytes_captured,
                       (unsigned long)s.bytes_dropped,
                       (unsigned long)s.write_errors);
     if (n < 0) n = 0;
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK" : "409 Conflict");
+    httpd_resp_set_status(req, (r == ESP_OK) ? "200 OK"
+                               : stopping    ? "202 Accepted"
+                                             : "409 Conflict");
     return httpd_resp_send(req, resp, n);
 }
 
@@ -1339,8 +1401,10 @@ esp_err_t http_server_start(void)
     cfg.stack_size       = 6144;
     // Pin to Core 0: Core 1 is ~98% saturated (ingest + worker), so a
     // no-affinity httpd task can get parked there and barely run. Core 0
-    // has ~23% idle headroom. Prio 5 cleanly outranks class_driver (3)
-    // on Core 0. recv/send timeouts cut to 2 s (default 5 s): under the
+    // has ~23% idle headroom. Prio 5 sits BELOW class_driver (6) on
+    // Core 0 — deliberate, so USB drain preempts HTTP work (see
+    // CLASS_TASK_PRIORITY in usb_host_lib_main.c).
+    // recv/send timeouts cut to 2 s (default 5 s): under the
     // esp_hosted SDIO TX throttle a blocking send() can wedge this single
     // serve task, making the WHOLE server unreachable; a short timeout
     // bounds that worst case so one stalled connection can't hold off
