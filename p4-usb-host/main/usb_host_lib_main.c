@@ -23,6 +23,7 @@
 #include "ota_runner.h"
 #include "sd_log.h"
 #include "sd_capture.h"
+#include "serial_cmd.h"
 #include "esp_heap_caps.h"
 
 // One-line snapshot of internal-DMA-capable heap (the pool the USB
@@ -204,6 +205,10 @@ void app_main(void)
     // missing keys — system stays operational with no NVS data.
     app_config_init();
     app_config_log();
+
+    // Serial NVS command interface — always active so config can be
+    // recovered even when WiFi is down or credentials are lost.
+    serial_cmd_init();
 
     // D16 software AGC. Idle unless gain_mode==SOFTWARE_AGC.
     agc_init();

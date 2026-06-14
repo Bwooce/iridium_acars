@@ -5,7 +5,7 @@ set(_app_srcs
     "worker_core1.c" "ingest_core1.c" "status_logger.c" "smoke_test.c"
     "frame_decoder.c" "pie_fft_diff_test.c" "app_config.c" "agc.c"
     "wifi_link.c" "http_server.c" "msg_ring.c" "captive_dns.c"
-    "acars_push.c" "ota_runner.c"
+    "acars_push.c" "ota_runner.c" "serial_cmd.c"
 )
 set(_app_reqs
     usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash
@@ -16,7 +16,7 @@ set(_app_reqs
     # two, but PRIV_REQUIRES is consumed on pass one). The runtime cost
     # comes from sd_log.c calling these APIs; that source file is what
     # the CONFIG_ENABLE_SD_LOG gate actually excludes.
-    esp_driver_sdmmc fatfs esp_driver_gpio
+    esp_driver_sdmmc fatfs esp_driver_gpio esp_driver_uart
 )
 # SD log subsystem (#63): opt-in via CONFIG_ENABLE_SD_LOG. Off by
 # default. When off, sd_log.c isn't compiled and sd_log.h exposes
