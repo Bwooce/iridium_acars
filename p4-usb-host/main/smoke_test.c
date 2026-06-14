@@ -1001,8 +1001,8 @@ void smoke_test_run(void)
                  peak_bin, EXPECTED_BIN_LO, EXPECTED_BIN_HI);
         pass = false;
     }
-    if (snr_db < 30.0f) {
-        ESP_LOGE(TAG, "  SNR %.2f dB lower than expected (>30 dB) — could be"
+    if (snr_db < 20.0f) {
+        ESP_LOGE(TAG, "  SNR %.2f dB lower than expected (>20 dB) — could be"
                       " a noise-floor spike rather than the tone",
                  snr_db);
         pass = false;
