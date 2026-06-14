@@ -74,30 +74,12 @@ static inline int16_t q15_from_float(float f)
     return q15_saturate(q);
 }
 
-// Apply a Q15 linear phase ramp exp(+j·dphi·n) in place to a complex
-// int16 IQ stream. Used both for the coarse pre-RRC freq-correction
-// and (with peak-phase initial value + sub-sample interp) for the
-// final post-UW pre-rotation step.
-static void q15_freq_shift_inplace(int16_t *iq, int n_complex,
-                                   int16_t pr_q_init, int16_t pi_q_init,
-                                   int16_t cs_q, int16_t ss_q)
-{
-    int16_t pr_q = pr_q_init;
-    int16_t pi_q = pi_q_init;
-    for (int i = 0; i < n_complex; i++) {
-        int32_t r     = iq[i * 2 + 0];
-        int32_t v     = iq[i * 2 + 1];
-        int32_t nr    = ((int32_t)r * pr_q - (int32_t)v * pi_q) >> 15;
-        int32_t ni    = ((int32_t)r * pi_q + (int32_t)v * pr_q) >> 15;
-        iq[i * 2 + 0] = q15_saturate(nr);
-        iq[i * 2 + 1] = q15_saturate(ni);
-        // Advance phasor: p ← p · (cs_q + j·ss_q) = p · exp(j·dphi).
-        int32_t npr = ((int32_t)pr_q * cs_q - (int32_t)pi_q * ss_q) >> 15;
-        int32_t npi = ((int32_t)pr_q * ss_q + (int32_t)pi_q * cs_q) >> 15;
-        pr_q        = q15_saturate(npr);
-        pi_q        = q15_saturate(npi);
-    }
-}
+// (q15_freq_shift_inplace used to live here — the Q15 phase-ramp
+// helper from the channelizer era. Both its roles are now served by
+// rotate_to_dc_q15_simd_at / the in-line pre-rotation in
+// try_decode_frame; removed as dead code. Doc references in
+// direct_if_decim.h / test_pipeline_wideband_albq.c describe the
+// rotation step generically.)
 
 #define SYNC_RRC_LEN_GUARD 280    // SYNC_LENGTH × sps — minimum slice
                                   //   that the matched filter can
@@ -129,6 +111,7 @@ static void q15_freq_shift_inplace(int16_t *iq, int n_complex,
 // (which is declared above the outer driver).
 #ifdef ESP_PLATFORM
 #include "esp_timer.h"
+#include "esp_attr.h"
 #define PROFILE_T0() int64_t _pt0 = esp_timer_get_time()
 #define PROFILE_NOW() esp_timer_get_time()
 #define PROFILE_LOG(name)                                      \
@@ -144,6 +127,9 @@ static void q15_freq_shift_inplace(int16_t *iq, int n_complex,
 #define PROFILE_LOG(name) \
     do {                  \
     } while (0)
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 #endif
 
 enum {
@@ -166,6 +152,13 @@ static volatile uint32_t s_profile_us[BP_N]    = {0};
 static volatile uint32_t s_profile_loops_first = 0;
 static volatile uint32_t s_profile_loops_retry = 0;
 
+// Decode scratch for try_decode_frame: fused interp+decim output, at most
+// one frame at 2 sps (1910 / POST_CORR_DECIM = 382 complex ≈ 1.6 KB).
+// Static (single-threaded worker / host test), +16 int16 trailing pad for
+// the PIE rotate kernel's vector look-ahead.
+#define TDF_POST_MAX (191 * UW_SPS / POST_CORR_DECIM)
+static EXT_RAM_BSS_ATTR int16_t s_tdf_post[TDF_POST_MAX * 2 + 16];
+
 static bool try_decode_frame(int16_t *adj_burst, int adj_n,
                              int                      search_start,
                              burst_pipeline_result_t *result, bool dump)
@@ -183,12 +176,20 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     //
     // Tested values: 840 (gri-exact) regresses BER 1.30 -> 2.12% on this
     // corpus because our wider buffer pushes some UWs past 840. Values
-    // 1909, 2520, 3000 all give identical BER 1.30% -- 1909 is the
-    // smallest that captures all UWs while remaining < 1 frame.
+    // 1909, 2520, 3000 all give identical BER 1.30% -- because they all
+    // exceed the correlator's HARD cap: a 2048-pt FFT with a 271-sample
+    // reference yields only 2048 - 271 + 1 = 1778 alias-free lags, and
+    // uw_correlator_find's search loop breaks at k + 270 >= 2048. So the
+    // effective search range was ALWAYS 1778, never the 1909 "just under
+    // one frame" this constant used to claim — UWs at offsets 1778..1908
+    // in a window are only found by the 655-step retry loop (~18 ms per
+    // retry). Set the constant to the real cap so the intent matches the
+    // behaviour; full 1909-lag coverage would need CORR_FFT_N = 4096
+    // (probably not worth it given the retries).
     //
     // Long-term, task #70 fix (tighten the tagger gone-event window)
     // would let this revert to 840 to match gri exactly.
-    const int SYNC_SEARCH_LEN = 191 * UW_SPS - 1; // 1909
+    const int SYNC_SEARCH_LEN = 2048 - 271 + 1; // 1778: correlator's alias-free lag count
     int       remaining       = adj_n - search_start;
     if (remaining < SYNC_RRC_LEN_GUARD) return false;
     int search_complex = SYNC_SEARCH_LEN;
@@ -252,31 +253,50 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     if (n_rot > MAX_FRAME_LEN_NORMAL_10SPS) {
         n_rot = MAX_FRAME_LEN_NORMAL_10SPS;
     }
-    if (interp_frac != 0.0f) {
-        int16_t a_q               = q15_from_float(1.0f - interp_frac);
-        int16_t b_q               = q15_from_float(interp_frac);
-        int     n_rot_cplx_interp = n_rot - 1;
-        if (n_rot_cplx_interp < 0) n_rot_cplx_interp = 0;
-        for (int i = 0; i < n_rot_cplx_interp; i++) {
-            int32_t re     = ((int32_t)a_q * src[i * 2 + 0] + (int32_t)b_q * src[(i + 1) * 2 + 0]) >> 15;
-            int32_t im     = ((int32_t)a_q * src[i * 2 + 1] + (int32_t)b_q * src[(i + 1) * 2 + 1]) >> 15;
-            src[i * 2 + 0] = q15_saturate(re);
-            src[i * 2 + 1] = q15_saturate(im);
-        }
-    }
     if (dump) {
+        // Pre-interp view of the UW-trimmed slice. (Used to be the
+        // post-interp buffer when interp ran in place; the fused
+        // interp+decim below no longer materialises that intermediate.)
         dump_iq_cf32("07b_post_rotate_cut_250k", src,
                      n_rot - 1 > 0 ? n_rot - 1 : 0);
     }
 
+    // Fused sub-sample interpolation + POST_CORR_DECIM:1 decimation into
+    // the dedicated s_tdf_post scratch. This used to run IN PLACE on
+    // adj_burst, mutilating [uw .. uw+n_rot): when qpsk_demod rejected
+    // the frame (the designed diffs>2 noise gate), the retry loop then
+    // correlated against low-pass-interpolated, decimation-compacted
+    // garbage — silently lowering multi-frame / retry recall. adj_burst
+    // now stays intact for the retries (the pre-rotation above is pure
+    // phase: it doesn't affect correlation magnitude and each retry
+    // re-estimates phase from the current buffer, so it may stay
+    // in place).
+    //
+    // Equivalence to the old interp-then-compact: output i took
+    // interp(src[j], src[j+1]) with j = i*POST_CORR_DECIM, and
+    // j+1 <= n_rot-4 for every kept sample, so no out-of-bounds read.
     int n_post_cplx = n_rot / POST_CORR_DECIM;
-    for (int i = 0; i < n_post_cplx; i++) {
-        int j          = i * POST_CORR_DECIM;
-        src[i * 2 + 0] = src[j * 2 + 0];
-        src[i * 2 + 1] = src[j * 2 + 1];
+    if (n_post_cplx > TDF_POST_MAX) n_post_cplx = TDF_POST_MAX; // can't trip: n_rot <= 1910
+    if (interp_frac != 0.0f) {
+        int16_t a_q = q15_from_float(1.0f - interp_frac);
+        int16_t b_q = q15_from_float(interp_frac);
+        for (int i = 0; i < n_post_cplx; i++) {
+            int     j             = i * POST_CORR_DECIM;
+            int32_t re            = ((int32_t)a_q * src[j * 2 + 0] + (int32_t)b_q * src[(j + 1) * 2 + 0]) >> 15;
+            int32_t im            = ((int32_t)a_q * src[j * 2 + 1] + (int32_t)b_q * src[(j + 1) * 2 + 1]) >> 15;
+            s_tdf_post[i * 2 + 0] = q15_saturate(re);
+            s_tdf_post[i * 2 + 1] = q15_saturate(im);
+        }
+    } else {
+        for (int i = 0; i < n_post_cplx; i++) {
+            int j                 = i * POST_CORR_DECIM;
+            s_tdf_post[i * 2 + 0] = src[j * 2 + 0];
+            s_tdf_post[i * 2 + 1] = src[j * 2 + 1];
+        }
     }
+    int16_t *post       = s_tdf_post;
     result->n_post_2sps = n_post_cplx;
-    if (dump) dump_iq_cf32("08_decim_2sps", src, n_post_cplx);
+    if (dump) dump_iq_cf32("08_decim_2sps", post, n_post_cplx);
     PROFILE_LOG(TDF_DECIM);
 
     // Apply post-UW CFO refinement. omega_per_sym from uw_correlator_find
@@ -290,13 +310,13 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     // src is at sps=2 after the POST_CORR_DECIM step, so phase_step =
     // omega_per_sym / 2.
     if (tmp.omega_per_sym != 0.0f) {
-        rotate_to_dc_q15_simd_at(src, n_post_cplx,
+        rotate_to_dc_q15_simd_at(post, n_post_cplx,
                                  (double)tmp.omega_per_sym * 0.5,
                                  0);
     }
-    if (dump) dump_iq_cf32("08b_post_uwcfo_2sps", src, n_post_cplx);
+    if (dump) dump_iq_cf32("08b_post_uwcfo_2sps", post, n_post_cplx);
 
-    bool ok = qpsk_demod_process(src, n_post_cplx * 2, &result->frame);
+    bool ok = qpsk_demod_process(post, n_post_cplx * 2, &result->frame);
     PROFILE_LOG(TDF_QPSK);
     if (ok) {
         result->demod_ok = true;
@@ -378,7 +398,10 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
     //    statistic as the device worker — closing the gap that hid the
     //    #115 regression where host PASS didn't predict device PASS.
     if (n_complex > 0) {
-        int32_t sum_re = 0, sum_im = 0;
+        // int64 accumulators: at WB_DECIM_MAX (~62,639 complex) a
+        // full-scale saturated burst sums to 2.05e9 — within 5% of
+        // INT32_MAX, i.e. signed-overflow UB one buffer-size bump away.
+        int64_t sum_re = 0, sum_im = 0;
         for (int i = 0; i < n_complex; i++) {
             sum_re += iq250[i * 2 + 0];
             sum_im += iq250[i * 2 + 1];
