@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "status_logger.h"
+#include "esp_iot_log.h"
 #include "signal_buffer.h"
 #include "ingest_core1.h"
 #include "esp_libusb.h"
@@ -188,6 +189,18 @@ static void emit(const status_snapshot_t *s)
              s->ws.bursts_processed, s->ws.bursts_bch_decoded,
              s->ws.bursts_bch_unknown,
              s->us.rb_full_drops, dsp_pct, worker_pct);
+    iot_log(IOT_LOG_INFO,
+            "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%%",
+            rate_inst,
+            (unsigned long)s->ws.bursts_bch_decoded,
+            (unsigned long)s->ws.bursts_bch_unknown,
+            (unsigned long)s->us.rb_full_drops,
+            (unsigned)dsp_pct, (unsigned)worker_pct);
+    iot_log_metric("rate_x100", (int32_t)(rate_inst * 100));
+    iot_log_metric("bch_dec", (int32_t)s->ws.bursts_bch_decoded);
+    iot_log_metric("drops", (int32_t)s->us.rb_full_drops);
+    iot_log_metric("dsp_cap", (int32_t)dsp_pct);
+    iot_log_metric("wk_cap", (int32_t)worker_pct);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
     // any drop / recovery counter ticks. Field names match
@@ -252,9 +265,12 @@ static void logger_task(void *arg)
     (void)arg;
     status_snapshot_t snap;
     while (1) {
-        if (xQueueReceive(s_queue, &snap, portMAX_DELAY) == pdTRUE) {
+        // 1100 ms timeout so iot_log_poll() runs at ~1 Hz even when no USB
+        // data is flowing (portMAX_DELAY would block mDNS discovery).
+        if (xQueueReceive(s_queue, &snap, pdMS_TO_TICKS(1100)) == pdTRUE) {
             emit(&snap);
         }
+        iot_log_poll();
     }
 }
 

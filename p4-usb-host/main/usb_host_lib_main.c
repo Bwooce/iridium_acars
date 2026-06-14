@@ -24,6 +24,7 @@
 #include "sd_log.h"
 #include "sd_capture.h"
 #include "serial_cmd.h"
+#include "esp_iot_log.h"
 #include "esp_heap_caps.h"
 
 // One-line snapshot of internal-DMA-capable heap (the pool the USB
@@ -221,6 +222,15 @@ void app_main(void)
     // during the synthetic-fixture regression.
 #if !CONFIG_SMOKE_TEST_MODE
     wifi_link_start();
+    {
+        app_config_t snap;
+        app_config_snapshot(&snap);
+        iot_log_config_t iot_cfg = IOT_LOG_CONFIG_DEFAULT();
+        if (snap.station_id[0]) {
+            iot_cfg.device_name = snap.station_id;
+        }
+        iot_log_init(&iot_cfg);
+    }
     http_server_start();
     // Only in AP-fallback mode: hijack DNS so phones auto-open the
     // config form via captive-portal detection. STA mode leaves DNS

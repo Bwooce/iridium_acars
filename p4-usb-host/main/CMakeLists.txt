@@ -16,7 +16,7 @@ set(_app_reqs
     # two, but PRIV_REQUIRES is consumed on pass one). The runtime cost
     # comes from sd_log.c calling these APIs; that source file is what
     # the CONFIG_ENABLE_SD_LOG gate actually excludes.
-    esp_driver_sdmmc fatfs esp_driver_gpio esp_driver_uart
+    esp_driver_sdmmc fatfs esp_driver_gpio esp_driver_uart esp_iot_log
 )
 # SD log subsystem (#63): opt-in via CONFIG_ENABLE_SD_LOG. Off by
 # default. When off, sd_log.c isn't compiled and sd_log.h exposes
