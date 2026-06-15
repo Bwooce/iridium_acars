@@ -21,6 +21,7 @@
 #include "sd_capture.h"
 #include "acars_push.h"
 #include "esp_libusb.h"
+#include "fault_inject.h"
 #include "worker_core1.h"
 #include "dsp_processor.h"
 #include "signal_buffer.h"
@@ -916,6 +917,49 @@ static esp_err_t debug_inject_post(httpd_req_t *req)
                            HTTPD_RESP_USE_STRLEN);
 }
 
+#if CONFIG_FAULT_INJECT
+// POST /debug/fault_inject?site=<name>&count=<N> — schedule N synthetic
+// failures at a recovery site (#122). Verify via /diag/recovery_counters
+// that the matching counter climbs while the stream keeps running. Only
+// compiled when CONFIG_FAULT_INJECT=y (test build).
+static esp_err_t debug_fault_inject_post(httpd_req_t *req)
+{
+    char query[96]   = {0};
+    char site_s[32]  = {0};
+    char count_s[12] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "site", site_s, sizeof(site_s)) != ESP_OK ||
+        site_s[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req,
+                               "usage: POST /debug/fault_inject?site=<name>&count=<N>\n"
+                               "sites: dma_submit dma_submit_wrap dispatch_queue "
+                               "take_converted urb_submit\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    fi_site_t site = fault_inject_site_from_name(site_s);
+    if (site >= FI_SITE_COUNT) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "unknown site\n", HTTPD_RESP_USE_STRLEN);
+    }
+    uint32_t count = 1;
+    if (httpd_query_key_value(query, "count", count_s, sizeof(count_s)) == ESP_OK && count_s[0]) {
+        count = (uint32_t)strtoul(count_s, NULL, 10);
+    }
+    fault_inject_request(site, count);
+    char body[128];
+    int  n = snprintf(body, sizeof(body),
+                      "{\"result\":\"ok\",\"site\":\"%s\",\"count\":%u,\"pending\":%u}\n",
+                      fault_inject_site_name(site), (unsigned)count,
+                      (unsigned)fault_inject_remaining(site));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, n);
+}
+#endif // CONFIG_FAULT_INJECT
+
 // POST /tune?hz=<lo_freq_hz> — set the SDR centre frequency dynamically and
 // reboot to apply (the LO is programmed at stream start, class_driver.c).
 // Touches ONLY lo_freq_hz; WiFi and all other config are preserved (unlike
@@ -1444,6 +1488,9 @@ esp_err_t http_server_start(void)
         {.uri = "/reset", .method = HTTP_POST, .handler = reset_post, .user_ctx = NULL},
         {.uri = "/ota", .method = HTTP_POST, .handler = ota_post, .user_ctx = NULL},
         {.uri = "/debug/inject", .method = HTTP_POST, .handler = debug_inject_post, .user_ctx = NULL},
+#if CONFIG_FAULT_INJECT
+        {.uri = "/debug/fault_inject", .method = HTTP_POST, .handler = debug_fault_inject_post, .user_ctx = NULL},
+#endif
         {.uri = "/tune", .method = HTTP_POST, .handler = tune_post, .user_ctx = NULL},
         {.uri = "/sd/mount", .method = HTTP_POST, .handler = sd_mount_post, .user_ctx = NULL},
         {.uri = "/sd/format", .method = HTTP_POST, .handler = sd_format_post, .user_ctx = NULL},

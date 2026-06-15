@@ -1,7 +1,20 @@
 # Fault-injection harness + tests for recovery counters — plan
 
-**Status:** design + concrete implementation plan for #122. Drafted
-2026-05-31 after the day's other tasks shipped.
+**Status: IMPLEMENTED 2026-06-15.** All five sites wired behind
+`CONFIG_FAULT_INJECT` (default off → hooks fold to `return false`, production
+binary byte-identical), `POST /debug/fault_inject?site=&count=` added, and
+`tests/scripts/fault_inject_recovery.sh` validates each site on a live device.
+End-to-end run (device built with `CONFIG_FAULT_INJECT=y`): **all 5 sites PASS**
+— each `/diag/recovery_counters` value climbed by the injected count, no reboot,
+USB stream kept advancing (no #106-class deadlock). One refinement vs the plan:
+`urb_submit` injection is non-destructive (it exercises the pool-lost accounting
++ log but resubmits the URB, so the in-flight pool isn't actually shrunk and the
+test is repeatable). The original design plan follows for reference.
+
+---
+
+**Original plan (design):** Drafted 2026-05-31 after the day's other tasks
+shipped.
 
 ## Why this is a plan rather than a commit
 

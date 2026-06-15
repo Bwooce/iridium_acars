@@ -24,6 +24,24 @@ config STATUS_LOG_VERBOSE
         second on Core 1. Off by default to keep long unattended
         captures readable.
 
+config FAULT_INJECT
+    bool "Compile in synthetic fault injection (#122 recovery-counter tests)"
+    default n
+    help
+        When enabled, compiles fault_inject.c and arms the
+        fault_inject_should_fail() hooks at five recovery sites
+        (signal_buffer DMA submit + wrap-path, ingest dispatch queue,
+        ingest take_converted wait, esp_libusb URB resubmit). A test can
+        then POST /debug/fault_inject?site=<name>&count=<N> to schedule
+        synthetic failures and assert the matching /diag/recovery_counters
+        value climbs while the stream keeps running (no #106-class
+        deadlock, no reboot).
+
+        Default off for production: with this off the hooks are
+        static-inline `return false`, so the optimiser removes them and
+        the DSP path is bit-identical. Enable only for the
+        fault-injection test build (tests/scripts/fault_inject_recovery.sh).
+
 config DIAG_TASK_DUMP
     bool "Emit per-task CPU/stack dump every 5 s"
     default n

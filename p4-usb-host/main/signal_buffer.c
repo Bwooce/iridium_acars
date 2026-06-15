@@ -8,6 +8,7 @@
 #include "esp_cache.h"
 #include "sdkconfig.h"
 #include "signal_buffer.h"
+#include "fault_inject.h"
 
 static const char *TAG = "SIG_BUF";
 
@@ -261,15 +262,23 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
     if (!wrap) {
         // Common path: single contiguous write. All three (src, dst, len)
         // are 64-aligned, so no cache-split-RX path triggered.
-        r = esp_async_memcpy(s_dma, dst_base + head_bytes, s_align_scratch,
-                             aligned_bytes, dma_done_cb, NULL);
+        if (fault_inject_should_fail(FI_SITE_DMA_SUBMIT)) {
+            r = ESP_ERR_NO_MEM; // synthetic (#122): exercise CPU-memcpy fallback
+        } else {
+            r = esp_async_memcpy(s_dma, dst_base + head_bytes, s_align_scratch,
+                                 aligned_bytes, dma_done_cb, NULL);
+        }
     } else {
         // Wrap: two writes. SIGNAL_BUF_SIZE is 64-multiple and head_bytes
         // is 64-aligned, so bytes_to_end is 64-aligned. aligned_bytes is
         // 64-multiple. Both submits are 64-aligned in src offset, dst
         // offset, and length. (#107 wrap-failure handling preserved.)
-        r = esp_async_memcpy(s_dma, dst_base + head_bytes, s_align_scratch,
-                             bytes_to_end, NULL, NULL);
+        if (fault_inject_should_fail(FI_SITE_DMA_SUBMIT_WRAP)) {
+            r = ESP_ERR_NO_MEM; // synthetic (#122): exercise wrap-path drop (#107)
+        } else {
+            r = esp_async_memcpy(s_dma, dst_base + head_bytes, s_align_scratch,
+                                 bytes_to_end, NULL, NULL);
+        }
         if (r == ESP_OK) {
             size_t remainder = aligned_bytes - bytes_to_end;
             r                = esp_async_memcpy(s_dma, dst_base,

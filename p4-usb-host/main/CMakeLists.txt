@@ -5,7 +5,7 @@ set(_app_srcs
     "worker_core1.c" "ingest_core1.c" "status_logger.c" "smoke_test.c"
     "frame_decoder.c" "pie_fft_diff_test.c" "app_config.c" "agc.c"
     "wifi_link.c" "http_server.c" "msg_ring.c" "captive_dns.c"
-    "acars_push.c" "ota_runner.c" "serial_cmd.c"
+    "acars_push.c" "ota_runner.c" "serial_cmd.c" "fault_inject.c"
 )
 set(_app_reqs
     usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash

@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "esp_libusb.h"
 #include "esp_timer.h"
+#include "fault_inject.h"
 
 static class_adsb_dev *adsbdev;
 
@@ -233,13 +234,23 @@ void stream_transfer_cb(usb_transfer_t *transfer)
     // ride out transient submit failures rather than leaking the URB.
     bool      submitted = false;
     esp_err_t last_err  = ESP_OK;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        last_err = usb_host_transfer_submit(transfer);
-        if (last_err == ESP_OK) {
-            submitted = true;
-            break;
+    // #122: FI_SITE_URB_SUBMIT simulates a URB whose 3 resubmit attempts all
+    // failed, to exercise the pool-lost accounting + loud log below. It is
+    // NON-destructive: the URB is still resubmitted in the !submitted block
+    // so the in-flight pool depth is preserved and the test is repeatable.
+    bool fi_urb = fault_inject_should_fail(FI_SITE_URB_SUBMIT);
+    if (fi_urb) {
+        last_err = ESP_ERR_NO_MEM;
+        s_xfer_resubmit_errors += 3;
+    } else {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            last_err = usb_host_transfer_submit(transfer);
+            if (last_err == ESP_OK) {
+                submitted = true;
+                break;
+            }
+            s_xfer_resubmit_errors++;
         }
-        s_xfer_resubmit_errors++;
     }
     if (!submitted) {
         // All 3 attempts exhausted — this URB is permanently retired from
@@ -251,6 +262,10 @@ void stream_transfer_cb(usb_transfer_t *transfer)
         s_xfer_pool_lost++;
         ESP_LOGE("LIBUSB", "URB resubmit exhausted 3 attempts: %s — pool shrunk (lost=%u)",
                  esp_err_to_name(last_err), (unsigned)s_xfer_pool_lost);
+        if (fi_urb) {
+            // #122 non-destructive: actually keep the URB in flight.
+            usb_host_transfer_submit(transfer);
+        }
     }
 }
 

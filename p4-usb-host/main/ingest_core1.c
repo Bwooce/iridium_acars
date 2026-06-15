@@ -10,6 +10,7 @@
 #include "ingest_core1.h"
 #include "signal_buffer.h"
 #include "resample_256_to_250.h"
+#include "fault_inject.h"
 
 static const char *TAG = "INGEST";
 
@@ -571,7 +572,10 @@ void ingest_core1_dispatch(int slot, size_t bytes_filled)
     // FOREVER → class deadlocks (same class as #106). Recover: mark the slot
     // zero-length and signal it ready, so take_converted returns immediately
     // (dsp_feed gets 0 samples) and the slot recycles instead of stranding.
-    if (xQueueSend(s_dispatch, &msg, 0) != pdTRUE) {
+    // #122: FI_SITE_DISPATCH_QUEUE short-circuits the send to exercise the
+    // drop-recovery below without an actual full queue.
+    if (fault_inject_should_fail(FI_SITE_DISPATCH_QUEUE) ||
+        xQueueSend(s_dispatch, &msg, 0) != pdTRUE) {
         s_dispatch_drops++;
         ESP_LOGW(TAG, "dispatch queue full — slot %d dropped (recovered, no deadlock)", slot);
         s_resamp_n_int16[slot] = 0;
@@ -595,7 +599,10 @@ int16_t *ingest_core1_take_converted(int slot, size_t *out_n_int16)
     // and worth logging before the watchdog acts. We log the first
     // slow wait and then every ~10 s while still waiting.
     int waited_ms = 0;
-    while (xSemaphoreTake(s_ready[slot], pdMS_TO_TICKS(500)) != pdTRUE) {
+    // #122: FI_SITE_TAKE_CONVERTED short-circuits the take (returns true,
+    // decrements) to drive the slow-wait path N times before the real take.
+    while (fault_inject_should_fail(FI_SITE_TAKE_CONVERTED) ||
+           xSemaphoreTake(s_ready[slot], pdMS_TO_TICKS(500)) != pdTRUE) {
         waited_ms += 500;
         s_take_converted_slow_waits++;
         if (waited_ms == 500 || (waited_ms % 10000) == 0) {
