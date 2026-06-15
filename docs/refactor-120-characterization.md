@@ -5,6 +5,30 @@ take explicit context (no behavior change intended), these characterization
 tests pin the *exact* current output so any drift is caught. Captured
 2026-06-15 from commit `8a41b4f` (pre-#120).
 
+## Outcome (2026-06-15)
+
+- **`direct_if_decim`** — already context-based (`direct_if_decim_t` +
+  `_init/_process/_process_split/_reset_state`). No change needed.
+- **`dsp_processor`** — refactored to an explicit `dsp_processor_t` handle
+  (commit `3e444c0`); the cross-task diagnostic reader uses
+  `dsp_processor_default()`. Validated on-device: RAW_IRIDIUM SMOKE_PASS,
+  GOLDEN matched=4 unchanged.
+- **`uw_correlator`** — **context-threading deferred by design.** Its public
+  functions already take input + output explicitly; there is *no per-call
+  logical state*. The only state behind them is (a) init-once shared,
+  read-only tables (twiddles, sync references, FIR taps) that are correct as
+  process-wide statics, and (b) single-instance scratch buffers. The only
+  scratch that would need to move for real reentrancy is `s_pie_fft_scratch`
+  — the exact buffer the silent **PIE heap-position corruption**
+  (`project_heap_position_decode_bug`) is keyed to, and a regression the host
+  golden tests cannot see. Moving it carries that risk; *not* moving it makes
+  the "context" a half-measure that still clobbers shared PIE scratch across
+  instances (i.e. not actually reentrant). So uw_correlator stays as-is until
+  a real multi-instance consumer exists (the multi-receiver SPI aggregator,
+  #119), at which point the PIE-buffer relocation gets its own dedicated
+  on-device PIE-placement validation. The golden tests below remain the
+  guard for any future change to it.
+
 ## Host golden tests (run every CI build, `ctest`)
 
 - **`test_uw_correlator_golden`** — runs the D13 + RRC + UW-correlator pipeline
