@@ -868,8 +868,21 @@ void smoke_test_run(void)
              (unsigned long long)fc.tl, (unsigned long long)fc.bc,
              (unsigned long long)fc.lw_da, (unsigned long long)fc.lw_other,
              (unsigned long long)total_classified, ALBQ_RAW_EXPECTED_BURSTS);
-    if (total_classified < 1) {
-        ESP_LOGE(TAG, "  no bursts reached the classifier — worker chain broken");
+    // Baseline (captured 2026-06-15, commit 4aa58f7, on ESP32-P4 v1.3):
+    // UNKNOWN=3 BC=1 LW.DA=2 → total=6 classified, GOLDEN matched=4. RAW
+    // mode is DETERMINISTIC (no random-noise priming — it primes on the
+    // real fixture), so this count is stable run-to-run on the same
+    // build. A drop below the floor is a decode REGRESSION — most likely
+    // the silent PIE heap-position corruption (see
+    // project_heap_position_decode_bug) that the host golden tests cannot
+    // see because they run the scalar path. This is the device gate for
+    // the #120 context refactor. Floor at 5 (baseline 6, −1 tolerance for
+    // any classifier jitter) — real corruption craters this to 0-1.
+#define RAW_IRIDIUM_MIN_CLASSIFIED 5
+    if ((int)total_classified < RAW_IRIDIUM_MIN_CLASSIFIED) {
+        ESP_LOGE(TAG, "  classified %llu < baseline floor %d — decode REGRESSION "
+                      "(worker chain broken or PIE heap-position corruption)",
+                 (unsigned long long)total_classified, RAW_IRIDIUM_MIN_CLASSIFIED);
         pass = false;
     }
     if (snr_db < 10.0f) {
