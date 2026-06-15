@@ -62,6 +62,9 @@
 
 static const char *TAG = "SMOKE";
 
+// Wideband detector handle (#120). Smoke runs one detector.
+static dsp_processor_t *s_smoke_dsp = NULL;
+
 #define TRANSFER_BYTES (16 * 1024)            // matches class_driver's out_block_size
 #define TRANSFER_SAMPLES (TRANSFER_BYTES / 2) // complex samples per transfer (1 byte I + 1 byte Q)
 
@@ -217,7 +220,7 @@ static int drive_transfer(uint8_t *src, int prev_slot)
         size_t   n_int16   = 0;
         int16_t *converted = ingest_core1_take_converted(prev_slot, &n_int16);
         // n_int16 is bytes_filled; complex sample count is /2.
-        dsp_processor_feed(converted, n_int16 / 2);
+        dsp_processor_feed(s_smoke_dsp, converted, n_int16 / 2);
         ingest_core1_release(prev_slot);
     }
     return slot;
@@ -534,14 +537,16 @@ void smoke_test_run(void)
         return;
     }
     HEAP_LOG("post-frame_decoder");
-    if (dsp_processor_init(on_burst_full_chain) != ESP_OK) {
-        ESP_LOGE(TAG, "dsp_processor_init failed -> SMOKE_FAIL");
+    s_smoke_dsp = dsp_processor_create(on_burst_full_chain);
+    if (!s_smoke_dsp) {
+        ESP_LOGE(TAG, "dsp_processor_create failed -> SMOKE_FAIL");
         return;
     }
     HEAP_LOG("post-dsp_processor");
 #else
-    if (dsp_processor_init(on_burst) != ESP_OK) {
-        ESP_LOGE(TAG, "dsp_processor_init failed -> SMOKE_FAIL");
+    s_smoke_dsp = dsp_processor_create(on_burst);
+    if (!s_smoke_dsp) {
+        ESP_LOGE(TAG, "dsp_processor_create failed -> SMOKE_FAIL");
         return;
     }
     HEAP_LOG("post-dsp_processor");
@@ -663,7 +668,7 @@ void smoke_test_run(void)
     // of end-of-fixture never reach the worker. Matches what gri's
     // GNU Radio stop-callback would do. Adds ~7 decodes on the ALBQ
     // fixture (measured on the host wideband test).
-    dsp_processor_flush();
+    dsp_processor_flush(s_smoke_dsp);
 
     // End-of-Phase-2 summary: drain the queues then read worker and
     // frame_decoder stats. We sleep a fixed 30 s rather than
@@ -821,7 +826,7 @@ void smoke_test_run(void)
     if (prev_slot >= 0) {
         size_t   n_int16   = 0;
         int16_t *converted = ingest_core1_take_converted(prev_slot, &n_int16);
-        dsp_processor_feed(converted, n_int16 / 2);
+        dsp_processor_feed(s_smoke_dsp, converted, n_int16 / 2);
         ingest_core1_release(prev_slot);
     }
 
@@ -1049,7 +1054,7 @@ void smoke_test_run(void)
     // (don't just raise it). If you intentionally regress for a feature
     // (e.g., adding a stage), update the comment + the bar together.
     dsp_stage_stats_t dsp_st;
-    dsp_processor_get_stage_stats(&dsp_st);
+    dsp_processor_get_stage_stats(s_smoke_dsp, &dsp_st);
     ingest_stats_t ing_st;
     ingest_core1_get_stats(&ing_st);
 

@@ -30,6 +30,10 @@
 #include "status_logger.h"
 #include "sd_capture.h"
 
+// Wideband detector handle (#120). class_driver is the owner task; it
+// creates the one detector and threads this handle to feed/stats.
+static dsp_processor_t *s_dsp = NULL;
+
 #define CLIENT_NUM_EVENT_MSG 5
 
 #define ACTION_OPEN_DEV 0x01
@@ -215,7 +219,10 @@ static void action_start_stream(class_driver_t *driver_obj)
     }
 
     ESP_LOGI(TAG, "Initializing DSP...");
-    dsp_processor_init(worker_core1_push_burst);
+    s_dsp = dsp_processor_create(worker_core1_push_burst);
+    if (!s_dsp) {
+        ESP_LOGE(TAG, "dsp_processor_create failed");
+    }
 
     ESP_LOGI(TAG, "Starting Async Stream...");
     esp_libusb_start_stream(driver_obj, 0x81);
@@ -447,7 +454,7 @@ void class_driver_task(void *arg)
                 int64_t t_pre_feed = esp_timer_get_time();
 
                 class_stage(CS_FEED);
-                dsp_processor_feed(converted, n_int16 / 2);
+                dsp_processor_feed(s_dsp, converted, n_int16 / 2);
                 int64_t t_post_feed = esp_timer_get_time();
                 dsp_total_time_us += (uint64_t)(t_post_feed - t_pre_feed);
                 dsp_frame_count += (n_int16 / 2) / 2048;
@@ -471,7 +478,7 @@ void class_driver_task(void *arg)
             if (prev_dsp_slot >= 0) {
                 size_t   n_int16   = 0;
                 int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
-                dsp_processor_feed(converted, n_int16 / 2);
+                dsp_processor_feed(s_dsp, converted, n_int16 / 2);
                 ingest_core1_release(prev_dsp_slot);
                 prev_dsp_slot = -1;
             }
@@ -514,7 +521,7 @@ void class_driver_task(void *arg)
             snap.cycle_iterations        = cycle_iterations;
             snap.psram_free_bytes        = (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
             esp_libusb_get_stream_stats(&snap.us);
-            dsp_processor_get_stage_stats(&snap.dsp);
+            dsp_processor_get_stage_stats(s_dsp, &snap.dsp);
             ingest_core1_get_stats(&snap.ingest);
             worker_core1_get_stats(&snap.ws);
             (void)status_logger_post(&snap);

@@ -793,7 +793,7 @@ static esp_err_t diag_dsp_health_get(httpd_req_t *req)
     // frames whenever status_logger fired between snapshots and reported
     // a phantom dsp_ok=false. dsp_processor_get_total_fft_frames is
     // monotonic; subtracting two snapshots gives an exact count.
-    uint64_t            dsp_frames0 = dsp_processor_get_total_fft_frames();
+    uint64_t            dsp_frames0 = dsp_processor_get_total_fft_frames(dsp_processor_default());
     usb_stream_totals_t usb0        = {0};
     esp_libusb_get_stream_totals(&usb0);
     uint64_t acars0 = frame_decoder_acars_decoded_total();
@@ -803,7 +803,7 @@ static esp_err_t diag_dsp_health_get(httpd_req_t *req)
     // (~1900 at 2.56 MSPS with FBT_FFT_SIZE=2048).
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    uint64_t            dsp_frames1 = dsp_processor_get_total_fft_frames();
+    uint64_t            dsp_frames1 = dsp_processor_get_total_fft_frames(dsp_processor_default());
     usb_stream_totals_t usb1        = {0};
     esp_libusb_get_stream_totals(&usb1);
     uint64_t acars1 = frame_decoder_acars_decoded_total();

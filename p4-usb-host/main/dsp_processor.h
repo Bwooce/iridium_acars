@@ -48,14 +48,31 @@ typedef struct {
 
 typedef void (*burst_detected_cb_t)(const detected_burst_t *burst);
 
-esp_err_t dsp_processor_init(burst_detected_cb_t cb);
-void      dsp_processor_feed(const int16_t *samples, size_t n_samples);
+// Wideband burst detector instance (#120). All state that used to be
+// file-scope static now lives in this context, so the module is reentrant
+// and could host multiple detectors (e.g. the multi-receiver SPI
+// aggregator). The current firmware runs exactly one; create it in the
+// owner task and thread the handle through feed/flush/stats.
+typedef struct dsp_processor dsp_processor_t;
+
+// Create a detector. cb fires (in the feed caller's context) once per
+// completed burst. Returns NULL on alloc failure. Also published as the
+// process "default" instance for cross-task diagnostic readers (see
+// dsp_processor_default()).
+dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb);
+
+// Most-recently-created instance, for cross-task diagnostic getters (e.g.
+// httpd /diag/dsp_health) that legitimately can't be handed the owner's
+// handle. NULL before the first create. Hot paths use their own handle.
+dsp_processor_t *dsp_processor_default(void);
+
+void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_samples);
 
 // End-of-stream flush. Forces still-active bursts to emit their
 // gone callback with stop = current sample index. Use at end of
 // an offline fixture / when the SDR source closes. Not needed on
 // a live feed: real bursts naturally time out via burst_post_len.
-void dsp_processor_flush(void);
+void dsp_processor_flush(dsp_processor_t *p);
 
 // Diagnostic stats: average per-frame time in each stage (microseconds),
 // computed over frames seen since the last call. Calling this resets the
@@ -77,13 +94,13 @@ typedef struct {
     uint32_t tag_steps;   // tagger steps in this window
 } dsp_stage_stats_t;
 
-void dsp_processor_get_stage_stats(dsp_stage_stats_t *out);
+void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out);
 
 // #127: race-free cumulative FFT-frames count. Use this from any path
 // that wants a delta over a wall-clock window (it is NEVER reset).
 // dsp_processor_get_stage_stats resets its accumulator on every call,
 // so /diag/dsp_health's 2 s window races status_logger's 1 Hz reset
 // and reports phantom dsp_ok=false; this getter avoids the race.
-uint64_t dsp_processor_get_total_fft_frames(void);
+uint64_t dsp_processor_get_total_fft_frames(dsp_processor_t *p);
 
 #endif
