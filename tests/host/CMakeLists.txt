@@ -202,6 +202,27 @@ add_executable(test_direct_if_decim
 target_include_directories(test_direct_if_decim PRIVATE ${COMMON_DIR})
 target_link_libraries(test_direct_if_decim PRIVATE m)
 
+# Characterization (golden) tests — task #133, safety net for the #120
+# context-threading refactor. Pin EXACT current output (checksum + scalars)
+# so a no-behavior-change refactor is provably no-behavior-change.
+add_executable(test_direct_if_decim_golden
+    test_direct_if_decim_golden.c
+    ${COMMON_DIR}/direct_if_decim.c
+)
+target_include_directories(test_direct_if_decim_golden PRIVATE ${COMMON_DIR})
+target_link_libraries(test_direct_if_decim_golden PRIVATE m)
+
+add_executable(test_uw_correlator_golden
+    test_uw_correlator_golden.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+)
+target_include_directories(test_uw_correlator_golden PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_uw_correlator_golden PRIVATE m)
+
 # Phase 3.6.M task #58 step 1: validate rotate_to_dc_q15_inc against
 # the cosf/sinf reference (rotate_to_dc) on synthetic tones. Asserts
 # NMSE ≤ -50 dB and amplitude-stability ratio in [0.98, 1.02] across
@@ -532,6 +553,8 @@ add_test(NAME sym_timing           COMMAND test_sym_timing)
 # uw_correlator coverage is in test_pipeline_wideband_albq (which
 # decodes 59 frames at threshold 10 dB on the ALBQ fixture).
 add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
+add_test(NAME uw_correlator_golden COMMAND test_uw_correlator_golden)
+add_test(NAME direct_if_decim_golden COMMAND test_direct_if_decim_golden)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
 # worker_pipeline_albq removed with the channelizer (the channelizer
 # was the front end it tested; coverage moved to test_pipeline_wideband_albq).
