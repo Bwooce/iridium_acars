@@ -1,10 +1,14 @@
 #include "serial_cmd.h"
 #include "app_config.h"
+#include "wifi_link.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -127,6 +131,83 @@ static void cmd_set(const char *key, const char *val)
     }
 }
 
+// Diagnostic: probe whether multicast egress works over esp_hosted/C6.
+// Sends 5 UNICAST datagrams (control — should always reach the host) and
+// 5 MULTICAST datagrams to 239.255.1.100:4210, logging each sendto() rc +
+// errno. Interpretation, paired with a host-side tcpdump:
+//   unicast arrives + mcast sendto OK but no mcast on wire => esp_hosted
+//     silently drops group-addressed TX (the iot_log blocker).
+//   mcast sendto < 0 with errno => host lwip/netif rejects mcast routing.
+static void cmd_nettest(const char *unicast_ip)
+{
+    char buf[112];
+    int  s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        uart_puts("ERR socket\r\n");
+        return;
+    }
+    uint8_t ttl = 1;
+    setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    const char *payload = "P4NETTEST";
+    size_t      plen    = strlen(payload);
+
+    if (unicast_ip && unicast_ip[0]) {
+        struct sockaddr_in u = {0};
+        u.sin_family         = AF_INET;
+        u.sin_port           = htons(9999);
+        u.sin_addr.s_addr    = inet_addr(unicast_ip);
+        for (int i = 0; i < 5; i++) {
+            errno = 0;
+            int r = sendto(s, payload, plen, 0, (struct sockaddr *)&u, sizeof(u));
+            snprintf(buf, sizeof(buf), "unicast %s:9999  sendto=%d errno=%d\r\n",
+                     unicast_ip, r, errno);
+            uart_puts(buf);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+    struct sockaddr_in m = {0};
+    m.sin_family         = AF_INET;
+    m.sin_port           = htons(4210);
+    m.sin_addr.s_addr    = inet_addr("239.255.1.100");
+
+    // Batch A: multicast with DEFAULT egress (no IP_MULTICAST_IF) — same as
+    // iot_log does today.
+    for (int i = 0; i < 5; i++) {
+        errno = 0;
+        int r = sendto(s, payload, plen, 0, (struct sockaddr *)&m, sizeof(m));
+        snprintf(buf, sizeof(buf), "mcastA(default) 239.255.1.100:4210  sendto=%d errno=%d\r\n",
+                 r, errno);
+        uart_puts(buf);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    // Batch B: multicast with IP_MULTICAST_IF pinned to the STA address.
+    // If A drops but B arrives => egress-interface selection bug (fixable
+    // with setsockopt), NOT an esp_hosted datapath drop.
+    uint32_t sta_ip = wifi_link_ip_u32(); // network byte order
+    if (sta_ip) {
+        struct in_addr ifa = {.s_addr = sta_ip};
+        int            sr  = setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, &ifa, sizeof(ifa));
+        snprintf(buf, sizeof(buf), "set IP_MULTICAST_IF=0x%08lx rc=%d errno=%d\r\n",
+                 (unsigned long)sta_ip, sr, errno);
+        uart_puts(buf);
+        for (int i = 0; i < 5; i++) {
+            errno = 0;
+            int r = sendto(s, payload, plen, 0, (struct sockaddr *)&m, sizeof(m));
+            snprintf(buf, sizeof(buf), "mcastB(IF=STA) 239.255.1.100:4210  sendto=%d errno=%d\r\n",
+                     r, errno);
+            uart_puts(buf);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    } else {
+        uart_puts("mcastB skipped (no STA IP)\r\n");
+    }
+    close(s);
+    uart_puts("nettest done\r\n");
+}
+
 static void dispatch(char *line)
 {
     // Trim trailing whitespace
@@ -146,6 +227,11 @@ static void dispatch(char *line)
     }
     if (strcmp(cmd, "config") == 0) {
         cmd_config();
+        return;
+    }
+    if (strcmp(cmd, "nettest") == 0) {
+        char *ip = strtok(NULL, " \t");
+        cmd_nettest(ip ? ip : "");
         return;
     }
 
