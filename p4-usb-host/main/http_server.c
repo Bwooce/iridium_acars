@@ -23,6 +23,7 @@
 #include "esp_libusb.h"
 #include "fault_inject.h"
 #include "worker_core1.h"
+#include "aggregator_ingest.h"
 #include "dsp_processor.h"
 #include "signal_buffer.h"
 #include "ingest_core1.h"
@@ -264,6 +265,40 @@ static esp_err_t status_get(httpd_req_t *req)
         n       = sizeof(body) - 1;
         body[n] = '\0';
     }
+
+#if !CONFIG_DEVICE_ROLE_STANDALONE
+    // PDU-link health (#138): worker output-ring depth/drops and, on the
+    // aggregator, per-source liveness. Spliced in before the root closing
+    // brace so the JSON shape is unchanged for STANDALONE builds.
+    if (n > 1 && body[n - 1] == '}') {
+        aggregator_ingest_stats_t ai;
+        aggregator_ingest_get_stats(&ai);
+        uint64_t now_us = (uint64_t)esp_timer_get_time();
+        n--; // drop the root closing brace; re-added below
+        int m = snprintf(body + n, sizeof(body) - n,
+                         ",\"pdu_link\":{\"forwarded\":%u,\"queue_depth\":%u,"
+                         "\"dropped\":%u,\"sources\":[",
+                         (unsigned)ai.forwarded, (unsigned)ai.pdu_queue_depth,
+                         (unsigned)ai.pdu_dropped);
+        if (m > 0) n += m;
+        for (uint32_t i = 0; i < ai.n_sources && n < (int)sizeof(body); i++) {
+            uint64_t age_ms = ai.sources[i].last_seen_us
+                                  ? (now_us - ai.sources[i].last_seen_us) / 1000
+                                  : 0;
+            m               = snprintf(body + n, sizeof(body) - n,
+                                       "%s{\"id\":\"%08lx\",\"count\":%u,\"age_ms\":%llu}",
+                         i ? "," : "", (unsigned long)ai.sources[i].source_id,
+                                       (unsigned)ai.sources[i].count, (unsigned long long)age_ms);
+            if (m > 0) n += m;
+        }
+        m = snprintf(body + n, sizeof(body) - n, "]}}");
+        if (m > 0) n += m;
+        if (n >= (int)sizeof(body)) {
+            n       = sizeof(body) - 1;
+            body[n] = '\0';
+        }
+    }
+#endif
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");

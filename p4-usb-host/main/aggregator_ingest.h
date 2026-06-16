@@ -30,6 +30,29 @@ esp_err_t aggregator_ingest_init(void);
 // Total PDUs popped from the queue and pushed into frame_decoder.
 uint32_t aggregator_ingest_count(void);
 
+// Per-source liveness, for receiver health/observability (#138). With a
+// single worker (COMBINED) only one source appears; the table is sized for
+// the small worker fleet a Phase-3 SPI aggregator will serve.
+#define AGG_MAX_SOURCES 4
+
+typedef struct {
+    uint32_t source_id;    // low 4 bytes of the worker STA MAC
+    uint32_t count;        // PDUs forwarded from this source
+    uint64_t last_seen_us; // esp_timer time of the most recent PDU
+} aggregator_source_stat_t;
+
+typedef struct {
+    uint32_t                 forwarded;       // total PDUs -> frame_decoder
+    uint32_t                 pdu_queue_depth; // current frame_pdu queue depth
+    uint32_t                 pdu_dropped;     // PDUs dropped at the queue
+    uint32_t                 n_sources;       // distinct sources seen
+    aggregator_source_stat_t sources[AGG_MAX_SOURCES];
+} aggregator_ingest_stats_t;
+
+// Snapshot the ingest stats (safe to call from another task, e.g. the
+// HTTP /status handler).
+void aggregator_ingest_get_stats(aggregator_ingest_stats_t *out);
+
 #ifdef __cplusplus
 }
 #endif
