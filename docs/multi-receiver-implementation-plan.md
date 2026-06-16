@@ -58,9 +58,15 @@ second board or SPI wiring.
    backlog), so the gate asserts that >= floor frames actually traversed
    pack→queue→ingest→unpack→frame_decoder (5 delivered, clean BCH
    blocks=10/10 errs=0 crc=OK → serialization is bit-exact).
-5. **Health + observability** — aggregator `/status` shows per-worker
-   link liveness / last-PDU / PDUs-per-sec; worker keeps a LAN-only debug
-   httpd. *Deliverable:* operator can see receiver health.
+5. **Health + observability** — DONE for the single-board surface
+   (commit 5687f8c). `/status` now carries a `pdu_link` object (gated to
+   non-STANDALONE roles): `forwarded`, `queue_depth`, `dropped`, and a
+   per-source `sources[]` table (`id`/`count`/`age_ms`) fed by
+   `aggregator_ingest`'s per-source tracking. STANDALONE `/status` is
+   unchanged. Verified on-device (COMBINED): valid JSON, block present.
+   *Deferred to Phase 3:* turning `age_ms` into a liveness verdict
+   (worker-silent alerting) and surfacing N>1 workers — both need real
+   multi-worker SPI traffic to exercise.
 
 ## Validation strategy (single board)
 
