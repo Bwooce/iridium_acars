@@ -72,4 +72,7 @@ bool frame_pdu_queue_push(const iridium_frame_pdu_t *pdu);
 bool frame_pdu_queue_pop(iridium_frame_pdu_t *pdu, uint32_t timeout_ms);
 
 uint32_t frame_pdu_queue_dropped(void);
+
+// Current depth (PDUs waiting to be consumed). 0 = drained.
+uint32_t frame_pdu_queue_count(void);
 #endif // ESP_PLATFORM

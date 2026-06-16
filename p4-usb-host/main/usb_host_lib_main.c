@@ -25,6 +25,9 @@
 #include "sd_capture.h"
 #include "serial_cmd.h"
 #include "frame_pdu.h"
+#include "frame_decoder.h"
+#include "bch_decoder.h"
+#include "aggregator_ingest.h"
 #include "esp_iot_log.h"
 #include "esp_heap_caps.h"
 
@@ -281,11 +284,20 @@ void app_main(void)
     // Aggregator role (#119/#134): no SDR/USB front end. It receives
     // decoded-frame PDUs from N worker P4s over SPI and runs the
     // classifier + outputs. The shared services above (wifi_link,
-    // http_server, acars_push, sd_log) are already up; the SPI ingest +
-    // dedupe land in Phase 4. For now, bring-up ends here — FreeRTOS keeps
-    // the wifi/http tasks running.
-    ESP_LOGW(TAG, "DEVICE_ROLE=AGGREGATOR: front-end disabled; awaiting "
-                  "worker PDUs (SPI ingest lands in Phase 4)");
+    // http_server, acars_push, sd_log) are already up. Bring up the
+    // decode chain + PDU consumer here (#137); the SPI slave that feeds
+    // the PDU queue lands in Phase 3. Until then the queue stays empty
+    // and the ingest task idles.
+    frame_pdu_queue_init();
+    bch_decoder_init();
+    if (frame_decoder_init() != ESP_OK) {
+        ESP_LOGE(TAG, "AGGREGATOR: frame_decoder_init failed");
+    }
+    if (aggregator_ingest_init() != ESP_OK) {
+        ESP_LOGE(TAG, "AGGREGATOR: aggregator_ingest_init failed");
+    }
+    ESP_LOGW(TAG, "DEVICE_ROLE=AGGREGATOR: front-end disabled; PDU consumer "
+                  "ready, awaiting worker PDUs (SPI ingest lands in Phase 3)");
     return;
 #endif
 

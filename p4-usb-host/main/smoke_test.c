@@ -60,6 +60,9 @@
 #include "qpsk_demod.h"
 #endif
 
+#include "frame_pdu.h"
+#include "aggregator_ingest.h"
+
 static const char *TAG = "SMOKE";
 
 // Wideband detector handle (#120). Smoke runs one detector.
@@ -545,6 +548,21 @@ void smoke_test_run(void)
         return;
     }
     HEAP_LOG("post-frame_decoder");
+#if CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
+    // COMBINED: worker emits PDUs to the frame_pdu queue (#135) instead of
+    // calling frame_decoder_push. Drain the queue back into frame_decoder
+    // in-process so this smoke run exercises the full distributed path
+    // (worker -> PDU -> aggregator ingest -> decode) on one board (#137).
+    if (frame_pdu_queue_init() != ESP_OK) {
+        ESP_LOGE(TAG, "frame_pdu_queue_init failed -> SMOKE_FAIL");
+        return;
+    }
+    if (aggregator_ingest_init() != ESP_OK) {
+        ESP_LOGE(TAG, "aggregator_ingest_init failed -> SMOKE_FAIL");
+        return;
+    }
+    HEAP_LOG("post-aggregator_ingest");
+#endif
     s_smoke_dsp = dsp_processor_create(on_burst_full_chain);
     if (!s_smoke_dsp) {
         ESP_LOGE(TAG, "dsp_processor_create failed -> SMOKE_FAIL");
@@ -867,6 +885,37 @@ void smoke_test_run(void)
     // at least one burst (since bursts are at their natural offsets
     // in the 2.56 MHz subband, peak_bin is correct for freq centring).
     // Wait for queues to drain, then check frame_decoder counts.
+    // Floor: baseline (captured 2026-06-15, commit 4aa58f7, ESP32-P4 v1.3)
+    // is UNKNOWN=3 BC=1 LW.DA=2 -> total=6 classified, GOLDEN matched=4.
+    // Floor at 5 (baseline 6, -1 tolerance) — real PIE heap-position
+    // corruption (project_heap_position_decode_bug) craters this to 0-1.
+#define RAW_IRIDIUM_MIN_CLASSIFIED 5
+#if CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
+    // COMBINED gate semantics differ from STANDALONE (#137). The worker
+    // ships ONLY known-type frames as PDUs (#111 drops UNKNOWN before the
+    // link), and on this fixture the worker is far from real-time (full
+    // backlog ~140 s). A fixed drain would therefore sample mid-flight and
+    // also can't count the UNKNOWN frames STANDALONE includes. Instead make
+    // a positive end-to-end DELIVERY assertion: wait (bounded 90 s) until
+    // at least the floor number of frames has actually traversed the PDU
+    // pack -> queue -> ingest -> unpack -> frame_decoder path and been
+    // classified. If pack/unpack corrupted bits, classify would fail, no
+    // PDUs would ship, and this times out -> SMOKE_FAIL.
+    ESP_LOGI(TAG, "COMBINED: waiting (<=90 s) for PDU path to deliver >= %d "
+                  "classified frames...",
+             RAW_IRIDIUM_MIN_CLASSIFIED);
+    frame_decoder_class_counts_t fc;
+    for (int i = 0; i < 900; i++) {
+        frame_decoder_get_class_counts(&fc);
+        uint64_t t = fc.unknown + fc.ms + fc.tl + fc.bc + fc.lw_da + fc.lw_other;
+        if ((int)t >= RAW_IRIDIUM_MIN_CLASSIFIED) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI(TAG, "COMBINED: PDU path delivered %lu frames (%lu dropped at "
+                  "PDU queue)",
+             (unsigned long)aggregator_ingest_count(),
+             (unsigned long)frame_pdu_queue_dropped());
+#else
     ESP_LOGI(TAG, "Waiting up to 2 s for worker + frame_decoder to drain...");
     for (int i = 0; i < 20; i++) {
         if (frame_decoder_queue_count() == 0) break;
@@ -874,6 +923,7 @@ void smoke_test_run(void)
     }
     frame_decoder_class_counts_t fc;
     frame_decoder_get_class_counts(&fc);
+#endif
     uint64_t total_classified = fc.unknown + fc.ms + fc.tl + fc.bc + fc.lw_da + fc.lw_other;
     ESP_LOGI(TAG, "Frame-decoder counts: UNKNOWN=%llu MS=%llu TL=%llu BC=%llu "
                   "LW.DA=%llu LW.other=%llu (total=%llu, expected=%d)",
@@ -881,17 +931,12 @@ void smoke_test_run(void)
              (unsigned long long)fc.tl, (unsigned long long)fc.bc,
              (unsigned long long)fc.lw_da, (unsigned long long)fc.lw_other,
              (unsigned long long)total_classified, ALBQ_RAW_EXPECTED_BURSTS);
-    // Baseline (captured 2026-06-15, commit 4aa58f7, on ESP32-P4 v1.3):
-    // UNKNOWN=3 BC=1 LW.DA=2 → total=6 classified, GOLDEN matched=4. RAW
-    // mode is DETERMINISTIC (no random-noise priming — it primes on the
-    // real fixture), so this count is stable run-to-run on the same
-    // build. A drop below the floor is a decode REGRESSION — most likely
-    // the silent PIE heap-position corruption (see
-    // project_heap_position_decode_bug) that the host golden tests cannot
-    // see because they run the scalar path. This is the device gate for
-    // the #120 context refactor. Floor at 5 (baseline 6, −1 tolerance for
-    // any classifier jitter) — real corruption craters this to 0-1.
-#define RAW_IRIDIUM_MIN_CLASSIFIED 5
+    // RAW mode is DETERMINISTIC (no random-noise priming — it primes on the
+    // real fixture), so this count is stable run-to-run on the same build.
+    // A drop below the floor is a decode REGRESSION — most likely the silent
+    // PIE heap-position corruption (project_heap_position_decode_bug) that
+    // the host golden tests cannot see because they run the scalar path.
+    // This is the device gate for the #120 context refactor.
     if ((int)total_classified < RAW_IRIDIUM_MIN_CLASSIFIED) {
         ESP_LOGE(TAG, "  classified %llu < baseline floor %d — decode REGRESSION "
                       "(worker chain broken or PIE heap-position corruption)",

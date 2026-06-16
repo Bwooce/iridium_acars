@@ -185,4 +185,10 @@ uint32_t frame_pdu_queue_dropped(void)
 {
     return atomic_load_explicit(&s_dropped, memory_order_relaxed);
 }
+
+uint32_t frame_pdu_queue_count(void)
+{
+    if (!s_q) return 0;
+    return (uint32_t)uxQueueMessagesWaiting(s_q);
+}
 #endif // ESP_PLATFORM

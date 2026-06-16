@@ -17,6 +17,7 @@
 #include "esp_libusb.h"
 #include "dsp_processor.h"
 #include "frame_decoder.h"
+#include "aggregator_ingest.h"
 #include "signal_buffer.h"
 #include "worker_core1.h"
 #include "ingest_core1.h"
@@ -217,6 +218,13 @@ static void action_start_stream(class_driver_t *driver_obj)
         ESP_LOGW(TAG, "frame_decoder_init failed; higher-layer "
                       "classification will be silently skipped");
     }
+#if CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
+    // COMBINED: the worker emits PDUs to the frame_pdu queue instead of
+    // calling frame_decoder_push directly (#135). Drain that queue back
+    // into frame_decoder in-process so one board exercises the full
+    // worker -> PDU -> aggregator -> decode path (#137).
+    aggregator_ingest_init();
+#endif
 
     ESP_LOGI(TAG, "Initializing DSP...");
     s_dsp = dsp_processor_create(worker_core1_push_burst);
