@@ -26,6 +26,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "worker_core1.h"
+#include "frame_pdu.h"
 #include "signal_buffer.h"
 #include "dsp_processor.h"
 #include "qpsk_demod.h"
@@ -476,6 +477,8 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
 
     int  e1_bch = -1, e2_bch = -1;
     bool chase_used = false;
+    bool real_known = false; // BCH-passed AND classified to a known type (#111)
+    (void)real_known;        // only read in WORKER/COMBINED builds
     if (frame.n_bits >= 24 + 64) {
         const uint8_t *payload = frame.bits + 24;
         uint8_t        block1[32], block2[32];
@@ -531,6 +534,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
                          e1_bch, e2_bch,
                          iridium_frame_type_name(classified.type));
                 s_bursts_bch_decoded++;
+                real_known = true;
             } else {
                 ESP_LOGD(TAG, "BCH PASS but UNKNOWN: errors=%d/%d "
                               "(BCH false-positive — noise corrected into "
@@ -548,9 +552,29 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
 #if CONFIG_SMOKE_TEST_RAW_IRIDIUM
     golden_compare_burst(wctx->burst, &frame, e1_bch, e2_bch);
 #endif
+#if CONFIG_DEVICE_ROLE_WORKER || CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
+    // Distributed front end (#135): ship only known-type frames as PDUs to
+    // the aggregator (preserves the #111 bandwidth saving vs BCH false
+    // positives). No local frame_decoder — that runs on the aggregator.
+    if (real_known) {
+        iridium_frame_pdu_t pdu = {0};
+        pdu.timestamp_us        = (uint64_t)esp_timer_get_time();
+        pdu.source_id           = frame_pdu_source_id();
+        pdu.rel_freq_hz         = (int32_t)wctx->burst->rel_freq_hz;
+        pdu.peak_snr_db         = wctx->burst->peak_snr_db;
+        pdu.peak_bin            = (int16_t)wctx->burst->peak_bin;
+        pdu.direction           = (frame.direction == DIR_DOWNLINK) ? 0 : 1;
+        pdu.bch_e1              = (int8_t)e1_bch;
+        pdu.bch_e2              = (int8_t)e2_bch;
+        pdu.flags               = chase_used ? FRAME_PDU_FLAG_CHASE : 0;
+        frame_pdu_pack_bits(&pdu, frame.bits, frame.n_bits);
+        frame_pdu_queue_push(&pdu);
+    }
+#else // STANDALONE (and AGGREGATOR, which never reaches here)
     frame_decoder_push(frame.bits, frame.n_bits,
                        frame.direction, 0u,
                        wctx->burst->peak_bin, wctx->burst->peak_snr_db);
+#endif
     free(frame.bits);
     free(frame.soft_bits); // #112
     wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);

@@ -30,6 +30,7 @@ endif()
 # P4 firmware; the tests don't need to know about that layout — they
 # just compile the same files with a host toolchain.
 set(COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/iridium_decoder)
+set(MAIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
 
 # bch_decoder is pure C with no IDF deps — compile it as-is.
 add_executable(test_bch
@@ -222,6 +223,14 @@ target_include_directories(test_uw_correlator_golden PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 target_link_libraries(test_uw_correlator_golden PRIVATE m)
+
+# #135: worker->aggregator frame PDU pack/unpack (pure C; the FreeRTOS
+# output queue in frame_pdu.c is behind ESP_PLATFORM, excluded on host).
+add_executable(test_frame_pdu
+    test_frame_pdu.c
+    ${MAIN_DIR}/frame_pdu.c
+)
+target_include_directories(test_frame_pdu PRIVATE ${MAIN_DIR})
 
 # Phase 3.6.M task #58 step 1: validate rotate_to_dc_q15_inc against
 # the cosf/sinf reference (rotate_to_dc) on synthetic tones. Asserts
@@ -555,6 +564,7 @@ add_test(NAME sym_timing           COMMAND test_sym_timing)
 add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
 add_test(NAME uw_correlator_golden COMMAND test_uw_correlator_golden)
 add_test(NAME direct_if_decim_golden COMMAND test_direct_if_decim_golden)
+add_test(NAME frame_pdu COMMAND test_frame_pdu)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
 # worker_pipeline_albq removed with the channelizer (the channelizer
 # was the front end it tested; coverage moved to test_pipeline_wideband_albq).

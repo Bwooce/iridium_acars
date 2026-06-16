@@ -24,6 +24,7 @@
 #include "sd_log.h"
 #include "sd_capture.h"
 #include "serial_cmd.h"
+#include "frame_pdu.h"
 #include "esp_iot_log.h"
 #include "esp_heap_caps.h"
 
@@ -268,6 +269,12 @@ void app_main(void)
     xTaskCreatePinnedToCore((TaskFunction_t)smoke_test_run,
                             "smoke", 32768, NULL, 5, NULL, 0);
     return;
+#endif
+
+#if CONFIG_DEVICE_ROLE_WORKER || CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
+    // Worker output ring for decoded-frame PDUs (#135). Must exist before
+    // the worker task starts emitting frames.
+    frame_pdu_queue_init();
 #endif
 
 #if CONFIG_DEVICE_ROLE_AGGREGATOR
