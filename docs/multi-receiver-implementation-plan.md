@@ -38,11 +38,18 @@ second board or SPI wiring.
    then enqueue a PDU instead of (WORKER role) / in addition to
    (COMBINED) the local frame_decoder call. *Deliverable:* worker fills
    the ring; unit-tested pack/unpack on host.
-3. **SPI transport** — `frame_link.{c,h}`: aggregator = SPI master
-   (`esp_driver_spi`, per-worker CS + INT), worker = SPI slave (serves
-   PDUs from the ring, asserts INT). Plus the COMBINED in-process shim.
-   *Validation:* COMBINED loopback on one board; optional GPSPI2(master)↔
-   GPSPI3(slave) jumper loopback to exercise the real SPI driver.
+3. **SPI transport** — DRAFT (`frame_link.{c,h}`, commit d12781e).
+   Aggregator = SPI master (SPI2), worker = SPI slave (SPI3) serving PDUs
+   from the ring and asserting a handshake GPIO. Fixed-size wire frame
+   `[magic][ver][flags][PDU][crc16]` (CRC-16/CCITT). Pins are
+   Kconfig-configurable (`FRAME_LINK_*_GPIO`); defaults avoid C6/SDIO
+   (6,14-19,54) and SD (39-45) but MUST be checked against board headers.
+   COMBINED keeps the in-process shim (no SPI). *Validated so far:* host
+   `test_frame_link` (framing + CRC, every-single-byte corruption rejected)
+   + clean builds in all four configs. *NOT hardware-validated:* the SPI
+   master/slave path and `frame_link_loopback_selftest()` need a second P4
+   or a GPSPI2↔GPSPI3 jumper (CONFIG_FRAME_LINK_LOOPBACK_SELFTEST runs the
+   one-board test at boot). This is the ready-to-bring-up draft.
 4. **Aggregator frame ingest + dedupe** — DONE (`aggregator_ingest.{c,h}`,
    commit d57625d). A Core-1 prio-4 task pops the frame_pdu queue, unpacks
    bits, and calls `frame_decoder_push` (which already does the
