@@ -26,8 +26,37 @@ tests pin the *exact* current output so any drift is caught. Captured
   instances (i.e. not actually reentrant). So uw_correlator stays as-is until
   a real multi-instance consumer exists (the multi-receiver SPI aggregator,
   #119), at which point the PIE-buffer relocation gets its own dedicated
-  on-device PIE-placement validation. The golden tests below remain the
-  guard for any future change to it.
+  on-device PIE-placement validation (now built — see below). The golden
+  tests below remain the guard for any future change to it.
+
+## PIE heap-placement test (the gate for the deferred uw_correlator change)
+
+`CONFIG_SMOKE_TEST_PIE_PLACEMENT=y` builds a standalone on-device sweep
+(`pie_fft_placement_run()` in `pie_fft_diff_test.c`) that:
+
+1. Computes a scalar golden FFT of a fixed broadband input.
+2. Drains the free internal-SRAM heap into 16 KB scratch blocks (leaving a
+   64 KB reserve), reaching every region the allocator can hand out.
+3. Runs the PIE FFT (`dsps_fft2r_fc32_arp4`) in each block and compares to
+   the golden — a corrupting placement shows as a gross diff, NaN/Inf, or a
+   shifted peak.
+4. Logs a per-address map and `PIE_PLACEMENT_PASS` / `PIE_PLACEMENT_FAIL`.
+
+This is the gate for the eventual uw_correlator change: before moving
+`s_pie_fft_scratch` into a per-instance heap context, run this and confirm
+the addresses the allocator returns are PIE-safe.
+
+**Baseline run (2026-06-16, ESP32-P4 v1.3):** `PIE_PLACEMENT_PASS` — 15/15
+allocatable internal blocks (`0x4ff25300 .. ~0x4ff50000`, ~240 KB) bit-correct
+(max abs diff 3.4e-5, pure float jitter). Notably the historically-suspect
+`~0x4ff6xxxx` zone is **not** in the free internal heap, so a context
+allocation can't land there anyway. Evidence that the heap region a future
+uw_correlator context would draw from is PIE-safe. (Caveat: re-run this in the
+actual refactor build — large new allocations can shift what the allocator
+returns.)
+
+How to run: `idf.py menuconfig` → enable `SMOKE_TEST_MODE` +
+`PIE FFT heap-placement sweep`, build/flash, read serial for the map.
 
 ## Host golden tests (run every CI build, `ctest`)
 

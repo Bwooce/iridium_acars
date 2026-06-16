@@ -443,9 +443,17 @@ static void smoke_test_run_live_sdr(void)
 // noise. Declared here rather than via header since the harness is
 // self-contained and only called from this one place.
 extern void pie_fft_diff_run(void);
+extern void pie_fft_placement_run(void); // #120 prep: PIE heap-placement sweep
 
 void smoke_test_run(void)
 {
+#if CONFIG_SMOKE_TEST_PIE_PLACEMENT
+    // Standalone PIE heap-placement sweep — runs FIRST and parks, before
+    // any pipeline init, so the internal-SRAM arena is as large as possible.
+    pie_fft_placement_run();
+    while (1)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+#endif
     // Run the PIE FFT diff harness first so its log lines are easy to
     // find. Tiny one-shot ~10 ms of synthetic FFT comparisons; doesn't
     // affect downstream smoke results.

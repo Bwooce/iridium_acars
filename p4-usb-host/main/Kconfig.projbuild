@@ -88,6 +88,23 @@ config SMOKE_TEST_CORPUS
         the smoke test uses a synthetic tone at FFT bin 200 (semantic
         regression check, not a corpus regression).
 
+config SMOKE_TEST_PIE_PLACEMENT
+    bool "PIE FFT heap-placement sweep (maps safe/unsafe scratch addresses)"
+    depends on SMOKE_TEST_MODE
+    default n
+    help
+        Standalone on-device test (#120 prep) that runs the PIE float FFT
+        (dsps_fft2r_fc32_arp4) at many heap addresses across a large
+        internal-SRAM arena and compares each result to a scalar golden.
+        Maps which addresses corrupt the PIE FFT (the silent
+        project_heap_position_decode_bug) so a future uw_correlator
+        context refactor can verify its scratch placement is safe.
+
+        Bypasses the whole ingest/DSP pipeline — it just sweeps and
+        reports PIE_PLACEMENT_PASS / PIE_PLACEMENT_FAIL with the
+        per-address map. Takes precedence over the other smoke modes
+        when set (smoke_test_run runs it first and parks).
+
 config SMOKE_TEST_FRAME_DECODER
     bool "Drive the frame_decoder task with canned post-demod bits from the Albuquerque corpus"
     depends on SMOKE_TEST_MODE

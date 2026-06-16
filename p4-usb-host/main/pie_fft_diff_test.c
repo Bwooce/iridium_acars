@@ -320,3 +320,152 @@ void pie_fft_diff_run(void)
 
     ESP_LOGI(TAG, "=== diff harness end ===");
 }
+
+#if CONFIG_SMOKE_TEST_MODE
+// On-device PIE FFT heap-placement sweep (#120 prep).
+//
+// The PIE float FFT (dsps_fft2r_fc32_arp4) operates in-place on a scratch
+// buffer and is known to silently corrupt when that buffer lands in
+// certain heap address ranges (project_heap_position_decode_bug).
+// uw_correlator works today only because the boot-time early-alloc dance
+// pins s_pie_fft_scratch to a known-good address. Before #120 can move
+// that scratch into a per-instance context (heap-allocated at an arbitrary
+// address), we need to know which addresses are actually safe.
+//
+// This walks a large internal-SRAM arena, runs the PIE FFT at many
+// 16-aligned offsets within it on a fixed broadband input, and compares
+// each result to a scalar golden. A corrupting placement shows up as a
+// gross diff, NaN/Inf, or a shifted peak. The log maps safe vs unsafe
+// address ranges; a future context allocation can be checked against it
+// (or this run used as the gate: PIE_PLACEMENT_PASS = scratch is safe
+// anywhere in the swept range).
+void pie_fft_placement_run(void)
+{
+    ESP_LOGW(TAG, "=== PIE FFT heap-placement sweep (N=%d, #120 prep) ===", FFTN);
+    pie_fft_init();
+    if (!s_pie_inited) {
+        ESP_LOGE(TAG, "PIE w_table init failed -> abort");
+        return;
+    }
+
+    // Deterministic broadband input + scalar golden (PSRAM scalar buffers —
+    // every output bin is non-trivial so any corruption is visible).
+    float *in_re   = heap_caps_malloc(FFTN * sizeof(float), MALLOC_CAP_SPIRAM);
+    float *in_im   = heap_caps_malloc(FFTN * sizeof(float), MALLOC_CAP_SPIRAM);
+    float *gold_re = heap_caps_malloc(FFTN * sizeof(float), MALLOC_CAP_SPIRAM);
+    float *gold_im = heap_caps_malloc(FFTN * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!in_re || !in_im || !gold_re || !gold_im) {
+        ESP_LOGE(TAG, "placement input/golden alloc failed");
+        heap_caps_free(in_re);
+        heap_caps_free(in_im);
+        heap_caps_free(gold_re);
+        heap_caps_free(gold_im);
+        return;
+    }
+    uint32_t st = 0xBADC0DEu;
+    for (int i = 0; i < FFTN; i++) {
+        st       = st * 1103515245u + 12345u;
+        in_re[i] = (float)((int16_t)(st & 0xFFFF)) / 32768.0f;
+        st       = st * 1103515245u + 12345u;
+        in_im[i] = (float)((int16_t)(st & 0xFFFF)) / 32768.0f;
+    }
+    memcpy(gold_re, in_re, FFTN * sizeof(float));
+    memcpy(gold_im, in_im, FFTN * sizeof(float));
+    ref_radix2_fft(gold_re, gold_im); // scalar reference spectrum
+
+    int   gpeak = 0;
+    float gpm2 = 0, gmax = 0;
+    for (int i = 0; i < FFTN; i++) {
+        float m = gold_re[i] * gold_re[i] + gold_im[i] * gold_im[i];
+        if (m > gpm2) {
+            gpm2  = m;
+            gpeak = i;
+        }
+        float a = fabsf(gold_re[i]);
+        if (a > gmax) gmax = a;
+        a = fabsf(gold_im[i]);
+        if (a > gmax) gmax = a;
+    }
+    // Scalar↔PIE float jitter is < ~1e-2 abs at this scale; corruption is
+    // gross (>> 1 or NaN). 0.5 separates the two cleanly.
+    const float TOL = 0.5f;
+
+    ESP_LOGW(TAG, "golden peak bin=%d gmax=%.2f tol=%.2f", gpeak, (double)gmax, (double)TOL);
+
+    // Walk EVERY free internal region the allocator can hand out: grab
+    // scratch-sized internal blocks until the heap is nearly exhausted
+    // (leaving a reserve so logging/system survive), run the PIE FFT in
+    // each, then free them all. Unlike a single contiguous arena, this
+    // reaches scattered free regions — incl. the historically-suspect
+    // ~0x4ff6xxxx zone if it's free — because the context scratch a future
+    // refactor allocates could land in any of them.
+    const size_t SCRATCH_BYTES = 2 * FFTN * sizeof(float); // 16 KB, in-place IQ
+#define PP_MAX_BLOCKS 96
+    static float *blocks[PP_MAX_BLOCKS];
+    int           n_blocks = 0;
+    while (n_blocks < PP_MAX_BLOCKS) {
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < SCRATCH_BYTES + 64 * 1024)
+            break; // keep a 64 KB reserve
+        float *b = heap_caps_aligned_alloc(16, SCRATCH_BYTES, MALLOC_CAP_INTERNAL);
+        if (!b) break;
+        blocks[n_blocks++] = b;
+    }
+    ESP_LOGW(TAG, "grabbed %d internal scratch blocks (16 KB each) to sweep", n_blocks);
+
+    int       n_fail = 0;
+    uintptr_t lo = 0, hi = 0;
+    for (int k = 0; k < n_blocks; k++) {
+        float *scr = blocks[k];
+        for (int i = 0; i < FFTN; i++) {
+            scr[2 * i + 0] = in_re[i];
+            scr[2 * i + 1] = in_im[i];
+        }
+        dsps_fft2r_fc32_arp4(scr, FFTN);
+        dsps_bit_rev_fc32_ansi(scr, FFTN);
+
+        float maxd    = 0;
+        int   ppeak   = 0;
+        float ppm2    = 0;
+        bool  bad_num = false;
+        for (int i = 0; i < FFTN; i++) {
+            float rr = scr[2 * i + 0], ii = scr[2 * i + 1];
+            if (isnan(rr) || isinf(rr) || isnan(ii) || isinf(ii)) bad_num = true;
+            float dr = fabsf(rr - gold_re[i]), di = fabsf(ii - gold_im[i]);
+            float dm = dr > di ? dr : di;
+            if (dm > maxd) maxd = dm;
+            float m = rr * rr + ii * ii;
+            if (m > ppm2) {
+                ppm2  = m;
+                ppeak = i;
+            }
+        }
+        bool      ok = !bad_num && (maxd < TOL) && (ppeak == gpeak);
+        uintptr_t a  = (uintptr_t)scr;
+        if (!ok) {
+            n_fail++;
+            if (!lo || a < lo) lo = a;
+            if (a > hi) hi = a;
+            ESP_LOGE(TAG, "  BAD @ %p maxd=%.3e peak=%d(exp %d)%s",
+                     scr, (double)maxd, ppeak, gpeak, bad_num ? " NaN/Inf" : "");
+        } else {
+            ESP_LOGI(TAG, "  ok  @ %p maxd=%.3e", scr, (double)maxd);
+        }
+    }
+    for (int k = 0; k < n_blocks; k++)
+        heap_caps_free(blocks[k]);
+
+    ESP_LOGW(TAG, "placement sweep: %d positions tested, %d corrupting", n_blocks, n_fail);
+    if (n_fail) {
+        ESP_LOGE(TAG, "  corrupting addresses span ~[%p .. %p] — keep PIE scratch OUT of this range",
+                 (void *)lo, (void *)hi);
+    }
+    ESP_LOGW(TAG, n_fail == 0
+                      ? "===== PIE_PLACEMENT_PASS (no corrupting positions found) ====="
+                      : "===== PIE_PLACEMENT_FAIL (corruption found — see BAD addresses) =====");
+
+    heap_caps_free(in_re);
+    heap_caps_free(in_im);
+    heap_caps_free(gold_re);
+    heap_caps_free(gold_im);
+}
+#endif // CONFIG_SMOKE_TEST_MODE
