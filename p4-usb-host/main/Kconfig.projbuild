@@ -38,6 +38,75 @@ config DEVICE_ROLE_COMBINED_LOOPBACK
 
 endchoice
 
+menu "Inter-chip frame link (SPI; #136 Phase 3)"
+
+config FRAME_LINK_SCLK_GPIO
+    int "frame_link SCLK GPIO (master SPI2 / used as primary in loopback)"
+    default 20
+    help
+        GPSPI pin numbers for the worker->aggregator PDU link. These are
+        ILLUSTRATIVE defaults — VERIFY them against your P4-NANO's free
+        header GPIOs before wiring. Avoid the C6/SDIO pins (6,14-19,54) and
+        the SD-card pins (39-45).
+
+config FRAME_LINK_MOSI_GPIO
+    int "frame_link MOSI GPIO"
+    default 21
+
+config FRAME_LINK_MISO_GPIO
+    int "frame_link MISO GPIO (slave drives; carries the PDU)"
+    default 22
+
+config FRAME_LINK_CS_GPIO
+    int "frame_link CS GPIO"
+    default 23
+
+config FRAME_LINK_HANDSHAKE_GPIO
+    int "frame_link handshake GPIO (slave out -> master in: data-ready)"
+    default 7
+
+config FRAME_LINK_CLOCK_HZ
+    int "frame_link SPI clock (Hz)"
+    default 1000000
+    help
+        Conservative 1 MHz default suits hand-wired jumpers. Raise once the
+        link is on a clean PCB trace.
+
+config FRAME_LINK_LOOPBACK_SELFTEST
+    bool "Run the one-board jumpered SPI loopback self-test at boot"
+    default n
+    help
+        Brings up the master (SPI2) and slave (SPI3) on this one board and
+        round-trips a known PDU. Requires the master pins jumpered to the
+        FRAME_LINK_LB_* slave pins below. Logs SELFTEST PASS/FAIL and stops.
+
+config FRAME_LINK_LB_SCLK_GPIO
+    int "loopback slave SCLK GPIO"
+    default 8
+    depends on FRAME_LINK_LOOPBACK_SELFTEST
+
+config FRAME_LINK_LB_MOSI_GPIO
+    int "loopback slave MOSI GPIO"
+    default 9
+    depends on FRAME_LINK_LOOPBACK_SELFTEST
+
+config FRAME_LINK_LB_MISO_GPIO
+    int "loopback slave MISO GPIO"
+    default 10
+    depends on FRAME_LINK_LOOPBACK_SELFTEST
+
+config FRAME_LINK_LB_CS_GPIO
+    int "loopback slave CS GPIO"
+    default 11
+    depends on FRAME_LINK_LOOPBACK_SELFTEST
+
+config FRAME_LINK_LB_HANDSHAKE_GPIO
+    int "loopback slave handshake GPIO"
+    default 13
+    depends on FRAME_LINK_LOOPBACK_SELFTEST
+
+endmenu
+
 config STATUS_LOG_VERBOSE
     bool "Emit the full 8-line per-second status block"
     default n

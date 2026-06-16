@@ -28,6 +28,7 @@
 #include "frame_decoder.h"
 #include "bch_decoder.h"
 #include "aggregator_ingest.h"
+#include "frame_link.h"
 #include "esp_iot_log.h"
 #include "esp_heap_caps.h"
 
@@ -206,6 +207,18 @@ void app_main(void)
 
     log_dma_int_heap("app_main entry");
 
+#if CONFIG_FRAME_LINK_LOOPBACK_SELFTEST
+    // One-board SPI loopback bring-up test (#136): requires the master pins
+    // jumpered to the FRAME_LINK_LB_* slave pins. Runs before anything else
+    // claims the SPI buses, logs PASS/FAIL, then idles.
+    {
+        esp_err_t lb = frame_link_loopback_selftest();
+        ESP_LOGW("BOOT", "frame_link loopback self-test: %s",
+                 lb == ESP_OK ? "PASS" : "FAIL");
+        return;
+    }
+#endif
+
     // Load runtime config from NVS (D18). Defaults are applied for any
     // missing keys — system stays operational with no NVS data.
     app_config_init();
@@ -280,6 +293,14 @@ void app_main(void)
     frame_pdu_queue_init();
 #endif
 
+#if CONFIG_DEVICE_ROLE_WORKER
+    // Worker ships PDUs to the aggregator over SPI (#136). COMBINED skips
+    // this — it drains the queue in-process via aggregator_ingest.
+    if (frame_link_slave_start() != ESP_OK) {
+        ESP_LOGE(TAG, "WORKER: frame_link_slave_start failed");
+    }
+#endif
+
 #if CONFIG_DEVICE_ROLE_AGGREGATOR
     // Aggregator role (#119/#134): no SDR/USB front end. It receives
     // decoded-frame PDUs from N worker P4s over SPI and runs the
@@ -296,8 +317,13 @@ void app_main(void)
     if (aggregator_ingest_init() != ESP_OK) {
         ESP_LOGE(TAG, "AGGREGATOR: aggregator_ingest_init failed");
     }
-    ESP_LOGW(TAG, "DEVICE_ROLE=AGGREGATOR: front-end disabled; PDU consumer "
-                  "ready, awaiting worker PDUs (SPI ingest lands in Phase 3)");
+    // SPI master ingest (#136): clocks PDUs from the worker(s) into the
+    // local frame_pdu queue, which aggregator_ingest drains.
+    if (frame_link_master_start() != ESP_OK) {
+        ESP_LOGE(TAG, "AGGREGATOR: frame_link_master_start failed");
+    }
+    ESP_LOGW(TAG, "DEVICE_ROLE=AGGREGATOR: front-end disabled; PDU consumer + "
+                  "SPI master ready, awaiting worker PDUs");
     return;
 #endif
 

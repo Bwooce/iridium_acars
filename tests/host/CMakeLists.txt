@@ -232,6 +232,15 @@ add_executable(test_frame_pdu
 )
 target_include_directories(test_frame_pdu PRIVATE ${MAIN_DIR})
 
+# #136 Phase 3: inter-chip frame_link wire framing (crc16 + encode/decode).
+# Pure layer only; SPI transport is target-only.
+add_executable(test_frame_link
+    test_frame_link.c
+    ${MAIN_DIR}/frame_link.c
+    ${MAIN_DIR}/frame_pdu.c
+)
+target_include_directories(test_frame_link PRIVATE ${MAIN_DIR})
+
 # Phase 3.6.M task #58 step 1: validate rotate_to_dc_q15_inc against
 # the cosf/sinf reference (rotate_to_dc) on synthetic tones. Asserts
 # NMSE ≤ -50 dB and amplitude-stability ratio in [0.98, 1.02] across
@@ -565,6 +574,7 @@ add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
 add_test(NAME uw_correlator_golden COMMAND test_uw_correlator_golden)
 add_test(NAME direct_if_decim_golden COMMAND test_direct_if_decim_golden)
 add_test(NAME frame_pdu COMMAND test_frame_pdu)
+add_test(NAME frame_link COMMAND test_frame_link)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
 # worker_pipeline_albq removed with the channelizer (the channelizer
 # was the front end it tested; coverage moved to test_pipeline_wideband_albq).

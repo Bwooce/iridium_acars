@@ -24,6 +24,7 @@
 #include "fault_inject.h"
 #include "worker_core1.h"
 #include "aggregator_ingest.h"
+#include "frame_link.h"
 #include "dsp_processor.h"
 #include "signal_buffer.h"
 #include "ingest_core1.h"
@@ -291,7 +292,15 @@ static esp_err_t status_get(httpd_req_t *req)
                                        (unsigned)ai.sources[i].count, (unsigned long long)age_ms);
             if (m > 0) n += m;
         }
-        m = snprintf(body + n, sizeof(body) - n, "]}}");
+        // Close sources[], then the SPI transport counters (#136).
+        frame_link_stats_t fl;
+        frame_link_get_stats(&fl);
+        m = snprintf(body + n, sizeof(body) - n,
+                     "],\"spi\":{\"tx\":%u,\"rx\":%u,\"crc_err\":%u,"
+                     "\"bus_err\":%u,\"queue_full\":%u}}}",
+                     (unsigned)fl.frames_tx, (unsigned)fl.frames_rx,
+                     (unsigned)fl.crc_errors, (unsigned)fl.bus_errors,
+                     (unsigned)fl.queue_full);
         if (m > 0) n += m;
         if (n >= (int)sizeof(body)) {
             n       = sizeof(body) - 1;
