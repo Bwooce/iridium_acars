@@ -270,6 +270,21 @@ void app_main(void)
     return;
 #endif
 
+#if CONFIG_DEVICE_ROLE_AGGREGATOR
+    // Aggregator role (#119/#134): no SDR/USB front end. It receives
+    // decoded-frame PDUs from N worker P4s over SPI and runs the
+    // classifier + outputs. The shared services above (wifi_link,
+    // http_server, acars_push, sd_log) are already up; the SPI ingest +
+    // dedupe land in Phase 4. For now, bring-up ends here — FreeRTOS keeps
+    // the wifi/http tasks running.
+    ESP_LOGW(TAG, "DEVICE_ROLE=AGGREGATOR: front-end disabled; awaiting "
+                  "worker PDUs (SPI ingest lands in Phase 4)");
+    return;
+#endif
+
+    // WORKER / COMBINED_LOOPBACK: full front-end DSP pipeline (today's
+    // single-P4 behaviour). COMBINED also consumes its own PDU queue
+    // in-process (added in later phases).
     SemaphoreHandle_t signaling_sem = xSemaphoreCreateBinary();
 
     TaskHandle_t daemon_task_hdl;

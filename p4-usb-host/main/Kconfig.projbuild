@@ -1,5 +1,37 @@
 menu "Iridium ACARS app options"
 
+choice DEVICE_ROLE
+    prompt "Device role (multi-receiver architecture)"
+    default DEVICE_ROLE_WORKER
+    help
+        Selects which top-level pipeline this firmware runs in the
+        N-worker -> 1-aggregator architecture. See
+        docs/multi-receiver-implementation-plan.md and
+        docs/multi-receiver-spi-aggregator-design.md.
+
+        WORKER (default) is today's single-P4 firmware: full front-end
+        DSP (ingest -> tagger -> worker -> BCH -> classify), and it ships
+        decoded-frame PDUs to an aggregator over SPI.
+
+        AGGREGATOR has no SDR/USB front end; it receives PDUs from N
+        workers, classifies, dedupes, and owns the operator-facing
+        outputs (msg_ring, acars_push, sd_log, http_server).
+
+        COMBINED_LOOPBACK runs both halves in one binary on one board,
+        with the SPI transport replaced by an in-process queue, for
+        single-board validation of the PDU pipeline + dedupe.
+
+config DEVICE_ROLE_WORKER
+    bool "Worker (front-end DSP, ships frame PDUs)"
+
+config DEVICE_ROLE_AGGREGATOR
+    bool "Aggregator (receives PDUs, classifies + outputs)"
+
+config DEVICE_ROLE_COMBINED_LOOPBACK
+    bool "Combined loopback (both halves, one board, in-process transport)"
+
+endchoice
+
 config STATUS_LOG_VERBOSE
     bool "Emit the full 8-line per-second status block"
     default n
