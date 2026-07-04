@@ -515,10 +515,11 @@ bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
     item.n_bits       = (uint16_t)n_bits;
     item.direction    = (uint8_t)((direction == DIR_DOWNLINK) ? 0 : 1);
     item.pad          = 0;
+    // No tail zero-fill: every consumer (iridium_frame_classify and the
+    // ida/ibc/ims/tl/ira decoders it dispatches to) bounds-checks against
+    // item.n_bits before indexing into bits[], so bits[n_bits..2047] is
+    // never read. frame_queue_push() also only copies the valid prefix.
     memcpy(item.bits, bits, n_bits);
-    if (n_bits < FRAME_QUEUE_MAX_BITS) {
-        memset(item.bits + n_bits, 0, FRAME_QUEUE_MAX_BITS - n_bits);
-    }
     return frame_queue_push(s_queue, &item);
 }
 

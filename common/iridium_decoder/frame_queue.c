@@ -87,9 +87,17 @@ bool frame_queue_push(frame_queue_t *q, const frame_queue_item_t *item)
         return false;
     }
 
-    // Copy the item into the ringbuffer slot. memcpy of ~432 bytes is
-    // negligible compared to the BCH and demod work upstream.
-    memcpy(&q->slots[tail], item, sizeof(*item));
+    // Copy only the header plus the valid bits[0..n_bits) prefix, not
+    // the full FRAME_QUEUE_MAX_BITS (2048-byte) slot. Every consumer
+    // (iridium_frame_classify and the ida/ibc/ims/tl/ira decoders)
+    // bounds-checks against n_bits before indexing into bits[], so the
+    // unused tail is never read and copying it is wasted work — n_bits
+    // is typically ~200-400 of the 2048-byte budget. Clamp defensively
+    // against FRAME_QUEUE_MAX_BITS so a bogus n_bits can't read past the
+    // source item.
+    size_t nb = item->n_bits;
+    if (nb > FRAME_QUEUE_MAX_BITS) nb = FRAME_QUEUE_MAX_BITS;
+    memcpy(&q->slots[tail], item, offsetof(frame_queue_item_t, bits) + nb);
 
     // Release-store on tail so the consumer's acquire-load sees the
     // payload write before the index update.
@@ -108,7 +116,17 @@ bool frame_queue_pop(frame_queue_t *q, frame_queue_item_t *out)
         return false; // empty
     }
 
-    memcpy(out, &q->slots[head], sizeof(*out));
+    // Mirror the partial copy done in frame_queue_push(): copy the fixed
+    // header first (which includes n_bits), then copy only that many
+    // bits[] bytes. Any stale bytes left in *out past n_bits are never
+    // read by consumers (see frame_queue_push()), and this is still an
+    // SPSC-safe two-step read of a slot the producer cannot touch again
+    // until head is advanced below.
+    const frame_queue_item_t *src = &q->slots[head];
+    memcpy(out, src, offsetof(frame_queue_item_t, bits));
+    size_t nb = out->n_bits;
+    if (nb > FRAME_QUEUE_MAX_BITS) nb = FRAME_QUEUE_MAX_BITS;
+    memcpy(out->bits, src->bits, nb);
 
     size_t next_head = (head + 1) & q->mask;
     atomic_store_explicit(&q->head, next_head, memory_order_release);
