@@ -384,17 +384,21 @@ static void smoke_test_run_live_sdr(void)
     ESP_LOGI(TAG, "  Will assert: no worker queue overflow, >= 1 burst tagged");
     ESP_LOGI(TAG, "  Will NOT assert: Iridium frame decode (antenna optional)");
 
-    // Spawn the same daemon + class_driver tasks the production
-    // app_main creates. class_driver_task does signal_buffer_init,
-    // worker_core1_init, ingest_core1_init, dsp_processor_init on
-    // first entry, so we don't need to call them explicitly here.
+    // Spawn the same daemon + class_driver (usb_pump) tasks the
+    // production app_main creates. class_driver_task does
+    // signal_buffer_init, worker_core1_init, ingest_core1_init,
+    // dsp_processor_init on first entry, so we don't need to call them
+    // explicitly here. T48: class_driver_task (usb_pump) also spawns its
+    // own dsp_feed sibling task internally once streaming starts (prio =
+    // this priority - 1, i.e. 3 here) — no change needed at this call
+    // site for that.
     SemaphoreHandle_t signaling_sem = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(host_lib_daemon_task,
                             "daemon", 4096,
                             (void *)signaling_sem,
                             5, NULL, 1);
     xTaskCreatePinnedToCore(class_driver_task,
-                            "class", 4096,
+                            "usb_pump", 4096,
                             (void *)signaling_sem,
                             4, NULL, 0);
 

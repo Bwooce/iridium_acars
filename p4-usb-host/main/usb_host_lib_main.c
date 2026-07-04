@@ -48,16 +48,20 @@ static void log_dma_int_heap(const char *tag)
 #endif
 
 #define DAEMON_TASK_PRIORITY 4
-// The class task both drains USB transfers into the usbring (T49a) and
-// consumes them (read_stream -> dsp_processor_feed). It MUST outrank the
-// httpd task (prio 5) so a multi-MB /capture/file download can't starve
-// the consumer and overflow the ring (rb_full_drops). It's effectively
-// event-driven (usbring_peek is a non-blocking poll + a 100 ms
-// usb_host_client_handle_events cap — 10 TICKS at the 100 Hz tick), so
-// it yields Core 0 naturally
-// every ~3-4 ms when data drains — raising its priority does not starve
-// httpd. See task #91 / #101.
-#define CLASS_TASK_PRIORITY 6
+// T48 (docs/perf-decoupling-design-2026-07-04.md §T48): class_driver_task
+// is now "usb_pump" — it only drains USB URB completions into the
+// usbring (T49a) and handles enumeration/recovery/the 1 Hz snapshot. The
+// actual ring-drain + DSP feed (the "USB consumer" the comment below used
+// to describe) moved into a separate task, dsp_feed, spawned internally
+// by class_driver.c at priority (this priority - 1) — see
+// action_start_stream()'s comment for the derivation. Bumped 6 -> 7 so
+// that dsp_feed (6) still outranks httpd (prio 5, http_server.c): a
+// multi-MB /capture/file download must not be able to starve ring drain
+// and reintroduce the rb_full_drops task #91 fixed. usb_pump itself
+// stays event-driven (usb_host_client_handle_events' 100 ms cap — 10
+// TICKS at the 100 Hz tick), so raising its priority further above
+// dsp_feed does not starve anything below it. See task #91 / #101.
+#define CLASS_TASK_PRIORITY 7
 
 extern void class_driver_task(void *arg);
 
@@ -351,9 +355,11 @@ void app_main(void)
                             DAEMON_TASK_PRIORITY,
                             &daemon_task_hdl,
                             1);
-    // class_driver stays on Core 0 — that's where the DSP feed runs.
+    // usb_pump (class_driver_task) stays on Core 0. It spawns its own
+    // dsp_feed sibling task internally (also Core 0, T48) once streaming
+    // starts — see class_driver.c:action_start_stream().
     xTaskCreatePinnedToCore(class_driver_task,
-                            "class",
+                            "usb_pump",
                             4096,
                             (void *)signaling_sem,
                             CLASS_TASK_PRIORITY,

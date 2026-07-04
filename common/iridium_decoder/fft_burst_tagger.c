@@ -31,6 +31,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
@@ -57,12 +58,22 @@ static inline uint64_t fbt_now_us(void)
 
 // Per-stage timer accumulators (single-tagger process — fine for our
 // usage). Order matches fft_burst_tagger_get_stage_us() docs.
-static uint64_t s_acc_wind_us;
-static uint64_t s_acc_fft_us;
-static uint64_t s_acc_mag_us;
-static uint64_t s_acc_detect_us;
-static uint64_t s_acc_base_us;
-static uint32_t s_acc_steps;
+//
+// T48 (docs/perf-decoupling-design-2026-07-04.md): on the host board
+// these are written from fft_burst_tagger_step(), called (via
+// dsp_processor_feed()/process_chunk()) from the dsp_feed task, and read
+// +reset from fft_burst_tagger_get_stage_us(), called (via
+// dsp_processor_get_stage_stats()) from usb_pump's 1 Hz snapshot — two
+// different tasks post-split, where before T48 both were the same task.
+// _Atomic + relaxed ordering (matches usbring.c/sd_capture.c's existing
+// idiom) avoids a torn 64-bit read/write across that task boundary;
+// these are diagnostics only, so the ordering itself is unconstrained.
+static _Atomic(uint64_t) s_acc_wind_us;
+static _Atomic(uint64_t) s_acc_fft_us;
+static _Atomic(uint64_t) s_acc_mag_us;
+static _Atomic(uint64_t) s_acc_detect_us;
+static _Atomic(uint64_t) s_acc_base_us;
+static _Atomic(uint32_t) s_acc_steps;
 
 #if defined(ESP_PLATFORM)
 // Pipelined helper task (Core 1): does mag+detect+EMA on the
@@ -669,12 +680,12 @@ static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
     uint64_t t2 = FBT_NOW_US();
     compute_magnitude_shifted(t, fb);
     uint64_t t3 = FBT_NOW_US();
-    s_acc_mag_us += (t3 - t2);
+    atomic_fetch_add_explicit(&s_acc_mag_us, (t3 - t2), memory_order_relaxed);
 
     if (!t->history_primed) {
         uint64_t b0 = FBT_NOW_US();
         update_baseline_ema(t);
-        s_acc_base_us += (FBT_NOW_US() - b0);
+        atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
         t->staged_n_new  = 0;
         t->staged_n_gone = 0;
     } else {
@@ -685,11 +696,11 @@ static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
         t->staged_n_gone = delete_gone_bursts_internal(
             t, t->staged_gone, t->staged_max_gone);
         uint64_t d1 = FBT_NOW_US();
-        s_acc_detect_us += (d1 - d0);
+        atomic_fetch_add_explicit(&s_acc_detect_us, (d1 - d0), memory_order_relaxed);
 
         uint64_t b0 = FBT_NOW_US();
         update_baseline_ema(t);
-        s_acc_base_us += (FBT_NOW_US() - b0);
+        atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
     }
 
     t->d_index = saved_d;
@@ -740,9 +751,9 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
         uint64_t t1 = FBT_NOW_US();
         fft_sc16_2048(fb);
         uint64_t t2 = FBT_NOW_US();
-        s_acc_wind_us += (t1 - t0);
-        s_acc_fft_us += (t2 - t1);
-        s_acc_steps += 1;
+        atomic_fetch_add_explicit(&s_acc_wind_us, (t1 - t0), memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_acc_fft_us, (t2 - t1), memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_acc_steps, 1, memory_order_relaxed);
 
         // 3. Snapshot pending state, ADVANCE d_index, then notify.
         //    Race-fix: t->d_index must be at its post-advance value
@@ -777,15 +788,15 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
     compute_magnitude_shifted(t, t->fft_buf);
     uint64_t t3 = FBT_NOW_US();
 
-    s_acc_wind_us += (t1 - t0);
-    s_acc_fft_us += (t2 - t1);
-    s_acc_mag_us += (t3 - t2);
-    s_acc_steps += 1;
+    atomic_fetch_add_explicit(&s_acc_wind_us, (t1 - t0), memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_acc_fft_us, (t2 - t1), memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_acc_mag_us, (t3 - t2), memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_acc_steps, 1, memory_order_relaxed);
 
     if (!t->history_primed) {
         uint64_t b0 = FBT_NOW_US();
         update_baseline_ema(t);
-        s_acc_base_us += (FBT_NOW_US() - b0);
+        atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
         t->d_index += N;
         return false;
     }
@@ -795,14 +806,14 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
     int      n_new_out  = create_new_bursts_internal(t, out_new_bursts, max_new);
     int      n_gone_out = delete_gone_bursts_internal(t, out_gone_bursts, max_gone);
     uint64_t d1         = FBT_NOW_US();
-    s_acc_detect_us += (d1 - d0);
+    atomic_fetch_add_explicit(&s_acc_detect_us, (d1 - d0), memory_order_relaxed);
 
     if (n_new) *n_new = n_new_out;
     if (n_gone) *n_gone = n_gone_out;
 
     uint64_t b0 = FBT_NOW_US();
     update_baseline_ema(t);
-    s_acc_base_us += (FBT_NOW_US() - b0);
+    atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
 
     t->d_index += N;
     return true;
@@ -810,18 +821,22 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 
 void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps)
 {
+    // T48: read-and-reset via atomic_exchange (one op per field, no
+    // load-then-clear window) — see the accumulators' declaration
+    // comment for why this is now a genuine cross-task read.
+    uint64_t wind_us   = atomic_exchange_explicit(&s_acc_wind_us, 0, memory_order_relaxed);
+    uint64_t fft_us    = atomic_exchange_explicit(&s_acc_fft_us, 0, memory_order_relaxed);
+    uint64_t mag_us    = atomic_exchange_explicit(&s_acc_mag_us, 0, memory_order_relaxed);
+    uint64_t detect_us = atomic_exchange_explicit(&s_acc_detect_us, 0, memory_order_relaxed);
+    uint64_t base_us   = atomic_exchange_explicit(&s_acc_base_us, 0, memory_order_relaxed);
+    uint32_t steps_v   = atomic_exchange_explicit(&s_acc_steps, 0, memory_order_relaxed);
+
     if (out) {
-        out[0] = s_acc_wind_us;
-        out[1] = s_acc_fft_us;
-        out[2] = s_acc_mag_us;
-        out[3] = s_acc_detect_us;
-        out[4] = s_acc_base_us;
+        out[0] = wind_us;
+        out[1] = fft_us;
+        out[2] = mag_us;
+        out[3] = detect_us;
+        out[4] = base_us;
     }
-    if (steps) *steps = s_acc_steps;
-    s_acc_wind_us   = 0;
-    s_acc_fft_us    = 0;
-    s_acc_mag_us    = 0;
-    s_acc_detect_us = 0;
-    s_acc_base_us   = 0;
-    s_acc_steps     = 0;
+    if (steps) *steps = steps_v;
 }

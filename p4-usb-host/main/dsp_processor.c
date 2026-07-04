@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -91,16 +92,26 @@ struct dsp_processor {
     uint64_t next_sample_idx;
 
     // Diagnostic accumulators (reset by get_stage_stats once per second).
-    volatile uint64_t acc_step_us;
-    volatile uint32_t acc_input_samples;
-    volatile uint32_t acc_new_bursts;
-    volatile uint32_t acc_gone_bursts;
+    // T48: dsp_processor_feed()/process_chunk() (the writers) now run on
+    // the dsp_feed task while dsp_processor_get_stage_stats() (the
+    // reader+resetter) runs on usb_pump — before the split both were the
+    // same task, so plain volatile was safe w.r.t. this specific
+    // reader/writer pair. Now that a higher-priority task (pump, prio
+    // pump_prio) can preempt the writer (dsp_feed, prio pump_prio-1)
+    // mid read-modify-write, a 64-bit accumulator could tear on this
+    // 32-bit core. _Atomic + relaxed ordering (matches usbring.c /
+    // sd_capture.c's existing idiom) costs nothing on the decode path —
+    // these are diagnostics-only — and removes the tear.
+    _Atomic(uint64_t) acc_step_us;
+    _Atomic(uint32_t) acc_input_samples;
+    _Atomic(uint32_t) acc_new_bursts;
+    _Atomic(uint32_t) acc_gone_bursts;
 
     // Non-resetting cumulative counter for callers that compute their own
     // deltas (e.g. /diag/dsp_health's 2-second window — #127). Readers
-    // snapshot at t0/t1 and subtract. NB volatile uint64 on RV32 can tear
-    // once per low-word wrap (~28 min) — diagnostic-only, not worth an atomic.
-    volatile uint64_t total_input_samples;
+    // snapshot at t0/t1 and subtract. Same cross-task tearing concern as
+    // above post-T48; _Atomic removes it.
+    _Atomic(uint64_t) total_input_samples;
 };
 
 // Process "default" instance for cross-task diagnostic getters that
@@ -161,13 +172,13 @@ static void process_chunk(dsp_processor_t *p, const int16_t *chunk_iq)
                                        new_bursts, &n_new,
                                        gone_bursts, &n_gone);
     int64_t t1 = esp_timer_get_time();
-    p->acc_step_us += (uint64_t)(t1 - t0);
+    atomic_fetch_add_explicit(&p->acc_step_us, (uint64_t)(t1 - t0), memory_order_relaxed);
 
     if (ok) {
         for (int i = 0; i < n_gone; i++)
             dispatch_gone_burst(p, &gone_bursts[i]);
-        p->acc_new_bursts += (uint32_t)n_new;
-        p->acc_gone_bursts += (uint32_t)n_gone;
+        atomic_fetch_add_explicit(&p->acc_new_bursts, (uint32_t)n_new, memory_order_relaxed);
+        atomic_fetch_add_explicit(&p->acc_gone_bursts, (uint32_t)n_gone, memory_order_relaxed);
     }
 
     p->next_sample_idx += FBT_FFT_SIZE;
@@ -186,7 +197,7 @@ void dsp_processor_flush(dsp_processor_t *p)
     fft_burst_tagger_flush(p->tagger, flushed, &n);
     for (int i = 0; i < n; i++)
         dispatch_gone_burst(p, &flushed[i]);
-    p->acc_gone_bursts += (uint32_t)n;
+    atomic_fetch_add_explicit(&p->acc_gone_bursts, (uint32_t)n, memory_order_relaxed);
     ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
 
@@ -250,8 +261,8 @@ void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_sam
     // after the 125/128 resample in ingest_core1.
     if (!p || !p->tagger) return;
 
-    p->acc_input_samples += (uint32_t)n_samples;
-    p->total_input_samples += (uint64_t)n_samples; // #127, never reset
+    atomic_fetch_add_explicit(&p->acc_input_samples, (uint32_t)n_samples, memory_order_relaxed);
+    atomic_fetch_add_explicit(&p->total_input_samples, (uint64_t)n_samples, memory_order_relaxed); // #127, never reset
 
     size_t off = 0;
     while (off < n_samples) {
@@ -278,7 +289,18 @@ void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)
         memset(out, 0, sizeof(*out));
         return;
     }
-    uint32_t frames          = p->acc_input_samples / FBT_FFT_SIZE;
+    // T48: read-and-reset each accumulator in one atomic_exchange so
+    // there's no load-then-clear window a concurrent dsp_feed increment
+    // could fall into (this getter runs on usb_pump; the increments run
+    // on dsp_feed — see the struct's field comments). Snapshot every
+    // value up front and derive the rest from the snapshot, matching the
+    // original same-task semantics exactly.
+    uint64_t acc_step_us_snap = atomic_exchange_explicit(&p->acc_step_us, 0, memory_order_relaxed);
+    uint32_t acc_input_snap   = atomic_exchange_explicit(&p->acc_input_samples, 0, memory_order_relaxed);
+    uint32_t acc_new_snap     = atomic_exchange_explicit(&p->acc_new_bursts, 0, memory_order_relaxed);
+    uint32_t acc_gone_snap    = atomic_exchange_explicit(&p->acc_gone_bursts, 0, memory_order_relaxed);
+
+    uint32_t frames          = acc_input_snap / FBT_FFT_SIZE;
     uint64_t tag_stage_us[5] = {0};
     uint32_t tag_steps       = 0;
     fft_burst_tagger_get_stage_us(tag_stage_us, &tag_steps);
@@ -294,21 +316,15 @@ void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)
         out->mag_us      = (float)tag_stage_us[2] / ts;
         out->detect_us   = (float)tag_stage_us[3] / ts;
         out->baseline_us = (float)tag_stage_us[4] / ts;
-        out->total_us    = (float)p->acc_step_us / fn;
+        out->total_us    = (float)acc_step_us_snap / fn;
     }
     // Raw accumulators for the `fbt:` line. No ESP_LOGI here: this
-    // getter runs on Core 0's hot read-feed loop (class_driver's 1 Hz
-    // snapshot) and log formatting belongs on Core 1 — status_logger
-    // emits the line from these fields.
-    out->new_bursts  = p->acc_new_bursts;
-    out->gone_bursts = p->acc_gone_bursts;
-    out->step_us     = (uint32_t)p->acc_step_us;
+    // getter runs on usb_pump's 1 Hz snapshot and log formatting belongs
+    // on Core 1 — status_logger emits the line from these fields.
+    out->new_bursts  = acc_new_snap;
+    out->gone_bursts = acc_gone_snap;
+    out->step_us     = (uint32_t)acc_step_us_snap;
     out->tag_steps   = tag_steps;
-
-    p->acc_step_us       = 0;
-    p->acc_input_samples = 0;
-    p->acc_new_bursts    = 0;
-    p->acc_gone_bursts   = 0;
 }
 
 // #127: race-free cumulative FFT-frames count. Callers that compute
@@ -319,5 +335,5 @@ void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)
 uint64_t dsp_processor_get_total_fft_frames(dsp_processor_t *p)
 {
     if (!p) return 0;
-    return p->total_input_samples / FBT_FFT_SIZE;
+    return atomic_load_explicit(&p->total_input_samples, memory_order_relaxed) / FBT_FFT_SIZE;
 }

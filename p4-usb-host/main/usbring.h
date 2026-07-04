@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // Buffer-backed single-producer/single-consumer byte ring for the USB
 // ingest stream (T49a, docs/perf-decoupling-design-2026-07-04.md §T49a).
@@ -18,9 +20,15 @@
 // usbring_ring.h documents but deliberately does not implement.
 //
 //   Producer: stream_transfer_cb (esp_libusb.c), the USB host client's
-//             URB completion callback.
-//   Consumer: class_driver's drain loop (class_driver.c) -- the ONLY
-//             call site for usbring_peek() / usbring_consume().
+//             URB completion callback -- runs inside usb_pump's
+//             usb_host_client_handle_events() (class_driver.c).
+//   Consumer: dsp_feed's drain loop (class_driver.c, T48 split) -- the
+//             ONLY call site for usbring_peek() / usbring_consume().
+//             Before T48 this was the same task as the producer
+//             (class_driver's single combined loop); post-T48 producer
+//             and consumer are genuinely concurrent tasks (both pinned
+//             to Core 0), which is exactly what the barriers below are
+//             for.
 //
 // IMPORTANT — single outstanding span: usbring_peek() always views the
 // ring from the current tail (per usbring_ring.h's contract). Calling
@@ -75,5 +83,20 @@ void usbring_consume(uint32_t n);
 // Diagnostics: bytes currently queued (unconsumed) + total capacity.
 // Both are 0 if the ring hasn't been usbring_init()'d.
 void usbring_get_info(size_t *used, size_t *capacity);
+
+// T48 (docs/perf-decoupling-design-2026-07-04.md §T48): register the task
+// that usbring_write() should wake -- via a lightweight task notification
+// -- every time it adds bytes to the ring. This lets the consumer (post-
+// T48: the dsp_feed task) block on ring-empty with ulTaskNotifyTake()
+// instead of busy-polling usbring_peek() when idle. Call once, right
+// after creating the consumer task; pass NULL to disable (e.g. once the
+// consumer task is stopped, before usbring_deinit()).
+//
+// No lock is needed around this pointer itself: unlike s_head/s_tail
+// (shared between the producer and consumer tasks), both the setter and
+// its only reader (usbring_write(), called from stream_transfer_cb
+// inside usb_host_client_handle_events) run on usb_pump -- the producer
+// task IS the task that starts/stops the consumer.
+void usbring_set_consumer_task(TaskHandle_t task);
 
 #endif // USBRING_H

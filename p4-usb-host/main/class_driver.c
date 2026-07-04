@@ -6,6 +6,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -15,6 +16,7 @@
 #include "esp_heap_caps.h"
 #include "usb/usb_host.h"
 #include "esp_libusb.h"
+#include "usbring.h"
 #include "dsp_processor.h"
 #include "frame_decoder.h"
 #include "aggregator_ingest.h"
@@ -51,50 +53,147 @@ static const char   *TAG               = "CLASS";
 static rtlsdr_dev_t *rtldev            = NULL;
 static volatile int  s_last_gain_dbx10 = -1;
 
-// Stall-forensics breadcrumb: the consumer loop sets this to its current
-// stage; the health watchdog dumps it (class_driver_dump_stall_diag) right
-// before rebooting a wedged stream, so we can see WHICH call the loop was
-// stuck on (#105 root-cause). Stages are ordered by loop position.
-enum { CS_TOP = 0,
-       CS_HANDLE_EVENTS,
-       CS_ACQUIRE,
-       CS_RAW_DONE, // T49a: wait+consume the previous dispatch's ring span
-       CS_READ,
-       CS_DISPATCH,
-       CS_TAKE_CONVERTED,
-       CS_FEED,
-       CS_RELEASE,
-       CS_REPORT };
-static const char *const k_class_stage_name[] = {
-    "top", "handle_events", "acquire_slot", "raw_done_consume", "read_stream",
-    "dispatch", "take_converted", "dsp_feed", "release", "report"};
-static volatile uint8_t  s_class_stage    = CS_TOP;
-static volatile uint64_t s_class_iter     = 0; // loop iterations
-static volatile int64_t  s_class_stage_us = 0; // when the stage was entered
+// T48 (docs/perf-decoupling-design-2026-07-04.md §T48): the combined
+// class_driver loop is split into two Core-0 tasks:
+//   - usb_pump: this function (class_driver_task) keeps its name/entry
+//     point for the extern declarations in usb_host_lib_main.c /
+//     smoke_test.c, but its body now only does
+//     usb_host_client_handle_events (URB completion -> ring write ->
+//     resubmit), enumeration actions, root-port recovery, the no-device
+//     idle path, and the 1 Hz snapshot/stall watchdog.
+//   - dsp_feed: a new task (dsp_feed_task, below) that runs the stream
+//     cycle -- usbring peek/consume, ingest_core1 dispatch/take/release,
+//     dsp_processor_feed -- moved VERBATIM (same call order, same
+//     blocking semantics) from the old combined loop.
+// Stall-forensics breadcrumbs are now two independent sets (pump-side,
+// feed-side) since either task can be the one that's wedged. Both are
+// dumped together by class_driver_dump_stall_diag().
+enum { CS_PUMP_TOP = 0,
+       CS_PUMP_HANDLE_EVENTS,
+       CS_PUMP_REPORT };
+static const char *const k_pump_stage_name[] = {
+    "top", "handle_events", "report"};
 
-static inline void class_stage(uint8_t s)
+enum { CS_FEED_TOP = 0,
+       CS_FEED_WAIT_DATA, // NEW: blocked on ring-empty (notify or timeout)
+       CS_FEED_ACQUIRE,
+       CS_FEED_RAW_DONE, // T49a: wait+consume the previous dispatch's ring span
+       CS_FEED_READ,
+       CS_FEED_DISPATCH,
+       CS_FEED_TAKE_CONVERTED,
+       CS_FEED_DSP_FEED,
+       CS_FEED_RELEASE };
+static const char *const k_feed_stage_name[] = {
+    "top", "wait_data", "acquire_slot", "raw_done_consume", "read_stream",
+    "dispatch", "take_converted", "dsp_feed", "release"};
+
+static _Atomic(uint8_t)  s_pump_stage    = CS_PUMP_TOP;
+static _Atomic(uint64_t) s_pump_iter     = 0; // loop iterations
+static _Atomic(int64_t)  s_pump_stage_us = 0; // when the stage was entered
+
+static _Atomic(uint8_t)  s_feed_stage    = CS_FEED_TOP;
+static _Atomic(uint64_t) s_feed_iter     = 0; // loop iterations
+static _Atomic(int64_t)  s_feed_stage_us = 0; // when the stage was entered
+
+static inline void pump_stage(uint8_t s)
 {
-    s_class_stage    = s;
-    s_class_stage_us = esp_timer_get_time();
+    atomic_store_explicit(&s_pump_stage, s, memory_order_relaxed);
+    atomic_store_explicit(&s_pump_stage_us, esp_timer_get_time(), memory_order_relaxed);
+}
+
+static inline void feed_stage(uint8_t s)
+{
+    atomic_store_explicit(&s_feed_stage, s, memory_order_relaxed);
+    atomic_store_explicit(&s_feed_stage_us, esp_timer_get_time(), memory_order_relaxed);
+}
+
+// T48: diagnostics the feeder accumulates and the pump's 1 Hz snapshot
+// reads (read-and-reset via atomic_exchange, except total_bytes which is
+// a lifetime, non-resetting counter). Before the split these were plain
+// locals inside the one combined loop; now the writer (dsp_feed) and
+// reader (usb_pump) are different tasks, so they need real cross-task
+// visibility. Relaxed ordering matches the codebase's existing
+// diagnostic-counter idiom (usbring.c, sd_capture.c) -- these feed
+// status reporting only, not the decode path.
+static _Atomic(uint64_t) s_feed_bytes_window            = 0;
+static _Atomic(uint64_t) s_feed_total_bytes             = 0;
+static _Atomic(uint32_t) s_feed_calls_window            = 0;
+static _Atomic(uint64_t) s_feed_dsp_total_time_us       = 0;
+static _Atomic(uint32_t) s_feed_dsp_frame_count         = 0;
+static _Atomic(uint64_t) s_feed_cycle_read_us           = 0;
+static _Atomic(uint64_t) s_feed_cycle_take_converted_us = 0;
+static _Atomic(uint32_t) s_feed_cycle_iterations        = 0;
+
+// T48 feeder lifecycle. Created once in action_start_stream() (after the
+// ping-pong infra + ring it depends on already exist), stopped from
+// action_close_dev() before this task (usb_pump) deregisters and parks.
+// See stop_dsp_feed_task() for the shutdown sequence.
+static TaskHandle_t      s_dsp_feed_task_hdl   = NULL;
+static SemaphoreHandle_t s_feed_stopped_sem    = NULL;
+static volatile bool     s_feed_stop_requested = false;
+
+static void dsp_feed_task(void *arg);
+
+// Ask dsp_feed to stop and wait (bounded) for its acknowledgement. Safe to
+// call multiple times (idempotent once s_dsp_feed_task_hdl is NULL). Must
+// run on usb_pump, BEFORE it deregisters the USB client -- see
+// action_close_dev().
+static void stop_dsp_feed_task(void)
+{
+    if (!s_dsp_feed_task_hdl) return;
+    s_feed_stop_requested = true;
+    // Wake it immediately if it's blocked in CS_FEED_WAIT_DATA; harmless
+    // if it's busy elsewhere in the protocol (it'll notice the flag the
+    // next time it reaches the top of its loop).
+    xTaskNotifyGive(s_dsp_feed_task_hdl);
+    if (s_feed_stopped_sem &&
+        xSemaphoreTake(s_feed_stopped_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        // dsp_feed is most likely blocked inside the ingest_core1 slot
+        // protocol's unbounded-in-effect retry loops (wait_raw_done /
+        // take_converted) -- those only return once ingest_core1
+        // progresses, which is exactly the pre-existing #106/#110
+        // failure mode health_wdt already watches for from outside.
+        // Proceed with pump teardown regardless: the device is gone
+        // either way, and today's action_close_dev() doesn't actually
+        // free anything the feeder could still be touching (rtlsdr_close
+        // is a stub -- see T19 in docs/review-2026-07-04-findings.md).
+        ESP_LOGW(TAG, "dsp_feed did not confirm stop within 2 s "
+                      "(likely blocked in the ingest slot protocol) -- "
+                      "proceeding with pump teardown");
+    }
+    s_dsp_feed_task_hdl = NULL;
+    usbring_set_consumer_task(NULL);
 }
 
 // Forensic dump for a wedged USB stream — called by the health watchdog
 // (wifi_link.c) just before it esp_restart()s, so every auto-recovery leaves
-// a trace on serial. Shows which loop stage `class` is stuck on (and for how
-// long), the USB transfer totals, and every task's state + stack high-water.
-// Safe to call from any task (reads counters, mallocs, logs — no flash ops).
+// a trace on serial. Shows which loop stage `usb_pump` AND `dsp_feed` are
+// each stuck on (and for how long), the USB transfer totals, and every
+// task's state + stack high-water. Safe to call from any task (reads
+// counters, mallocs, logs — no flash ops).
 void class_driver_dump_stall_diag(void)
 {
-    unsigned st = s_class_stage;
-    if (st >= sizeof(k_class_stage_name) / sizeof(k_class_stage_name[0])) st = 0;
-    int64_t stuck_ms = (esp_timer_get_time() - s_class_stage_us) / 1000;
+    unsigned pump_st = atomic_load_explicit(&s_pump_stage, memory_order_relaxed);
+    if (pump_st >= sizeof(k_pump_stage_name) / sizeof(k_pump_stage_name[0])) pump_st = 0;
+    int64_t pump_stuck_ms = (esp_timer_get_time() -
+                             atomic_load_explicit(&s_pump_stage_us, memory_order_relaxed)) /
+                            1000;
+
+    unsigned feed_st = atomic_load_explicit(&s_feed_stage, memory_order_relaxed);
+    if (feed_st >= sizeof(k_feed_stage_name) / sizeof(k_feed_stage_name[0])) feed_st = 0;
+    int64_t feed_stuck_ms = (esp_timer_get_time() -
+                             atomic_load_explicit(&s_feed_stage_us, memory_order_relaxed)) /
+                            1000;
 
     usb_stream_totals_t ut = {0};
     esp_libusb_get_stream_totals(&ut);
-    ESP_LOGW(TAG, "STALL DIAG: class stage=%s for %lld ms, iter=%llu | "
+    ESP_LOGW(TAG, "STALL DIAG: usb_pump stage=%s for %lld ms (iter=%llu) | "
+                  "dsp_feed stage=%s for %lld ms (iter=%llu) | "
                   "USB completed=%llu status_err=%llu short=%llu rb_drops=%llu",
-             k_class_stage_name[st], (long long)stuck_ms,
-             (unsigned long long)s_class_iter,
+             k_pump_stage_name[pump_st], (long long)pump_stuck_ms,
+             (unsigned long long)atomic_load_explicit(&s_pump_iter, memory_order_relaxed),
+             k_feed_stage_name[feed_st], (long long)feed_stuck_ms,
+             (unsigned long long)atomic_load_explicit(&s_feed_iter, memory_order_relaxed),
              (unsigned long long)ut.completed, (unsigned long long)ut.status_errors,
              (unsigned long long)ut.short_xfers, (unsigned long long)ut.rb_full_drops);
 
@@ -250,12 +349,58 @@ static void action_start_stream(class_driver_t *driver_obj)
     // so allocating right here gives us the cleanest window.
     sd_capture_alloc_writer_buf();
 
+    // T48: start the dsp_feed task now that everything it touches
+    // (ingest_core1/worker_core1/signal_buffer/s_dsp, and the usbring
+    // ring via esp_libusb_start_stream above) exists. By construction
+    // the feeder can never run before streaming has actually started —
+    // this replaces the old combined loop's `dev_addr==0 || rtldev==NULL`
+    // continue-guard with "the task doesn't exist yet".
+    //
+    // Priority: dsp_feed must stay BELOW this task (usb_pump) so URB
+    // completions always preempt the feed step (unchanged latency
+    // bound from before the split), and ABOVE httpd (prio 5,
+    // http_server.c) so a slow /capture/file download can't starve ring
+    // drain and reintroduce the rb_full_drops task #91 fixed — dsp_feed
+    // is now the "USB consumer" that rule refers to. Deriving the
+    // feeder's priority as "our own priority minus one" keeps
+    // pump > feed correct under whatever priority the caller gave this
+    // task (production: pump=7 -> feed=6 > httpd 5, see
+    // CLASS_TASK_PRIORITY in usb_host_lib_main.c; smoke test: pump=4 ->
+    // feed=3, httpd isn't running there).
+    s_feed_stop_requested = false;
+    if (!s_feed_stopped_sem) s_feed_stopped_sem = xSemaphoreCreateBinary();
+    UBaseType_t my_prio   = uxTaskPriorityGet(NULL);
+    UBaseType_t feed_prio = (my_prio > (UBaseType_t)(tskIDLE_PRIORITY + 1))
+                                ? my_prio - 1
+                                : (UBaseType_t)(tskIDLE_PRIORITY + 1);
+    BaseType_t  task_ok   = xTaskCreatePinnedToCore(dsp_feed_task, "dsp_feed", 4096,
+                                                    NULL, feed_prio,
+                                                    &s_dsp_feed_task_hdl, 0);
+    if (task_ok != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreatePinnedToCore(dsp_feed) failed — streaming "
+                      "will not drain the ring; expect rb_full_drops");
+        s_dsp_feed_task_hdl = NULL;
+    } else {
+        usbring_set_consumer_task(s_dsp_feed_task_hdl);
+        ESP_LOGI(TAG, "dsp_feed task started (prio %u, usb_pump prio %u)",
+                 (unsigned)feed_prio, (unsigned)my_prio);
+    }
+
     driver_obj->actions &= ~ACTION_START_STREAM;
 }
 
 static void action_close_dev(class_driver_t *driver_obj)
 {
     ESP_LOGI(TAG, "Closing device");
+
+    // T48: stop dsp_feed BEFORE this task (usb_pump) deregisters the USB
+    // client / parks below. Mirrors this task's own end-of-life pattern
+    // (stop cleanly, then park forever) — see stop_dsp_feed_task()'s doc
+    // comment for why this is safe even though today's rtlsdr_close() is
+    // a stub (T19, docs/review-2026-07-04-findings.md: replug already
+    // requires a reboot, independent of this change).
+    stop_dsp_feed_task();
+
     if (rtldev) {
         rtlsdr_close(rtldev);
         rtldev = NULL;
@@ -303,51 +448,21 @@ void class_driver_task(void *arg)
     // and the in-loop "stream-stall watchdog" below catches the
     // post-enumeration case where bytes_window stalls to zero.
 
-    uint32_t out_block_size = 16 * 1024;
-    // The converted buffers are owned by ingest_core1 (ping-pong on Core 1).
-    // class_driver reserves output slots via ingest_core1_acquire_slot,
-    // peeks raw USB bytes straight out of the usbring PSRAM ring (T49a —
-    // esp_libusb_read_stream is zero-copy now), and consumes converted
-    // buffers via ingest_core1_take_converted.
+    // T48: this loop is now purely event-driven — no stream-path calls.
+    // The ring-drain + dispatch + DSP-feed cycle that used to interleave
+    // here moved verbatim into dsp_feed_task(), below, which
+    // action_start_stream() spawns once streaming actually begins.
 
-    // Ping-pong steady-state book-keeping. We start by reading into slot 0;
-    // the matching DSP feed for slot 0 happens AFTER slot 1 has been
-    // dispatched (one-cycle pipeline). prev_dsp_slot tracks which slot the
-    // DSP should next consume; it's -1 on the very first iteration.
-    int prev_dsp_slot = -1;
+    int64_t start_time  = esp_timer_get_time();
+    int64_t last_report = start_time;
 
-    // T49a: the usbring only supports ONE outstanding un-consumed span
-    // (usbring_peek() always views from the current tail — see
-    // usbring.h). raw_bytes[slot] records how many ring bytes each
-    // slot's last dispatch peeked, so the NEXT read can wait for Core 1
-    // to finish reading them (ingest_core1_wait_raw_done) and
-    // reclaim them (esp_libusb_consume_stream) before peeking again.
-    // This is a NEW synchronisation point (see ingest_core1.h); it does
-    // not change the existing acquire(s_free)/dispatch/take(s_ready)/
-    // release(s_free) sequence's order or blocking semantics.
-    size_t raw_bytes[INGEST_NUM_SLOTS] = {0};
-
-    uint64_t total_bytes = 0;
-    int64_t  start_time  = esp_timer_get_time();
-    int64_t  last_report = start_time;
-
-    // Per-window counters for diagnostic reporting (reset each 1s window).
-    uint64_t bytes_window      = 0; // USB bytes received in this window
-    uint32_t feed_calls_window = 0; // dsp_processor_feed calls in this window
-    uint64_t dsp_total_time_us = 0; // sum of dsp_processor_feed wall time
-    uint32_t dsp_frame_count   = 0; // FFT frames processed in this window
-    // Core 0 cycle stage breakdown. Convert and push happen on Core 1
-    // (ingest task) post-Step 5; only read and feed live here now.
-    uint64_t      cycle_read_us           = 0;
-    uint64_t      cycle_handle_events_us  = 0; // time blocked in usb_host_client_handle_events
-    uint64_t      cycle_take_converted_us = 0; // time blocked in ingest_core1_take_converted
-    uint32_t      cycle_iterations        = 0;
-    int64_t       last_idle_log           = esp_timer_get_time();
-    int64_t       last_taskdump           = esp_timer_get_time();
-    int64_t       last_recovery_us        = esp_timer_get_time();
-    int           recovery_attempts       = 0;
-    const int     MAX_RECOVERY_ATTEMPTS   = 3;
-    const int64_t RECOVERY_INTERVAL_US    = 6 * 1000000;
+    uint64_t      cycle_handle_events_us = 0; // time blocked in usb_host_client_handle_events
+    int64_t       last_idle_log          = esp_timer_get_time();
+    int64_t       last_taskdump          = esp_timer_get_time();
+    int64_t       last_recovery_us       = esp_timer_get_time();
+    int           recovery_attempts      = 0;
+    const int     MAX_RECOVERY_ATTEMPTS  = 3;
+    const int64_t RECOVERY_INTERVAL_US   = 6 * 1000000;
 
     // Stream-stall watchdog (task #72): when a device IS enumerated but
     // USB bytes_window stays effectively zero across several seconds,
@@ -365,7 +480,7 @@ void class_driver_task(void *arg)
         // task would never get to run and TWDT would trigger every 5 s.
         // (No esp_task_wdt_reset — class isn't WDT-subscribed; see init.)
 
-        class_stage(CS_HANDLE_EVENTS);
+        pump_stage(CS_PUMP_HANDLE_EVENTS);
         int64_t t_he0 = esp_timer_get_time();
         // NB: the timeout argument is in TICKS — 10 ticks = 100 ms at
         // the default 100 Hz tick, not the 10 ms some older comments
@@ -375,8 +490,7 @@ void class_driver_task(void *arg)
         // without re-measuring the no-device idle load.
         usb_host_client_handle_events(s_driver_obj.client_hdl, 10);
         cycle_handle_events_us += (uint64_t)(esp_timer_get_time() - t_he0);
-        cycle_iterations++;
-        s_class_iter++;
+        atomic_fetch_add_explicit(&s_pump_iter, 1, memory_order_relaxed);
 
         // Periodic status / recovery watchdog while no device is open.
         if (s_driver_obj.dev_addr == 0) {
@@ -415,136 +529,14 @@ void class_driver_task(void *arg)
         if (s_driver_obj.actions & ACTION_CLOSE_DEV) action_close_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_EXIT) break;
 
-        // The ping-pong infrastructure (ingest task, semaphores, slot
-        // buffers) is only created in action_start_stream. Skip the
-        // ping-pong path until streaming is active so we don't take a
-        // NULL semaphore.
-        if (s_driver_obj.dev_addr == 0 || rtldev == NULL) {
-            continue;
-        }
-
-        // Ping-pong path: peek raw USB bytes straight out of the usbring
-        // (T49a — no consumer-side copy), dispatch the ring region to the
-        // ingest task for convert+push, then consume the previous cycle's
-        // converted slot via DSP. Core 1 (ingest) and Core 0 (DSP feed)
-        // overlap, which collapses the per-cycle wall time on Core 0 from
-        // "read + convert + push + feed" to "read + feed".
-        int slot_for_read;
-        class_stage(CS_ACQUIRE);
-        ingest_core1_acquire_slot(&slot_for_read);
-
-        // T49a: the usbring supports only one outstanding un-consumed
-        // span. Before peeking fresh data, reclaim the PREVIOUS cycle's
-        // dispatch (if any) once Core 1 confirms (raw_done) it has
-        // finished reading it. This is the "acquire-next serialises
-        // against convert-done" tradeoff the design doc calls out —
-        // a NEW wait, spliced in before the existing acquire/read/
-        // dispatch/take/release sequence, not a change to that
-        // sequence's own ordering.
-        class_stage(CS_RAW_DONE);
-        if (prev_dsp_slot >= 0) {
-            ingest_core1_wait_raw_done(prev_dsp_slot);
-            esp_libusb_consume_stream(raw_bytes[prev_dsp_slot]);
-        }
-
-        size_t         n_read       = 0;
-        const uint8_t *raw          = NULL;
-        int64_t        t_read_start = esp_timer_get_time();
-        class_stage(CS_READ);
-        int     read_ok    = esp_libusb_read_stream(&raw, out_block_size, &n_read);
-        int64_t t_read_end = esp_timer_get_time();
-
-        if (read_ok == 0) {
-            // Tripwire: an odd-length read would silently invert I/Q
-            // pairing for the REST OF THE STREAM (ingest floors n/2;
-            // the next read then starts on a Q byte). Never observed —
-            // transfers are 16 KB multiples — but if it ever fires we
-            // want the log line, not weeks of "demod mysteriously dead".
-            if (n_read & 1) {
-                static bool s_odd_read_logged = false;
-                if (!s_odd_read_logged) {
-                    s_odd_read_logged = true;
-                    ESP_LOGE(TAG, "ODD-LENGTH USB read (%zu B) — I/Q "
-                                  "pairing now suspect until next stream restart",
-                             n_read);
-                }
-            }
-            cycle_read_us += (uint64_t)(t_read_end - t_read_start);
-            total_bytes += n_read;
-            bytes_window += n_read;
-
-            // Optional raw IQ capture (#63). Fast no-op when no
-            // capture is active; otherwise copies n_read bytes
-            // into a PSRAM stream buffer (non-blocking, drops on
-            // overflow). Tap is here — pre-dispatch — so we
-            // capture the exact uint8 payload before any conversion.
-            // Reads straight from the ring pointer; safe because the
-            // region isn't reclaimed (usbring_consume) until next
-            // cycle, well after this synchronous call returns.
-            sd_capture_write(raw, n_read);
-
-            // Hand the ring region to ingest on Core 1. Convert + push
-            // happen there; we don't block on completion.
-            ingest_core1_dispatch(slot_for_read, raw, n_read);
-            raw_bytes[slot_for_read] = n_read;
-
-            // If we have a previous slot in flight, consume it now via DSP.
-            // Wait for Core 1's ingest to mark it ready (typically immediate
-            // — ingest is faster than feed, so by the time we need the data
-            // it's already been converted + signal_buffer_pushed).
-            if (prev_dsp_slot >= 0) {
-                size_t  n_int16 = 0;
-                int64_t t_tc0   = esp_timer_get_time();
-                class_stage(CS_TAKE_CONVERTED);
-                int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
-                cycle_take_converted_us += (uint64_t)(esp_timer_get_time() - t_tc0);
-                int64_t t_pre_feed = esp_timer_get_time();
-
-                class_stage(CS_FEED);
-                dsp_processor_feed(s_dsp, converted, n_int16 / 2);
-                int64_t t_post_feed = esp_timer_get_time();
-                dsp_total_time_us += (uint64_t)(t_post_feed - t_pre_feed);
-                dsp_frame_count += (n_int16 / 2) / 2048;
-                feed_calls_window++;
-
-                // Mark the slot free so ingest can reuse it next cycle.
-                ingest_core1_release(prev_dsp_slot);
-            }
-
-            prev_dsp_slot = slot_for_read;
-        } else {
-            // No data this iteration. Before releasing the slot we just
-            // acquired, drain any in-flight slot from the previous cycle.
-            // Skipping this deadlocked the loop: with prev_dsp_slot's
-            // s_free still held and the rotation pointer already advanced
-            // past the slot we're releasing, the next acquire_slot blocks
-            // forever on s_free[prev_dsp_slot] — which only this task can
-            // give, after a take_converted it can no longer reach. Armed
-            // exactly when the stream pauses (dongle hiccup / unplug /
-            // quiet ring); the #105/#106 "stuck in acquire_slot" signature.
-            // (The prev_dsp_slot's ring span, if any, was already reclaimed
-            // above at CS_RAW_DONE — unaffected by whether THIS cycle's
-            // read finds new data.)
-            if (prev_dsp_slot >= 0) {
-                size_t   n_int16   = 0;
-                int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
-                dsp_processor_feed(s_dsp, converted, n_int16 / 2);
-                ingest_core1_release(prev_dsp_slot);
-                prev_dsp_slot = -1;
-            }
-            // Release the slot we just acquired so ingest can reuse it
-            // (we never dispatched — nothing to reclaim from the ring
-            // for it).
-            ingest_core1_release(slot_for_read);
-        }
-
-        // Producer-side ringbuffer fill is tracked inside esp_libusb's
-        // streaming callback (USB-RB log line). The consumer-side HWM
-        // sampled here previously was biased low (taken right after a
-        // read drained 16 KB) so it has been removed.
+        // T48: the ring-drain / dispatch / DSP-feed cycle that used to
+        // run right here now runs in dsp_feed_task(). This task has
+        // nothing else to do per-iteration besides the periodic report
+        // below, so it falls straight through to it.
 
         int64_t now = esp_timer_get_time();
         if (now - last_report >= 1000000) {
+            pump_stage(CS_PUMP_REPORT);
             // Per-second snapshot. Build a status_snapshot_t on the stack
             // (~150 bytes), pull all the accumulators (each getter resets
             // its internal state), and post to the logger task on Core 1.
@@ -558,18 +550,26 @@ void class_driver_task(void *arg)
             // which let the 512 KB USB ringbuffer fill past 480 KB and
             // produced exactly 7 rb_full_drops/sec. With the offload,
             // drops go to 0.
+            //
+            // T48: bytes_window/total_bytes/feed_calls_window/
+            // dsp_total_time_us/dsp_frame_count/cycle_read_us/
+            // cycle_take_converted_us/cycle_iterations are now written by
+            // dsp_feed_task and read here via atomic_exchange (read-and-
+            // reset in one op) — see the s_feed_* declarations above.
+            // cycle_handle_events_us stays a plain local: only this task
+            // (usb_pump) ever writes or reads it.
             status_snapshot_t snap       = {0};
             snap.window_us               = now - last_report;
             snap.elapsed_us              = now - start_time;
-            snap.bytes_window            = bytes_window;
-            snap.total_bytes             = total_bytes;
-            snap.feed_calls_window       = feed_calls_window;
-            snap.dsp_total_time_us       = dsp_total_time_us;
-            snap.dsp_frame_count         = dsp_frame_count;
-            snap.cycle_read_us           = cycle_read_us;
+            snap.bytes_window            = atomic_exchange_explicit(&s_feed_bytes_window, 0, memory_order_relaxed);
+            snap.total_bytes             = atomic_load_explicit(&s_feed_total_bytes, memory_order_relaxed);
+            snap.feed_calls_window       = atomic_exchange_explicit(&s_feed_calls_window, 0, memory_order_relaxed);
+            snap.dsp_total_time_us       = atomic_exchange_explicit(&s_feed_dsp_total_time_us, 0, memory_order_relaxed);
+            snap.dsp_frame_count         = atomic_exchange_explicit(&s_feed_dsp_frame_count, 0, memory_order_relaxed);
+            snap.cycle_read_us           = atomic_exchange_explicit(&s_feed_cycle_read_us, 0, memory_order_relaxed);
             snap.cycle_handle_events_us  = cycle_handle_events_us;
-            snap.cycle_take_converted_us = cycle_take_converted_us;
-            snap.cycle_iterations        = cycle_iterations;
+            snap.cycle_take_converted_us = atomic_exchange_explicit(&s_feed_cycle_take_converted_us, 0, memory_order_relaxed);
+            snap.cycle_iterations        = atomic_exchange_explicit(&s_feed_cycle_iterations, 0, memory_order_relaxed);
             snap.psram_free_bytes        = (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
             esp_libusb_get_stream_stats(&snap.us);
             dsp_processor_get_stage_stats(s_dsp, &snap.dsp);
@@ -611,11 +611,15 @@ void class_driver_task(void *arg)
             // + 3 s) so transient zero-byte windows during enumeration
             // don't trigger.
             if (s_driver_obj.dev_addr != 0 && (now - start_time) > 3 * 1000000) {
-                if (bytes_window < STALL_BYTES_FLOOR) {
+                // T48: use the bytes_window value just exchanged into
+                // snap above (already the feeder's window total, already
+                // reset) instead of a separate local — same value the
+                // old combined loop's bare `bytes_window` local held here.
+                if (snap.bytes_window < STALL_BYTES_FLOOR) {
                     stall_seconds++;
                     ESP_LOGW(TAG, "stream stall #%d/%d (%llu B in last 1s, threshold %llu)",
                              stall_seconds, STALL_TRIGGER_SECONDS,
-                             (unsigned long long)bytes_window,
+                             (unsigned long long)snap.bytes_window,
                              (unsigned long long)STALL_BYTES_FLOOR);
                 } else {
                     stall_seconds = 0;
@@ -648,17 +652,20 @@ void class_driver_task(void *arg)
                 if (s_driver_obj.dev_addr != 0) stall_recoveries = 0;
             }
 
-            last_report             = now;
-            bytes_window            = 0;
-            feed_calls_window       = 0;
-            dsp_total_time_us       = 0;
-            dsp_frame_count         = 0;
-            cycle_read_us           = 0;
-            cycle_handle_events_us  = 0;
-            cycle_take_converted_us = 0;
-            cycle_iterations        = 0;
+            // T48: only cycle_handle_events_us is still a plain local
+            // (usb_pump-only); everything else was already reset by the
+            // atomic_exchange calls above when snap was built.
+            last_report            = now;
+            cycle_handle_events_us = 0;
         }
     }
+
+    // T48 defensive second call: ACTION_EXIT is only ever set from
+    // action_close_dev() (which already calls stop_dsp_feed_task()), so
+    // this is a no-op today (s_dsp_feed_task_hdl is already NULL) — kept
+    // as insurance against a future path that sets ACTION_EXIT some
+    // other way.
+    stop_dsp_feed_task();
 
     ESP_LOGI(TAG, "Deregistering Client");
     usb_host_client_deregister(s_driver_obj.client_hdl);
@@ -666,5 +673,192 @@ void class_driver_task(void *arg)
     // Wait to be deleted by app_main (same pattern as the daemon task).
     // Self-deleting here raced app_main's vTaskDelete(handle) — the idle
     // task could free this TCB first, making that call a use-after-free.
+    vTaskSuspend(NULL);
+}
+
+// T48 (docs/perf-decoupling-design-2026-07-04.md §T48): the DSP feed
+// task. Runs the stream cycle that used to interleave with
+// usb_host_client_handle_events inside the single combined class_driver
+// loop — peek raw USB bytes straight out of the usbring PSRAM ring
+// (T49a), dispatch the ring region to ingest_core1 on Core 1, consume
+// the PREVIOUS cycle's converted slot via dsp_processor_feed, release.
+//
+// The acquire/raw_done/read/dispatch/take_converted/feed/release
+// sequence below — including the drain-in-flight-slot-on-empty branch —
+// is UNCHANGED in order and blocking semantics from the old combined
+// loop (docs/perf-decoupling-design-2026-07-04.md §T48: "moves
+// verbatim"). The only addition is the CS_FEED_WAIT_DATA block at the
+// bottom of the "no data" branch, which blocks this task when the ring
+// is genuinely empty and nothing is in flight to drain — the old
+// combined loop got that idle throttling for free from
+// usb_host_client_handle_events' 100 ms cap, which now lives solely in
+// usb_pump and no longer runs in this task.
+static void dsp_feed_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "dsp_feed task starting");
+
+    uint32_t out_block_size = 16 * 1024;
+
+    // Ping-pong steady-state book-keeping — same roles as the old
+    // combined loop's locals of the same names. We start by reading into
+    // slot 0; the matching DSP feed for slot 0 happens AFTER slot 1 has
+    // been dispatched (one-cycle pipeline). prev_dsp_slot tracks which
+    // slot the DSP should next consume; it's -1 on the very first
+    // iteration.
+    int prev_dsp_slot = -1;
+
+    // T49a: the usbring only supports ONE outstanding un-consumed span
+    // (usbring_peek() always views from the current tail — see
+    // usbring.h). raw_bytes[slot] records how many ring bytes each
+    // slot's last dispatch peeked, so the NEXT read can wait for Core 1
+    // to finish reading them (ingest_core1_wait_raw_done) and reclaim
+    // them (esp_libusb_consume_stream) before peeking again. This is a
+    // synchronisation point separate from (and earlier than) the
+    // existing acquire(s_free)/dispatch/take(s_ready)/release(s_free)
+    // sequence; it does not change that sequence's order or blocking
+    // semantics.
+    size_t raw_bytes[INGEST_NUM_SLOTS] = {0};
+
+    while (!s_feed_stop_requested) {
+        int slot_for_read;
+        feed_stage(CS_FEED_ACQUIRE);
+        ingest_core1_acquire_slot(&slot_for_read);
+
+        // T49a: the usbring supports only one outstanding un-consumed
+        // span. Before peeking fresh data, reclaim the PREVIOUS cycle's
+        // dispatch (if any) once Core 1 confirms (raw_done) it has
+        // finished reading it. This is the "acquire-next serialises
+        // against convert-done" tradeoff the design doc calls out — a
+        // NEW wait, spliced in before the existing acquire/read/
+        // dispatch/take/release sequence, not a change to that
+        // sequence's own ordering.
+        feed_stage(CS_FEED_RAW_DONE);
+        if (prev_dsp_slot >= 0) {
+            ingest_core1_wait_raw_done(prev_dsp_slot);
+            esp_libusb_consume_stream(raw_bytes[prev_dsp_slot]);
+        }
+
+        size_t         n_read       = 0;
+        const uint8_t *raw          = NULL;
+        int64_t        t_read_start = esp_timer_get_time();
+        feed_stage(CS_FEED_READ);
+        int     read_ok    = esp_libusb_read_stream(&raw, out_block_size, &n_read);
+        int64_t t_read_end = esp_timer_get_time();
+
+        if (read_ok == 0) {
+            // Tripwire: an odd-length read would silently invert I/Q
+            // pairing for the REST OF THE STREAM (ingest floors n/2;
+            // the next read then starts on a Q byte). Never observed —
+            // transfers are 16 KB multiples — but if it ever fires we
+            // want the log line, not weeks of "demod mysteriously dead".
+            if (n_read & 1) {
+                static bool s_odd_read_logged = false;
+                if (!s_odd_read_logged) {
+                    s_odd_read_logged = true;
+                    ESP_LOGE(TAG, "ODD-LENGTH USB read (%zu B) — I/Q "
+                                  "pairing now suspect until next stream restart",
+                             n_read);
+                }
+            }
+            atomic_fetch_add_explicit(&s_feed_cycle_read_us, (uint64_t)(t_read_end - t_read_start), memory_order_relaxed);
+            atomic_fetch_add_explicit(&s_feed_total_bytes, n_read, memory_order_relaxed);
+            atomic_fetch_add_explicit(&s_feed_bytes_window, n_read, memory_order_relaxed);
+
+            feed_stage(CS_FEED_DISPATCH);
+            // Optional raw IQ capture (#63). Fast no-op when no capture
+            // is active; otherwise copies n_read bytes into a PSRAM
+            // stream buffer (non-blocking, drops on overflow). Tap is
+            // here — pre-dispatch — so we capture the exact uint8
+            // payload before any conversion. Reads straight from the
+            // ring pointer; safe because the region isn't reclaimed
+            // (usbring_consume) until next cycle, well after this
+            // synchronous call returns.
+            sd_capture_write(raw, n_read);
+
+            // Hand the ring region to ingest on Core 1. Convert + push
+            // happen there; we don't block on completion.
+            ingest_core1_dispatch(slot_for_read, raw, n_read);
+            raw_bytes[slot_for_read] = n_read;
+
+            // If we have a previous slot in flight, consume it now via DSP.
+            // Wait for Core 1's ingest to mark it ready (typically immediate
+            // — ingest is faster than feed, so by the time we need the data
+            // it's already been converted + signal_buffer_pushed).
+            if (prev_dsp_slot >= 0) {
+                size_t  n_int16 = 0;
+                int64_t t_tc0   = esp_timer_get_time();
+                feed_stage(CS_FEED_TAKE_CONVERTED);
+                int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
+                atomic_fetch_add_explicit(&s_feed_cycle_take_converted_us,
+                                          (uint64_t)(esp_timer_get_time() - t_tc0), memory_order_relaxed);
+                int64_t t_pre_feed = esp_timer_get_time();
+
+                feed_stage(CS_FEED_DSP_FEED);
+                dsp_processor_feed(s_dsp, converted, n_int16 / 2);
+                int64_t t_post_feed = esp_timer_get_time();
+                atomic_fetch_add_explicit(&s_feed_dsp_total_time_us,
+                                          (uint64_t)(t_post_feed - t_pre_feed), memory_order_relaxed);
+                atomic_fetch_add_explicit(&s_feed_dsp_frame_count, (uint32_t)((n_int16 / 2) / 2048), memory_order_relaxed);
+                atomic_fetch_add_explicit(&s_feed_calls_window, 1, memory_order_relaxed);
+
+                // Mark the slot free so ingest can reuse it next cycle.
+                feed_stage(CS_FEED_RELEASE);
+                ingest_core1_release(prev_dsp_slot);
+            }
+
+            prev_dsp_slot = slot_for_read;
+        } else {
+            // No data this iteration. Before releasing the slot we just
+            // acquired, drain any in-flight slot from the previous cycle.
+            // Skipping this deadlocked the loop: with prev_dsp_slot's
+            // s_free still held and the rotation pointer already advanced
+            // past the slot we're releasing, the next acquire_slot blocks
+            // forever on s_free[prev_dsp_slot] — which only this task can
+            // give, after a take_converted it can no longer reach. Armed
+            // exactly when the stream pauses (dongle hiccup / unplug /
+            // quiet ring); the #105/#106 "stuck in acquire_slot" signature.
+            // (The prev_dsp_slot's ring span, if any, was already reclaimed
+            // above at CS_FEED_RAW_DONE — unaffected by whether THIS
+            // cycle's read finds new data.)
+            if (prev_dsp_slot >= 0) {
+                size_t n_int16 = 0;
+                feed_stage(CS_FEED_TAKE_CONVERTED);
+                int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
+                feed_stage(CS_FEED_DSP_FEED);
+                dsp_processor_feed(s_dsp, converted, n_int16 / 2);
+                feed_stage(CS_FEED_RELEASE);
+                ingest_core1_release(prev_dsp_slot);
+                prev_dsp_slot = -1;
+            }
+            // Release the slot we just acquired so ingest can reuse it
+            // (we never dispatched — nothing to reclaim from the ring
+            // for it).
+            ingest_core1_release(slot_for_read);
+
+            // Ring genuinely empty and nothing in flight: block on the
+            // producer's wake notification instead of immediately
+            // re-looping (T48 — see usbring_set_consumer_task()).
+            // pdTRUE clears the notification count on take, coalescing
+            // any number of writes since the last wake into a single
+            // wake-and-drain-everything pass. The bounded timeout is a
+            // safety net (a write that raced stream-start before this
+            // task's handle was registered, or any future refactor that
+            // drops a notification) — never a correctness dependency.
+            feed_stage(CS_FEED_WAIT_DATA);
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+        }
+
+        feed_stage(CS_FEED_TOP);
+        atomic_fetch_add_explicit(&s_feed_iter, 1, memory_order_relaxed);
+    }
+
+    ESP_LOGI(TAG, "dsp_feed task stopping (device gone)");
+    if (s_feed_stopped_sem) xSemaphoreGive(s_feed_stopped_sem);
+    // Mirror usb_pump's own end-of-life pattern: stop touching shared
+    // state, then park forever. Nobody calls vTaskDelete() on this
+    // task (its handle is private to class_driver.c and is cleared by
+    // stop_dsp_feed_task() before this point), so self-suspending here —
+    // unlike self-deleting — cannot race an external vTaskDelete().
     vTaskSuspend(NULL);
 }

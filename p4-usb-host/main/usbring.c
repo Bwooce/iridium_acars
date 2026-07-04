@@ -21,6 +21,16 @@ static uint32_t         s_capacity = 0;
 static _Atomic uint32_t s_head     = 0;
 static _Atomic uint32_t s_tail     = 0;
 
+// T48: the task usbring_write() wakes on a successful write. Set/cleared
+// only by usb_pump (see usbring_set_consumer_task()'s doc comment for why
+// this needs no lock of its own).
+static TaskHandle_t s_consumer_task = NULL;
+
+void usbring_set_consumer_task(TaskHandle_t task)
+{
+    s_consumer_task = task;
+}
+
 esp_err_t usbring_init(uint32_t capacity)
 {
     if (!usbring_is_pow2_capacity(capacity)) {
@@ -48,6 +58,7 @@ void usbring_deinit(void)
     s_capacity = 0;
     atomic_store_explicit(&s_head, 0, memory_order_relaxed);
     atomic_store_explicit(&s_tail, 0, memory_order_relaxed);
+    s_consumer_task = NULL;
 }
 
 bool usbring_write(const uint8_t *data, uint32_t n)
@@ -82,6 +93,16 @@ bool usbring_write(const uint8_t *data, uint32_t n)
     // start reading this memory. Same pattern as ingest_core1.c:137.
     __sync_synchronize();
     atomic_store_explicit(&s_head, usbring_next_head(head, n), memory_order_relaxed);
+
+    // T48: wake the consumer if it's blocked waiting for data. Harmless
+    // no-op if it's already running or already has a notification
+    // pending -- ulTaskNotifyTake(pdTRUE, ...) only cares that at least
+    // one arrived since its last take, and NULL means "no consumer
+    // registered yet / stopped" (e.g. the boot-transient window before
+    // dsp_feed's task handle is registered, or after it's been stopped).
+    if (s_consumer_task) {
+        xTaskNotifyGive(s_consumer_task);
+    }
     return true;
 }
 
