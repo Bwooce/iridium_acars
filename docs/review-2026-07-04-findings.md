@@ -51,6 +51,21 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   hot-unplug/teardown) need physical unplug testing not available on the current bench;
   T48–T50 (throughput/PIE) deferred — no impact while not throughput-bound.
 
+**Live-device verification (2026-07-04, device on LAN at 192.168.1.235, build 5e18864):**
+- **T2 wrap-desync — PROVEN via fault injection.** Built with CONFIG_FAULT_INJECT=y,
+  armed `POST /debug/fault_inject?site=dma_submit_wrap&count=15`. All 15 fired the
+  fix's recovery branch (`wrap=1, wrap_first_submitted=0 — CPU memcpy fallback (both
+  segments)`); counters ended `stash_fails=15 recoveries=15 audio_dropped=0` — every
+  wrap-path DMA failure CPU-recovered with zero drop and zero desync, stream stable
+  at 4.88 MB/s. Strongest T2 verification (the injection hits the wrap sub-case the
+  fix rewrote, which natural failures rarely reach). Production fw (fault-inject off)
+  restored afterward.
+- **T5/T6 HTTP output — path confirmed.** `POST /debug/inject` → `GET /messages`
+  returned well-formed JSON with all escaped fields correct; write→ring→serve path
+  and the snprintf clamp are sound. Caveat: /debug/inject uses fixed benign text, so
+  the adversarial escaping (quotes/control bytes) is not stressed — that needs a real
+  RF decode (none, poor antenna).
+
 Legend: **bug** / **sec** (security) / **perf**. "verified" = main agent
 re-read the source and confirmed the defect.
 
