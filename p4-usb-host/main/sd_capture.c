@@ -88,6 +88,18 @@ static sd_capture_stats_t   s_stats    = {0};
 static volatile bool     s_burst_mode = false;
 static volatile uint32_t s_burst_seq  = 0;
 
+// Set by sd_capture_record_burst_begin() when the CURRENT burst's
+// whole record (header + IQ) won't fit in the stream buffer's free
+// space right now. Consulted by _chunk() (and left alone by _end(),
+// which is a no-op) so a burst that doesn't fit contributes ZERO
+// bytes to the stream -- never a torn header or a partial IQ tail,
+// which would desync every subsequent burst's "header +
+// length_samples*4 bytes" framing for the rest of the file. Single
+// producer (worker_core1 calls _begin/_chunk/_end serially for one
+// burst at a time -- see sd_capture.h), so no locking needed; each
+// _begin() call overwrites this before any _chunk() can read it.
+static volatile bool s_burst_skip = false;
+
 static void update_bytes_written(size_t n)
 {
     if (!s_stats_mu) return;
@@ -121,7 +133,7 @@ static void writer_task(void *arg)
     // action_start_stream() AFTER tagger init. Until then we idle —
     // s_stream stays NULL anyway because sd_capture_start refuses if
     // s_writer_buf hasn't landed yet.
-    int64_t last_flush = 0;
+    int64_t last_sync_us = 0;
 
     // Throttle the fwrite-failure log spam — when SDMMC returns EIO
     // continuously (card bus error / unrecoverable controller state),
@@ -237,11 +249,25 @@ static void writer_task(void *arg)
         }
         stash_len = leftover;
 
-        // Periodic flush — limits crash-loss to ~1 s of capture.
+        // Periodic fsync — limits crash-loss to ~1 s of capture.
+        // DEFECT B: the file is opened _IONBF (setvbuf in
+        // sd_capture_start), so there is no libc-level stdio buffer
+        // for fflush() to push out -- fflush() alone was a no-op
+        // here and the "~1 s crash-loss" guarantee never actually
+        // held. Bytes ARE already handed to FATFS by each fwrite,
+        // but the FAT cluster chain + directory entry can stay
+        // dirty in FATFS's own window cache until fsync() forces an
+        // f_sync; without it, a power loss could lose the WHOLE
+        // multi-MB file rather than ~1 s of it. Throttled to the
+        // same ~1 s cadence as the old (ineffective) fflush, since
+        // fsync is expensive on SDMMC and must not run per-chunk.
         int64_t now = esp_timer_get_time();
-        if (s_fp && (now - last_flush) >= 1000000) {
-            fflush(s_fp);
-            last_flush = now;
+        if (s_fp && (now - last_sync_us) >= 1000000) {
+            if (fsync(fileno(s_fp)) != 0) {
+                ESP_LOGW(TAG, "periodic fsync failed errno=%d", errno);
+                update_write_error();
+            }
+            last_sync_us = now;
         }
 
         // Handle stop: drain whatever's still in the buffer, then
@@ -288,7 +314,14 @@ static void writer_task(void *arg)
                 stash_len = 0;
             }
             if (s_fp) {
-                fflush(s_fp);
+                // Final commit before close. fclose()/f_close() should
+                // already commit FATFS's cache, but an explicit fsync
+                // here is cheap (happens once per capture) and removes
+                // any doubt — belt and suspenders around DEFECT B.
+                if (fsync(fileno(s_fp)) != 0) {
+                    ESP_LOGW(TAG, "final fsync failed errno=%d", errno);
+                    update_write_error();
+                }
                 fclose(s_fp);
                 s_fp = NULL;
             }
@@ -514,7 +547,37 @@ void sd_capture_write(const uint8_t *data, size_t n)
         n = tgt - cap;
     }
 
-    size_t sent = xStreamBufferSend(s_stream, data, n, 0);
+    // DEFECT A (continuous mode): xStreamBufferSend() does a PARTIAL
+    // enqueue under back-pressure with a 0 (non-blocking) timeout.
+    // This stream's granule is one complex sample = 2 bytes (1 B I +
+    // 1 B Q -- raw RTL-SDR uint8 format; see class_driver.c's
+    // `n_read & 1` sanity check on the producer side). An odd
+    // accepted-byte count would flip I/Q interleave parity for every
+    // sample after it for the rest of the file.
+    //
+    // Continuous mode has no per-record framing to desync (unlike
+    // burst mode), so we don't need an atomic all-or-nothing send —
+    // we just need to never let a half-sample land in the stream.
+    // Pre-check free space and cap the request to an even byte
+    // count <= what's currently free: sd_capture_write is the sole
+    // producer here (burst mode is mutually exclusive via
+    // s_burst_mode, checked above) and the writer task only ever
+    // drains (frees more space), so a request capped to <= the
+    // snapshot below cannot itself be partially completed.
+    size_t avail = xStreamBufferSpacesAvailable(s_stream);
+    size_t want  = (n < avail) ? n : avail;
+    want &= ~(size_t)1; // whole 2-byte (I+Q) samples only
+
+    size_t sent = 0;
+    if (want > 0) {
+        sent = xStreamBufferSend(s_stream, data, want, 0);
+        if (sent < want) {
+            // Not expected given the space check above (single
+            // producer); guard anyway rather than silently desyncing.
+            ESP_LOGW(TAG, "continuous send short %u/%u despite space check",
+                     (unsigned)sent, (unsigned)want);
+        }
+    }
     if (sent < n) {
         update_bytes_dropped(n - sent);
     }
@@ -548,7 +611,12 @@ void sd_capture_record_burst_begin(uint32_t length_samples,
                                    float    magnitude_db,
                                    float    noise_db)
 {
-    if (!s_burst_mode || s_state != CAP_STATE_ACTIVE || !s_stream) return;
+    if (!s_burst_mode || s_state != CAP_STATE_ACTIVE || !s_stream) {
+        // No header will be written -- make sure a stray _chunk()
+        // call (contract violation aside) can't send orphan IQ bytes.
+        s_burst_skip = true;
+        return;
+    }
 
     sd_capture_burst_hdr_t hdr = {
         .magic          = SD_CAPTURE_BURST_MAGIC,
@@ -560,21 +628,64 @@ void sd_capture_record_burst_begin(uint32_t length_samples,
         .magnitude_db   = magnitude_db,
         .noise_db       = noise_db,
     };
+
+    // DEFECT A fix (burst mode): reserve room for the WHOLE record
+    // (header + all IQ bytes to come) before sending anything.
+    // xStreamBufferSend() does a PARTIAL enqueue under back-pressure
+    // with a 0 timeout; a torn header or a truncated IQ chunk would
+    // desync the "header + length_samples*4 bytes" framing for
+    // EVERY burst after it in the file, since a parser has no way to
+    // tell how much of the promised payload actually arrived. A
+    // whole-burst drop, in contrast, is harmless to a parser: it
+    // just resyncs on the next BRST magic.
+    //
+    // xStreamBufferSpacesAvailable() is a live snapshot, but this is
+    // the sole producer (burst mode and continuous mode are mutually
+    // exclusive via s_burst_mode) and the writer task only ever
+    // drains the buffer (frees more space), so "enough room now"
+    // cannot go stale before our own sends below complete.
+    size_t iq_bytes    = (size_t)length_samples * 2 * sizeof(int16_t);
+    size_t total_bytes = sizeof(hdr) + iq_bytes;
+    if (xStreamBufferSpacesAvailable(s_stream) < total_bytes) {
+        s_burst_skip = true;
+        update_bytes_dropped(total_bytes);
+        ESP_LOGW(TAG, "burst seq=%u dropped whole (%u B won't fit)",
+                 (unsigned)hdr.seq, (unsigned)total_bytes);
+        return;
+    }
+    s_burst_skip = false;
+
     size_t sent = xStreamBufferSend(s_stream, &hdr, sizeof(hdr), 0);
     if (sent < sizeof(hdr)) {
+        // Not expected given the space check above; guard anyway
+        // rather than silently desyncing the rest of the file.
         update_bytes_dropped(sizeof(hdr) - sent);
+        s_burst_skip = true; // block the _chunk()s that would follow
+        ESP_LOGW(TAG, "burst seq=%u header send short %u/%u despite "
+                      "space check",
+                 (unsigned)hdr.seq,
+                 (unsigned)sent, (unsigned)sizeof(hdr));
     }
 }
 
 void sd_capture_record_burst_chunk(const int16_t *iq, size_t n_complex)
 {
     if (!s_burst_mode || s_state != CAP_STATE_ACTIVE || !s_stream) return;
+    if (s_burst_skip) return; // whole record already dropped atomically at _begin()
     if (!iq || n_complex == 0) return;
 
     size_t n_bytes = n_complex * 2 * sizeof(int16_t);
     size_t sent    = xStreamBufferSend(s_stream, iq, n_bytes, 0);
     if (sent < n_bytes) {
+        // Not expected: _begin() reserved space for the header plus
+        // length_samples worth of IQ, and this is the sole producer.
+        // If it does happen (e.g. a caller bug sends more IQ bytes
+        // across chunks than length_samples promised), the record is
+        // already torn -- there is no way to "un-send" the header we
+        // already wrote from here, so just count and log it.
         update_bytes_dropped(n_bytes - sent);
+        ESP_LOGW(TAG, "burst chunk send short %u/%u (record now torn)",
+                 (unsigned)sent, (unsigned)n_bytes);
     }
 }
 
