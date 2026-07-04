@@ -47,9 +47,16 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   driver root cause (unconditional stash alloc, no safe config knob — comment-only, the
   T2 CPU-memcpy recovery stays the mitigation). On-device: batch-5 RAW_IRIDIUM SMOKE_PASS
   (DSP 513 µs, LW.SY/DA/IP/U3/IBC decode) + normal fw live-stable 4.88 MB/s, no atomic/panic.
-- Remaining open: T13–T16, T18–T21, T24–T50 (T51–T54 done). Note T18/T19 (USB
-  hot-unplug/teardown) need physical unplug testing not available on the current bench;
-  T48–T50 (throughput/PIE) deferred — no impact while not throughput-bound.
+- Batch 6 — T13, T21 DONE, pushed. T13 makes the WiFi STA_DISCONNECTED reconnect
+  non-blocking (one-shot esp_timer instead of a 5 s vTaskDelay in the shared event-loop
+  handler); T21 realigns the SD file position after a short fwrite (fseek back to the
+  512-byte boundary + re-queue the uncommitted bytes) to avoid the FATFS/SDMMC EIO cliff.
+  Neither is DSP-path (no smoke trailer). On-device: boots clean, WiFi associates + IP,
+  stream stable 4.88 MB/s. Follow-up: T21b — the CAP_STATE_STOPPING drain loop has the
+  same short-write gap (lower risk, runs once before fclose).
+- Remaining open: T14, T15, T16, T18–T20, T24–T50 (T13/T21 done; T21b minor follow-up).
+  Note T18/T19 (USB hot-unplug/teardown) need physical unplug testing not available on
+  the current bench; T48–T50 (throughput/PIE) deferred — no impact while not throughput-bound.
 
 **Live-device verification (2026-07-04, device on LAN at 192.168.1.235, build 5e18864):**
 - **T2 wrap-desync — PROVEN via fault injection.** Built with CONFIG_FAULT_INJECT=y,
@@ -138,7 +145,7 @@ re-read the source and confirmed the defect.
   Session gate checks `ida.ok && header_ok` but NOT `crc_ok` (BCH false-positives
   pollute reassembly); multi-IDA-frame packets unrecoverable (da_cont/da_ctr unused);
   payload_len fixed 20/22 not da_len → filler bytes leak to ACARS parser.
-- [ ] **T13** `wifi_link.c:60` — bug. 5 s `vTaskDelay` in disconnect handler blocks
+- [x] **T13** `wifi_link.c:60` — bug. 5 s `vTaskDelay` in disconnect handler blocks
   shared default event loop during AP flaps. Fix: esp_timer for reconnect.
 - [ ] **T14** `ota_runner.c:70` — sec. No image authenticity (no cert, project_name
   only logged) + unauthenticated LAN/open-AP POST /ota. Fix: reject project_name
@@ -157,7 +164,7 @@ re-read the source and confirmed the defect.
   freed on DEV_GONE, teardown can't complete → replug-requires-reboot. Document or fix.
 - [ ] **T20** `librtlsdr.c:1346` — bug. `rtlsdr_open` panics via `ESP_ERROR_CHECK` on
   transient open/claim failure (boot-loop vs retry); `driver_obj` calloc unchecked.
-- [ ] **T21** `sd_capture.c:186` — bug. Partial short `fwrite` leaves file position
+- [x] **T21** `sd_capture.c:186` — bug. Partial short `fwrite` leaves file position
   mid-sector → reintroduces the known EIO cliff. Fix: fseek back to 512 boundary.
 - [x] **T22** `frame_decoder.c:386` — bug. DECODER_STACK=6144 tight vs ~2.1 KB stack
   `frame_queue_item_t` + process_one + libacars + vsnprintf(256). Fix: static item or 8-12 KB.
