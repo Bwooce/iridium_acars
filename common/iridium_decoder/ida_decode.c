@@ -133,22 +133,39 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
     // repair (matches upstream bch_repair() / nrepair2 syndrome table
     // for poly=3545). The first 21 bits of each codeword are the
     // message; the remaining 10 are ECC.
-    int bit_pos = 0;
     for (int i = 0; i < 10; i++) {
         uint8_t cw[BCH_CW_BITS];
         memcpy(cw, codewords + i * BCH_CW_BITS, BCH_CW_BITS);
         int errs = iridium_bch_repair2(ACCH_BCH_POLY, cw, BCH_CW_BITS);
         if (errs < 0) {
-            // Fail soft: skip this block, continue. The SBD reassembler
-            // upstream tolerates partial frames via segment retry.
+            // Fail soft: leave this block's slot zero-filled (already
+            // zero from the memset above) and move on. We deliberately
+            // do NOT compact/shift later blocks into this slot: writing
+            // every surviving block at its TRUE position (i *
+            // BCH_MSG_BITS) keeps out->bits positionally addressable by
+            // block index even under partial decode, so a stray
+            // positional read of a failed block's slot sees zeros
+            // instead of a later block's bits shifted into its place.
+            // The SBD reassembler upstream tolerates partial frames via
+            // segment retry, gated on out->ok / out->blocks_ok — not by
+            // reading bits[] positionally for a block that failed.
             continue;
         }
-        // Take the first 21 bits as the message.
-        memcpy(out->bits + bit_pos, cw, BCH_MSG_BITS);
-        bit_pos += BCH_MSG_BITS;
+        // Take the first 20 bits as the message, written at this
+        // block's true position (not a running/compacted cursor).
+        memcpy(out->bits + i * BCH_MSG_BITS, cw, BCH_MSG_BITS);
         out->blocks_ok++;
         out->total_errors += errs;
     }
+    // n_bits is a *count* of valid bits (blocks_ok * BCH_MSG_BITS), for
+    // backward-compatible reporting. It is NOT necessarily a contiguous
+    // prefix of bits[] when blocks_ok < n_blocks: failed blocks are
+    // zero-filled in place at their true position, not skipped/compacted
+    // (see the loop above). Since blocks_ok * BCH_MSG_BITS only reaches
+    // the 196-bit threshold below when blocks_ok == n_blocks (10 * 20 =
+    // 200; 9 * 20 = 180 < 196), the header/payload/CRC parse further
+    // down only ever runs once all 10 blocks are true-position-complete.
+    int bit_pos = out->blocks_ok * BCH_MSG_BITS;
     out->n_bits = (uint16_t)bit_pos;
     out->ok     = (out->blocks_ok == out->n_blocks);
 

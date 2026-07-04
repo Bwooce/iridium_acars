@@ -30,12 +30,26 @@ extern "C" {
 #define IDA_DECODE_MAX_BYTES 25
 
 typedef struct {
-    bool     ok;                        // true iff all BCH blocks decoded
-    int      n_blocks;                  // BCH blocks attempted (always 10 for full IDA)
-    int      blocks_ok;                 // BCH blocks that decoded successfully
-    int      total_errors;              // total bit errors corrected across blocks
-    uint16_t n_bits;                    // valid bits in `bits[]` (= blocks_ok × 21)
-    uint8_t  bits[IDA_DECODE_MAX_BITS]; // 0/1-per-byte descrambled stream
+    bool     ok;                       // true iff all BCH blocks decoded
+    int      n_blocks;                 // BCH blocks attempted (always 10 for full IDA)
+    int      blocks_ok;                // BCH blocks that decoded successfully
+    int      total_errors;             // total bit errors corrected across blocks
+    uint16_t n_bits;                   // count of valid bits (= blocks_ok * 20);
+                                       // NOT a contiguous prefix length when
+                                       // blocks_ok < n_blocks — see `bits[]`.
+    uint8_t bits[IDA_DECODE_MAX_BITS]; // 0/1-per-byte descrambled stream.
+                                       // Positionally addressed by BCH block:
+                                       // block i's 20 message bits live at
+                                       // bits[i*20 .. i*20+20). A block that
+                                       // failed BCH repair is zero-filled at
+                                       // its own position (never shifted or
+                                       // backfilled with another block's
+                                       // bits). Header/payload/CRC fields
+                                       // below are only parsed — and bits[]
+                                       // is only fully valid — when `ok` is
+                                       // true (blocks_ok == n_blocks); a
+                                       // partial decode's zero-filled gaps
+                                       // are NOT meaningful data.
 
     // Header fields parsed from bits[0..19] (per
     // iridium-toolkit/bitsparser.py:IridiumDAMessage):
