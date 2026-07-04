@@ -29,7 +29,17 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   gate + da_len payload, T4t sd_capture framing host regression. On-device: batch-3
   RAW_IRIDIUM SMOKE_PASS (DSP 520 µs/frame, corrected SNRs still clear the 10 dB gate) +
   normal fw live-stable 4.88 MB/s. Four DSP-path commits carry `Smoke-verified:` trailers.
-- Remaining open: T13–T54 (see tiers below).
+- Batch 4 — T17, T22, T23 DONE, pushed. T17 bounds burst_pipeline pre-rotation to the
+  consumed frame span (≈gri's frame_size, saving ~12-14k Q15 MACs/call on hard bursts;
+  a 4-bit BER wobble on one marginal burst from removing compounded truncating rotations,
+  no decode-classification change — host golden + device smoke both confirm). T22 moves
+  the ~2.1 KB frame_queue_item_t off the decoder-task stack (single-consumer static).
+  T23 hardens ida_decode partial-decode to write blocks at true positions (latent bug,
+  no live consumer; all-10 path byte-identical). On-device: batch-4 RAW_IRIDIUM SMOKE_PASS
+  (LW.SY/DA/IP/IBC decoding, DSP 514 µs) + normal fw live-stable 4.88 MB/s. Three DSP-path
+  commits carry `Smoke-verified:` trailers.
+- Remaining open: T13–T16, T18–T21, T24–T54 (see tiers below). Note T18/T19 (USB
+  hot-unplug/teardown) need physical unplug testing not available on the current bench.
 
 Legend: **bug** / **sec** (security) / **perf**. "verified" = main agent
 re-read the source and confirmed the defect.
@@ -113,7 +123,7 @@ re-read the source and confirmed the defect.
 - [ ] **T16** `frame_link.c:356` — bug. Loopback selftest passes primary handshake
   GPIO to slave instead of `..._LB_HANDSHAKE_GPIO`; passes only via fixed 5 ms delay,
   never exercises handshake.
-- [ ] **T17** `burst_pipeline.c:227` — perf, verified. Pre-rotation rotates entire
+- [x] **T17** `burst_pipeline.c:227` — perf, verified. Pre-rotation rotates entire
   remaining burst (~16k cplx) per try, only ~1911 consumed; ~1-2 ms/burst × 20 retries.
   Also truncating `>>15` (no rounding) accumulates bias per retry. Fix: bound rotate.
 - [ ] **T18** `class_driver.c:114` — bug. `rtldev` TOCTOU UAF: AGC uses it unlocked
@@ -124,9 +134,9 @@ re-read the source and confirmed the defect.
   transient open/claim failure (boot-loop vs retry); `driver_obj` calloc unchecked.
 - [ ] **T21** `sd_capture.c:186` — bug. Partial short `fwrite` leaves file position
   mid-sector → reintroduces the known EIO cliff. Fix: fseek back to 512 boundary.
-- [ ] **T22** `frame_decoder.c:386` — bug. DECODER_STACK=6144 tight vs ~2.1 KB stack
+- [x] **T22** `frame_decoder.c:386` — bug. DECODER_STACK=6144 tight vs ~2.1 KB stack
   `frame_queue_item_t` + process_one + libacars + vsnprintf(256). Fix: static item or 8-12 KB.
-- [ ] **T23** `ida_decode.c:141` — robustness. Partial-decode compacts skipped blocks
+- [x] **T23** `ida_decode.c:141` — robustness. Partial-decode compacts skipped blocks
   left → misaligned bitstream for positional consumers. Fix: zeros at true pos + ok-mask.
 
 ## P3 — Low
