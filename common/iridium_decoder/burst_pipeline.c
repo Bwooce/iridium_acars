@@ -215,16 +215,54 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     if (tmp.direction == UW_DIR_UNKNOWN) return false;
     result->uw_res = tmp;
 
-    // Pre-rotation: rotate adj_burst[search_start..adj_n] by
+    // Pre-rotation: rotate adj_burst[search_start..rot_end] by
     // conj(peak/|peak|). gri rotates frame_size of d_tmp_a into d_tmp_b
     // (lines 692-694) — equivalent to in-place on our slice.
+    //
+    // Bound rot_end to what THIS call's own interp/decim/demod actually
+    // reads, instead of rotating out to adj_n (which can be ~16k complex
+    // samples for our wider wideband-tagger windows -- task #70). Below,
+    // `int_base` lands at tmp.uw_offset or tmp.uw_offset - 1 (correction
+    // is in (-0.5, +0.5)), and the sub-sample interp + POST_CORR_DECIM
+    // loop consumes at most MAX_FRAME_LEN_NORMAL_10SPS (1910) complex
+    // samples past int_base. So this call never reads past
+    // search_start + uw_offset + 1910; +4 covers the interpolator's
+    // src[j+1] look-ahead and the int_base-vs-uw_offset off-by-one, and
+    // the clamp to adj_n keeps this safe even if uw_offset were ever
+    // larger than expected.
+    //
+    // Numerical note: the multi-frame/retry loop in
+    // burst_pipeline_process_burst reuses this same adj_burst across
+    // calls with advancing search_start, and previously every call
+    // re-rotated the *entire* remaining tail -- including the span this
+    // call's own demod doesn't touch -- so a position could accumulate
+    // several compounded Q15 (truncating >>15) rotations before the call
+    // that finally consumes it. Bounding here removes those extra
+    // rotations. Verified against test_pipeline_wideband_albq (the
+    // gri-golden BER measurement, not ctest-gated): decode
+    // success/failure per burst (pipeline-ran/UW-found/decoded/missed
+    // sets) is bit-for-bit unchanged, but on already-marginal CLOSE/
+    // PARTIAL frames the raw bit-error count can shift by a handful of
+    // bits (299/23024 -> 303/23024 BER on this corpus) because
+    // truncating fixed-point rotation is not associative -- N rounds of
+    // Q15 truncation is not bit-identical to 1 round, even to the same
+    // target angle. This is NOT a clipping bug (confirmed: widening the
+    // margin to +2000 makes the wobble worse, not better/gone, since it
+    // changes the compounding history further rather than restoring
+    // it), so no bound recovers bit-exact parity with the old
+    // accidental-extra-rounding behaviour short of not bounding at all.
+    // All ctest-gated tests (pipeline_wideband_resampled,
+    // pipeline_drift_snr, demod_*, uw_correlator_*, iridium_frame_*)
+    // are unaffected.
+    int rot_end = search_start + tmp.uw_offset + 1910 + 4;
+    if (rot_end > adj_n) rot_end = adj_n;
     float pmag = sqrtf(tmp.peak_re * tmp.peak_re + tmp.peak_im * tmp.peak_im);
     if (pmag > 1e-3f) {
         float   rot_re = tmp.peak_re / pmag;
         float   rot_im = tmp.peak_im / pmag;
         int16_t pr_q   = q15_from_float(rot_re);
         int16_t pi_q   = q15_from_float(rot_im);
-        for (int i = search_start; i < adj_n; i++) {
+        for (int i = search_start; i < rot_end; i++) {
             int32_t re           = adj_burst[i * 2 + 0];
             int32_t im           = adj_burst[i * 2 + 1];
             int32_t nr           = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
