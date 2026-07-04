@@ -145,6 +145,17 @@ target_include_directories(test_ida_decode_corpus PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 
+# ibc_decode: IBC (Iridium Broadcast) body parser bit-orientation
+# regression. Synthesizes a valid BC frame with a non-palindromic
+# payload and checks the header/block fields round-trip correctly.
+add_executable(test_ibc_decode
+    test_ibc_decode.c
+    ${COMMON_DIR}/ibc_decode.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+)
+target_include_directories(test_ibc_decode PRIVATE ${COMMON_DIR})
+
 # Phase D part 5: SBD reassembler (multi-frame state machine).
 add_executable(test_sbd_reassembler
     test_sbd_reassembler.c
@@ -590,6 +601,7 @@ add_test(NAME iridium_frame_phaseB COMMAND test_iridium_frame_phaseB)
 add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
 add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
+add_test(NAME ibc_decode           COMMAND test_ibc_decode)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME resample_split        COMMAND test_resample_split)

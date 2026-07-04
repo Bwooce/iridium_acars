@@ -12,6 +12,7 @@
 #define IBC_BLOCK_BITS 64
 #define IBC_N_BLOCKS 4      // IBC has exactly 4 BCH blocks
 #define IBC_DATA_PER_BLK 42 // 2 × BCH(31,21) data bits per 64-bit block
+#define IBC_BODY_BITS (IBC_HDR_BITS + IBC_N_BLOCKS * IBC_BLOCK_BITS)
 
 #define IBC_HDR_POLY 29u   // BCH(6, 2)
 #define IBC_BLK_POLY 1207u // BCH(31, 21), ringalert poly
@@ -83,10 +84,22 @@ int ibc_decode(const iridium_frame_t *frame, ibc_decoded_t *out)
     out->block1_subtype = -1;
 
     // Frame body starts after the 24-bit UW. Need header (6) + 4 blocks (256).
-    if (frame->n_bits < UW_BITS + IBC_HDR_BITS + IBC_N_BLOCKS * IBC_BLOCK_BITS) {
+    if (frame->n_bits < UW_BITS + IBC_BODY_BITS) {
         return -1;
     }
-    const uint8_t *p = frame->bits + UW_BITS;
+    const uint8_t *raw = frame->bits + UW_BITS;
+
+    // frame->bits is in qpsk_demod orientation (un-swapped). The
+    // classifier only accepts a BC frame after applying the adjacent-pair
+    // swap iridium-toolkit does at ingest (symbol_reverse); redo that
+    // swap here so the header CRC and block BCH checks see the same bit
+    // orientation the classifier validated. Same convention as
+    // ira_decode.c / ims_decode.c.
+    uint8_t p[IBC_BODY_BITS];
+    for (int i = 0; i + 1 < IBC_BODY_BITS; i += 2) {
+        p[i + 0] = raw[i + 1] & 1;
+        p[i + 1] = raw[i + 0] & 1;
+    }
 
     // Header: 6 bits, BCH(6, 2) with poly=29. Allow 1-bit repair (matches
     // iridium-toolkit which uses bch_repair1 here).
@@ -103,10 +116,10 @@ int ibc_decode(const iridium_frame_t *frame, ibc_decoded_t *out)
     out->bc_type = (int)pick_bits(hdr, 0, 2);
 
     // 4 × 64-bit blocks immediately follow the header.
-    uint8_t block_data[IBC_DATA_PER_BLK]; // 42-bit decoded payload per block
-    p += IBC_HDR_BITS;
+    uint8_t        block_data[IBC_DATA_PER_BLK]; // 42-bit decoded payload per block
+    const uint8_t *blocks = p + IBC_HDR_BITS;
     for (int blk = 0; blk < IBC_N_BLOCKS; blk++) {
-        int n_ok = decode_ibc_block(p + (size_t)blk * IBC_BLOCK_BITS, block_data);
+        int n_ok = decode_ibc_block(blocks + (size_t)blk * IBC_BLOCK_BITS, block_data);
         if (n_ok == 2) {
             out->n_blocks_ok++;
         } else {
