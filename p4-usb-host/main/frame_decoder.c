@@ -328,7 +328,7 @@ static void process_one(const frame_queue_item_t *it)
                      ida.ok, ida.blocks_ok, ida.n_blocks, ida.total_errors,
                      ida.header_ok, ida.da_ctr, (unsigned)ida.payload_len,
                      ida.crc_ok ? "OK" : "BAD");
-            if (rc_ida == 0 && ida.ok && ida.header_ok) {
+            if (rc_ida == 0 && ida.ok && ida.header_ok && ida.crc_ok) {
                 sbd_message_t sbd;
                 int           rc_sbd = sbd_reassembler_feed(&s_sbd, &ida,
                                                             it->direction == 1,

@@ -175,16 +175,21 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
     uint8_t zero1  = (uint8_t)PACKBITS_N(17, 3);
     out->header_ok = (zero1 == 0);
 
-    // Pack payload bytes. Per iridium-toolkit/bitsparser.py:1366,
-    // when da_len > 0 the payload is bits[20..9*20] = 20 bytes; when
-    // da_len == 0 the payload spans bits[20..end] = up to 23 bytes
-    // for our 210-bit bitstream_bch (bits[20:220] truncates to 210).
+    // Pack payload bytes. Per iridium-toolkit/bitsparser.py:1366, the
+    // payload is bits[20..(20+da_len*8)] when da_len > 0; when da_len
+    // == 0 the payload spans bits[20..end] = up to 23 bytes for our
+    // 210-bit bitstream_bch (bits[20:220] truncates to 210). da_len is
+    // a header field (0..24, per ida_decode.h) so clamp it against
+    // both the payload[] buffer and the bits actually decoded.
     int payload_bits = (out->da_len > 0)
-                           ? 9 * 20 - 20     // 160 bits = 20 bytes
-                           : (bit_pos - 20); // up to ~190 bits = 23 bytes
+                           ? (int)out->da_len * 8 // = da_len bytes
+                           : (bit_pos - 20);      // up to ~190 bits = 23 bytes
     if (payload_bits < 0) payload_bits = 0;
     int max_len = payload_bits / 8;
-    if (max_len > 24) max_len = 24;
+    if (max_len > 24) max_len = 24;     // payload[] buffer size
+    int avail_len = (bit_pos - 20) / 8; // bytes actually decoded
+    if (avail_len < 0) avail_len = 0;
+    if (max_len > avail_len) max_len = avail_len; // defensive: garbage da_len
     out->payload_len = (uint8_t)max_len;
     for (int byte_i = 0; byte_i < max_len; byte_i++) {
         out->payload[byte_i] = (uint8_t)PACKBITS_N(20 + byte_i * 8, 8);
