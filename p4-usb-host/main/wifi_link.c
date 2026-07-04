@@ -10,6 +10,7 @@
 #include "esp_mac.h"
 #include "nvs_flash.h"
 #include "esp_system.h"     // esp_restart() — link-loss watchdog (#104)
+#include "esp_timer.h"      // non-blocking reconnect timer (#T13)
 #include "ping/ping_sock.h" // gateway-ping reachability watchdog
 #include "lwip/ip_addr.h"
 #include "freertos/FreeRTOS.h"
@@ -45,6 +46,37 @@ static volatile int      s_wdt_fails    = 0; // consecutive failed gw-ping cycle
 static volatile bool s_stream_live   = false; // usb.completed advanced at least once
 static volatile int  s_stream_stalls = 0;     // consecutive frozen cycles
 
+// Non-blocking STA reconnect (#T13): STA_DISCONNECTED used to vTaskDelay(5s)
+// right in the event handler, stalling the shared default event-loop task
+// (blocks IP events and every other subsystem on WiFi flaps). Instead arm a
+// one-shot esp_timer whose callback fires esp_wifi_connect() ~5 s later; the
+// handler itself only (re)arms the timer and returns immediately.
+static esp_timer_handle_t s_reconnect_timer = NULL;
+
+static void reconnect_timer_cb(void *arg)
+{
+    (void)arg;
+    esp_wifi_connect();
+}
+
+static void arm_reconnect_timer(void)
+{
+    if (!s_reconnect_timer) {
+        const esp_timer_create_args_t targs = {
+            .callback = &reconnect_timer_cb,
+            .name     = "wifi_reconnect",
+        };
+        if (esp_timer_create(&targs, &s_reconnect_timer) != ESP_OK) {
+            ESP_LOGW(TAG, "reconnect timer create failed — falling back to immediate connect");
+            esp_wifi_connect();
+            return;
+        }
+    } else if (esp_timer_is_active(s_reconnect_timer)) {
+        esp_timer_stop(s_reconnect_timer); // restart the ~5s window on repeated flaps
+    }
+    esp_timer_start_once(s_reconnect_timer, 5000000ULL); // 5 s, in µs
+}
+
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
@@ -62,8 +94,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
             ESP_LOGW(TAG, "STA_DISCONNECTED reason=%d → reconnect in 5s",
                      e ? e->reason : -1);
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            esp_wifi_connect();
+            arm_reconnect_timer();
             break;
         }
         case WIFI_EVENT_AP_START:
