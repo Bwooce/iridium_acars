@@ -592,10 +592,14 @@ static inline void ema_step_inner(int32_t *__restrict__ bsum,
                                   int n)
 {
     for (int k = 0; k < n; k++) {
-        int32_t old = slot[k];             // one PSRAM read (L2 cached)
-        int32_t cur = mag[k];              // in-SRAM read
-        bsum[k]     = bsum[k] - old + cur; // in-SRAM RMW
-        slot[k]     = cur;                 // one PSRAM write (L2 writeback)
+        int32_t old = slot[k]; // one PSRAM read (L2 cached)
+        int32_t cur = mag[k];  // in-SRAM read
+        // Clamp mag² to prevent baseline_sum int32 overflow under strong carrier
+        if (cur > INT32_MAX / FBT_HISTORY_SIZE) {
+            cur = INT32_MAX / FBT_HISTORY_SIZE;
+        }
+        bsum[k] = bsum[k] - old + cur; // in-SRAM RMW
+        slot[k] = cur;                 // one PSRAM write (L2 writeback)
     }
 }
 
