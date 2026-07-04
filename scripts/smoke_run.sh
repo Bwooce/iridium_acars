@@ -33,6 +33,7 @@ declare -A SYM=(
     [frame]=CONFIG_SMOKE_TEST_FRAME_DECODER
     [raw]=CONFIG_SMOKE_TEST_RAW_IRIDIUM
     [real]=CONFIG_SMOKE_TEST_REAL_IRIDIUM
+    [pieplace]=CONFIG_SMOKE_TEST_PIE_PLACEMENT
 )
 
 # Snapshot the production sdkconfig ONCE (only if it isn't already a
