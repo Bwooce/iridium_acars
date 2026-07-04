@@ -58,6 +58,13 @@ static void aggregator_ingest_task(void *arg)
         if (!frame_pdu_queue_pop(&pdu, 1000)) {
             continue;
         }
+        // Reject any PDU with n_bits > FRAME_PDU_MAX_BITS to prevent out-of-bounds
+        // read into s_bits01 (sized to FRAME_PDU_MAX_BITS).
+        if (pdu.n_bits > FRAME_PDU_MAX_BITS) {
+            ESP_LOGW(TAG, "dropping PDU with oversized n_bits=%u (max %u)",
+                     pdu.n_bits, FRAME_PDU_MAX_BITS);
+            continue;
+        }
         frame_pdu_unpack_bits(&pdu, s_bits01);
         // PDU direction: 0 = DL, 1 = UL -> ir_direction_t (DIR_DOWNLINK=0,
         // DIR_UPLINK=1). freq_hz is unused by the classifier (peak_bin +

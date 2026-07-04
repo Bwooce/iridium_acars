@@ -90,6 +90,37 @@ int main(void)
     CHECK(!frame_link_decode(buf, FRAME_LINK_FRAME_SIZE - 1, &b), "short buffer accepted");
     CHECK(frame_link_encode(&a, buf, FRAME_LINK_FRAME_SIZE - 1) == 0, "short encode not rejected");
 
+    // 5) PDU with oversized n_bits (> FRAME_PDU_MAX_BITS) is rejected even with
+    //    valid CRC. This is the security fix for out-of-bounds read vulnerability.
+    //    We manually craft a wire frame with n_bits > FRAME_PDU_MAX_BITS and recalculate CRC.
+    iridium_frame_pdu_t c;
+    fill_pdu(&c);
+    c.n_bits = 2048; // oversized: > FRAME_PDU_MAX_BITS (512)
+    uint8_t pdu_buf[FRAME_PDU_WIRE_SIZE];
+    frame_pdu_pack(&c, pdu_buf, sizeof(pdu_buf));
+
+    // Manually build the wire frame with correct CRC.
+    memset(buf, 0, sizeof(buf));
+    buf[0] = (uint8_t)(FRAME_LINK_MAGIC & 0xFF);
+    buf[1] = (uint8_t)(FRAME_LINK_MAGIC >> 8);
+    buf[2] = FRAME_LINK_VER;
+    buf[3] = 0; // flags
+    memcpy(buf + FRAME_LINK_HDR_BYTES, pdu_buf, FRAME_PDU_WIRE_SIZE);
+    uint16_t crc     = frame_link_crc16(buf + 2, (size_t)(FRAME_LINK_HDR_BYTES - 2) + FRAME_PDU_WIRE_SIZE);
+    size_t   crc_off = FRAME_LINK_HDR_BYTES + FRAME_PDU_WIRE_SIZE;
+    buf[crc_off]     = (uint8_t)(crc & 0xFF);
+    buf[crc_off + 1] = (uint8_t)(crc >> 8);
+
+    // Verify CRC is valid (sanity check).
+    uint16_t crc_check = frame_link_crc16(buf + 2, (size_t)(FRAME_LINK_HDR_BYTES - 2) + FRAME_PDU_WIRE_SIZE);
+    CHECK(crc_check == crc, "CRC sanity check failed");
+
+    // Now decode and verify it's rejected because n_bits > FRAME_PDU_MAX_BITS.
+    iridium_frame_pdu_t oversized;
+    CHECK(!frame_link_decode(buf, sizeof(buf), &oversized),
+          "oversized n_bits PDU not rejected (n_bits=%u > max %u)",
+          c.n_bits, FRAME_PDU_MAX_BITS);
+
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed ? 1 : 0;
 }

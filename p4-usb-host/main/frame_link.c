@@ -52,8 +52,16 @@ bool frame_link_decode(const uint8_t *buf, size_t buflen, iridium_frame_pdu_t *p
     uint16_t want    = (uint16_t)(buf[crc_off] | (buf[crc_off + 1] << 8));
     uint16_t got     = frame_link_crc16(buf + 2, (size_t)(FRAME_LINK_HDR_BYTES - 2) + FRAME_PDU_WIRE_SIZE);
     if (want != got) return false;
-    return frame_pdu_unpack(buf + FRAME_LINK_HDR_BYTES, FRAME_PDU_WIRE_SIZE, pdu) ==
-           FRAME_PDU_WIRE_SIZE;
+    if (frame_pdu_unpack(buf + FRAME_LINK_HDR_BYTES, FRAME_PDU_WIRE_SIZE, pdu) !=
+        FRAME_PDU_WIRE_SIZE) {
+        return false;
+    }
+    // Reject any PDU with n_bits > FRAME_PDU_MAX_BITS to prevent out-of-bounds
+    // read in downstream unpacking (aggregator_ingest.c unpacks to a 512-byte buffer).
+    if (pdu->n_bits > FRAME_PDU_MAX_BITS) {
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
