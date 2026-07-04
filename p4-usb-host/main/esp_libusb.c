@@ -48,11 +48,23 @@ static volatile size_t   s_producer_rb_max_used     = 0;
 static volatile size_t   s_producer_rb_used_at_drop = 0;
 static volatile uint32_t s_producer_samples         = 0;
 
+// Mutex-take timeout for the control/bulk transfer critical section (#T8).
+// Generous relative to a single USB control transfer (CTRL_TIMEOUT=300 ms in
+// librtlsdr.c) since worst case is waiting out one other in-flight transfer,
+// not an unbounded block.
+#define XFER_MUTEX_TIMEOUT_MS 1000
+
 void init_adsb_dev()
 {
     adsbdev = calloc(1, sizeof(class_adsb_dev));
     assert(adsbdev != NULL); // boot-time, tiny: failure means heap is gone
-    adsbdev->is_adsb = true;
+    adsbdev->is_adsb    = true;
+    adsbdev->xfer_mutex = xSemaphoreCreateMutex();
+    if (adsbdev->xfer_mutex == NULL) {
+        // Non-fatal here: esp_libusb_control_transfer/esp_libusb_bulk_transfer
+        // both check for NULL and fail the transfer rather than dereference it.
+        ESP_LOGE("LIBUSB", "Failed to create xfer_mutex — control/bulk transfers will fail");
+    }
 }
 
 void bulk_transfer_read_cb(usb_transfer_t *transfer)
@@ -82,11 +94,26 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
     assert(driver_obj->client_hdl != NULL);
     usb_device_handle_t dev_hdl = driver_obj->dev_hdl ? driver_obj->dev_hdl : adsbdev->dev_hdl;
 
-    size_t          sizePacket = usb_round_up_to_mps(length, 64);
-    usb_transfer_t *transfer   = NULL;
+    // Serialise against esp_libusb_control_transfer(): both share
+    // adsbdev->response_buf/is_done/is_success/bytes_transferred (#T8).
+    if (adsbdev->xfer_mutex == NULL) {
+        ESP_LOGE("LIBUSB", "bulk_transfer: xfer_mutex not initialised");
+        return -1;
+    }
+    if (xSemaphoreTake(adsbdev->xfer_mutex, pdMS_TO_TICKS(XFER_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE("LIBUSB", "bulk_transfer: timed out waiting for xfer_mutex");
+        return -1;
+    }
+
+    int             ret = -1;
+    size_t          sizePacket;
+    usb_transfer_t *transfer = NULL;
+    esp_err_t       r;
+
+    sizePacket = usb_round_up_to_mps(length, 64);
     if (usb_host_transfer_alloc(sizePacket, 0, &transfer) != ESP_OK ||
         transfer == NULL) {
-        return -1;
+        goto done;
     }
 
     transfer->num_bytes        = sizePacket;
@@ -102,14 +129,15 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
     adsbdev->response_buf = calloc(sizePacket, sizeof(uint8_t));
     if (!adsbdev->response_buf) {
         usb_host_transfer_free(transfer);
-        return -1;
+        goto done;
     }
 
-    esp_err_t r = usb_host_transfer_submit(transfer);
+    r = usb_host_transfer_submit(transfer);
     if (r != ESP_OK) {
         free(adsbdev->response_buf);
+        adsbdev->response_buf = NULL;
         usb_host_transfer_free(transfer);
-        return -1;
+        goto done;
     }
     while (!adsbdev->is_done) {
         usb_host_client_handle_events(driver_obj->client_hdl, portMAX_DELAY);
@@ -117,8 +145,9 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
 
     if (!adsbdev->is_success) {
         free(adsbdev->response_buf);
+        adsbdev->response_buf = NULL;
         usb_host_transfer_free(transfer);
-        return -1;
+        goto done;
     }
 
     ESP_ERROR_CHECK(usb_host_endpoint_clear(dev_hdl, endpoint));
@@ -129,11 +158,35 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
     free(adsbdev->response_buf);
     adsbdev->response_buf = NULL;
     usb_host_transfer_free(transfer);
-    return 0;
+    ret = 0;
+
+done:
+    xSemaphoreGive(adsbdev->xfer_mutex);
+    return ret;
 }
 
 int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout)
 {
+    // Serialise: adsbdev->transfer/response_buf/is_done are shared with
+    // esp_libusb_bulk_transfer() and with any concurrent caller of this
+    // function (e.g. the AGC task's multi-register gain sequence in
+    // agc.c/librtlsdr.c racing the class_driver task's own control
+    // transfers). Without this lock, one caller can free() a transfer or
+    // response_buf that another caller's in-flight completion callback is
+    // still about to write into (#T8).
+    if (adsbdev->xfer_mutex == NULL) {
+        ESP_LOGE("LIBUSB", "control_transfer: xfer_mutex not initialised");
+        return -1;
+    }
+    if (xSemaphoreTake(adsbdev->xfer_mutex, pdMS_TO_TICKS(XFER_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE("LIBUSB", "control_transfer: timed out waiting for xfer_mutex");
+        return -1;
+    }
+
+    int       ret = -1;
+    size_t    sizePacket;
+    esp_err_t r;
+
     if (adsbdev->transfer) {
         usb_host_transfer_free(adsbdev->transfer);
         adsbdev->transfer = NULL;
@@ -143,10 +196,10 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
         adsbdev->response_buf = NULL;
     }
 
-    size_t sizePacket = sizeof(usb_setup_packet_t) + wLength;
+    sizePacket = sizeof(usb_setup_packet_t) + wLength;
     if (usb_host_transfer_alloc(sizePacket, 0, &adsbdev->transfer) != ESP_OK ||
         adsbdev->transfer == NULL) {
-        return -1;
+        goto done;
     }
     USB_SETUP_PACKET_INIT_CONTROL((usb_setup_packet_t *)adsbdev->transfer->data_buffer, bm_req_type, b_request, wValue, wIndex, wLength);
     adsbdev->transfer->num_bytes     = sizePacket;
@@ -162,9 +215,9 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
             adsbdev->transfer->data_buffer[sizeof(usb_setup_packet_t) + i] = data[i];
         }
     }
-    esp_err_t r = usb_host_transfer_submit_control(driver_obj->client_hdl, adsbdev->transfer);
+    r = usb_host_transfer_submit_control(driver_obj->client_hdl, adsbdev->transfer);
     if (r != ESP_OK) {
-        return -1;
+        goto done;
     }
 
     while (!adsbdev->is_done) {
@@ -172,13 +225,17 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     }
 
     if (!adsbdev->is_success) {
-        return -1;
+        goto done;
     }
 
     for (uint8_t i = 0; i < wLength; i++) {
         data[i] = adsbdev->response_buf[sizeof(usb_setup_packet_t) + i];
     }
-    return adsbdev->bytes_transferred;
+    ret = adsbdev->bytes_transferred;
+
+done:
+    xSemaphoreGive(adsbdev->xfer_mutex);
+    return ret;
 }
 
 void stream_transfer_cb(usb_transfer_t *transfer)

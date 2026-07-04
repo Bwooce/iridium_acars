@@ -8,7 +8,11 @@
 
 // Apply a manual tuner gain at runtime (tenths of dB, e.g., 350 = 35.0 dB).
 // Returns true if applied, false if the device is not yet ready.
-// Safe to call from any task; serialised by the RTL-SDR driver.
+// Safe to call from any task: the underlying control transfers
+// (esp_libusb_control_transfer, esp_libusb.c) are serialised by
+// adsbdev->xfer_mutex, so this can run concurrently with the
+// class_driver task's own USB traffic without racing the shared
+// transfer/response_buf state (#T8).
 bool class_driver_set_tuner_gain_dbx10(int gain_dbx10);
 
 // Returns the most recently applied tuner gain in tenths of dB,
