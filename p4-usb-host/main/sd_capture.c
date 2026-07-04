@@ -1,7 +1,8 @@
 // Raw IQ capture to SD — see sd_capture.h for the architecture.
 
 #include "sd_capture.h"
-#include "sd_log.h" // for sd_log_force_mount()
+#include "sd_capture_framing.h" // pure size/fit arithmetic, host-tested
+#include "sd_log.h"             // for sd_log_force_mount()
 
 #include <string.h>
 #include <stdio.h>
@@ -644,9 +645,9 @@ void sd_capture_record_burst_begin(uint32_t length_samples,
     // exclusive via s_burst_mode) and the writer task only ever
     // drains the buffer (frees more space), so "enough room now"
     // cannot go stale before our own sends below complete.
-    size_t iq_bytes    = (size_t)length_samples * 2 * sizeof(int16_t);
-    size_t total_bytes = sizeof(hdr) + iq_bytes;
-    if (xStreamBufferSpacesAvailable(s_stream) < total_bytes) {
+    size_t total_bytes = sd_capture_burst_record_bytes(sizeof(hdr), length_samples);
+    if (!sd_capture_burst_fits(xStreamBufferSpacesAvailable(s_stream),
+                               sizeof(hdr), length_samples)) {
         s_burst_skip = true;
         update_bytes_dropped(total_bytes);
         ESP_LOGW(TAG, "burst seq=%u dropped whole (%u B won't fit)",

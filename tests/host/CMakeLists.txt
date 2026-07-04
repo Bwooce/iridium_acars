@@ -254,6 +254,18 @@ add_executable(test_signal_buffer_index
 )
 target_include_directories(test_signal_buffer_index PRIVATE ${MAIN_DIR})
 
+# T4 regression: sd_capture's atomic burst-record framing (the whole
+# header+IQ record must fit in the stream buffer's free space or the
+# whole record is dropped -- never a torn header/IQ tail). sd_capture.c
+# itself is device-only (FreeRTOS stream buffers / SDMMC) and doesn't
+# build on host, so this test only needs the pure size/fit arithmetic
+# in sd_capture_framing.h, which sd_capture_record_burst_begin() also
+# calls.
+add_executable(test_sd_capture_framing
+    test_sd_capture_framing.c
+)
+target_include_directories(test_sd_capture_framing PRIVATE ${MAIN_DIR})
+
 # #136 Phase 3: inter-chip frame_link wire framing (crc16 + encode/decode).
 # Pure layer only; SPI transport is target-only.
 add_executable(test_frame_link
@@ -597,6 +609,7 @@ add_test(NAME uw_correlator_golden COMMAND test_uw_correlator_golden)
 add_test(NAME direct_if_decim_golden COMMAND test_direct_if_decim_golden)
 add_test(NAME frame_pdu COMMAND test_frame_pdu)
 add_test(NAME signal_buffer_index COMMAND test_signal_buffer_index)
+add_test(NAME sd_capture_framing COMMAND test_sd_capture_framing)
 add_test(NAME frame_link COMMAND test_frame_link)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
 # worker_pipeline_albq removed with the channelizer (the channelizer
