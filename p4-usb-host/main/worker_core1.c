@@ -588,7 +588,7 @@ void worker_task(void *arg)
     while (1) {
         if (xQueueReceive(burst_queue, &burst, portMAX_DELAY)) {
             int64_t burst_t0 = esp_timer_get_time();
-            ESP_LOGI(TAG, "Worker burst: start=%lu len=%lu rel=%+.0f Hz SNR=%.1f dB",
+            ESP_LOGD(TAG, "Worker burst: start=%lu len=%lu rel=%+.0f Hz SNR=%.1f dB",
                      (unsigned long)burst.start_sample_idx,
                      (unsigned long)burst.length_samples,
                      (double)burst.rel_freq_hz,
