@@ -138,18 +138,27 @@ static size_t format_msg(char *buf, size_t cap, const acars_msg_t *m)
     char esc_txt[2 * MSG_RING_TXT_MAX + 8];
     char esc_msgnum[2 * sizeof(m->msg_num) + 1];
     char esc_flight[2 * sizeof(m->flight_id) + 1];
+    char esc_mode[8];
+    char esc_block[8];
+    char esc_label[16];
     json_escape(esc_txt, sizeof(esc_txt), m->txt);
     json_escape(esc_msgnum, sizeof(esc_msgnum), m->msg_num);
     json_escape(esc_flight, sizeof(esc_flight), m->flight_id);
+    char mode_buf[2]  = {m->mode, 0};
+    char block_buf[2] = {m->block_id, 0};
+    char label_buf[3] = {m->label[0], m->label[1], 0};
+    json_escape(esc_mode, sizeof(esc_mode), mode_buf);
+    json_escape(esc_block, sizeof(esc_block), block_buf);
+    json_escape(esc_label, sizeof(esc_label), label_buf);
 
     int n = snprintf(buf, cap,
                      "{"
                      "\"id\":%llu,"
                      "\"t_us\":%llu,"
                      "\"dir\":\"%s\","
-                     "\"mode\":\"%c\","
-                     "\"label\":\"%.2s\","
-                     "\"block\":\"%c\","
+                     "\"mode\":\"%s\","
+                     "\"label\":\"%s\","
+                     "\"block\":\"%s\","
                      "\"msg_num\":\"%s\","
                      "\"flight\":\"%s\","
                      "\"crc\":%s,"
@@ -160,9 +169,9 @@ static size_t format_msg(char *buf, size_t cap, const acars_msg_t *m)
                      (unsigned long long)m->id,
                      (unsigned long long)m->timestamp_us,
                      m->uplink ? "UL" : "DL",
-                     m->mode,
-                     m->label,
-                     m->block_id,
+                     esc_mode,
+                     esc_label,
+                     esc_block,
                      esc_msgnum,
                      esc_flight,
                      m->crc_ok ? "true" : "false",

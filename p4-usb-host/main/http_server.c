@@ -179,10 +179,12 @@ static esp_err_t status_get(httpd_req_t *req)
     char host_esc[2 * sizeof(cfg.out_host) + 1];
     char ota_esc[2 * sizeof(cfg.ota_url) + 1];
     char mnt_err_esc[2 * sizeof(sd.mount_error) + 1];
+    char station_id_esc[2 * sizeof(cfg.station_id) + 1];
     json_escape(ssid_esc, sizeof(ssid_esc), wifi_link_ssid());
     json_escape(host_esc, sizeof(host_esc), cfg.out_host);
     json_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
     json_escape(mnt_err_esc, sizeof(mnt_err_esc), sd.mount_error);
+    json_escape(station_id_esc, sizeof(station_id_esc), cfg.station_id);
 
     char body[1600];
     int  n = snprintf(body, sizeof(body),
@@ -230,7 +232,7 @@ static esp_err_t status_get(httpd_req_t *req)
                      wifi_link_is_connected() ? "true" : "false",
                       ip_str,
                       (long long)(uptime_us / 1000000),
-                      cfg.station_id,
+                      station_id_esc,
                       (unsigned)cfg.lo_freq_hz,
                       (unsigned)cfg.sample_rate_hz,
                      cfg.bias_tee ? "true" : "false",
@@ -281,7 +283,10 @@ static esp_err_t status_get(httpd_req_t *req)
                          "\"dropped\":%u,\"sources\":[",
                          (unsigned)ai.forwarded, (unsigned)ai.pdu_queue_depth,
                          (unsigned)ai.pdu_dropped);
-        if (m > 0) n += m;
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
         for (uint32_t i = 0; i < ai.n_sources && n < (int)sizeof(body); i++) {
             uint64_t age_ms = ai.sources[i].last_seen_us
                                   ? (now_us - ai.sources[i].last_seen_us) / 1000
@@ -290,7 +295,10 @@ static esp_err_t status_get(httpd_req_t *req)
                                        "%s{\"id\":\"%08lx\",\"count\":%u,\"age_ms\":%llu}",
                          i ? "," : "", (unsigned long)ai.sources[i].source_id,
                                        (unsigned)ai.sources[i].count, (unsigned long long)age_ms);
-            if (m > 0) n += m;
+            if (m > 0) {
+                n += m;
+                if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+            }
         }
         // Close sources[], then the SPI transport counters (#136).
         frame_link_stats_t fl;
@@ -301,11 +309,11 @@ static esp_err_t status_get(httpd_req_t *req)
                      (unsigned)fl.frames_tx, (unsigned)fl.frames_rx,
                      (unsigned)fl.crc_errors, (unsigned)fl.bus_errors,
                      (unsigned)fl.queue_full);
-        if (m > 0) n += m;
-        if (n >= (int)sizeof(body)) {
-            n       = sizeof(body) - 1;
-            body[n] = '\0';
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
         }
+        body[n] = '\0';
     }
 #endif
 
@@ -325,24 +333,50 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
 
     char body[1024];
     int  n = 0;
-    n += snprintf(body + n, sizeof(body) - n,
-                  "{\"snr_total\":%u,\"bch_total\":%u,"
-                  "\"snr_bin_dB_width\":1,\"snr\":[",
-                  (unsigned)h.snr_total, (unsigned)h.bch_total);
+    int  m;
+    m = snprintf(body + n, sizeof(body) - n,
+                 "{\"snr_total\":%u,\"bch_total\":%u,"
+                 "\"snr_bin_dB_width\":1,\"snr\":[",
+                 (unsigned)h.snr_total, (unsigned)h.bch_total);
+    if (m > 0) {
+        n += m;
+        if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+    }
     for (int i = 0; i < 32; i++) {
-        n += snprintf(body + n, sizeof(body) - n,
-                      "%s%u", i ? "," : "", (unsigned)h.snr[i]);
+        if (n >= (int)sizeof(body) - 1) break;
+        m = snprintf(body + n, sizeof(body) - n,
+                     "%s%u", i ? "," : "", (unsigned)h.snr[i]);
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
     }
     // bch layout: bch[(e1+1)*4 + (e2+1)] for e in {-1=fail, 0,1,2=corrected}.
-    n += snprintf(body + n, sizeof(body) - n,
-                  "],\"bch_index\":\"(e1+1)*4+(e2+1), e in {-1=fail,0,1,2}\","
-                  "\"bch\":[");
-    for (int i = 0; i < 16; i++) {
-        n += snprintf(body + n, sizeof(body) - n,
-                      "%s%u", i ? "," : "", (unsigned)h.bch[i]);
+    if (n < (int)sizeof(body) - 1) {
+        m = snprintf(body + n, sizeof(body) - n,
+                     "],\"bch_index\":\"(e1+1)*4+(e2+1), e in {-1=fail,0,1,2}\","
+                     "\"bch\":[");
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
     }
-    n += snprintf(body + n, sizeof(body) - n, "]}\n");
-    if (n < 0 || n >= (int)sizeof(body)) n = sizeof(body) - 1;
+    for (int i = 0; i < 16; i++) {
+        if (n >= (int)sizeof(body) - 1) break;
+        m = snprintf(body + n, sizeof(body) - n,
+                     "%s%u", i ? "," : "", (unsigned)h.bch[i]);
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
+    }
+    if (n < (int)sizeof(body) - 1) {
+        m = snprintf(body + n, sizeof(body) - n, "]}\n");
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, body, n);
@@ -705,19 +739,26 @@ static esp_err_t messages_get(httpd_req_t *req)
     int  len = snprintf(chunk, sizeof(chunk),
                         "{\"total\":%llu,\"messages\":[",
                         (unsigned long long)msg_ring_total());
+    if (len >= (int)sizeof(chunk)) len = sizeof(chunk) - 1;
     httpd_resp_send_chunk(req, chunk, len);
 
     char esc_txt[2 * MSG_RING_TXT_MAX + 8];
     char esc_flight[16];
     char esc_msgnum[16];
     char esc_label[8];
+    char esc_mode[8];
+    char esc_block[8];
     for (size_t i = 0; i < n; i++) {
         const acars_msg_t *m = &s_snap[i];
 
         char label_buf[3] = {m->label[0], m->label[1], 0};
+        char mode_buf[2]  = {m->mode, 0};
+        char block_buf[2] = {m->block_id, 0};
         json_escape(esc_label, sizeof(esc_label), label_buf);
         json_escape(esc_msgnum, sizeof(esc_msgnum), m->msg_num);
         json_escape(esc_flight, sizeof(esc_flight), m->flight_id);
+        json_escape(esc_mode, sizeof(esc_mode), mode_buf);
+        json_escape(esc_block, sizeof(esc_block), block_buf);
         json_escape(esc_txt, sizeof(esc_txt), m->txt);
 
         len = snprintf(chunk, sizeof(chunk),
@@ -725,9 +766,9 @@ static esp_err_t messages_get(httpd_req_t *req)
                        "\"id\":%llu,"
                        "\"t_us\":%llu,"
                        "\"dir\":\"%s\","
-                       "\"mode\":\"%c\","
+                       "\"mode\":\"%s\","
                        "\"label\":\"%s\","
-                       "\"block\":\"%c\","
+                       "\"block\":\"%s\","
                        "\"msg_num\":\"%s\","
                        "\"flight\":\"%s\","
                        "\"crc\":%s,"
@@ -739,15 +780,16 @@ static esp_err_t messages_get(httpd_req_t *req)
                        (unsigned long long)m->id,
                        (unsigned long long)m->timestamp_us,
                        m->uplink ? "UL" : "DL",
-                       m->mode,
+                       esc_mode,
                        esc_label,
-                       m->block_id,
+                       esc_block,
                        esc_msgnum,
                        esc_flight,
                        m->crc_ok ? "true" : "false",
                        (long)m->peak_bin,
                        (double)m->snr_db,
                        esc_txt);
+        if (len >= (int)sizeof(chunk)) len = sizeof(chunk) - 1;
         if (len > 0) {
             httpd_resp_send_chunk(req, chunk, len);
         }
@@ -1137,6 +1179,7 @@ static esp_err_t sd_list_get(httpd_req_t *req)
         int         n  = snprintf(line, sizeof(line),
                                   "%s{\"name\":\"%s\",\"size\":%lld,\"mtime\":%lld}",
                          first ? "" : ",", e->d_name, sz, mt);
+        if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
         if (n > 0) httpd_resp_send_chunk(req, line, n);
         first = false;
     }
