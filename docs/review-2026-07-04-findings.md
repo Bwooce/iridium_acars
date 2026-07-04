@@ -38,8 +38,18 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   no live consumer; all-10 path byte-identical). On-device: batch-4 RAW_IRIDIUM SMOKE_PASS
   (LW.SY/DA/IP/IBC decoding, DSP 514 µs) + normal fw live-stable 4.88 MB/s. Three DSP-path
   commits carry `Smoke-verified:` trailers.
-- Remaining open: T13–T16, T18–T21, T24–T54 (see tiers below). Note T18/T19 (USB
-  hot-unplug/teardown) need physical unplug testing not available on the current bench.
+- Batch 5 — T51, T52, T53, T54 DONE, pushed. T51 demotes the per-burst worker log to
+  DEBUG; T52 drops the per-call stats mutex on the sd_capture ingest path (IDF 64-bit
+  atomics = interrupt-safe global spinlock, cheaper than the FreeRTOS mutex — NOT
+  lock-free, but safe); T53 removes the dead ~1.8 KB tail memset + copies only bits[0..n_bits)
+  in frame_queue push/pop (verified no consumer reads past n_bits; bits[] is the last
+  struct field); T54 investigated the async-memcpy split-RX stash and documented the IDF
+  driver root cause (unconditional stash alloc, no safe config knob — comment-only, the
+  T2 CPU-memcpy recovery stays the mitigation). On-device: batch-5 RAW_IRIDIUM SMOKE_PASS
+  (DSP 513 µs, LW.SY/DA/IP/U3/IBC decode) + normal fw live-stable 4.88 MB/s, no atomic/panic.
+- Remaining open: T13–T16, T18–T21, T24–T50 (T51–T54 done). Note T18/T19 (USB
+  hot-unplug/teardown) need physical unplug testing not available on the current bench;
+  T48–T50 (throughput/PIE) deferred — no impact while not throughput-bound.
 
 Legend: **bug** / **sec** (security) / **perf**. "verified" = main agent
 re-read the source and confirmed the defect.
@@ -190,11 +200,11 @@ re-read the source and confirmed the defect.
   3-4× (~19 MB/s avoidable). Remove consumer copy (RingbufferReceiveUpTo returns ptr),
   fuse convert→resample via SRAM staging, PIE-vectorise convert.
 - [ ] **T50** `fft_burst_tagger.c:364` — window_multiply 2048 scalar Q15 muls/step → PIE 8-lane.
-- [ ] **T51** `worker_core1.c:591` — per-burst ESP_LOGI in dequeue hot path steals worker
+- [x] **T51** `worker_core1.c:591` — per-burst ESP_LOGI in dequeue hot path steals worker
   CPU during burst storms.
-- [ ] **T52** `sd_capture.c:504` — takes s_stats_mu every USB-ingest call to read cap/target;
+- [x] **T52** `sd_capture.c:504` — takes s_stats_mu every USB-ingest call to read cap/target;
   use _Atomic.
-- [ ] **T53** `frame_decoder.c:499` — three 2 KB copies + unconditional memset of unused
+- [x] **T53** `frame_decoder.c:499` — three 2 KB copies + unconditional memset of unused
   bits tail per frame.
-- [ ] **T54** `signal_buffer.c:153` — root-cause why async-memcpy takes split-RX path when
+- [x] **T54** `signal_buffer.c:153` — root-cause why async-memcpy takes split-RX path when
   src/dst/len all 64-aligned; eliminating it makes stash_fails structurally zero (T2/DMA-INT).
