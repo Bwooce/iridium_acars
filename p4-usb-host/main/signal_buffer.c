@@ -154,16 +154,44 @@ esp_err_t signal_buffer_init()
     async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
     cfg.backlog               = 4;  // up to 4 outstanding transfers
     cfg.dma_burst_size        = 64; // match L2 cache line for efficient bursts
-    // Note: IDF v6.1's async_memcpy_config_t doesn't expose
-    // psram_trans_align / sram_trans_align (those were earlier-IDF
-    // fields). We can't tell GDMA "skip the split-RX path because
-    // our buffers are guaranteed 64-aligned" — even though the
-    // 64-aligned scratch + 64-aligned head invariant from #125 makes
-    // that true, the driver re-validates and triggers the split path
-    // anyway. Result: residual ~110 split-RX errors/min vs the ~300/min
-    // pre-#125 baseline (63% reduction). Going further would need
-    // either an IDF source patch or a different memcpy mechanism
-    // (e.g. direct gdma_link API).
+    // Note: IDF v6.1's async_memcpy_config_t only has backlog/weight/
+    // dma_burst_size/flags (esp_async_memcpy.h) — no psram_trans_align /
+    // sram_trans_align field (those were earlier-IDF fields), and `flags`
+    // is dead in this version (grep finds no reader of config->flags in
+    // async_memcpy_gdma.c or esp_dma_utils.c). There is no config knob
+    // that can suppress the split-RX stash allocation.
+    //
+    // T54 root cause (traced into esp-idf/components/esp_driver_dma,
+    // checkout v6.1-dev-4427-gc00874869b): mcp_gdma_memcpy() in
+    // async_memcpy_gdma.c unconditionally frees the transaction's
+    // previous stash_buffer and sets it to NULL (lines 356-359) on
+    // EVERY call, before it knows whether this transfer needs one. It
+    // then calls esp_dma_split_rx_buffer_to_cache_aligned() (line 411),
+    // which — because *ret_stash_buffer is NULL — unconditionally
+    // heap_caps_calloc()s a fresh 2×cache-line stash from
+    // MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL (esp_dma_utils.c:50-54) BEFORE
+    // it computes head_overflow_len/tail_overflow_len and decides
+    // whether the split is actually needed (esp_dma_utils.c:67-99). For
+    // our transfers head_overflow_len and tail_overflow_len both work
+    // out to 0 (64-aligned src/dst/len per #125's invariant), so the
+    // stash is allocated, never written to (head/tail segment lengths
+    // are 0), and immediately eligible to be freed on the next push —
+    // pure churn of a ~128 B DMA-INT allocation on every single
+    // esp_async_memcpy() call to PSRAM, aligned or not. This is a
+    // worst-case-provisioning pattern baked into the driver, not
+    // something the alignment check gates; there is no public API to
+    // hand the driver a persistent stash buffer (the low-level
+    // esp_dma_split_rx_buffer_to_cache_aligned() supports reuse via a
+    // non-NULL *ret_stash_buffer, but mcp_gdma_memcpy never exercises
+    // that path). Avoiding it structurally would mean bypassing
+    // esp_async_memcpy entirely and driving the low-level gdma_link_list
+    // API ourselves (own channel setup, link-list construction, cache
+    // sync) — a materially larger and riskier change than this
+    // DSP-path file warrants; not attempted here. The T2 CPU-memcpy
+    // recovery (#106/#107/#126E, this function's `r != ESP_OK` branch
+    // below) remains the correct mitigation: it's cheap (~50 us/16 KB),
+    // 100% effective, and infrequent (fires only when DMA-INT is
+    // transiently exhausted by this same churn from other allocators).
     esp_err_t r = esp_async_memcpy_install_gdma_axi(&cfg, &s_dma);
     if (r != ESP_OK) {
         ESP_LOGE(TAG, "esp_async_memcpy_install_gdma_axi failed: 0x%x (%s)",
