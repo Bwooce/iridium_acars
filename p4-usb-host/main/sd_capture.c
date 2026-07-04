@@ -199,6 +199,12 @@ static void writer_task(void *arg)
         size_t aligned  = total & ~(SECTOR_BYTES - 1);
         size_t leftover = total - aligned;
         n               = aligned;
+        // Sector-aligned offset up to which this iteration's data is
+        // considered committed. Normally `aligned` (the whole write
+        // succeeded); a short fwrite (T21, below) pulls this back to
+        // the last fully-committed sector so the uncommitted bytes
+        // get re-queued instead of lost.
+        size_t retry_from = aligned;
         if (n > 0 && s_fp) {
             // Single fwrite of the whole received chunk. We tried
             // chunking to 512 bytes with vTaskDelay(0) between
@@ -230,11 +236,39 @@ static void writer_task(void *arg)
                     s_state = CAP_STATE_STOPPING;
                 }
             } else {
+                // T21: a SHORT fwrite (0 <= total_wr < n) can leave the
+                // FATFS file position mid-sector even though we only
+                // ever ASK for sector-multiple sizes -- the size
+                // rounding above bounds the REQUEST, not what actually
+                // lands on a short/interrupted write. Back the file
+                // position up to the last full-sector boundary so the
+                // NEXT fwrite starts aligned again (otherwise every
+                // later fwrite hands SDMMC a misaligned buf+offset and
+                // hits the exact EIO cliff the size rounding was meant
+                // to prevent), and re-queue every byte from that
+                // boundary onward -- including the tail already held
+                // in `leftover` -- so nothing captured is silently
+                // dropped.
+                size_t partial_sector = total_wr % SECTOR_BYTES;
+                size_t committed      = total_wr - partial_sector;
+                if (partial_sector != 0) {
+                    if (fseek(s_fp, -(long)partial_sector, SEEK_CUR) != 0) {
+                        ESP_LOGE(TAG, "fseek realign after short write "
+                                      "failed errno=%d -- file position "
+                                      "may now be misaligned",
+                                 errno);
+                    }
+                }
+                if (committed > 0) update_bytes_written(committed);
+                retry_from = committed;
+
                 int64_t now = esp_timer_get_time();
                 if (now - last_warn_us >= WARN_THROTTLE_US) {
-                    ESP_LOGW(TAG, "fwrite short %u/%u (errno=%d) "
+                    ESP_LOGW(TAG, "fwrite short %u/%u (errno=%d) realigned "
+                                  "to %u B committed, re-queuing %u B "
                                   "consec_fail=%u (skipped %u since last)",
                              (unsigned)total_wr, (unsigned)n, errno,
+                             (unsigned)committed, (unsigned)(n - committed),
                              (unsigned)consec_fail + 1, (unsigned)warn_skipped);
                     last_warn_us = now;
                     warn_skipped = 0;
@@ -253,11 +287,15 @@ static void writer_task(void *arg)
                 }
             }
         }
-        // Move the unaligned tail to the front of buf for the next
-        // iteration's stash. Always do this after computing aligned/
-        // leftover so the rotation happens whether or not we wrote.
+        // Move the unwritten tail to the front of buf for the next
+        // iteration's stash. Normally this is just the unaligned
+        // `leftover` computed above; a short write (T21, handled
+        // above) pulls `retry_from` back to the last committed
+        // sector, so the bytes fwrite didn't actually commit get
+        // re-queued here too instead of being lost.
+        leftover = total - retry_from;
         if (leftover > 0) {
-            memmove(buf, buf + aligned, leftover);
+            memmove(buf, buf + retry_from, leftover);
         }
         stash_len = leftover;
 
