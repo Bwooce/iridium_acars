@@ -7,31 +7,34 @@ device healthy at 4.88 MB/s, decode drought is the poor bench antenna.
 Priority order, unique task IDs. `[ ]` = open, `[~]` = in progress, `[x]` = done.
 Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md`.
 
-**Fix status:** T1–T4 fixed on branch `review-fixes-2026-07-04` (2026-07-04).
-T1/T3 host-verified with new regression tests (28/28 ctest); T2/T4 source-verified,
-pending on-device smoke (device-only code). Not yet merged to main / pushed.
+**Fix status:** T1–T4 DONE — merged to `main` and pushed (2026-07-04, commits
+1aca876/e6db4b9/933ab38/97c54ea). T1/T3 host-verified with new regression tests
+(28/28 ctest); T2/T4 source-verified + clean device build; whole set passed the
+on-device RAW_IRIDIUM smoke (SMOKE_PASS, DSP 514 µs/frame). T1/T2 (DSP-path) carry
+`Smoke-verified:` trailers. Device left running normal firmware, decoding live RF.
+Follow-up regression coverage tracked below as T2t/T4t.
 
 Legend: **bug** / **sec** (security) / **perf**. "verified" = main agent
 re-read the source and confirmed the defect.
 
 ## P0 — fix first (verified, real decode/data impact)
 
-- [~] **T1** `ibc_decode.c:93` — bug, verified. FIXED (branch, host-verified). IBC body parsed WITHOUT the
+- [x] **T1** `ibc_decode.c:93` — bug, verified. FIXED (branch, host-verified). IBC body parsed WITHOUT the
   pair-swap the classifier applied (`iridium_frame.c:397` `classify_bc(swapped)`).
   Siblings ida/ira/ims/tl all re-swap `frame->bits`; ibc does raw `memcpy`.
   Every clean BC frame decodes in wrong orientation → header_ok false or
   silently-wrong sv_id/beam_id/iri_time. No host test covers ibc. Fix: copy +
   pair-swap the 6+256 post-UW bits first, mirror `ida_decode.c:118-124`. Add a test.
-- [~] **T2** `signal_buffer.c:333` — bug, verified. FIXED (branch, pending device smoke). Wrap-path async-memcpy submit
+- [x] **T2** `signal_buffer.c:333` — bug, verified. FIXED (branch, pending device smoke). Wrap-path async-memcpy submit
   failure drops the chunk but does NOT advance `head`, while the tagger's
   cumulative sample index keeps advancing → `start_sample_idx % total_cap`
   mapping skews ~4 ms permanently, no re-sync. Device shows `audio_dropped=4`/29 min.
   Fix: CPU-memcpy-recover the wrap path like the simple path, or advance head.
-- [~] **T3** `aggregator_ingest.c:67` (+ `frame_pdu.c:91`, `frame_link` decode) — FIXED (branch, host-verified).
+- [x] **T3** `aggregator_ingest.c:67` (+ `frame_pdu.c:91`, `frame_link` decode) — FIXED (branch, host-verified).
   bug/sec, verified. Wire `n_bits` unclamped; `s_bits01` is 512 B but
   `frame_decoder_push` accepts 2048 → ~1.5 KB OOB read on a CRC-valid hostile PDU.
   Fix: reject `n_bits > FRAME_PDU_MAX_BITS` in `frame_link_decode` and before push.
-- [~] **T4** `sd_capture.c:562,575,422` — bug, verified. FIXED (branch, pending device smoke). (a) burst records use
+- [x] **T4** `sd_capture.c:562,575,422` — bug, verified. FIXED (branch, pending device smoke). (a) burst records use
   `xStreamBufferSend(...,0)` whose partial write desyncs the hdr+IQ framing on any
   SD stall; (b) file is `_IONBF` so the "periodic flush" `fflush` at :243/:291 are
   no-ops and there's no `fsync` → power-loss loses whole file. Fix: atomic
