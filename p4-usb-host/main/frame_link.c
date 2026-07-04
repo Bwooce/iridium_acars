@@ -219,8 +219,8 @@ static esp_err_t master_bus_init(spi_host_device_t host, int sclk, int mosi, int
 static void slave_task(void *arg)
 {
     (void)arg;
-    uint8_t *txbuf = heap_caps_malloc(FRAME_LINK_FRAME_SIZE, MALLOC_CAP_DMA);
-    uint8_t *rxbuf = heap_caps_malloc(FRAME_LINK_FRAME_SIZE, MALLOC_CAP_DMA);
+    uint8_t *txbuf = heap_caps_aligned_alloc(64, FRAME_LINK_XFER_SIZE, MALLOC_CAP_DMA);
+    uint8_t *rxbuf = heap_caps_aligned_alloc(64, FRAME_LINK_XFER_SIZE, MALLOC_CAP_DMA);
     if (!txbuf || !rxbuf) {
         ESP_LOGE(TAG, "slave DMA buf alloc failed");
         free(txbuf);
@@ -231,11 +231,12 @@ static void slave_task(void *arg)
     iridium_frame_pdu_t pdu;
     while (1) {
         if (!frame_pdu_queue_pop(&pdu, 1000)) continue;
-        if (frame_link_encode(&pdu, txbuf, FRAME_LINK_FRAME_SIZE) != FRAME_LINK_FRAME_SIZE) {
+        memset(txbuf, 0, FRAME_LINK_XFER_SIZE);
+        if (frame_link_encode(&pdu, txbuf, FRAME_LINK_XFER_SIZE) != FRAME_LINK_FRAME_SIZE) {
             continue;
         }
         spi_slave_transaction_t t = {
-            .length    = FRAME_LINK_FRAME_SIZE * 8,
+            .length    = FRAME_LINK_XFER_SIZE * 8,
             .tx_buffer = txbuf,
             .rx_buffer = rxbuf,
         };
@@ -256,8 +257,8 @@ static spi_device_handle_t s_master_dev;
 static void master_task(void *arg)
 {
     (void)arg;
-    uint8_t *rxbuf = heap_caps_malloc(FRAME_LINK_FRAME_SIZE, MALLOC_CAP_DMA);
-    uint8_t *txbuf = heap_caps_calloc(1, FRAME_LINK_FRAME_SIZE, MALLOC_CAP_DMA);
+    uint8_t *rxbuf = heap_caps_aligned_alloc(64, FRAME_LINK_XFER_SIZE, MALLOC_CAP_DMA);
+    uint8_t *txbuf = heap_caps_aligned_alloc(64, FRAME_LINK_XFER_SIZE, MALLOC_CAP_DMA);
     if (!rxbuf || !txbuf) {
         ESP_LOGE(TAG, "master DMA buf alloc failed");
         free(rxbuf);
@@ -265,6 +266,7 @@ static void master_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+    memset(txbuf, 0, FRAME_LINK_XFER_SIZE);
     while (1) {
         // Wait for the slave's data-ready edge (1 s fallback poll so a missed
         // edge can't wedge the link forever).
@@ -272,7 +274,7 @@ static void master_task(void *arg)
         if (gpio_get_level(CONFIG_FRAME_LINK_HANDSHAKE_GPIO) == 0) continue;
 
         spi_transaction_t t = {
-            .length    = FRAME_LINK_FRAME_SIZE * 8,
+            .length    = FRAME_LINK_XFER_SIZE * 8,
             .tx_buffer = txbuf,
             .rx_buffer = rxbuf,
         };
@@ -282,7 +284,7 @@ static void master_task(void *arg)
             continue;
         }
         iridium_frame_pdu_t pdu;
-        if (!frame_link_decode(rxbuf, FRAME_LINK_FRAME_SIZE, &pdu)) {
+        if (!frame_link_decode(rxbuf, FRAME_LINK_XFER_SIZE, &pdu)) {
             atomic_fetch_add(&s_crc_errors, 1);
             continue;
         }
@@ -379,9 +381,9 @@ esp_err_t frame_link_loopback_selftest(void)
         return rc;
     }
 
-    uint8_t *tx = heap_caps_malloc(FRAME_LINK_FRAME_SIZE, MALLOC_CAP_DMA);
-    uint8_t *rx = heap_caps_calloc(1, FRAME_LINK_FRAME_SIZE, MALLOC_CAP_DMA);
-    uint8_t *st = heap_caps_malloc(FRAME_LINK_FRAME_SIZE, MALLOC_CAP_DMA);
+    uint8_t *tx = heap_caps_aligned_alloc(64, FRAME_LINK_XFER_SIZE, MALLOC_CAP_DMA);
+    uint8_t *rx = heap_caps_aligned_alloc(64, FRAME_LINK_XFER_SIZE, MALLOC_CAP_DMA);
+    uint8_t *st = heap_caps_aligned_alloc(64, FRAME_LINK_XFER_SIZE, MALLOC_CAP_DMA);
     if (!tx || !rx || !st) {
         free(tx);
         free(rx);
@@ -401,13 +403,14 @@ esp_err_t frame_link_loopback_selftest(void)
     pdu.n_bits              = 382;
     for (int i = 0; i < FRAME_PDU_BITS_BYTES; i++)
         pdu.bits_packed[i] = (uint8_t)(i * 7 + 3);
-    frame_link_encode(&pdu, st, FRAME_LINK_FRAME_SIZE);
+    memset(st, 0, FRAME_LINK_XFER_SIZE);
+    frame_link_encode(&pdu, st, FRAME_LINK_XFER_SIZE);
 
     // Queue the slave's outgoing frame, then clock it from the master.
     static spi_slave_transaction_t lb_trans; // static: outlives the call window
     memset(&lb_trans, 0, sizeof(lb_trans));
-    memcpy(tx, st, FRAME_LINK_FRAME_SIZE);
-    lb_trans.length    = FRAME_LINK_FRAME_SIZE * 8;
+    memcpy(tx, st, FRAME_LINK_XFER_SIZE);
+    lb_trans.length    = FRAME_LINK_XFER_SIZE * 8;
     lb_trans.tx_buffer = tx;
     rc                 = spi_slave_queue_trans(SLAVE_HOST, &lb_trans, pdMS_TO_TICKS(100));
     if (rc != ESP_OK) {
@@ -417,7 +420,7 @@ esp_err_t frame_link_loopback_selftest(void)
     vTaskDelay(pdMS_TO_TICKS(5)); // let post_setup raise the handshake
 
     spi_transaction_t mt = {
-        .length    = FRAME_LINK_FRAME_SIZE * 8,
+        .length    = FRAME_LINK_XFER_SIZE * 8,
         .rx_buffer = rx,
     };
     rc = spi_device_transmit(dev, &mt);
@@ -429,7 +432,7 @@ esp_err_t frame_link_loopback_selftest(void)
     spi_slave_get_trans_result(SLAVE_HOST, &done_trans, pdMS_TO_TICKS(100));
 
     iridium_frame_pdu_t got;
-    if (!frame_link_decode(rx, FRAME_LINK_FRAME_SIZE, &got)) {
+    if (!frame_link_decode(rx, FRAME_LINK_XFER_SIZE, &got)) {
         ESP_LOGE(TAG, "loopback: decode/CRC FAILED");
         rc = ESP_FAIL;
         goto done;

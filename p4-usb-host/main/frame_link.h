@@ -39,6 +39,11 @@ extern "C" {
 #define FRAME_LINK_FRAME_SIZE \
     (FRAME_LINK_HDR_BYTES + FRAME_PDU_WIRE_SIZE + FRAME_LINK_CRC_BYTES)
 
+// SPI DMA transfer size: padded to 64-byte cache-line boundary for P4 alignment
+// and to satisfy ESP-IDF SPI-DMA requirement that rx lengths be multiples of 4.
+// FRAME_LINK_FRAME_SIZE (98 bytes) is NOT a multiple of 4; this xfer size is.
+#define FRAME_LINK_XFER_SIZE ((FRAME_LINK_FRAME_SIZE + 63) / 64 * 64)
+
 // CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection/xorout).
 uint16_t frame_link_crc16(const uint8_t *data, size_t len);
 
