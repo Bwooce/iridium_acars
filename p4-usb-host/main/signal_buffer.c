@@ -8,6 +8,7 @@
 #include "esp_cache.h"
 #include "sdkconfig.h"
 #include "signal_buffer.h"
+#include "signal_buffer_ring.h"
 #include "fault_inject.h"
 
 static const char *TAG = "SIG_BUF";
@@ -383,7 +384,7 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
         }
     }
 
-    head = (head + (uint32_t)aligned_count) % total_cap;
+    head = signal_buffer_next_head(head, (uint32_t)aligned_count, total_cap);
 
     // Update carry with the tail of THIS push's source (samples we deferred).
     if (new_carry_count) {

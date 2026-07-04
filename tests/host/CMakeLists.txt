@@ -243,6 +243,17 @@ add_executable(test_frame_pdu
 )
 target_include_directories(test_frame_pdu PRIVATE ${MAIN_DIR})
 
+# T2 regression: signal_buffer's ring index invariant (head must advance
+# by aligned_count on every push, including wrap-path DMA-submit-failure
+# recovery paths -- commit 933ab38). signal_buffer.c itself is device-only
+# (ESP-IDF/FreeRTOS deps) and doesn't build on host, so this test only
+# needs the pure head-advance arithmetic in signal_buffer_ring.h, which
+# signal_buffer.c's single head-update exit site also calls.
+add_executable(test_signal_buffer_index
+    test_signal_buffer_index.c
+)
+target_include_directories(test_signal_buffer_index PRIVATE ${MAIN_DIR})
+
 # #136 Phase 3: inter-chip frame_link wire framing (crc16 + encode/decode).
 # Pure layer only; SPI transport is target-only.
 add_executable(test_frame_link
@@ -585,6 +596,7 @@ add_test(NAME uw_correlator_albq   COMMAND test_uw_correlator_albq)
 add_test(NAME uw_correlator_golden COMMAND test_uw_correlator_golden)
 add_test(NAME direct_if_decim_golden COMMAND test_direct_if_decim_golden)
 add_test(NAME frame_pdu COMMAND test_frame_pdu)
+add_test(NAME signal_buffer_index COMMAND test_signal_buffer_index)
 add_test(NAME frame_link COMMAND test_frame_link)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
 # worker_pipeline_albq removed with the channelizer (the channelizer
