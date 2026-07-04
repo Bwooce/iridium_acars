@@ -11,7 +11,7 @@ git apply ../patches/0001-esp_dma_utils-defer-stash-alloc-until-overflow-confirm
 ## 0001 — async_memcpy_gdma: place link list descriptors in PSRAM
 
 **File:** `components/esp_driver_dma/src/async_memcpy_gdma.c`
-**IDF version:** v6.1 (commit the vendored copy tracks)
+**IDF version:** v6.1 — vendored checkout tracks `release/v6.1` (was master snapshot; upgraded 2026-07-04). Re-verify this patch applies on IDF updates.
 
 `gdma_new_link_list` was called with `items_in_ext_mem = false`, placing
 GDMA descriptor arrays in the DMA-INT heap (`MALLOC_CAP_DMA |

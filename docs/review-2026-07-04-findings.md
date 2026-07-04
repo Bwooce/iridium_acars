@@ -73,6 +73,16 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   the adversarial escaping (quotes/control bytes) is not stressed — that needs a real
   RF decode (none, poor antenna).
 
+**ESP-IDF upgrade (2026-07-04): master snapshot `v6.1-dev-4427-gc00874869b` (2026-04-30)
+→ `release/v6.1` branch @ `v6.1-dev-5215-g0d92878008` (2026-06-08, 788 commits, clean
+superset).** IDF is a gitignored local checkout (not repo-tracked), so this is an
+environment change; `patches/0001` (async_memcpy descriptors → PSRAM) re-applies cleanly.
+Full cycle passed: clean rebuild (our code warning-clean), 32 MB PSRAM inits, host suite
+30/30, RAW_IRIDIUM SMOKE_PASS (DSP 515 µs, decode distribution identical to old IDF),
+production fw live-stable 4.86–5.01 MB/s, drops=0, then multi-hour soak. Config drift
+fixed: `sdkconfig.defaults` stale `SPIRAM_TYPE_OCTAL` → `SPIRAM_MODE_HEX` (P4 default;
+old symbol removed in v6.1). Rollback point: IDF commit `c00874869b`.
+
 Legend: **bug** / **sec** (security) / **perf**. "verified" = main agent
 re-read the source and confirmed the defect.
 

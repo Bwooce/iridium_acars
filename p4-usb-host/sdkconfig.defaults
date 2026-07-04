@@ -21,7 +21,10 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # signal_buffer.c's esp_log_level_set call.
 CONFIG_LOG_VERSION_2=y
 CONFIG_SPIRAM=y
-CONFIG_SPIRAM_TYPE_OCTAL=y
+# P4-NANO PSRAM is HEX (x16) mode — SPIRAM_TYPE_OCTAL was a stale/inapplicable
+# symbol (removed in IDF release/v6.1, produced an "unknown kconfig symbol"
+# warning). The P4 defaults to SPIRAM_MODE_HEX; set it explicitly.
+CONFIG_SPIRAM_MODE_HEX=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
