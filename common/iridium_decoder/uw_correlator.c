@@ -1289,15 +1289,24 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     // and was the single largest non-FFT cost (~5 ms/uw_call). Float
     // precision is adequate: peak magnitudes are O(1e15) with ~1e7
     // resolution per float ULP, well below the noise floor.
-    float     best_dl_f = 0.0f, best_ul_f = 0.0f;
-    float     best_dl_re_f = 0.0f, best_dl_im_f = 0.0f;
-    float     best_ul_re_f = 0.0f, best_ul_im_f = 0.0f;
-    float     sum_dl_f = 0.0f, sum_ul_f = 0.0f;
-    int64_t   best_dl = 0, best_ul = 0;
+    float best_dl_f = 0.0f, best_ul_f = 0.0f;
+    float best_dl_re_f = 0.0f, best_dl_im_f = 0.0f;
+    float best_ul_re_f = 0.0f, best_ul_im_f = 0.0f;
+    float sum_dl_f = 0.0f, sum_ul_f = 0.0f;
+    // These were int64_t/int32_t as a legacy bridge from the Q15 BFP
+    // path (below). On a strong/saturated burst the float-path
+    // magnitudes (unscaled FFT x sync x IFFT, no 1/N) can reach
+    // ~1e25-1e27, far beyond INT64_MAX/INT32_MAX -- casting an
+    // out-of-range float straight to a signed integer type is
+    // undefined behaviour (observed: x86 yields INT64_MIN, RISC-V
+    // saturates to INT_MAX, both wrong). double's exponent range holds
+    // these values without UB, and is still exact for the Q15 path's
+    // bounded int64_t/int32_t results assigned into it below.
+    double    best_dl = 0.0, best_ul = 0.0;
     int       best_dl_k = 0, best_ul_k = 0;
-    int32_t   best_dl_re = 0, best_dl_im = 0;
-    int32_t   best_ul_re = 0, best_ul_im = 0;
-    int64_t   sum_dl = 0, sum_ul = 0;
+    double    best_dl_re = 0.0, best_dl_im = 0.0;
+    double    best_ul_re = 0.0, best_ul_im = 0.0;
+    double    sum_dl = 0.0, sum_ul = 0.0;
     int       valid_count = 0;
     const int L_minus_1   = SYNC_RRC_LEN - 1;
 
@@ -1404,18 +1413,21 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     g_uw_magsearch_us += (uint64_t)(esp_timer_get_time() - _t0);
 #endif
 
-    // Bridge float-path results to the int64 names the downstream
-    // direction-pick + SNR code uses (those originated with the Q15 BFP
-    // path which still uses int64; sharing the variable names keeps the
-    // post-mag-search code identical for both paths).
-    best_dl    = (int64_t)best_dl_f;
-    best_ul    = (int64_t)best_ul_f;
-    sum_dl     = (int64_t)sum_dl_f;
-    sum_ul     = (int64_t)sum_ul_f;
-    best_dl_re = (int32_t)best_dl_re_f;
-    best_dl_im = (int32_t)best_dl_im_f;
-    best_ul_re = (int32_t)best_ul_re_f;
-    best_ul_im = (int32_t)best_ul_im_f;
+    // Bridge float-path results to the double names the downstream
+    // direction-pick + SNR code uses (those originated as an int64_t/
+    // int32_t bridge from the Q15 BFP path; sharing the variable names
+    // keeps the post-mag-search code identical for both paths). double
+    // is used instead of int64_t/int32_t so an out-of-range float
+    // magnitude on a strong/saturated burst converts cleanly instead of
+    // hitting UB -- see the declaration comment above.
+    best_dl    = (double)best_dl_f;
+    best_ul    = (double)best_ul_f;
+    sum_dl     = (double)sum_dl_f;
+    sum_ul     = (double)sum_ul_f;
+    best_dl_re = (double)best_dl_re_f;
+    best_dl_im = (double)best_dl_im_f;
+    best_ul_re = (double)best_ul_re_f;
+    best_ul_im = (double)best_ul_im_f;
 #else
     // Q15 BFP matched filter (legacy path).
     static int32_t burst_re[CORR_FFT_N], burst_im[CORR_FFT_N];
