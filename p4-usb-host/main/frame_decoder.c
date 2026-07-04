@@ -396,8 +396,12 @@ static void decoder_task(void *arg)
                  wdt_rc, esp_err_to_name(wdt_rc));
     }
 
-    frame_queue_item_t item;
-    uint64_t           last_tick = (uint64_t)esp_timer_get_time();
+    // Decoder task is a single serial consumer (one xTaskCreatePinnedToCoreWithCaps
+    // instance, non-reentrant). Move the ~2.1 KB frame_queue_item_t from stack to
+    // static .bss to relieve stack pressure (6144 B stack was marginal). Safe
+    // because the item is not captured/reused across task iterations.
+    static frame_queue_item_t item      = {0};
+    uint64_t                  last_tick = (uint64_t)esp_timer_get_time();
     while (1) {
         bool got = frame_queue_pop(s_queue, &item);
         // Tick the SBD reassembler periodically (~1 Hz) so stale
