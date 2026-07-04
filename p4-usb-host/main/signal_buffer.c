@@ -85,10 +85,14 @@ static SemaphoreHandle_t s_dma_done = NULL;
 //     cache-line stash buffer; esp_async_memcpy returns ESP_ERR_NO_MEM.
 //     This IS the count of "no mem for stash buffer" events that
 //     LOG_VERSION_2 + esp_log_level_set silence in the UART log.
-//   stash_alloc_recoveries — simple-path submit fails that we
-//     recovered via CPU memcpy (#126E). audio-dropped count =
-//     stash_alloc_fails - stash_alloc_recoveries (the wrap-path
-//     remainder we can't safely CPU-fallback).
+//   stash_alloc_recoveries — submit fails that we recovered via CPU
+//     memcpy: the simple path (#126E) and the wrap path when neither
+//     segment reached GDMA. stash_alloc_fails - stash_alloc_recoveries
+//     is now just the wrap sub-case where the first segment's GDMA was
+//     already in flight when the second failed to submit — the ring
+//     gets a garbage window there, but head still advances (no more
+//     permanent index desync; see signal_buffer_push's wrap-fail
+//     handling).
 //   dma_timeouts — s_dma_done wait timed out (a previous DMA's give
 //     never came). Untreated would hang signal_buffer_push forever ->
 //     ingest never signals s_ready -> class deadlocks in
@@ -259,6 +263,11 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
 
     esp_err_t r;
     bool      wrap = (aligned_bytes > bytes_to_end);
+    // Set only on the wrap path, true once the FIRST segment's GDMA submit
+    // has succeeded (i.e. it may be in flight reading s_align_scratch /
+    // writing the ring tail even though the overall push goes on to fail).
+    // Distinguishes the two wrap failure sub-cases below.
+    bool wrap_first_submitted = false;
     if (!wrap) {
         // Common path: single contiguous write. All three (src, dst, len)
         // are 64-aligned, so no cache-split-RX path triggered.
@@ -272,48 +281,67 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
         // Wrap: two writes. SIGNAL_BUF_SIZE is 64-multiple and head_bytes
         // is 64-aligned, so bytes_to_end is 64-aligned. aligned_bytes is
         // 64-multiple. Both submits are 64-aligned in src offset, dst
-        // offset, and length. (#107 wrap-failure handling preserved.)
+        // offset, and length.
         if (fault_inject_should_fail(FI_SITE_DMA_SUBMIT_WRAP)) {
-            r = ESP_ERR_NO_MEM; // synthetic (#122): exercise wrap-path drop (#107)
+            r = ESP_ERR_NO_MEM; // synthetic (#122): exercise wrap-path first-segment failure
         } else {
             r = esp_async_memcpy(s_dma, dst_base + head_bytes, s_align_scratch,
                                  bytes_to_end, NULL, NULL);
         }
         if (r == ESP_OK) {
-            size_t remainder = aligned_bytes - bytes_to_end;
-            r                = esp_async_memcpy(s_dma, dst_base,
-                                                ((uint8_t *)s_align_scratch) + bytes_to_end,
-                                                remainder, dma_done_cb, NULL);
+            wrap_first_submitted = true;
+            size_t remainder     = aligned_bytes - bytes_to_end;
+            r                    = esp_async_memcpy(s_dma, dst_base,
+                                                    ((uint8_t *)s_align_scratch) + bytes_to_end,
+                                                    remainder, dma_done_cb, NULL);
         }
     }
     if (r != ESP_OK) {
         // Submit failed — dma_done_cb won't fire and s_dma_done would
-        // never be returned (#106 deadlock class). Behaviour depends on
-        // wrap state:
+        // never be returned (#106 deadlock class), so every branch below
+        // gives it back synchronously. Recovery strategy depends on wrap
+        // state AND, on the wrap path, on which of the two segments
+        // failed:
         //
         //   Simple path (no wrap, #126E): CPU memcpy fallback. Nothing
         //   was enqueued. Both src+dst are 64-aligned (#125) so it's a
         //   plain block copy; ~50 us per 16 KB on Core 0. No audio
         //   dropped; head advances normally.
         //
-        //   Wrap path: keep the existing drop behaviour. If the FIRST
-        //   submit succeeded and the SECOND failed, the first GDMA is
-        //   in flight reading s_align_scratch. We'd need to wait for it
-        //   to complete before letting the next push overwrite scratch
-        //   — and GDMA's first transaction had a NULL callback, so we
-        //   have no signal for that. Wrap-path failures are extremely
-        //   rare with #125's alignment (the wrap itself is only at the
-        //   end of the 32 MB ring, and even then the per-transaction
-        //   alloc usually succeeds); not worth the complexity.
+        //   Wrap path, neither segment submitted (first failed): nothing
+        //   is in flight touching s_align_scratch or the ring, so it's
+        //   safe to CPU-recover both segments the same way, in two
+        //   pieces (end-of-ring then start-of-ring).
+        //
+        //   Wrap path, first segment submitted but second failed: the
+        //   first GDMA transaction may still be in flight reading
+        //   s_align_scratch / writing the ring tail, and it has a NULL
+        //   completion callback (#125's design — only the second
+        //   segment signals completion), so there is no way to wait for
+        //   it before touching either buffer. We do NOT CPU-recover this
+        //   case; we accept a single garbage window in the ring.
+        //
+        // In ALL wrap sub-cases head still advances by aligned_count
+        // (see below) instead of being left behind (the old #107
+        // behaviour). head is the base for every cumulative sample index
+        // -> ring offset mapping (signal_buffer_read_chunk, burst_valid,
+        // and the worker's start_idx % total_cap): leaving it unadvanced
+        // after the producer's own sample count has already moved on
+        // permanently desyncs that mapping for every future burst, not
+        // just this one. One bad decode window is far cheaper than a
+        // permanent skew.
         s_stash_alloc_fails++;
         if ((s_stash_alloc_fails & 0x3f) == 1) { // rate-limit to ~1/64
             // Log contains both 'stash_alloc_fail' (new canonical name)
             // and 'submit failed' (legacy phrase) so old grep filters
             // and any external dashboards keep matching.
             ESP_LOGW(TAG, "stash_alloc_fail (esp_async_memcpy submit failed): %s "
-                          "(n=%u, wrap=%d) — %s",
+                          "(n=%u, wrap=%d, wrap_first_submitted=%d) — %s",
                      esp_err_to_name(r), (unsigned)aligned_count, (int)wrap,
-                     wrap ? "chunk dropped, sem restored" : "CPU memcpy fallback");
+                     (int)wrap_first_submitted,
+                     !wrap ? "CPU memcpy fallback"
+                           : (wrap_first_submitted ? "garbage window, head still advanced"
+                                                   : "CPU memcpy fallback (both segments)"));
         }
         if (!wrap) {
             memcpy(dst_base + head_bytes, s_align_scratch, aligned_bytes);
@@ -329,10 +357,29 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
             s_stash_alloc_recoveries++;
             xSemaphoreGive(s_dma_done);
             // fall through to head + carry update — data IS in ring
-        } else {
-            // Wrap fail: drop, do not advance head, preserve carry.
+        } else if (!wrap_first_submitted) {
+            // Neither segment reached GDMA: nothing is in flight, so it
+            // is safe to CPU-recover both pieces of the wrap, mirroring
+            // the simple path but split at the ring end.
+            size_t remainder = aligned_bytes - bytes_to_end;
+            memcpy(dst_base + head_bytes, s_align_scratch, bytes_to_end);
+            esp_cache_msync(dst_base + head_bytes, bytes_to_end,
+                            ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            memcpy(dst_base, ((uint8_t *)s_align_scratch) + bytes_to_end, remainder);
+            esp_cache_msync(dst_base, remainder, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            s_stash_alloc_recoveries++;
             xSemaphoreGive(s_dma_done);
-            return;
+            // fall through to head + carry update — data IS in ring
+        } else {
+            // First segment's GDMA may still be in flight; cannot safely
+            // touch s_align_scratch or the ring tail from the CPU. Give
+            // the semaphore back (nothing will complete it otherwise) and
+            // fall through WITHOUT a CPU recovery — this chunk's ring
+            // contents may be stale/garbage for the second segment's
+            // span, but head still advances (see block comment above).
+            xSemaphoreGive(s_dma_done);
+            // fall through to head + carry update — audio in this window
+            // may be wrong; the index invariant is preserved regardless
         }
     }
 
