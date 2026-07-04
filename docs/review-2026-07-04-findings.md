@@ -19,7 +19,17 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
 - Note: the batch-1 firmware left on the bench was mistakenly the smoke image (a
   restore-to-normal step ran in the wrong cwd and silently failed); corrected in batch 2
   — device now runs the real normal streaming firmware.
-- Remaining open: T4t (sd_capture framing test) + T9–T54.
+- Batch 3 — T9, T10, T11, T12, T4t DONE, pushed. T9 keeps uw_correlator direction/SNR
+  in float (the int64 bridge was UB: `sum_dl_f≈2.63e20 > INT64_MAX`, independently
+  confirmed by instrumenting the pre-fix code); the `uw_correlator_golden` characterization
+  value was a snapshot of that UB output and was corrected 27.05→11.44 dB (the true
+  correlation peak-to-sidelobe ratio, hand-verified). **NB: CORR_USE_FLOAT_FFT=1 on
+  device, so device SNR reporting for strong bursts was UB-inflated and is now correct.**
+  T10 tagger baseline_sum overflow clamp, T11 resample scalar saturation, T12 SBD crc_ok
+  gate + da_len payload, T4t sd_capture framing host regression. On-device: batch-3
+  RAW_IRIDIUM SMOKE_PASS (DSP 520 µs/frame, corrected SNRs still clear the 10 dB gate) +
+  normal fw live-stable 4.88 MB/s. Four DSP-path commits carry `Smoke-verified:` trailers.
+- Remaining open: T13–T54 (see tiers below).
 
 Legend: **bug** / **sec** (security) / **perf**. "verified" = main agent
 re-read the source and confirmed the defect.
@@ -55,7 +65,7 @@ re-read the source and confirmed the defect.
   (no desync). Optionally a host model test of the index arithmetic. Rides the pre-push
   smoke gate already enforced for signal_buffer. **Highest-value gap** — T2 is the one
   decode-affecting bug and self-masks as "bad antenna/RF".
-- [ ] **T4t** sd_capture atomic-record framing (T4) has no automated regression. Factor
+- [x] **T4t** sd_capture atomic-record framing (T4) has no automated regression. Factor
   the whole-record space-check decision into a pure helper and host-test it; framing/fsync
   themselves are device-only (consider a device capture-mode assertion).
 
@@ -80,16 +90,16 @@ re-read the source and confirmed the defect.
 
 ## P2 — Medium
 
-- [ ] **T9** `uw_correlator.c:1411` — bug, verified. float→int64 magnitude bridge
+- [x] **T9** `uw_correlator.c:1411` — bug, verified. float→int64 magnitude bridge
   overflows int64 (UB) on strong burst; RISC-V saturates both dirs → tie → always UL.
   Fix: direction-pick + SNR in float/double.
-- [ ] **T10** `fft_burst_tagger.c:597` — bug, verified. `baseline_sum` int32 can
+- [x] **T10** `fft_burst_tagger.c:597` — bug, verified. `baseline_sum` int32 can
   overflow under coherent strong carrier in un-primed first 512 steps (code says
   "needs int64"). Fix: widen or clamp per-bin mag².
-- [ ] **T11** `resample_256_to_250.c:346` — bug, verified. scalar MAC store
+- [x] **T11** `resample_256_to_250.c:346` — bug, verified. scalar MAC store
   `(int16)(acc>>15)` no saturation, PIE path saturates → host/device divergence at
   full-scale, breaks bit-exact parity gate. Fix: saturate scalar store.
-- [ ] **T12** `sbd_reassembler.c` + `ida_decode.c:183` + `frame_decoder.c:332` — bug.
+- [x] **T12** `sbd_reassembler.c` + `ida_decode.c:183` + `frame_decoder.c:332` — bug.
   Session gate checks `ida.ok && header_ok` but NOT `crc_ok` (BCH false-positives
   pollute reassembly); multi-IDA-frame packets unrecoverable (da_cont/da_ctr unused);
   payload_len fixed 20/22 not da_len → filler bytes leak to ACARS parser.
