@@ -358,6 +358,25 @@ void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start)
     t->d_index = start;
 }
 
+// Pure scalar Q15 window-multiply kernel. Exported (declared in
+// fft_burst_tagger.h) so the host golden-fixture harness
+// (tests/host/test_window_multiply_golden.c) exercises the EXACT
+// function the device runs — single source of truth for the T50
+// bit-exact gate. Semantics are pinned: (int32)a * (int32)w >> 15,
+// TRUNCATING arithmetic shift (not rounding); any SIMD replacement
+// must reproduce this bit-for-bit.
+FBT_HOT void fbt_window_multiply_q15(const int16_t *input_iq,
+                                     const int16_t *window,
+                                     int16_t *out_iq, int n_complex)
+{
+    for (int i = 0; i < n_complex; i++) {
+        int32_t re        = (int32_t)input_iq[i * 2 + 0] * (int32_t)window[i];
+        int32_t im        = (int32_t)input_iq[i * 2 + 1] * (int32_t)window[i];
+        out_iq[i * 2 + 0] = (int16_t)(re >> 15);
+        out_iq[i * 2 + 1] = (int16_t)(im >> 15);
+    }
+}
+
 // Window-multiply the input into a caller-provided FFT scratch
 // buffer. Q15 × Q15 → Q15. Buffer-pointer parameter so pipelined
 // mode can ping-pong between two fft_buf instances.
@@ -365,12 +384,7 @@ static FBT_HOT void window_multiply(fft_burst_tagger_t *t,
                                     const int16_t      *input,
                                     int16_t            *fb_out)
 {
-    for (int i = 0; i < N; i++) {
-        int32_t re        = (int32_t)input[i * 2 + 0] * (int32_t)t->window[i];
-        int32_t im        = (int32_t)input[i * 2 + 1] * (int32_t)t->window[i];
-        fb_out[i * 2 + 0] = (int16_t)(re >> 15);
-        fb_out[i * 2 + 1] = (int16_t)(im >> 15);
-    }
+    fbt_window_multiply_q15(input, t->window, fb_out, N);
 }
 
 // Compute |FFT output|² with FFT-shift (bin 0 = -fs/2, bin N/2 = DC,

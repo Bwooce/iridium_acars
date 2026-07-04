@@ -149,3 +149,18 @@ void fft_burst_tagger_flush(fft_burst_tagger_t *t,
 // calls; per-step values are out[i] / *steps. Safe to call without
 // instrumentation enabled — returns zeros.
 void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps);
+
+// Scalar Q15 window-multiply kernel — the tagger's window stage AND
+// the bit-exact REFERENCE for any SIMD replacement (T50 golden
+// harness, tests/host/test_window_multiply_golden.c). For each
+// complex sample i in [0, n_complex):
+//   out_iq[2i+0] = (int16_t)(((int32_t)input_iq[2i+0] * window[i]) >> 15)
+//   out_iq[2i+1] = (int16_t)(((int32_t)input_iq[2i+1] * window[i]) >> 15)
+// i.e. Q15 multiply with TRUNCATING (floor) shift, no rounding, no
+// saturation. The device window table is a Q15 Blackman (values in
+// [0, 32767], never negative). Do not change this arithmetic without
+// regenerating the golden fixture — and don't do that to make a
+// candidate kernel pass (no test-fitting).
+void fbt_window_multiply_q15(const int16_t *input_iq,
+                             const int16_t *window,
+                             int16_t *out_iq, int n_complex);

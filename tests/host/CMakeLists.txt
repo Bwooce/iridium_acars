@@ -202,6 +202,21 @@ target_include_directories(test_fft_burst_tagger PRIVATE
 )
 target_link_libraries(test_fft_burst_tagger PRIVATE m)
 
+# T50 golden-fixture bit-exact harness for the tagger window-multiply
+# (chain C prerequisite, perf-decoupling design 2026-07-04 §T50). Pins
+# the scalar fbt_window_multiply_q15 output over deterministic vectors
+# (embedded FNV baseline, test_direct_if_decim_golden idiom) and gates
+# any candidate replacement kernel at EXACT-ZERO elementwise diff.
+# Includes always-on negative controls (rounding / 1-LSB perturbations
+# must be detected) and a --demo-fail red-path mode.
+add_executable(test_window_multiply_golden
+    test_window_multiply_golden.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_window_multiply_golden PRIVATE ${COMMON_DIR})
+target_link_libraries(test_window_multiply_golden PRIVATE m)
+
 # Phase 3.6.M: C direct-IF decimator vs Python scipy reference. For
 # one burst, runs the same rotate+decim in C and compares NMSE
 # against /tmp/host_direct_if/burst_NNN.cf32 (the Python output).
@@ -631,6 +646,7 @@ add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME resample_split        COMMAND test_resample_split)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
+add_test(NAME window_multiply_golden COMMAND test_window_multiply_golden)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
 add_test(NAME rotate_to_dc          COMMAND test_rotate_to_dc)
