@@ -325,12 +325,16 @@ void pie_fft_diff_run(void)
 // On-device PIE FFT heap-placement sweep (#120 prep).
 //
 // The PIE float FFT (dsps_fft2r_fc32_arp4) operates in-place on a scratch
-// buffer and is known to silently corrupt when that buffer lands in
-// certain heap address ranges (project_heap_position_decode_bug).
-// uw_correlator works today only because the boot-time early-alloc dance
-// pins s_pie_fft_scratch to a known-good address. Before #120 can move
-// that scratch into a per-instance context (heap-allocated at an arbitrary
-// address), we need to know which addresses are actually safe.
+// buffer and is known to silently corrupt when that buffer is NOT in main
+// internal DRAM — under DRAM pressure MALLOC_CAP_INTERNAL falls back to
+// RTCRAM (0x5010_xxxx), where the PIE vector loads mis-decode
+// (project_heap_position_decode_bug). uw_correlator now pins its scratch
+// in DRAM via uw_correlator_prealloc_pie_fft(), called from the boot-time
+// early-alloc dance (class_driver.c / smoke_test.c) while DRAM is plentiful,
+// with an esp_ptr_in_dram guard that fails loudly on a non-DRAM placement.
+// This sweep walks the main-DRAM arena; note it does NOT exercise the
+// RTCRAM fallback that actually caused the bug (that is caught by the guard
+// + the RAW smoke's GOLDEN-matched gate).
 //
 // This walks a large internal-SRAM arena, runs the PIE FFT at many
 // 16-aligned offsets within it on a fixed broadband input, and compares

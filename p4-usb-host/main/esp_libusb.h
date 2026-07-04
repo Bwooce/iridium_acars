@@ -4,7 +4,6 @@
 #include "usb/usb_host.h"
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 
 #ifndef portMAX_DELAY
@@ -50,10 +49,11 @@ typedef struct
 #define ASYNC_TRANSFER_COUNT 8
 #define ASYNC_TRANSFER_SIZE (8 * 1024)
 
-// PSRAM stream ringbuffer size. Single source of truth for both the
-// xRingbufferCreateWithCaps call and the /status capacity metric —
-// these were once separate literals and drifted 8× apart after the
-// 512 KB → 4 MB upgrade (#109).
+// PSRAM stream ring size. Single source of truth for both the
+// usbring_init() call and the /status capacity metric — these were
+// once separate literals and drifted 8× apart after the 512 KB → 4 MB
+// upgrade (#109). MUST stay a power of two (usbring_init() rejects
+// anything else) — 4 MiB already is.
 #define STREAM_RINGBUF_BYTES (4 * 1024 * 1024)
 
 typedef struct
@@ -73,20 +73,36 @@ typedef struct
     // has in flight (#T8).
     SemaphoreHandle_t xfer_mutex;
 
-    // Async streaming
-    RingbufHandle_t ringbuf;
+    // Async streaming. The stream byte ring itself is a module-level
+    // singleton owned by usbring.c (T49a) — mirrors signal_buffer.c's
+    // circular_buf pattern — so there's no handle to store here anymore.
     usb_transfer_t *transfers[ASYNC_TRANSFER_COUNT];
     bool            streaming;
 } class_adsb_dev;
 
-void                init_adsb_dev();
-void                bulk_transfer_read_cb(usb_transfer_t *transfer);
-void                stream_transfer_cb(usb_transfer_t *transfer);
-void                transfer_read_cb(usb_transfer_t *transfer);
-int                 esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint, unsigned char *data, int length, int *transferred, unsigned int timeout);
-int                 esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout);
-int                 esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint);
-int                 esp_libusb_read_stream(uint8_t *buffer, size_t length, size_t *received, TickType_t timeout);
+void init_adsb_dev();
+void bulk_transfer_read_cb(usb_transfer_t *transfer);
+void stream_transfer_cb(usb_transfer_t *transfer);
+void transfer_read_cb(usb_transfer_t *transfer);
+int  esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint, unsigned char *data, int length, int *transferred, unsigned int timeout);
+int  esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout);
+int  esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint);
+// Zero-copy stream read (T49a): peeks the usbring instead of memcpy'ing
+// into a caller buffer. On success (return 0), *out_ptr points directly
+// into the ring's PSRAM backing store and *received is the contiguous
+// byte count available there, clamped to max_length (which may be LESS
+// than max_length near a physical wrap boundary — callers must already
+// tolerate short reads, same as before). Always non-blocking (the old
+// `timeout` parameter is gone — every call site used 0). The caller
+// MUST eventually pass the same *received count to
+// esp_libusb_consume_stream() once it — and anything it handed the
+// pointer to — is done reading, before peeking again (see usbring.h's
+// "single outstanding span" note).
+int esp_libusb_read_stream(const uint8_t **out_ptr, size_t max_length, size_t *received);
+// Reclaim `n` bytes at the ring's tail. Must match a length previously
+// returned by esp_libusb_read_stream() that hasn't already been
+// (partially) consumed.
+void                esp_libusb_consume_stream(size_t n);
 void                esp_libusb_get_ringbuffer_info(size_t *used, size_t *capacity);
 usb_device_handle_t esp_libusb_get_dev_hdl();
 void                esp_libusb_set_dev_hdl(usb_device_handle_t hdl);

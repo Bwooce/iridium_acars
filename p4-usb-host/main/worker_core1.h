@@ -52,4 +52,11 @@ void worker_core1_get_histograms(worker_histograms_t *out);
 // CONFIG_SMOKE_TEST_RAW_IRIDIUM build.
 void worker_core1_golden_print_summary(void);
 
+// Smoke-only: read the golden-match counters (RAW_IRIDIUM fixture). Used
+// by the RAW smoke to gate on real decode correctness (matched vs the 65
+// gr-iridium golden frames) instead of a coarse classified-count that
+// includes UNKNOWN/BCH false positives. matched cratering (e.g. 62 -> 4)
+// is the PIE RTCRAM-spill decode regression (project_heap_position_decode_bug).
+void worker_core1_golden_get(uint32_t *matched, uint32_t *decoded, int *gri_total);
+
 #endif

@@ -23,6 +23,7 @@
 #include "ingest_core1.h"
 #include "resample_256_to_250.h"
 #include "fft_sc16_2048.h"
+#include "uw_correlator.h"
 #include "app_config.h"
 #include "sd_capture.h"
 #include "class_driver.h"
@@ -57,6 +58,7 @@ static volatile int  s_last_gain_dbx10 = -1;
 enum { CS_TOP = 0,
        CS_HANDLE_EVENTS,
        CS_ACQUIRE,
+       CS_RAW_DONE, // T49a: wait+consume the previous dispatch's ring span
        CS_READ,
        CS_DISPATCH,
        CS_TAKE_CONVERTED,
@@ -64,8 +66,8 @@ enum { CS_TOP = 0,
        CS_RELEASE,
        CS_REPORT };
 static const char *const k_class_stage_name[] = {
-    "top", "handle_events", "acquire_raw", "read_stream", "dispatch",
-    "take_converted", "dsp_feed", "release", "report"};
+    "top", "handle_events", "acquire_slot", "raw_done_consume", "read_stream",
+    "dispatch", "take_converted", "dsp_feed", "release", "report"};
 static volatile uint8_t  s_class_stage    = CS_TOP;
 static volatile uint64_t s_class_iter     = 0; // loop iterations
 static volatile int64_t  s_class_stage_us = 0; // when the stage was entered
@@ -198,6 +200,10 @@ static void action_start_stream(class_driver_t *driver_obj)
     // See project_heap_position_decode_bug.md.
     resample_256_to_250_alloc_coeffs();
     fft_sc16_2048_init();
+    // uw_correlator's PIE float-FFT scratch (16 KB) must be pinned in DRAM
+    // here too: left to the worker's lazy first call it spills to RTCRAM
+    // under DRAM pressure and silently mis-decodes (the ~95%->~6% cliff).
+    uw_correlator_prealloc_pie_fft();
     // The pipeline inits can fail (ESP_ERR_NO_MEM). Proceeding with a
     // half-built pipeline either crashes (acquire on a NULL semaphore)
     // or runs silently dead (signal_buffer_push no-ops without its
@@ -298,15 +304,28 @@ void class_driver_task(void *arg)
     // post-enumeration case where bytes_window stalls to zero.
 
     uint32_t out_block_size = 16 * 1024;
-    // The raw + converted buffers are owned by ingest_core1 (ping-pong on
-    // Core 1). class_driver acquires raw buffers via ingest_core1_acquire_raw
-    // and consumes converted buffers via ingest_core1_take_converted.
+    // The converted buffers are owned by ingest_core1 (ping-pong on Core 1).
+    // class_driver reserves output slots via ingest_core1_acquire_slot,
+    // peeks raw USB bytes straight out of the usbring PSRAM ring (T49a —
+    // esp_libusb_read_stream is zero-copy now), and consumes converted
+    // buffers via ingest_core1_take_converted.
 
     // Ping-pong steady-state book-keeping. We start by reading into slot 0;
     // the matching DSP feed for slot 0 happens AFTER slot 1 has been
     // dispatched (one-cycle pipeline). prev_dsp_slot tracks which slot the
     // DSP should next consume; it's -1 on the very first iteration.
     int prev_dsp_slot = -1;
+
+    // T49a: the usbring only supports ONE outstanding un-consumed span
+    // (usbring_peek() always views from the current tail — see
+    // usbring.h). raw_bytes[slot] records how many ring bytes each
+    // slot's last dispatch peeked, so the NEXT read can wait for Core 1
+    // to finish reading them (ingest_core1_wait_raw_done) and
+    // reclaim them (esp_libusb_consume_stream) before peeking again.
+    // This is a NEW synchronisation point (see ingest_core1.h); it does
+    // not change the existing acquire(s_free)/dispatch/take(s_ready)/
+    // release(s_free) sequence's order or blocking semantics.
+    size_t raw_bytes[INGEST_NUM_SLOTS] = {0};
 
     uint64_t total_bytes = 0;
     int64_t  start_time  = esp_timer_get_time();
@@ -404,19 +423,35 @@ void class_driver_task(void *arg)
             continue;
         }
 
-        // Ping-pong path: read USB into a Core-1-owned raw buffer, dispatch
-        // it to the ingest task for convert+push, then consume the previous
-        // cycle's converted slot via DSP. Core 1 (ingest) and Core 0 (DSP
-        // feed) overlap, which collapses the per-cycle wall time on Core 0
-        // from "read + convert + push + feed" to "read + feed".
+        // Ping-pong path: peek raw USB bytes straight out of the usbring
+        // (T49a — no consumer-side copy), dispatch the ring region to the
+        // ingest task for convert+push, then consume the previous cycle's
+        // converted slot via DSP. Core 1 (ingest) and Core 0 (DSP feed)
+        // overlap, which collapses the per-cycle wall time on Core 0 from
+        // "read + convert + push + feed" to "read + feed".
         int slot_for_read;
         class_stage(CS_ACQUIRE);
-        uint8_t *raw = ingest_core1_acquire_raw(&slot_for_read);
+        ingest_core1_acquire_slot(&slot_for_read);
 
-        size_t  n_read       = 0;
-        int64_t t_read_start = esp_timer_get_time();
+        // T49a: the usbring supports only one outstanding un-consumed
+        // span. Before peeking fresh data, reclaim the PREVIOUS cycle's
+        // dispatch (if any) once Core 1 confirms (raw_done) it has
+        // finished reading it. This is the "acquire-next serialises
+        // against convert-done" tradeoff the design doc calls out —
+        // a NEW wait, spliced in before the existing acquire/read/
+        // dispatch/take/release sequence, not a change to that
+        // sequence's own ordering.
+        class_stage(CS_RAW_DONE);
+        if (prev_dsp_slot >= 0) {
+            ingest_core1_wait_raw_done(prev_dsp_slot);
+            esp_libusb_consume_stream(raw_bytes[prev_dsp_slot]);
+        }
+
+        size_t         n_read       = 0;
+        const uint8_t *raw          = NULL;
+        int64_t        t_read_start = esp_timer_get_time();
         class_stage(CS_READ);
-        int     read_ok    = esp_libusb_read_stream(raw, out_block_size, &n_read, 0);
+        int     read_ok    = esp_libusb_read_stream(&raw, out_block_size, &n_read);
         int64_t t_read_end = esp_timer_get_time();
 
         if (read_ok == 0) {
@@ -443,11 +478,15 @@ void class_driver_task(void *arg)
             // into a PSRAM stream buffer (non-blocking, drops on
             // overflow). Tap is here — pre-dispatch — so we
             // capture the exact uint8 payload before any conversion.
+            // Reads straight from the ring pointer; safe because the
+            // region isn't reclaimed (usbring_consume) until next
+            // cycle, well after this synchronous call returns.
             sd_capture_write(raw, n_read);
 
-            // Hand the freshly-filled raw buffer to ingest on Core 1.
-            // Convert + push happen there; we don't block on completion.
-            ingest_core1_dispatch(slot_for_read, n_read);
+            // Hand the ring region to ingest on Core 1. Convert + push
+            // happen there; we don't block on completion.
+            ingest_core1_dispatch(slot_for_read, raw, n_read);
+            raw_bytes[slot_for_read] = n_read;
 
             // If we have a previous slot in flight, consume it now via DSP.
             // Wait for Core 1's ingest to mark it ready (typically immediate
@@ -478,11 +517,14 @@ void class_driver_task(void *arg)
             // acquired, drain any in-flight slot from the previous cycle.
             // Skipping this deadlocked the loop: with prev_dsp_slot's
             // s_free still held and the rotation pointer already advanced
-            // past the slot we're releasing, the next acquire_raw blocks
+            // past the slot we're releasing, the next acquire_slot blocks
             // forever on s_free[prev_dsp_slot] — which only this task can
             // give, after a take_converted it can no longer reach. Armed
             // exactly when the stream pauses (dongle hiccup / unplug /
-            // quiet ring); the #105/#106 "stuck in acquire_raw" signature.
+            // quiet ring); the #105/#106 "stuck in acquire_slot" signature.
+            // (The prev_dsp_slot's ring span, if any, was already reclaimed
+            // above at CS_RAW_DONE — unaffected by whether THIS cycle's
+            // read finds new data.)
             if (prev_dsp_slot >= 0) {
                 size_t   n_int16   = 0;
                 int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
@@ -491,7 +533,8 @@ void class_driver_task(void *arg)
                 prev_dsp_slot = -1;
             }
             // Release the slot we just acquired so ingest can reuse it
-            // (we never dispatched).
+            // (we never dispatched — nothing to reclaim from the ring
+            // for it).
             ingest_core1_release(slot_for_read);
         }
 

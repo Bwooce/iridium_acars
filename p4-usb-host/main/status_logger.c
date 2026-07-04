@@ -207,13 +207,14 @@ static void emit(const status_snapshot_t *s)
     // /diag/recovery_counters exactly — same names in log and endpoint.
     // Component prefixes (usb./sb./ing.) so grepping for one
     // component's counters is straightforward.
-    uint32_t sb_fails      = signal_buffer_stash_alloc_fails();
-    uint32_t sb_recoveries = signal_buffer_stash_alloc_recoveries();
-    uint32_t sb_dma_to     = signal_buffer_dma_timeouts();
-    uint32_t ic_disp_drops = ingest_core1_dispatch_drops();
-    uint32_t ic_slow_waits = ingest_core1_take_converted_slow_waits();
-    uint32_t lu_pool_lost  = esp_libusb_xfer_pool_lost();
-    uint32_t sb_audio_drop = (sb_fails > sb_recoveries) ? (sb_fails - sb_recoveries) : 0;
+    uint32_t sb_fails         = signal_buffer_stash_alloc_fails();
+    uint32_t sb_recoveries    = signal_buffer_stash_alloc_recoveries();
+    uint32_t sb_dma_to        = signal_buffer_dma_timeouts();
+    uint32_t ic_disp_drops    = ingest_core1_dispatch_drops();
+    uint32_t ic_slow_waits    = ingest_core1_take_converted_slow_waits();
+    uint32_t ic_raw_slow_wait = ingest_core1_raw_done_slow_waits(); // T49a
+    uint32_t lu_pool_lost     = esp_libusb_xfer_pool_lost();
+    uint32_t sb_audio_drop    = (sb_fails > sb_recoveries) ? (sb_fails - sb_recoveries) : 0;
 
     uint32_t dma_free    = heap_caps_get_free_size(MALLOC_CAP_DMA);
     uint32_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
@@ -227,17 +228,19 @@ static void emit(const status_snapshot_t *s)
     // safe.)
     static uint32_t prev_sb_fails = 0, prev_sb_dma_to = 0,
                     prev_ic_disp_drops = 0, prev_ic_slow_waits = 0,
-                    prev_lu_pool_lost = 0;
-    bool any_recovery                 = (sb_fails != prev_sb_fails) ||
+                    prev_ic_raw_slow_wait = 0, prev_lu_pool_lost = 0;
+    bool any_recovery = (sb_fails != prev_sb_fails) ||
                         (sb_dma_to != prev_sb_dma_to) ||
                         (ic_disp_drops != prev_ic_disp_drops) ||
                         (ic_slow_waits != prev_ic_slow_waits) ||
+                        (ic_raw_slow_wait != prev_ic_raw_slow_wait) ||
                         (lu_pool_lost != prev_lu_pool_lost);
-    prev_sb_fails      = sb_fails;
-    prev_sb_dma_to     = sb_dma_to;
-    prev_ic_disp_drops = ic_disp_drops;
-    prev_ic_slow_waits = ic_slow_waits;
-    prev_lu_pool_lost  = lu_pool_lost;
+    prev_sb_fails         = sb_fails;
+    prev_sb_dma_to        = sb_dma_to;
+    prev_ic_disp_drops    = ic_disp_drops;
+    prev_ic_slow_waits    = ic_slow_waits;
+    prev_ic_raw_slow_wait = ic_raw_slow_wait;
+    prev_lu_pool_lost     = lu_pool_lost;
 
     bool over_capacity = (dsp_pct > 80.0) || (worker_pct > 80.0);
     if (over_capacity || s->us.rb_full_drops || s->us.status_errors ||
@@ -247,14 +250,14 @@ static void emit(const status_snapshot_t *s)
                  "usb[rb_full=%u status_err=%u resubmit_err=%u pool_lost=%u last=0x%02x] "
                  "worker[dropped=%u] "
                  "sb[stash_fails=%u recoveries=%u audio_dropped=%u dma_timeouts=%u] "
-                 "ing[dispatch_drops=%u slow_waits=%u] "
+                 "ing[dispatch_drops=%u slow_waits=%u raw_slow_waits=%u] "
                  "heap[dma_free=%uKB dma_largest=%uKB]",
                  dsp_pct, worker_pct,
                  s->us.rb_full_drops, s->us.status_errors,
                  s->us.resubmit_errors, lu_pool_lost, s->us.last_error_status,
                  s->ws.bursts_dropped,
                  sb_fails, sb_recoveries, sb_audio_drop, sb_dma_to,
-                 ic_disp_drops, ic_slow_waits,
+                 ic_disp_drops, ic_slow_waits, ic_raw_slow_wait,
                  dma_free / 1024, dma_largest / 1024);
     }
 #endif

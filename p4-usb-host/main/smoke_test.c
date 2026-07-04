@@ -26,6 +26,7 @@
 #include "esp_attr.h"
 #include "resample_256_to_250.h"
 #include "fft_sc16_2048.h"
+#include "uw_correlator.h"
 #include "esp_chip_info.h"
 #include "sdkconfig.h"
 #include "ingest_core1.h"
@@ -208,16 +209,31 @@ static void fill_tone(uint8_t *out, int tone_bin)
     }
 }
 
+// T49a: ingest_core1 no longer owns a raw input buffer per slot (the
+// production path hands ingest_task a pointer straight into the
+// usbring PSRAM ring instead). This harness bypasses esp_libusb/usbring
+// entirely and calls ingest_core1_dispatch() directly, so it needs its
+// own per-slot scratch to hand off a stable pointer — reusing the
+// caller's shared `synth` buffer directly would race the NEXT
+// iteration's fill against ingest_task still reading the CURRENT one.
+// Two slots, matching INGEST_NUM_SLOTS: re-acquiring slot i already
+// waits (via s_free[i]) for ingest_task's PREVIOUS use of slot i to be
+// fully done (convert+resample+push+s_ready), which is stronger than
+// the "convert done" gate the real ring needs — no extra wait required
+// here, unlike class_driver's usbring-backed path.
+static EXT_RAM_BSS_ATTR uint8_t s_smoke_raw[INGEST_NUM_SLOTS][TRANSFER_BYTES]
+    __attribute__((aligned(64)));
+
 // Drive one transfer through the production ingest -> dsp_processor path.
 // `prev_slot` is the slot index from the previous call (or -1 first time);
 // returns the slot index this call dispatched, for the next iteration's
 // prev_slot.
 static int drive_transfer(uint8_t *src, int prev_slot)
 {
-    int      slot;
-    uint8_t *raw = ingest_core1_acquire_raw(&slot);
-    memcpy(raw, src, TRANSFER_BYTES);
-    ingest_core1_dispatch(slot, TRANSFER_BYTES);
+    int slot;
+    ingest_core1_acquire_slot(&slot);
+    memcpy(s_smoke_raw[slot], src, TRANSFER_BYTES);
+    ingest_core1_dispatch(slot, s_smoke_raw[slot], TRANSFER_BYTES);
 
     if (prev_slot >= 0) {
         size_t   n_int16   = 0;
@@ -507,7 +523,7 @@ void smoke_test_run(void)
 // Per-phase heap diagnostic: tracks how internal-SRAM fragmentation
 // evolves through init. Prints total + largest-contiguous free for
 // MALLOC_CAP_INTERNAL (all internal) and MALLOC_CAP_INTERNAL|DMA
-// (DMA-capable subset, used by s_raw / USB pool).
+// (DMA-capable subset, used by the USB transfer pool).
 #define HEAP_LOG(where)                                                                      \
     do {                                                                                     \
         size_t fi  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);                           \
@@ -529,8 +545,12 @@ void smoke_test_run(void)
     //      The PIE FFT operates ON s_fft_scratch directly; if it
     //      lands in the broken zone (e.g., 0x4ff6_xxxx), the
     //      tagger FFT silently corrupts and decode collapses.
+    //   3. uw_correlator PIE float-FFT scratch (16 KB) — the WORKER's
+    //      decode FFT. Under DRAM pressure its lazy alloc spills to
+    //      RTCRAM where the PIE unit mis-decodes (RAW recall ~95%->~6%).
     resample_256_to_250_alloc_coeffs();
     fft_sc16_2048_init();
+    uw_correlator_prealloc_pie_fft();
     HEAP_LOG("post-pie-buffers");
     HEAP_LOG("pre-signal_buffer");
     if (signal_buffer_init() != ESP_OK) {
@@ -585,8 +605,9 @@ void smoke_test_run(void)
 
     // Stack-borrowed scratch is too small for 16 KB; use a static buffer.
     // Lives in PSRAM (EXT_RAM_BSS_ATTR) — the buffer is filled then
-    // memcpy'd into ingest_core1's slot (which is internal+DMA), never
-    // DMA'd directly. Frees 16 KB of internal .bss for hotter consumers.
+    // memcpy'd into drive_transfer's own per-slot scratch (s_smoke_raw,
+    // also PSRAM), never DMA'd directly. Frees 16 KB of internal .bss
+    // for hotter consumers.
     static EXT_RAM_BSS_ATTR uint8_t synth[TRANSFER_BYTES] __attribute__((aligned(64)));
 
     int prev_slot = -1;
@@ -885,10 +906,15 @@ void smoke_test_run(void)
     // at least one burst (since bursts are at their natural offsets
     // in the 2.56 MHz subband, peak_bin is correct for freq centring).
     // Wait for queues to drain, then check frame_decoder counts.
-    // Floor: baseline (captured 2026-06-15, commit 4aa58f7, ESP32-P4 v1.3)
-    // is UNKNOWN=3 BC=1 LW.DA=2 -> total=6 classified, GOLDEN matched=4.
-    // Floor at 5 (baseline 6, -1 tolerance) — real PIE heap-position
-    // corruption (project_heap_position_decode_bug) craters this to 0-1.
+    // NOTE: this classified-count floor is a WEAK secondary sanity check
+    // only. Its old "baseline 6 -> floor 5" was CALIBRATED TO THE CORRUPTED
+    // DEVICE (the 2026-06-15 baseline of total=6/matched=4 was itself the
+    // PIE-FFT-to-RTCRAM heap-position bug), and the assumption that
+    // corruption "craters to 0-1" was wrong — it sat at 6-7, just above
+    // the floor, and passed for months. total_classified also counts
+    // UNKNOWN/BCH false positives. The REAL decode-correctness gate is now
+    // the GOLDEN-matched assertion below (matched vs the 65 gr-iridium
+    // frames). Keep this only to catch a total pipeline stall.
 #define RAW_IRIDIUM_MIN_CLASSIFIED 5
 #if CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
     // COMBINED gate semantics differ from STANDALONE (#137). The worker
@@ -948,6 +974,29 @@ void smoke_test_run(void)
                  snr_db);
         pass = false;
     }
+    // PRIMARY decode-correctness gate (STANDALONE): assert the worker
+    // actually decoded the majority of the 65 gr-iridium golden frames.
+    // total_classified>=5 above is a WEAK secondary check — it counts
+    // UNKNOWN/BCH false positives, so it passed even when real decode
+    // cratered (the PIE-FFT-to-RTCRAM bug: matched 62->4, recall 95%->6%,
+    // long mistaken for an antenna problem). Healthy: matched~62;
+    // corruption: matched~4. Floor 40 (~62% recall) separates them with
+    // wide margin and is what a working PIE FFT reliably clears.
+#if !CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
+    uint32_t g_matched = 0, g_decoded = 0;
+    int      g_gri = 0;
+    worker_core1_golden_get(&g_matched, &g_decoded, &g_gri);
+#define RAW_IRIDIUM_MIN_GOLDEN_MATCHED 40
+    ESP_LOGI(TAG, "GOLDEN gate: matched=%u/%d decoded=%u (need matched>=%d)",
+             g_matched, g_gri, g_decoded, RAW_IRIDIUM_MIN_GOLDEN_MATCHED);
+    if ((int)g_matched < RAW_IRIDIUM_MIN_GOLDEN_MATCHED) {
+        ESP_LOGE(TAG, "  GOLDEN matched %u < floor %d — real decode REGRESSION "
+                      "(most likely PIE FFT scratch spilled to RTCRAM / "
+                      "project_heap_position_decode_bug)",
+                 g_matched, RAW_IRIDIUM_MIN_GOLDEN_MATCHED);
+        pass = false;
+    }
+#endif
     // Golden-bits comparison: per-burst Hamming distance vs gri's
     // canonical decoded bits, with claim-tracking so each gri entry
     // is matched at most once and unclaimed entries are surfaced as

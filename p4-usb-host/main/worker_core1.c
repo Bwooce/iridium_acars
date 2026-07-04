@@ -284,6 +284,13 @@ static void golden_compare_burst(const detected_burst_t *burst,
     }
 }
 
+void worker_core1_golden_get(uint32_t *matched, uint32_t *decoded, int *gri_total)
+{
+    if (matched) *matched = s_gold_matched;
+    if (decoded) *decoded = s_gold_decoded;
+    if (gri_total) *gri_total = FIXTURE_ALBQ_RAW_GOLDEN_COUNT;
+}
+
 void worker_core1_golden_print_summary(void)
 {
     int n_gri    = FIXTURE_ALBQ_RAW_GOLDEN_COUNT;

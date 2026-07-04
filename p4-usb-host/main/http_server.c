@@ -953,7 +953,8 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
                                "},"
                                "\"ingest_core1\":{"
                                "\"dispatch_drops\":%u,"
-                               "\"slow_waits\":%u"
+                               "\"slow_waits\":%u,"
+                               "\"raw_slow_waits\":%u"
                                "},"
                                "\"esp_libusb\":{"
                                "\"xfer_pool_lost\":%u"
@@ -963,6 +964,7 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
                           (unsigned)signal_buffer_dma_timeouts(),
                           (unsigned)ingest_core1_dispatch_drops(),
                           (unsigned)ingest_core1_take_converted_slow_waits(),
+                          (unsigned)ingest_core1_raw_done_slow_waits(),
                           (unsigned)esp_libusb_xfer_pool_lost());
     if (n < 0 || n >= (int)sizeof(body)) n = sizeof(body) - 1;
     httpd_resp_set_type(req, "application/json");

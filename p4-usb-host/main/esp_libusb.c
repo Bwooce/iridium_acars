@@ -3,6 +3,7 @@
 #include "esp_libusb.h"
 #include "esp_timer.h"
 #include "fault_inject.h"
+#include "usbring.h"
 
 static class_adsb_dev *adsbdev;
 
@@ -261,18 +262,14 @@ void stream_transfer_cb(usb_transfer_t *transfer)
             if (post_grace) s_total_short_xfers++;
         }
         if (transfer->actual_num_bytes > 0) {
-            // Sample fill BEFORE the send. vRingbufferGetInfo's last arg is
-            // uxItemsWaiting which IS the used-byte count for a byte buffer
-            // (not free bytes — earlier code had this inverted).
-            UBaseType_t items_waiting = 0;
-            vRingbufferGetInfo(dev->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
-            size_t used_bytes = (size_t)items_waiting;
+            // Sample fill BEFORE the write (usbring_get_info reads head/tail).
+            size_t used_bytes = 0;
+            usbring_get_info(&used_bytes, NULL);
             if (used_bytes > s_producer_rb_max_used) s_producer_rb_max_used = used_bytes;
             s_producer_samples++;
 
-            BaseType_t ok = xRingbufferSend(dev->ringbuf, transfer->data_buffer,
-                                            transfer->actual_num_bytes, 0);
-            if (ok != pdTRUE) {
+            bool ok = usbring_write(transfer->data_buffer, (uint32_t)transfer->actual_num_bytes);
+            if (!ok) {
                 s_xfer_rb_full_drops++;
                 if (post_grace) s_total_rb_full_drops++;
                 s_producer_rb_used_at_drop = used_bytes;
@@ -393,10 +390,10 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
     // samples corrupting downstream burst data. 4 MB is well within
     // the 32 MB PSRAM budget and turns the consumer-stall window
     // into a true elastic queue.
-    dev->ringbuf = xRingbufferCreateWithCaps(STREAM_RINGBUF_BYTES,
-                                             RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
-    if (dev->ringbuf == NULL) {
-        ESP_LOGE("LIBUSB", "Failed to create stream ringbuffer in PSRAM");
+    esp_err_t ring_rc = usbring_init(STREAM_RINGBUF_BYTES);
+    if (ring_rc != ESP_OK) {
+        ESP_LOGE("LIBUSB", "Failed to create stream ring in PSRAM: %s",
+                 esp_err_to_name(ring_rc));
         return -1;
     }
 
@@ -459,44 +456,33 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
     return 0;
 }
 
-int esp_libusb_read_stream(uint8_t *buffer, size_t length, size_t *received, TickType_t timeout)
+int esp_libusb_read_stream(const uint8_t **out_ptr, size_t max_length, size_t *received)
 {
-    class_adsb_dev *dev = adsbdev;
-    if (!dev || !dev->ringbuf) {
+    if (!adsbdev) {
         *received = 0;
         return -1;
     }
 
-    size_t   item_size;
-    uint8_t *item = xRingbufferReceiveUpTo(dev->ringbuf, &item_size, timeout, length);
-    if (item != NULL) {
-        memcpy(buffer, item, item_size);
-        vRingbufferReturnItem(dev->ringbuf, item);
-        *received = item_size;
-        return 0;
+    uint32_t       n_contig = 0;
+    const uint8_t *ptr      = usbring_peek(&n_contig);
+    if (ptr == NULL || n_contig == 0) {
+        *received = 0;
+        return -1;
     }
-    *received = 0;
-    return -1;
+    size_t n  = (size_t)n_contig < max_length ? (size_t)n_contig : max_length;
+    *out_ptr  = ptr;
+    *received = n;
+    return 0;
+}
+
+void esp_libusb_consume_stream(size_t n)
+{
+    usbring_consume((uint32_t)n);
 }
 
 void esp_libusb_get_ringbuffer_info(size_t *used, size_t *capacity)
 {
-    if (adsbdev && adsbdev->ringbuf) {
-        // vRingbufferGetInfo's last arg is uxItemsWaiting which for a
-        // RINGBUF_TYPE_BYTEBUF is the number of pending bytes (= used).
-        // Earlier code passed this into a variable called `free` and then
-        // computed (1 - free/total) as "usage", which was inverted.
-        UBaseType_t items_waiting = 0;
-        vRingbufferGetInfo(adsbdev->ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
-        *used = (size_t)items_waiting;
-        // Capacity must track the actual ringbuf allocation above
-        // (was hardcoded 512 KB after the 512 KB → 4 MB upgrade —
-        // every /status utilisation metric was 8× under-reported). #109
-        *capacity = STREAM_RINGBUF_BYTES;
-    } else {
-        *used     = 0;
-        *capacity = 0;
-    }
+    usbring_get_info(used, capacity);
 }
 
 usb_device_handle_t esp_libusb_get_dev_hdl()

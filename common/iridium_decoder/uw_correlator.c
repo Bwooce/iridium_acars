@@ -469,23 +469,66 @@ volatile uint64_t g_uw_magsearch_us  = 0;
 // ~1e-4 worst case, impulse case bit-exact at 0.0.
 #include "dsps_fft2r.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 static float *s_pie_fft_scratch = NULL; // 2*CORR_FFT_N floats interleaved IQ
 static float *s_pie_fft_w_table = NULL; // 1*CORR_FFT_N floats twiddle table
 static bool   s_pie_fft_inited  = false;
 
+// The PIE float FFT (dsps_fft2r_fc32_arp4) reads/writes s_pie_fft_scratch
+// with vector loads that only work correctly on main internal DRAM. Under
+// DRAM pressure, MALLOC_CAP_INTERNAL silently falls back to RTCRAM
+// (0x5010_xxxx), where the PIE asm produces GARBAGE — the silent
+// project_heap_position_decode_bug: it cratered clean-signal RAW-smoke
+// decode from ~95% to ~6% and was mistaken for an antenna problem.
+// Two defences: (1) uw_correlator_prealloc_pie_fft() runs this from the
+// boot-time early-alloc dance while DRAM is plentiful, so it lands in
+// DRAM; (2) the esp_ptr_in_dram guard below refuses an RTCRAM/other
+// placement LOUDLY instead of mis-decoding in silence.
 static void pie_fft_fc32_init(void)
 {
     if (s_pie_fft_inited) return;
-    s_pie_fft_scratch = (float *)heap_caps_aligned_alloc(
+    size_t largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t free_before    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s_pie_fft_scratch     = (float *)heap_caps_aligned_alloc(
         16, 2 * CORR_FFT_N * sizeof(float),
         MALLOC_CAP_INTERNAL);
     s_pie_fft_w_table = (float *)heap_caps_aligned_alloc(
         16, CORR_FFT_N * sizeof(float),
         MALLOC_CAP_INTERNAL);
-    if (!s_pie_fft_scratch || !s_pie_fft_w_table) return;
+    if (!s_pie_fft_scratch || !s_pie_fft_w_table) {
+        ESP_LOGE("UWCORR", "PIE FFT scratch alloc FAILED (need 16KB+4KB INTERNAL; "
+                           "had free=%zu largest=%zu) -> FFT no-op, WILL MIS-DECODE",
+                 free_before, largest_before);
+        return;
+    }
+    // Hard guard: the PIE vector unit garbles data on non-DRAM (RTCRAM/TCM).
+    // Refuse a non-DRAM scratch rather than mis-decode silently.
+    if (!esp_ptr_in_dram(s_pie_fft_scratch)) {
+        ESP_LOGE("UWCORR", "PIE FFT scratch landed OUTSIDE DRAM at %p (RTCRAM/TCM "
+                           "fallback under DRAM pressure; free=%zu largest=%zu) -> "
+                           "PIE FFT would MIS-DECODE. Call uw_correlator_prealloc_pie_fft() "
+                           "earlier in boot.",
+                 s_pie_fft_scratch, free_before, largest_before);
+        heap_caps_free(s_pie_fft_scratch);
+        heap_caps_free(s_pie_fft_w_table);
+        s_pie_fft_scratch = NULL;
+        s_pie_fft_w_table = NULL;
+        return;
+    }
     if (dsps_fft2r_init_fc32(s_pie_fft_w_table, CORR_FFT_N) != ESP_OK) return;
     s_pie_fft_inited = true;
+    ESP_LOGI("UWCORR", "PIE FFT scratch OK in DRAM at %p (INTERNAL free_before=%zu largest_before=%zu)",
+             s_pie_fft_scratch, free_before, largest_before);
+}
+
+// Public entry point for the boot-time early-alloc dance. Pins the PIE
+// FFT scratch in DRAM while it is plentiful, so the worker's lazy first
+// call never spills it to RTCRAM. Idempotent. See pie_fft_fc32_init.
+void uw_correlator_prealloc_pie_fft(void)
+{
+    pie_fft_fc32_init();
 }
 
 // In-place float FFT on de-interleaved re[]/im[] arrays.

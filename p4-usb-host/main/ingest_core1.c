@@ -15,7 +15,9 @@
 static const char *TAG = "INGEST";
 
 // Per-slot state. Two slots alternated per consumer cycle.
-static uint8_t *s_raw[INGEST_NUM_SLOTS];            // raw uint8 USB ingress, internal SRAM, DMA-aligned
+// T49a: raw USB bytes no longer have a slot-owned buffer -- they live
+// in the usbring PSRAM ring (esp_libusb.c/usbring.c) and are handed to
+// ingest_task as a (ptr, bytes) pair per dispatch. See dispatch_msg_t.
 static int16_t *s_conv[INGEST_NUM_SLOTS];           // PSRAM heap-alloc'd
 static int16_t *s_resamp[INGEST_NUM_SLOTS];         // resampled int16 Q15 @ 2.5 MSPS (downstream feed, internal SRAM)
 static size_t   s_resamp_n_int16[INGEST_NUM_SLOTS]; // int16 element count in s_resamp
@@ -145,19 +147,32 @@ static void resample_worker_task(void *arg)
 // by ingest task before reusing the slot.
 static SemaphoreHandle_t s_ready[INGEST_NUM_SLOTS];
 static SemaphoreHandle_t s_free[INGEST_NUM_SLOTS];
+// raw_done[i]: given by ingest task right after the convert step reads
+// the LAST byte of this dispatch's ring region (before resample/push).
+// Taken by class_driver (ingest_core1_wait_raw_done) before it
+// usbring_consume()s that region and peeks the ring for the next
+// dispatch. New for T49a — see ingest_core1.h's doc comment. Does not
+// change the existing s_free/s_ready protocol's shape; it is an
+// additional, earlier signal for a different resource (the ring
+// region) than s_ready (which covers convert+resample+push).
+static SemaphoreHandle_t s_raw_done[INGEST_NUM_SLOTS];
 
-// Dispatch queue: class_driver posts (slot, bytes) tuples; ingest task
-// receives them. Length 4 — enough for the 2 slots in flight plus a small
-// runway, but small enough that a stuck ingest blocks dispatch quickly.
+// Dispatch queue: class_driver posts (slot, ptr, bytes) tuples; ingest
+// task receives them. `ptr` points into the usbring PSRAM ring (T49a);
+// it is only valid until ingest_task's convert step finishes reading it
+// (see s_raw_done above). Length 4 — enough for the 2 slots in flight
+// plus a small runway, but small enough that a stuck ingest blocks
+// dispatch quickly.
 typedef struct {
-    int    slot;
-    size_t bytes;
+    int            slot;
+    const uint8_t *ptr;
+    size_t         bytes;
 } dispatch_msg_t;
 static QueueHandle_t s_dispatch;
 
-// Consumer-side raw acquisition state. The class_driver alternates between
-// slots; we track the next slot to allocate so we can wait on s_free[i]
-// before handing the raw pointer back.
+// Consumer-side slot acquisition state. The class_driver alternates
+// between slots; we track the next slot to allocate so we can wait on
+// s_free[i] before handing the slot back.
 static int s_next_acquire_slot = 0;
 
 // Diagnostic accumulators (reset by ingest_core1_get_stats).
@@ -194,10 +209,13 @@ static void ingest_task(void *arg)
         if (!xQueueReceive(s_dispatch, &msg, portMAX_DELAY)) continue;
 
         // Slot ownership protocol:
-        //   - class_driver took s_free[slot] in acquire_raw → it owns the
-        //     slot exclusively until it gives s_free back
-        //   - class_driver fills raw and dispatches
-        //   - ingest task (here) processes raw → conv, signals s_ready
+        //   - class_driver took s_free[slot] in acquire_slot → it owns
+        //     the slot exclusively until it gives s_free back
+        //   - class_driver dispatches a ring region (ptr, bytes) for
+        //     this slot
+        //   - ingest task (here) converts ptr -> conv, gives raw_done
+        //     (the ring region is no longer read after this point),
+        //     then resamples + pushes, and signals s_ready
         //   - class_driver takes s_ready, runs DSP on converted, gives
         //     s_free back
         // We do NOT take s_free here — that would deadlock since
@@ -206,9 +224,16 @@ static void ingest_task(void *arg)
         // 1. Convert raw uint8 -> int16 Q15.
         //   out[i] = (int16_t)((b[i] << 8) ^ 0x8000)
         // Same formula as the in-class_driver path before this offload.
-        // 4x unrolled with 32-bit input loads. Buffers are 64-byte aligned.
+        // 4x unrolled, 32-bit-at-a-time. `src` used to be s_raw[slot], a
+        // dedicated 64-byte-aligned buffer; it is now a pointer straight
+        // into the usbring PSRAM ring (T49a), whose physical offset can
+        // land on ANY byte alignment (e.g. after a short USB transfer
+        // leaves an odd byte count at the ring's wrap point) -- so the
+        // 4-byte group is read via memcpy into a local, not a `uint32_t*`
+        // reinterpret-cast, to avoid an unaligned-access fault. `dst` is
+        // still the dedicated 64-byte-aligned s_conv[slot] PSRAM buffer.
         int64_t t0                    = esp_timer_get_time();
-        const uint8_t *__restrict src = s_raw[msg.slot];
+        const uint8_t *__restrict src = msg.ptr;
         int16_t *__restrict dst       = s_conv[msg.slot];
         size_t n                      = msg.bytes;
 
@@ -233,17 +258,27 @@ static void ingest_task(void *arg)
         size_t n4 = n & ~(size_t)3;
         size_t i  = 0;
         for (; i < n4; i += 4) {
-            uint32_t b4 = *(const uint32_t *)(src + i);
-            dst[i + 0]  = (int16_t)((((b4 >> 0) & 0xff) << 8) ^ 0x8000);
-            dst[i + 1]  = (int16_t)((((b4 >> 8) & 0xff) << 8) ^ 0x8000);
-            dst[i + 2]  = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
-            dst[i + 3]  = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
+            uint32_t b4;
+            memcpy(&b4, src + i, sizeof(b4)); // safe unaligned load, see comment above
+            dst[i + 0] = (int16_t)((((b4 >> 0) & 0xff) << 8) ^ 0x8000);
+            dst[i + 1] = (int16_t)((((b4 >> 8) & 0xff) << 8) ^ 0x8000);
+            dst[i + 2] = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
+            dst[i + 3] = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
         }
         for (; i < n; i++) {
             dst[i] = (int16_t)(((src[i] << 8) ^ 0x8000));
         }
         int64_t t1 = esp_timer_get_time();
         s_acc_convert_us += (uint64_t)(t1 - t0);
+
+        // The convert loop above is the LAST read of msg.ptr (the ring
+        // region). Signal raw_done now so class_driver can
+        // usbring_consume() it and peek the ring for the next dispatch
+        // — this must happen before resample/push (which don't touch
+        // the ring) so the ring reclaim isn't gated on the slower
+        // resample+signal_buffer_push stage. See ingest_core1.h's
+        // ingest_core1_wait_raw_done() doc comment.
+        xSemaphoreGive(s_raw_done[msg.slot]);
 
         // 2. Resample 2.56 → 2.5 MSPS (125/128 polyphase). gri's
         // wideband tagger / direct_if_decim are tuned at 2.5 MSPS;
@@ -358,8 +393,14 @@ esp_err_t ingest_core1_init(void)
 {
     // Allocate ping-pong buffers.
     //
-    // s_raw[]: USB DWC OTG DMA target. MUST be in DMA-capable internal
-    //   SRAM because CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n.
+    // T49a: there is no more s_raw[] here. It used to be a 2 * 16 KB
+    // DMA-capable internal-SRAM buffer the convert loop read from; the
+    // raw USB bytes now live directly in the usbring PSRAM ring
+    // (esp_libusb.c/usbring.c) and are handed to ingest_task as a
+    // (ptr, bytes) pair per dispatch (see dispatch_msg_t / ingest_task's
+    // convert step). Removing it frees ~32 KB of DMA-internal heap,
+    // directly funding the USB transfer pool's pre-stream budget (see
+    // esp_libusb.c's "Pre-stream DMA-internal heap: free=" log).
     //
     // s_conv[]: CPU-only path -- written by the uint8->int16 convert
     //   loop (above this fn), read by resample_256_to_250_process.
@@ -388,27 +429,23 @@ esp_err_t ingest_core1_init(void)
         // headroom — measured cost: -13% LIVE_SDR throughput (4.57
         // → 3.97 MB/s), +160% USB handle_events latency, +62%
         // sbpush. Net regression. Sticking with PSRAM s_conv.
-        s_conv[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
-                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        s_raw[i]  = heap_caps_aligned_alloc(64, 16 * 1024,
-                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-        ESP_LOGW("HEAP", "slot %d s_raw=%p  DMA-INT now free=%zu largest=%zu",
-                 i, s_raw[i],
-                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
-                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        s_conv[i]   = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         s_resamp[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-        if (!s_raw[i] || !s_conv[i] || !s_resamp[i]) {
-            ESP_LOGE(TAG, "Slot %d alloc failed (raw=%p conv=%p resamp=%p)",
-                     i, s_raw[i], s_conv[i], s_resamp[i]);
+        if (!s_conv[i] || !s_resamp[i]) {
+            ESP_LOGE(TAG, "Slot %d alloc failed (conv=%p resamp=%p)",
+                     i, s_conv[i], s_resamp[i]);
             goto slot_cleanup;
         }
         s_resamp_n_int16[i] = 0;
 
-        s_ready[i] = xSemaphoreCreateBinary();
-        s_free[i]  = xSemaphoreCreateBinary();
-        if (!s_ready[i] || !s_free[i]) goto slot_cleanup;
-        // Initially: free=1 (slot available), ready=0 (no data yet).
+        s_ready[i]    = xSemaphoreCreateBinary();
+        s_free[i]     = xSemaphoreCreateBinary();
+        s_raw_done[i] = xSemaphoreCreateBinary();
+        if (!s_ready[i] || !s_free[i] || !s_raw_done[i]) goto slot_cleanup;
+        // Initially: free=1 (slot available), ready=0 (no data yet),
+        // raw_done=0 (nothing dispatched yet).
         xSemaphoreGive(s_free[i]);
         continue;
 
@@ -420,16 +457,16 @@ esp_err_t ingest_core1_init(void)
         // the caller treats any failure as fatal-for-streaming and the
         // system is headed for an operator/watchdog reboot anyway.)
         for (int j = 0; j <= i; j++) {
-            free(s_raw[j]);
             free(s_conv[j]);
             free(s_resamp[j]);
-            s_raw[j]    = NULL;
             s_conv[j]   = NULL;
             s_resamp[j] = NULL;
             if (s_ready[j]) vSemaphoreDelete(s_ready[j]);
             if (s_free[j]) vSemaphoreDelete(s_free[j]);
-            s_ready[j] = NULL;
-            s_free[j]  = NULL;
+            if (s_raw_done[j]) vSemaphoreDelete(s_raw_done[j]);
+            s_ready[j]    = NULL;
+            s_free[j]     = NULL;
+            s_raw_done[j] = NULL;
         }
         return ESP_ERR_NO_MEM;
     }
@@ -522,11 +559,11 @@ esp_err_t ingest_core1_init(void)
     return ESP_OK;
 }
 
-uint8_t *ingest_core1_acquire_raw(int *out_slot)
+void ingest_core1_acquire_slot(int *out_slot)
 {
     int slot = s_next_acquire_slot;
-    // The slot must be free before the consumer overwrites the raw
-    // buffer. Wait unbounded — a previous bounded-timeout attempt
+    // The slot must be free before the consumer starts a new dispatch
+    // cycle for it. Wait unbounded — a previous bounded-timeout attempt
     // caused subtle data loss (when the timeout fired, the slot
     // wasn't released and the corresponding ingest output went
     // unconsumed; DSP throughput halved). The class TASK_WDT
@@ -542,7 +579,6 @@ uint8_t *ingest_core1_acquire_raw(int *out_slot)
     }
     *out_slot           = slot;
     s_next_acquire_slot = (slot + 1) % INGEST_NUM_SLOTS;
-    return s_raw[slot];
 }
 
 static volatile uint32_t s_dispatch_drops = 0;
@@ -562,9 +598,9 @@ uint32_t                 ingest_core1_take_converted_slow_waits(void)
     return s_take_converted_slow_waits;
 }
 
-void ingest_core1_dispatch(int slot, size_t bytes_filled)
+void ingest_core1_dispatch(int slot, const uint8_t *ptr, size_t bytes_filled)
 {
-    dispatch_msg_t msg = {.slot = slot, .bytes = bytes_filled};
+    dispatch_msg_t msg = {.slot = slot, .ptr = ptr, .bytes = bytes_filled};
     // Non-blocking send. The queue depth (4) exceeds the slot count (2),
     // so a successful acquire always implies space — this should never fail.
     // But if it ever did, ingest would never process this slot and never give
@@ -572,6 +608,16 @@ void ingest_core1_dispatch(int slot, size_t bytes_filled)
     // FOREVER → class deadlocks (same class as #106). Recover: mark the slot
     // zero-length and signal it ready, so take_converted returns immediately
     // (dsp_feed gets 0 samples) and the slot recycles instead of stranding.
+    // ALSO give raw_done here (T49a) — ingest_task will never process this
+    // message, so it will never give raw_done either; without this,
+    // class_driver's ingest_core1_wait_raw_done(slot) would hang FOREVER
+    // (same #106 class, new resource). The dropped ring region is still
+    // reclaimed correctly: class_driver set raw_bytes[slot] and
+    // prev_dsp_slot=slot unconditionally, so next cycle's CS_RAW_DONE
+    // calls esp_libusb_consume_stream() for it once this synthetic
+    // raw_done is taken — no ring-space leak. This branch should never
+    // fire in practice anyway (queue depth > outstanding slots) and the
+    // alternative is a deadlock.
     // #122: FI_SITE_DISPATCH_QUEUE short-circuits the send to exercise the
     // drop-recovery below without an actual full queue.
     if (fault_inject_should_fail(FI_SITE_DISPATCH_QUEUE) ||
@@ -579,7 +625,38 @@ void ingest_core1_dispatch(int slot, size_t bytes_filled)
         s_dispatch_drops++;
         ESP_LOGW(TAG, "dispatch queue full — slot %d dropped (recovered, no deadlock)", slot);
         s_resamp_n_int16[slot] = 0;
+        xSemaphoreGive(s_raw_done[slot]);
         xSemaphoreGive(s_ready[slot]);
+    }
+}
+
+// Count of 500 ms ticks ingest_core1_wait_raw_done waited without
+// raw_done being given (T49a). See ingest_core1.h's doc comment.
+static volatile uint32_t s_raw_done_slow_waits = 0;
+uint32_t                 ingest_core1_raw_done_slow_waits(void)
+{
+    return s_raw_done_slow_waits;
+}
+
+void ingest_core1_wait_raw_done(int slot)
+{
+    // Same diagnostic-poll-loop shape as ingest_core1_take_converted()
+    // below (#110-class visibility): the wait is unbounded in effect,
+    // but logs if it's taking suspiciously long. ingest_task ALWAYS
+    // gives raw_done unconditionally right after its convert step (or
+    // via the dispatch-drop recovery above) — it never waits on
+    // class_driver to do anything first — so this cannot deadlock
+    // against anything class_driver holds.
+    int waited_ms = 0;
+    while (xSemaphoreTake(s_raw_done[slot], pdMS_TO_TICKS(500)) != pdTRUE) {
+        waited_ms += 500;
+        s_raw_done_slow_waits++;
+        if (waited_ms == 500 || (waited_ms % 10000) == 0) {
+            ESP_LOGW(TAG, "wait_raw_done slot=%d waited %dms — ingest "
+                          "may be wedged before convert; health_wdt will "
+                          "reboot if class stops progressing",
+                     slot, waited_ms);
+        }
     }
 }
 

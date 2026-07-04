@@ -48,13 +48,13 @@ static void log_dma_int_heap(const char *tag)
 #endif
 
 #define DAEMON_TASK_PRIORITY 4
-// The class task both drains USB transfers into the ringbuffer and
+// The class task both drains USB transfers into the usbring (T49a) and
 // consumes them (read_stream -> dsp_processor_feed). It MUST outrank the
 // httpd task (prio 5) so a multi-MB /capture/file download can't starve
-// the consumer and overflow the ringbuffer (rb_full_drops). It's
-// effectively event-driven (xRingbufferReceiveUpTo with timeout 0 + a
-// 100 ms usb_host_client_handle_events cap — 10 TICKS at the 100 Hz
-// tick), so it yields Core 0 naturally
+// the consumer and overflow the ring (rb_full_drops). It's effectively
+// event-driven (usbring_peek is a non-blocking poll + a 100 ms
+// usb_host_client_handle_events cap — 10 TICKS at the 100 Hz tick), so
+// it yields Core 0 naturally
 // every ~3-4 ms when data drains — raising its priority does not starve
 // httpd. See task #91 / #101.
 #define CLASS_TASK_PRIORITY 6
@@ -77,10 +77,13 @@ static const char *TAG = "DAEMON";
 // We currently run with the default (permissive) APM policy and a single
 // AHB master targeting PSRAM (AXI-GDMA via esp_async_memcpy in
 // signal_buffer.c). USB DWC-OTG-HS DMA writes into INTERNAL SRAM only
-// (s_raw[], s_conv[] in ingest_core1.c). This avoids the APM-560
-// concurrency window. Before adding ANY of (SDMMC, GMAC, USB-OTGFS,
-// APM enforcement policy) that touches PSRAM concurrently with the
-// signal-buffer DMA, audit the PSRAM access ordering — APM-560
+// (the URB transfer pool in esp_libusb.c — ASYNC_TRANSFER_COUNT ×
+// ASYNC_TRANSFER_SIZE). This avoids the APM-560 concurrency window; the
+// usbring PSRAM stream ring (T49a, usbring.c) is filled by a plain CPU
+// memcpy in the URB completion callback, not by the DMA engine, so it
+// doesn't change this invariant. Before adding ANY of (SDMMC, GMAC,
+// USB-OTGFS, APM enforcement policy) that touches PSRAM concurrently
+// with the signal-buffer DMA, audit the PSRAM access ordering — APM-560
 // recovery is system-reset-only on v1.3.
 
 void host_lib_daemon_task(void *arg)

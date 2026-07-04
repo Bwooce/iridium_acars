@@ -140,6 +140,14 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
 int uw_correlator_find_burst_start(const int16_t *burst,
                                    int n_complex, int search_max);
 
+// Pre-allocate the PIE float-FFT scratch in DRAM. MUST be called from the
+// boot-time early-alloc dance (before the USB/DSP init that fragments
+// internal SRAM). If left to the worker's lazy first call, the 16 KB
+// scratch can spill into RTCRAM where the PIE vector unit silently
+// mis-decodes (project_heap_position_decode_bug). Idempotent, no-op after
+// the first successful call.
+void uw_correlator_prealloc_pie_fft(void);
+
 #ifdef __cplusplus
 }
 #endif
