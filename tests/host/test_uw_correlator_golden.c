@@ -9,6 +9,20 @@
 // must reproduce all of these bit-for-bit; any drift fails here.
 //
 // Baseline captured 2026-06-15 from commit 8a41b4f (pre-#120).
+//
+// G_SNR_DB updated 2026-07-04 (task T9, uw_correlator.c int64 overflow
+// fix): on this exact ALBQ fixture, sum_dl_f reaches ~2.63e20 -- already
+// past INT64_MAX (~9.22e18) even though this is an ordinary (not a
+// deliberately "strong/saturated") burst, since the unscaled FFT x sync
+// x IFFT magnitude accumulates over ~1800 search steps. The pre-T9 code
+// cast that out-of-range float straight to int64_t (UB), which on this
+// x86 build produced INT64_MIN, then a signed-overflow subtraction
+// against best_dl wrapped to a large positive value -- two chained UB
+// events that happened to average out to a deterministic but wrong
+// 27.047224 dB. T9 keeps the bridge in double (no overflow), giving the
+// mathematically correct off-peak average and therefore SNR: 11.438478
+// dB. Direction/uw_offset/correction/omega/peak_re/peak_im are all
+// unaffected -- only the SNR path touched the overflowing sum.
 
 #include <stdio.h>
 #include <stdint.h>
@@ -24,7 +38,7 @@
 #define G_UW_OFFSET 196
 #define G_DIRECTION UW_DIR_DOWNLINK // == 1
 #define G_CORRECTION 0.000000f
-#define G_SNR_DB 27.047224f
+#define G_SNR_DB 11.438478f
 #define G_OMEGA 0.003292f
 #define G_PEAK_RE 393440320.000000f
 #define G_PEAK_IM 1375337344.000000f
