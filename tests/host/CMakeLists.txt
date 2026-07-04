@@ -269,6 +269,19 @@ add_executable(test_signal_buffer_index
 )
 target_include_directories(test_signal_buffer_index PRIVATE ${MAIN_DIR})
 
+# T49a chain A step 1: pure index/wrap arithmetic for the custom SPSC
+# byte ring that will replace dev->ringbuf (the IDF byte ringbuffer,
+# which only allows one outstanding retrieval) in the USB ingest path --
+# docs/perf-decoupling-design-2026-07-04.md §T49a. usbring_ring.h is
+# header-only and dependency-free (mirrors signal_buffer_ring.h); the
+# buffer-backed, PSRAM-placed, barrier-aware implementation is a later
+# step gated by this test. Includes a randomised producer/consumer
+# interleaving model test and --demo-fail (see test_usbring_index.c).
+add_executable(test_usbring_index
+    test_usbring_index.c
+)
+target_include_directories(test_usbring_index PRIVATE ${MAIN_DIR})
+
 # T4 regression: sd_capture's atomic burst-record framing (the whole
 # header+IQ record must fit in the stream buffer's free space or the
 # whole record is dropped -- never a torn header/IQ tail). sd_capture.c
@@ -624,6 +637,7 @@ add_test(NAME uw_correlator_golden COMMAND test_uw_correlator_golden)
 add_test(NAME direct_if_decim_golden COMMAND test_direct_if_decim_golden)
 add_test(NAME frame_pdu COMMAND test_frame_pdu)
 add_test(NAME signal_buffer_index COMMAND test_signal_buffer_index)
+add_test(NAME usbring_index       COMMAND test_usbring_index)
 add_test(NAME sd_capture_framing COMMAND test_sd_capture_framing)
 add_test(NAME frame_link COMMAND test_frame_link)
 add_test(NAME uw_correlator_albq_ul COMMAND test_uw_correlator_albq_ul)
