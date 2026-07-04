@@ -68,6 +68,14 @@ extern void resample_125_128_enable_pie_cfg(void);
 #define RS25_USE_PIE_ASM 0
 #endif
 
+// Q15 saturation helper: clamp int32 to int16 range.
+static inline int16_t q15_saturate(int32_t x)
+{
+    if (x > INT16_MAX) return INT16_MAX;
+    if (x < INT16_MIN) return INT16_MIN;
+    return (int16_t)x;
+}
+
 // Modified Bessel I0, for Kaiser window. Copy of the same function in
 // direct_if_decim.c — could be deduped, but the two modules are
 // independent.
@@ -343,8 +351,8 @@ RS25_HOT int resample_256_to_250_process_explicit(int16_t *delay_i, int16_t *del
                     acc_i += (int32_t)di[wpos + k] * c;
                     acc_q += (int32_t)dq[wpos + k] * c;
                 }
-                *out_i = (int16_t)(acc_i >> 15);
-                *out_q = (int16_t)(acc_q >> 15);
+                *out_i = q15_saturate(acc_i >> 15);
+                *out_q = q15_saturate(acc_q >> 15);
 #endif
                 n_out++;
                 if (batch_scratch) {
