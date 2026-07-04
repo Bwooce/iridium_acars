@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -81,6 +82,15 @@ static FILE                *s_fp       = NULL;
 static SemaphoreHandle_t    s_stats_mu = NULL;
 static sd_capture_stats_t   s_stats    = {0};
 
+// Atomic mirrors of hot-path read fields (bytes_captured, bytes_target).
+// These allow sd_capture_write and writer_task to read the target/capacity
+// values without taking the mutex. Writers (update_bytes_written,
+// sd_capture_start) maintain sync by updating the atomic after releasing
+// the mutex. Memory order is relaxed since we don't need synchronization
+// across other fields.
+static _Atomic(uint64_t) s_bytes_captured_atomic = 0;
+static _Atomic(uint64_t) s_bytes_target_atomic   = 0;
+
 // Capture mode: 0 = continuous (sd_capture_write tap in
 // class_driver), 1 = burst-only (sd_capture_record_burst_*
 // from worker_core1). The two modes share the writer task and
@@ -106,6 +116,8 @@ static void update_bytes_written(size_t n)
     if (!s_stats_mu) return;
     xSemaphoreTake(s_stats_mu, portMAX_DELAY);
     s_stats.bytes_captured += n;
+    atomic_store_explicit(&s_bytes_captured_atomic, s_stats.bytes_captured,
+                          memory_order_relaxed);
     xSemaphoreGive(s_stats_mu);
 }
 
@@ -208,11 +220,10 @@ static void writer_task(void *arg)
                 }
                 // Stop on target reached. Producer also gates on
                 // bytes_target so this is belt-and-suspenders.
-                uint64_t cap = 0, tgt = 0;
-                xSemaphoreTake(s_stats_mu, portMAX_DELAY);
-                cap = s_stats.bytes_captured;
-                tgt = s_stats.bytes_target;
-                xSemaphoreGive(s_stats_mu);
+                uint64_t cap = atomic_load_explicit(&s_bytes_captured_atomic,
+                                                    memory_order_relaxed);
+                uint64_t tgt = atomic_load_explicit(&s_bytes_target_atomic,
+                                                    memory_order_relaxed);
                 if (tgt > 0 && cap >= tgt) {
                     ESP_LOGI(TAG, "target reached (%llu bytes) — stopping",
                              (unsigned long long)cap);
@@ -482,6 +493,8 @@ esp_err_t sd_capture_start(uint64_t target_bytes)
     s_stats.write_errors   = 0;
     s_stats.start_us       = t0;
     strlcpy(s_stats.path, path, sizeof(s_stats.path));
+    atomic_store_explicit(&s_bytes_captured_atomic, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_bytes_target_atomic, target_bytes, memory_order_relaxed);
     xSemaphoreGive(s_stats_mu);
 
     s_state = CAP_STATE_ACTIVE;
@@ -534,14 +547,12 @@ void sd_capture_write(const uint8_t *data, size_t n)
     // Target gate — stop accepting bytes once we've queued past the
     // target. The writer also checks and transitions to STOPPING
     // when its own counter passes the target; this just avoids
-    // queueing extra bytes that would get truncated.
-    uint64_t cap = 0, tgt = 0;
-    if (s_stats_mu) {
-        xSemaphoreTake(s_stats_mu, portMAX_DELAY);
-        cap = s_stats.bytes_captured;
-        tgt = s_stats.bytes_target;
-        xSemaphoreGive(s_stats_mu);
-    }
+    // queueing extra bytes that would get truncated. Read atomically
+    // without mutex to avoid per-ingest locking overhead.
+    uint64_t cap = atomic_load_explicit(&s_bytes_captured_atomic,
+                                        memory_order_relaxed);
+    uint64_t tgt = atomic_load_explicit(&s_bytes_target_atomic,
+                                        memory_order_relaxed);
     if (tgt > 0 && cap + n > tgt) {
         // Trim to remaining target.
         if (cap >= tgt) return;
