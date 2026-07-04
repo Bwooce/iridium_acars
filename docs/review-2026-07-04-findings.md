@@ -7,12 +7,19 @@ device healthy at 4.88 MB/s, decode drought is the poor bench antenna.
 Priority order, unique task IDs. `[ ]` = open, `[~]` = in progress, `[x]` = done.
 Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md`.
 
-**Fix status:** T1–T4 DONE — merged to `main` and pushed (2026-07-04, commits
-1aca876/e6db4b9/933ab38/97c54ea). T1/T3 host-verified with new regression tests
-(28/28 ctest); T2/T4 source-verified + clean device build; whole set passed the
-on-device RAW_IRIDIUM smoke (SMOKE_PASS, DSP 514 µs/frame). T1/T2 (DSP-path) carry
-`Smoke-verified:` trailers. Device left running normal firmware, decoding live RF.
-Follow-up regression coverage tracked below as T2t/T4t.
+**Fix status (2026-07-04):**
+- Batch 1 — T1–T4 DONE, pushed (commits 1aca876/e6db4b9/933ab38/97c54ea). T1/T3
+  host-verified with new regression tests; T2/T4 source-verified + device build;
+  on-device RAW_IRIDIUM SMOKE_PASS. T1/T2 (DSP-path) carry `Smoke-verified:` trailers.
+- Batch 2 — T2t, T5, T6, T7, T8 DONE, pushed. T2t adds the host regression for the
+  T2 ring-index invariant (29/29 ctest, teeth-proven); T5/T6 http/push output safety;
+  T7 frame_link SPI-DMA size; T8 esp_libusb control-transfer mutex. On-device: batch-2
+  RAW_IRIDIUM SMOKE_PASS (T2t signal_buffer, carries the trailer) + normal firmware
+  live-stable at 4.88 MB/s, drops=0, no xfer_mutex timeout/panic (validates T8).
+- Note: the batch-1 firmware left on the bench was mistakenly the smoke image (a
+  restore-to-normal step ran in the wrong cwd and silently failed); corrected in batch 2
+  — device now runs the real normal streaming firmware.
+- Remaining open: T4t (sd_capture framing test) + T9–T54.
 
 Legend: **bug** / **sec** (security) / **perf**. "verified" = main agent
 re-read the source and confirmed the defect.
@@ -42,7 +49,7 @@ re-read the source and confirmed the defect.
 
 ## Follow-up test coverage (tracked 2026-07-04)
 
-- [ ] **T2t** signal_buffer wrap-desync (T2) has NO automated regression — device-only
+- [x] **T2t** signal_buffer wrap-desync (T2) has NO automated regression — device-only
   code. Add a SMOKE_TEST sub-test that arms `FI_SITE_DMA_SUBMIT_WRAP`, pushes across a
   ring wrap, and asserts a marker sample is still retrievable at its cumulative index
   (no desync). Optionally a host model test of the index arithmetic. Rides the pre-push
@@ -54,19 +61,19 @@ re-read the source and confirmed the defect.
 
 ## P1 — High (verified)
 
-- [ ] **T5** `http_server.c:723` — sec, verified. `snprintf` truncation returns
+- [x] **T5** `http_server.c:723` — sec, verified. `snprintf` truncation returns
   would-be length, passed unclamped to `httpd_resp_send_chunk` → sends adjacent
   httpd stack to LAN client (RF-crafted escape-heavy ACARS txt). Same pattern:
   `status_get` pdu_link splice `:298` (size_t wrap → stack overflow, non-STANDALONE),
   `sd_list_get:1137`, latent `diag_histograms:328`. Fix: clamp len to buf-1.
-- [ ] **T6** `acars_push.c:150`, `http_server.c:728/744/233` — sec. RF-decoded
+- [x] **T6** `acars_push.c:150`, `http_server.c:728/744/233` — sec. RF-decoded
   `mode`/`block_id`/`label`/`station_id` emitted unescaped → JSON injection into
   every push consumer / /messages client. Fix: escape/isprint-filter.
-- [ ] **T7** `frame_link.c:229,266` — bug (hardware-only). `FRAME_LINK_FRAME_SIZE`=98
+- [x] **T7** `frame_link.c:229,266` — bug (hardware-only). `FRAME_LINK_FRAME_SIZE`=98
   not a multiple of 4 → SPI DMA rx rejected or trailing CRC word corrupted; rx
   buffers (`:214,251`) not cache-line padded on P4. Fix before hw bring-up: pad to
   mult of 64, `heap_caps_aligned_calloc(64,...)`.
-- [ ] **T8** `librtlsdr.c` + `esp_libusb.c:135` — bug. No serialisation of control
+- [x] **T8** `librtlsdr.c` + `esp_libusb.c:135` — bug. No serialisation of control
   transfers despite `class_driver.h`'s claim; AGC gain-change racing class task can
   free in-flight transfer (UAF) / two tasks in handle_events. Works by luck today;
   an HTTP retune endpoint detonates it. Fix: mutex around all control/bulk transfers.
