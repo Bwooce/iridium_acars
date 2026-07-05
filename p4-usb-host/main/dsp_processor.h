@@ -115,4 +115,18 @@ void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out);
 // and reports phantom dsp_ok=false; this getter avoids the race.
 uint64_t dsp_processor_get_total_fft_frames(dsp_processor_t *p);
 
+// Scanner (Phase 1) narrowband-density readout. Counts bursts whose spectral
+// width (T60) is <= DSP_NARROWBAND_MAX_BINS, i.e. channel-shaped Iridium
+// rather than wide broadband RFI.
+#define DSP_NARROWBAND_MAX_BINS 48
+
+typedef struct {
+    uint32_t narrowband_bursts;
+    uint32_t all_bursts;
+    float    mean_snr_db;
+} dsp_density_t;
+
+void dsp_processor_read_reset_density(dsp_processor_t *p, dsp_density_t *out);
+void dsp_processor_reset_tagger_baseline(dsp_processor_t *p);
+
 #endif

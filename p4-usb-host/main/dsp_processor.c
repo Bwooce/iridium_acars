@@ -112,6 +112,13 @@ struct dsp_processor {
     // snapshot at t0/t1 and subtract. Same cross-task tearing concern as
     // above post-T48; _Atomic removes it.
     _Atomic(uint64_t) total_input_samples;
+
+    // Scanner density counters (Phase 1). Tapped in dispatch_gone_burst,
+    // read-and-reset by dsp_processor_read_reset_density from the serial_cmd
+    // task. Same relaxed-atomic idiom as the diagnostics above.
+    _Atomic(uint32_t) acc_nb_bursts;   // width <= DSP_NARROWBAND_MAX_BINS
+    _Atomic(uint32_t) acc_dens_bursts; // all gone bursts in the window
+    _Atomic(uint64_t) acc_snr_milli;   // sum of SNR(dB) * 1000
 };
 
 // Process "default" instance for cross-task diagnostic getters that
@@ -157,6 +164,14 @@ static void dispatch_gone_burst(dsp_processor_t *p, const fbt_burst_t *b)
         // detected_burst_t byte-identical (no PIE-position perturbation).
         .peak_bin = BURST_PACK_BIN_WIDTH(b->center_bin, b->width_bins),
     };
+
+    atomic_fetch_add_explicit(&p->acc_dens_bursts, 1u, memory_order_relaxed);
+    if (b->width_bins > 0 && b->width_bins <= DSP_NARROWBAND_MAX_BINS)
+        atomic_fetch_add_explicit(&p->acc_nb_bursts, 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&p->acc_snr_milli,
+                              (uint64_t)(int64_t)(b->magnitude_db * 1000.0f),
+                              memory_order_relaxed);
+
     p->user_cb(&out);
 }
 
@@ -327,6 +342,23 @@ void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)
     out->gone_bursts = acc_gone_snap;
     out->step_us     = (uint32_t)acc_step_us_snap;
     out->tag_steps   = tag_steps;
+}
+
+void dsp_processor_read_reset_density(dsp_processor_t *p, dsp_density_t *out)
+{
+    if (!p || !out) return;
+    uint32_t nb            = atomic_exchange_explicit(&p->acc_nb_bursts, 0u, memory_order_relaxed);
+    uint32_t all           = atomic_exchange_explicit(&p->acc_dens_bursts, 0u, memory_order_relaxed);
+    uint64_t smil          = atomic_exchange_explicit(&p->acc_snr_milli, 0u, memory_order_relaxed);
+    out->narrowband_bursts = nb;
+    out->all_bursts        = all;
+    out->mean_snr_db       = all ? (float)((double)smil / 1000.0 / (double)all) : 0.0f;
+}
+
+void dsp_processor_reset_tagger_baseline(dsp_processor_t *p)
+{
+    if (!p || !p->tagger) return;
+    fft_burst_tagger_reset_baseline(p->tagger);
 }
 
 // #127: race-free cumulative FFT-frames count. Callers that compute
