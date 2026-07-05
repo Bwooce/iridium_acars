@@ -158,3 +158,25 @@ CONFIG_ESP_HOSTED_MAX_SIMULTANEOUS_SYNC_RPC_REQUESTS=2
 CONFIG_ESP_HOSTED_MAX_SIMULTANEOUS_ASYNC_RPC_REQUESTS=2
 CONFIG_ESP_HOSTED_MEM_MONITOR=n
 CONFIG_ESP_HOSTED_CLI_ENABLED=n
+
+# ---------------------------------------------------------------
+# Robustness (T59 crash fix, 2026-07-05)
+# ---------------------------------------------------------------
+# The default 1536 B/core FreeRTOS interrupt stack overflows under the
+# high interrupt + cross-core IPC load the SNR priority queue drives at
+# extreme detection rates (~700 bursts/s of bench RFI). Symptom was a
+# "Stack protection fault" on Core 1's xIsrStack (found via UART core dump:
+# no task stack overflowed — worker used 688/16384 — it was the ISR stack).
+# 4096 gives ample margin for nested IRQs + SysTick + the cross-core mutex
+# churn. (Deeper follow-up: reduce that IPC churn at the source.)
+CONFIG_FREERTOS_ISR_STACKSIZE=4096
+
+# UART core dump on panic (ELF format) — the tool that localized the crash
+# above. Cheap (only fires on panic), invaluable for the intermittent
+# load-dependent faults this pipeline can hit. Decode with:
+#   esp-coredump info_corefile --core <b64> --core-format b64 build/p4-usb-host.elf
+CONFIG_ESP_COREDUMP_ENABLE_TO_UART=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=64
+CONFIG_ESP_COREDUMP_UART_DELAY=0
