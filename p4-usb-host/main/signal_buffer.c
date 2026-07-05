@@ -6,6 +6,7 @@
 #include "esp_attr.h"
 #include "esp_async_memcpy.h"
 #include "esp_cache.h"
+#include "esp_timer.h"
 #include "sdkconfig.h"
 #include "signal_buffer.h"
 #include "signal_buffer_ring.h"
@@ -51,6 +52,15 @@ static uint32_t head         = 0; // in complex samples
 // pattern usbring.c uses for its producer/consumer handoff.
 static volatile uint32_t s_head_total_seq = 0;
 static uint64_t          s_head_total     = 0; // guarded by s_head_total_seq
+
+// Wall-clock (esp_timer µs) captured when the first sample was committed, i.e.
+// the time of cumulative sample index 0. Lets callers convert a burst's
+// start_sample_idx into a CAPTURE timestamp (stream_epoch + idx/rate) rather
+// than stamping at decode time — processing order then can't reorder the
+// timestamps (prerequisite for a freshness-first/LIFO worker queue). Written
+// once by the producer on the first push; a plain 64-bit read is fine (it
+// stops changing after the first push, so no tear window in steady state).
+static uint64_t s_stream_epoch_us = 0;
 
 static uint64_t read_head_total(void)
 {
@@ -200,15 +210,17 @@ esp_err_t signal_buffer_init()
     esp_log_level_set("dma_utils", ESP_LOG_NONE);
     esp_log_level_set("async_mcp.gdma", ESP_LOG_NONE);
 
-    ESP_LOGI(TAG, "Allocating 4MB Signal Buffer in PSRAM (DMA-aligned)...");
+    ESP_LOGI(TAG, "Allocating %u MB Signal Buffer in PSRAM (DMA-aligned)...",
+             (unsigned)(SIGNAL_BUF_SIZE / (1024 * 1024)));
     // 64-byte cache-line alignment for the DMA destination.
     circular_buf = heap_caps_aligned_alloc(64, SIGNAL_BUF_SIZE,
                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!circular_buf) return ESP_ERR_NO_MEM;
     memset(circular_buf, 0, SIGNAL_BUF_SIZE);
-    head             = 0;
-    s_head_total     = 0;
-    s_head_total_seq = 0;
+    head              = 0;
+    s_head_total      = 0;
+    s_stream_epoch_us = 0;
+    s_head_total_seq  = 0;
 
     async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
     cfg.backlog               = 4;  // up to 4 outstanding transfers
@@ -473,6 +485,12 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
 
     head = signal_buffer_next_head(head, (uint32_t)aligned_count, total_cap);
 
+    // Capture the stream epoch on the first committed block: head_total is
+    // still 0 here, so "now" is the wall-clock of cumulative sample index 0.
+    if (s_stream_epoch_us == 0) {
+        s_stream_epoch_us = (uint64_t)esp_timer_get_time();
+    }
+
     // T44: publish the 64-bit cumulative counter under the seqlock, in
     // lockstep with `head` (same single exit site, so the T2 index invariant
     // holds for both — every push advances both counters by aligned_count).
@@ -498,6 +516,16 @@ uint32_t signal_buffer_head(void)
     // that was actually fine). That's acceptable; we never get a false
     // negative (think a burst is valid when it's not).
     return head;
+}
+
+uint64_t signal_buffer_head_total(void)
+{
+    return read_head_total();
+}
+
+uint64_t signal_buffer_stream_epoch_us(void)
+{
+    return s_stream_epoch_us;
 }
 
 bool signal_buffer_burst_valid(uint64_t start_idx, uint32_t length)

@@ -5,8 +5,13 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
-// 4MB Circular buffer = ~400ms at 2.56 MSPS SC16
-#define SIGNAL_BUF_SIZE (4 * 1024 * 1024)
+// 16MB circular buffer = ~1.6s at 2.56 MSPS SC16 (T59 experiment): the
+// detector runs behind live ingest under high signal load, so a 4MB/~400ms
+// ring made every burst stale (ring-lapped) before the worker could read it.
+// A larger freshness window lets bursts survive the detector lag long enough
+// to decode. 16 MB fits the 32 MB PSRAM alongside the 4 MB tagger baseline.
+// Multiple of 64 (wrap-path DMA alignment) and /4 is a multiple of 16.
+#define SIGNAL_BUF_SIZE (16 * 1024 * 1024)
 
 esp_err_t signal_buffer_init();
 void      signal_buffer_push(const int16_t *samples, size_t n_samples);
@@ -29,6 +34,16 @@ void signal_buffer_read_chunk(uint32_t start_idx, uint32_t length, int16_t *dest
 // need to gauge how much capacity remains before a queued burst's
 // window gets overwritten.
 uint32_t signal_buffer_head(void);
+
+// 64-bit monotonic cumulative complex-sample count committed to the ring
+// (T44's absolute clock). Used to measure how far a burst's start index lags
+// the producer (staleness magnitude) and to derive capture timestamps.
+uint64_t signal_buffer_head_total(void);
+
+// Wall-clock (esp_timer µs) of cumulative sample index 0. Convert a burst
+// start index to its capture time as: stream_epoch_us + idx * 1e6 / rate.
+// Returns 0 until the first push has occurred.
+uint64_t signal_buffer_stream_epoch_us(void);
 
 // Recovery-counter accessors (surfaced in /diag/recovery_counters and
 // in the STATUS-ERR log line when nonzero).

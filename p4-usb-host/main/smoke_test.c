@@ -279,7 +279,7 @@ static void smoke_test_run_frame_decoder(void)
         bool ok = false;
         for (int attempt = 0; attempt < 100; attempt++) {
             ok = frame_decoder_push(e->bits, e->n_bits, qdir,
-                                    e->freq_hz, 0, e->snr_db);
+                                    e->freq_hz, 0, e->snr_db, 0u);
             if (ok) break;
             vTaskDelay(1); // one tick = drain a bit, then retry
         }

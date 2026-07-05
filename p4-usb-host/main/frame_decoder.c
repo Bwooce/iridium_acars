@@ -514,13 +514,15 @@ esp_err_t frame_decoder_init(void)
 
 bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
                         ir_direction_t direction,
-                        uint32_t freq_hz, int peak_bin, float snr_db)
+                        uint32_t freq_hz, int peak_bin, float snr_db,
+                        uint64_t timestamp_us)
 {
     if (!s_initialised || !bits) return false;
     if (n_bits == 0 || n_bits > FRAME_QUEUE_MAX_BITS) return false;
 
     frame_queue_item_t item;
-    item.timestamp_us = (uint64_t)esp_timer_get_time();
+    // Capture time from the caller (burst sample position); 0 = stamp now.
+    item.timestamp_us = timestamp_us ? timestamp_us : (uint64_t)esp_timer_get_time();
     item.freq_hz      = freq_hz;
     item.peak_bin     = peak_bin;
     item.snr_db       = snr_db;

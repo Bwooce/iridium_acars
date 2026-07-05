@@ -35,9 +35,14 @@ esp_err_t frame_decoder_init(void);
 //
 // Returns true on enqueue, false if dropped or if frame_decoder_init
 // hasn't been called yet.
+// timestamp_us is the burst's CAPTURE time (from its sample position), not
+// decode time, so processing order doesn't reorder emitted timestamps. Pass 0
+// to fall back to esp_timer_get_time() at enqueue (callers without a capture
+// clock, e.g. the aggregator/corpus paths).
 bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
                         ir_direction_t direction,
-                        uint32_t freq_hz, int peak_bin, float snr_db);
+                        uint32_t freq_hz, int peak_bin, float snr_db,
+                        uint64_t timestamp_us);
 
 // Stats accessors for the per-second status block.
 uint64_t frame_decoder_pushed(void);  // total bursts the worker handed off

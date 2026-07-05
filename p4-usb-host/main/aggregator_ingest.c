@@ -71,8 +71,10 @@ static void aggregator_ingest_task(void *arg)
         // snr carry the per-burst metadata); pass 0 as the STANDALONE
         // worker_core1 path does.
         ir_direction_t dir = (pdu.direction != 0) ? DIR_UPLINK : DIR_DOWNLINK;
+        // The PDU already carries the worker's capture timestamp; preserve it
+        // through the aggregator rather than restamp at ingest time.
         frame_decoder_push(s_bits01, pdu.n_bits, dir, 0u,
-                           (int)pdu.peak_bin, pdu.peak_snr_db);
+                           (int)pdu.peak_bin, pdu.peak_snr_db, pdu.timestamp_us);
         atomic_fetch_add_explicit(&s_ingested, 1, memory_order_relaxed);
         note_source(pdu.source_id, (uint64_t)esp_timer_get_time());
     }

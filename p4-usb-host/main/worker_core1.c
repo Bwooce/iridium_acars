@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -46,7 +47,70 @@
 
 static const char *TAG = "WORKER1";
 
-static QueueHandle_t burst_queue = NULL;
+// SNR priority queue (T59). The worker can only fully-decode ~13 bursts/s
+// (~76 ms each, dominated by the demod pipeline); the tagger, at the
+// gri-aligned threshold, hands it far more under bench noise (~70-130/s, mostly
+// false positives). A plain FIFO/LIFO forces the worker to waste its budget on
+// whatever arrived, in arrival order. Instead, keep a small bounded buffer
+// ordered by the tagger's peak_snr_db (known for free at detection): admit the
+// strongest, EVICT the weakest when full, and always decode the strongest
+// available first. Noise (low SNR) is shed WITHOUT ever paying the 76 ms. This
+// does not touch detection (still gri-aligned) — it only allocates the scarce
+// decode budget to the most-likely-real bursts. When the worker is NOT
+// overloaded (good antenna, few bursts), nothing is evicted and every burst is
+// decoded, just strongest-first.
+// Cap sized above the dense-corpus peak backlog (smoke high_water≈36) so the
+// GOLDEN corpus — where every burst is real — evicts nothing and still decodes
+// all 62. Live, the strongest (real) bursts are never the ones evicted, so a
+// larger cap doesn't change the triage; it only widens the candidate pool.
+#define BURST_PQ_CAP 64
+static detected_burst_t  s_pq[BURST_PQ_CAP];
+static int               s_pq_count = 0;
+static SemaphoreHandle_t s_pq_lock  = NULL; // guards s_pq / s_pq_count
+static SemaphoreHandle_t s_pq_items = NULL; // counts occupied slots (worker waits on it)
+
+// Producer-side insert (called from the tagger callback context). Returns:
+//   1  = admitted into an empty slot (caller must give s_pq_items)
+//   0  = admitted by EVICTING the weakest (net slot count unchanged, no give)
+//  -1  = dropped (buffer full and this burst is weaker than everything in it)
+// Caller holds s_pq_lock.
+static int pq_insert_locked(const detected_burst_t *b)
+{
+    if (s_pq_count < BURST_PQ_CAP) {
+        s_pq[s_pq_count++] = *b;
+        return 1;
+    }
+    // Full: find the weakest slot; replace it only if the newcomer is stronger.
+    int   min_i = 0;
+    float min_s = s_pq[0].peak_snr_db;
+    for (int i = 1; i < BURST_PQ_CAP; i++) {
+        if (s_pq[i].peak_snr_db < min_s) {
+            min_s = s_pq[i].peak_snr_db;
+            min_i = i;
+        }
+    }
+    if (b->peak_snr_db > min_s) {
+        s_pq[min_i] = *b; // evict weakest (its occupied-slot give still stands)
+        return 0;
+    }
+    return -1;
+}
+
+// Consumer-side extract of the STRONGEST burst; compacts the array. Caller
+// holds s_pq_lock and has already taken s_pq_items (so count > 0 is guaranteed).
+static void pq_extract_max_locked(detected_burst_t *out)
+{
+    int   max_i = 0;
+    float max_s = s_pq[0].peak_snr_db;
+    for (int i = 1; i < s_pq_count; i++) {
+        if (s_pq[i].peak_snr_db > max_s) {
+            max_s = s_pq[i].peak_snr_db;
+            max_i = i;
+        }
+    }
+    *out        = s_pq[max_i];
+    s_pq[max_i] = s_pq[--s_pq_count]; // move last into the hole
+}
 
 // Diagnostic counters. Read & reset by worker_core1_get_stats().
 // _Atomic, not volatile: push_burst increments s_bursts_queued from the
@@ -59,7 +123,10 @@ static _Atomic uint32_t s_bursts_dropped   = 0;
 static _Atomic uint32_t s_bursts_processed = 0;
 static _Atomic uint32_t s_bursts_skipped   = 0;
 static _Atomic uint32_t s_queue_high_water = 0;
-static _Atomic uint64_t s_burst_total_us   = 0;
+// T59 lag instrument: throttle for the (spammy) pre-read stale log so we can
+// print the actual staleness magnitude ~1/s instead of ~130/s.
+static uint32_t         s_stale_log_throttle = 0;
+static _Atomic uint64_t s_burst_total_us     = 0;
 // BCH outcome counters. processed counts qpsk_demod successes (the
 // "DEMOD SUCCESS" log). bch_decoded counts the ones that actually
 // passed BCH — the real decode rate. bch_failed counts qpsk-demod
@@ -596,13 +663,19 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
 #if CONFIG_SMOKE_TEST_RAW_IRIDIUM
     golden_compare_burst(wctx->burst, &frame, e1_bch, e2_bch);
 #endif
+    // Capture timestamp from the burst's sample position (not decode time),
+    // so a freshness-first/LIFO queue can't reorder emitted timestamps.
+    // stream_epoch is 0 only before the first push (never here); then this is
+    // just esp_timer at index 0 + the burst's age in sample-time.
+    const uint64_t cap_us = signal_buffer_stream_epoch_us() +
+                            wctx->burst->start_sample_idx * 1000000ULL / FS_DETECT_HZ;
 #if CONFIG_DEVICE_ROLE_WORKER || CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
     // Distributed front end (#135): ship only known-type frames as PDUs to
     // the aggregator (preserves the #111 bandwidth saving vs BCH false
     // positives). No local frame_decoder — that runs on the aggregator.
     if (real_known) {
         iridium_frame_pdu_t pdu = {0};
-        pdu.timestamp_us        = (uint64_t)esp_timer_get_time();
+        pdu.timestamp_us        = cap_us;
         pdu.source_id           = frame_pdu_source_id();
         pdu.rel_freq_hz         = (int32_t)wctx->burst->rel_freq_hz;
         pdu.peak_snr_db         = wctx->burst->peak_snr_db;
@@ -617,7 +690,8 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
 #else // STANDALONE (and AGGREGATOR, which never reaches here)
     frame_decoder_push(frame.bits, frame.n_bits,
                        frame.direction, 0u,
-                       wctx->burst->peak_bin, wctx->burst->peak_snr_db);
+                       wctx->burst->peak_bin, wctx->burst->peak_snr_db,
+                       cap_us);
 #endif
     free(frame.bits);
     free(frame.soft_bits); // #112
@@ -630,7 +704,12 @@ void worker_task(void *arg)
     detected_burst_t burst;
 
     while (1) {
-        if (xQueueReceive(burst_queue, &burst, portMAX_DELAY)) {
+        {
+            // Block until a burst is available, then take the STRONGEST one.
+            xSemaphoreTake(s_pq_items, portMAX_DELAY);
+            xSemaphoreTake(s_pq_lock, portMAX_DELAY);
+            pq_extract_max_locked(&burst);
+            xSemaphoreGive(s_pq_lock);
             int64_t burst_t0 = esp_timer_get_time();
             ESP_LOGD(TAG, "Worker burst: start=%llu len=%lu rel=%+.0f Hz SNR=%.1f dB",
                      (unsigned long long)burst.start_sample_idx,
@@ -664,9 +743,17 @@ void worker_task(void *arg)
             uint64_t check_start = burst.start_sample_idx - WB_PRE_PAD_SAMPLES;
             uint32_t check_len   = burst.length_samples + WB_PRE_PAD_SAMPLES;
             if (!signal_buffer_burst_valid(check_start, check_len)) {
-                ESP_LOGW(TAG, "stale burst: start=%llu len=%lu (head wrapped) — drop",
-                         (unsigned long long)burst.start_sample_idx,
-                         (unsigned long)burst.length_samples);
+                // T59 lag instrument: how far behind the producer is this
+                // burst's start when we finally look at it? >ring-span means
+                // the detect chain is lagging live ingest; the magnitude tells
+                // fixed-latency (shrinkable) vs unbounded-deficit apart.
+                if ((s_stale_log_throttle++ & 0x7F) == 0) {
+                    uint64_t lag = signal_buffer_head_total() - burst.start_sample_idx;
+                    ESP_LOGW(TAG, "stale burst: start=%llu lag=%lu ms (%.2f ring-spans) — drop",
+                             (unsigned long long)burst.start_sample_idx,
+                             (unsigned long)(lag * 1000ULL / FS_DETECT_HZ),
+                             (double)lag / (double)(SIGNAL_BUF_SIZE / 4));
+                }
                 s_bursts_skipped++;
                 continue;
             }
@@ -806,9 +893,10 @@ void worker_task(void *arg)
             // WB_PRE_PAD_SAMPLES on both sides) and drop rather than
             // hand a possibly-torn burst to the pipeline.
             if (!signal_buffer_burst_valid(check_start, check_len)) {
-                ESP_LOGW(TAG, "stale burst: start=%llu len=%lu (head wrapped during read) — drop",
+                uint64_t lag = signal_buffer_head_total() - burst.start_sample_idx;
+                ESP_LOGW(TAG, "stale burst: start=%llu lag=%lu ms (during read) — drop",
                          (unsigned long long)burst.start_sample_idx,
-                         (unsigned long)burst.length_samples);
+                         (unsigned long)(lag * 1000ULL / FS_DETECT_HZ));
                 s_bursts_skipped++;
                 continue;
             }
@@ -883,38 +971,31 @@ void worker_core1_prealloc_fir(void)
 
 esp_err_t worker_core1_init(void)
 {
-// Burst queue depth 1024, storage in PSRAM. Each detected_burst_t
-// is 28 bytes, so 1024 entries cost ~28 KB of PSRAM (trivial out
-// of 32 MB). At the current 103 ms/burst worker time this is
-// ~100 seconds of buffering -- well past any transient overload.
-//
-// History: we ran 16, then 32, growing as the wideband front end
-// produced multi-frame bursts that take longer to process. 32
-// still hit high_water=10 on the smoke corpus and would queue-
-// overflow under live RF with bursty traffic. Going large is
-// safer than guessing; PSRAM is cheap and the per-enqueue cost
-// (a 28-byte memcpy via L2 cache) is invisible at burst rates.
-//
-// Static queue: control block in internal-SRAM .bss, storage
-// array in PSRAM heap. xQueueCreateStatic binds the two.
-#define BURST_QUEUE_DEPTH 1024
-    static StaticQueue_t s_burst_queue_buf;
-    static uint8_t      *s_burst_queue_storage = NULL;
-    size_t               storage_bytes         = (size_t)BURST_QUEUE_DEPTH * sizeof(detected_burst_t);
-    s_burst_queue_storage                      = (uint8_t *)heap_caps_malloc(storage_bytes,
-                                                                             MALLOC_CAP_SPIRAM);
-    if (!s_burst_queue_storage) {
-        ESP_LOGE(TAG, "Burst queue PSRAM alloc failed (%zu B)", storage_bytes);
+    // Burst queue depth 1024, storage in PSRAM. Each detected_burst_t
+    // is 28 bytes, so 1024 entries cost ~28 KB of PSRAM (trivial out
+    // of 32 MB). At the current 103 ms/burst worker time this is
+    // ~100 seconds of buffering -- well past any transient overload.
+    //
+    // History: we ran 16, then 32, growing as the wideband front end
+    // produced multi-frame bursts that take longer to process. 32
+    // still hit high_water=10 on the smoke corpus and would queue-
+    // overflow under live RF with bursty traffic. Going large is
+    // safer than guessing; PSRAM is cheap and the per-enqueue cost
+    // (a 28-byte memcpy via L2 cache) is invisible at burst rates.
+    //
+    // SNR priority queue (T59): a small bounded buffer in .bss (BURST_PQ_CAP ×
+    // detected_burst_t ≈ 1.3 KB — no PSRAM needed) guarded by a mutex, with a
+    // counting semaphore tracking occupied slots so the worker can block-wait.
+    s_pq_lock  = xSemaphoreCreateMutex();
+    s_pq_items = xSemaphoreCreateCounting(BURST_PQ_CAP, 0);
+    if (!s_pq_lock || !s_pq_items) {
+        ESP_LOGE(TAG, "Burst PQ semaphore create failed");
         return ESP_ERR_NO_MEM;
     }
-    burst_queue = xQueueCreateStatic(BURST_QUEUE_DEPTH,
-                                     sizeof(detected_burst_t),
-                                     s_burst_queue_storage,
-                                     &s_burst_queue_buf);
-    if (!burst_queue) return ESP_ERR_NO_MEM;
-    ESP_LOGI(TAG, "Burst queue: depth=%d × %u B = %zu B PSRAM",
-             BURST_QUEUE_DEPTH, (unsigned)sizeof(detected_burst_t),
-             storage_bytes);
+    s_pq_count = 0;
+    ESP_LOGI(TAG, "Burst SNR priority queue: cap=%d × %u B = %u B",
+             BURST_PQ_CAP, (unsigned)sizeof(detected_burst_t),
+             (unsigned)(BURST_PQ_CAP * sizeof(detected_burst_t)));
 
     // Wideband buffers. Big working surfaces stay in PSRAM (extract +
     // decim output). The PIE FIR scratch must live in INTERNAL SRAM,
@@ -986,13 +1067,14 @@ esp_err_t worker_core1_init(void)
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(worker_task, "worker_core1",
                                                     16384, NULL, 4, NULL, 1, MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
-        // Don't report a healthy init with no worker: burst_queue would still
-        // exist, so push_burst would enqueue bursts that nothing ever drains —
-        // the queue fills and every burst is silently dropped. Tear down so
-        // the caller sees the failure.
+        // Don't report a healthy init with no worker: the PQ would still exist,
+        // so push_burst would admit bursts that nothing ever drains. Tear down
+        // so the caller sees the failure.
         ESP_LOGE(TAG, "worker_core1 task create failed — tearing down");
-        vQueueDelete(burst_queue);
-        burst_queue = NULL;
+        vSemaphoreDelete(s_pq_items);
+        vSemaphoreDelete(s_pq_lock);
+        s_pq_items = NULL;
+        s_pq_lock  = NULL;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -1000,13 +1082,20 @@ esp_err_t worker_core1_init(void)
 
 void worker_core1_push_burst(const detected_burst_t *burst)
 {
-    if (burst_queue) {
-        s_bursts_queued++;
-        UBaseType_t depth = uxQueueMessagesWaiting(burst_queue);
-        if (depth > s_queue_high_water) s_queue_high_water = depth;
-        if (xQueueSend(burst_queue, burst, 0) != pdTRUE) {
-            s_bursts_dropped++;
-        }
+    if (!s_pq_lock) return;
+    s_bursts_queued++;
+    xSemaphoreTake(s_pq_lock, portMAX_DELAY);
+    int r = pq_insert_locked(burst);
+    if (s_pq_count > (int)s_queue_high_water) s_queue_high_water = s_pq_count;
+    xSemaphoreGive(s_pq_lock);
+    // Give the "item available" count only when a slot went from empty to
+    // occupied. r==0 evicted the weakest in place (occupied-slot count
+    // unchanged — its original give still stands); r<0 dropped this burst
+    // (buffer full and it was weaker than everything already queued).
+    if (r > 0) {
+        xSemaphoreGive(s_pq_items);
+    } else if (r < 0) {
+        s_bursts_dropped++;
     }
 }
 
