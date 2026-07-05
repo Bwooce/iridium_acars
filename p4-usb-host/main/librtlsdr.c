@@ -361,7 +361,6 @@ static rtlsdr_dongle_t known_devices[] = {
 // #define CTRL_IN (LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN)
 // #define CTRL_OUT (LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT)
 #define CTRL_TIMEOUT 300
-#define BULK_TIMEOUT 0
 
 #define EEPROM_ADDR 0xa0
 
@@ -1521,14 +1520,6 @@ int rtlsdr_reset_buffer(rtlsdr_dev_t *dev)
     rtlsdr_write_reg(dev, USBB, USB_EPA_CTL, 0x0000, 2);
 
     return 0;
-}
-
-int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read)
-{
-    if (!dev)
-        return -1;
-
-    return esp_libusb_bulk_transfer(dev->driver_obj, 0x81, buf, len, n_read, BULK_TIMEOUT);
 }
 
 // static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)

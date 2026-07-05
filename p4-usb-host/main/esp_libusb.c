@@ -62,21 +62,10 @@ void init_adsb_dev()
     adsbdev->is_adsb    = true;
     adsbdev->xfer_mutex = xSemaphoreCreateMutex();
     if (adsbdev->xfer_mutex == NULL) {
-        // Non-fatal here: esp_libusb_control_transfer/esp_libusb_bulk_transfer
-        // both check for NULL and fail the transfer rather than dereference it.
-        ESP_LOGE("LIBUSB", "Failed to create xfer_mutex — control/bulk transfers will fail");
+        // Non-fatal here: esp_libusb_control_transfer() checks for NULL and
+        // fails the transfer rather than dereferencing it.
+        ESP_LOGE("LIBUSB", "Failed to create xfer_mutex — control transfers will fail");
     }
-}
-
-void bulk_transfer_read_cb(usb_transfer_t *transfer)
-{
-    for (int i = 0; i < transfer->actual_num_bytes; i++) {
-        adsbdev->response_buf[i] = transfer->data_buffer[i];
-    }
-    adsbdev->is_done           = true;
-    adsbdev->is_success        = transfer->status == 0;
-    adsbdev->bytes_transferred = transfer->num_bytes;
-    if (adsbdev->dev_hdl == NULL) adsbdev->dev_hdl = transfer->device_handle;
 }
 
 void transfer_read_cb(usb_transfer_t *transfer)
@@ -90,97 +79,11 @@ void transfer_read_cb(usb_transfer_t *transfer)
     if (adsbdev->dev_hdl == NULL) adsbdev->dev_hdl = transfer->device_handle;
 }
 
-int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint, unsigned char *data, int length, int *transferred, unsigned int timeout)
-{
-    assert(driver_obj->client_hdl != NULL);
-    usb_device_handle_t dev_hdl = driver_obj->dev_hdl ? driver_obj->dev_hdl : adsbdev->dev_hdl;
-
-    // Serialise against esp_libusb_control_transfer(): both share
-    // adsbdev->response_buf/is_done/is_success/bytes_transferred (#T8).
-    if (adsbdev->xfer_mutex == NULL) {
-        ESP_LOGE("LIBUSB", "bulk_transfer: xfer_mutex not initialised");
-        return -1;
-    }
-    if (xSemaphoreTake(adsbdev->xfer_mutex, pdMS_TO_TICKS(XFER_MUTEX_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGE("LIBUSB", "bulk_transfer: timed out waiting for xfer_mutex");
-        return -1;
-    }
-
-    int             ret = -1;
-    size_t          sizePacket;
-    usb_transfer_t *transfer = NULL;
-    esp_err_t       r;
-
-    // NOTE (T43): 64 is the Full-Speed bulk MPS; High-Speed bulk endpoints
-    // use 512. This rounds `length` up to a *smaller* multiple than the
-    // real MPS on an HS link, which is fine for allocating a buffer >=
-    // length but is not the endpoint's actual wMaxPacketSize. Left as-is:
-    // esp_libusb_bulk_transfer()/rtlsdr_read_sync() have no callers in this
-    // firmware (the real streaming IN path is class_driver.c's own bulk
-    // submission, which doesn't use this helper), so there's no live bug
-    // here today — but if this function grows a caller, look up the
-    // endpoint's wMaxPacketSize (via the device's config descriptor) rather
-    // than hardcoding it.
-    sizePacket = usb_round_up_to_mps(length, 64);
-    if (usb_host_transfer_alloc(sizePacket, 0, &transfer) != ESP_OK ||
-        transfer == NULL) {
-        goto done;
-    }
-
-    transfer->num_bytes        = sizePacket;
-    transfer->device_handle    = dev_hdl;
-    transfer->bEndpointAddress = endpoint;
-    transfer->callback         = bulk_transfer_read_cb;
-    // driver_obj, not &driver_obj: the latter was the address of this
-    // function's PARAMETER — dangling the moment we return. (No current
-    // callback reads context; fixed so the next one that does can.)
-    transfer->context     = (void *)driver_obj;
-    transfer->timeout_ms  = timeout;
-    adsbdev->is_done      = false;
-    adsbdev->response_buf = calloc(sizePacket, sizeof(uint8_t));
-    if (!adsbdev->response_buf) {
-        usb_host_transfer_free(transfer);
-        goto done;
-    }
-
-    r = usb_host_transfer_submit(transfer);
-    if (r != ESP_OK) {
-        free(adsbdev->response_buf);
-        adsbdev->response_buf = NULL;
-        usb_host_transfer_free(transfer);
-        goto done;
-    }
-    while (!adsbdev->is_done) {
-        usb_host_client_handle_events(driver_obj->client_hdl, portMAX_DELAY);
-    }
-
-    if (!adsbdev->is_success) {
-        free(adsbdev->response_buf);
-        adsbdev->response_buf = NULL;
-        usb_host_transfer_free(transfer);
-        goto done;
-    }
-
-    ESP_ERROR_CHECK(usb_host_endpoint_clear(dev_hdl, endpoint));
-    for (int i = 0; i < length; i++) {
-        data[i] = adsbdev->response_buf[i];
-    }
-    *transferred = adsbdev->bytes_transferred;
-    free(adsbdev->response_buf);
-    adsbdev->response_buf = NULL;
-    usb_host_transfer_free(transfer);
-    ret = 0;
-
-done:
-    xSemaphoreGive(adsbdev->xfer_mutex);
-    return ret;
-}
-
 int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout)
 {
     // Serialise: adsbdev->transfer/response_buf/is_done are shared with
-    // esp_libusb_bulk_transfer() and with any concurrent caller of this
-    // function (e.g. the AGC task's multi-register gain sequence in
+    // any concurrent caller of this function (e.g. the AGC task's
+    // multi-register gain sequence in
     // agc.c/librtlsdr.c racing the class_driver task's own control
     // transfers). Without this lock, one caller can free() a transfer or
     // response_buf that another caller's in-flight completion callback is

@@ -65,9 +65,9 @@ typedef struct
     int                 bytes_transferred;
     usb_transfer_t     *transfer;
     usb_device_handle_t dev_hdl; // Permanent handle
-    // Serialises esp_libusb_control_transfer() / esp_libusb_bulk_transfer():
-    // both read-modify-write the transfer/response_buf/is_done fields above
-    // and share one usb_host_client event loop. Without this, the AGC task
+    // Serialises esp_libusb_control_transfer() callers: they read-modify-write
+    // the transfer/response_buf/is_done fields above and share one
+    // usb_host_client event loop. Without this, the AGC task
     // (agc.c, multi control-transfer gain sequence) can race the class_driver
     // task's own control transfers, freeing a transfer the other side still
     // has in flight (#T8).
@@ -81,10 +81,8 @@ typedef struct
 } class_adsb_dev;
 
 void init_adsb_dev();
-void bulk_transfer_read_cb(usb_transfer_t *transfer);
 void stream_transfer_cb(usb_transfer_t *transfer);
 void transfer_read_cb(usb_transfer_t *transfer);
-int  esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint, unsigned char *data, int length, int *transferred, unsigned int timeout);
 int  esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout);
 int  esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint);
 // Zero-copy stream read (T49a): peeks the usbring instead of memcpy'ing
