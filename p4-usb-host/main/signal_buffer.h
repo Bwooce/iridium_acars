@@ -55,7 +55,9 @@ uint32_t signal_buffer_dma_timeouts(void);
 // holds the original-pushed data — i.e. the producer hasn't yet lapped
 // onto the burst window. Returns false when the burst is stale and
 // would extract garbage; the worker uses this to skip rather than
-// decode noise.
-bool signal_buffer_burst_valid(uint32_t start_idx, uint32_t length);
+// decode noise. `start_idx` is the tagger's 64-bit cumulative complex-
+// sample index (T44) so the check disambiguates full ring laps rather
+// than only the most-recent lap.
+bool signal_buffer_burst_valid(uint64_t start_idx, uint32_t length);
 
 #endif

@@ -37,7 +37,9 @@
 // frame. rel_freq_hz is the signed offset of the burst's center bin
 // from band center (positive = above LO).
 typedef struct {
-    uint32_t start_sample_idx; // signal_buffer frame, FS_DETECT_HZ units
+    uint64_t start_sample_idx; // cumulative FS_DETECT_HZ index (T44: 64-bit
+                               // so signal_buffer_burst_valid can disambiguate
+                               // ring laps; ring offset is this % total_cap)
     uint32_t length_samples;   // FS_DETECT_HZ samples
     float    rel_freq_hz;      // signed offset from band centre
     float    peak_snr_db;      // magnitude_db - noise_db

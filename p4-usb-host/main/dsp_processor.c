@@ -147,7 +147,7 @@ static void dispatch_gone_burst(dsp_processor_t *p, const fbt_burst_t *b)
     // (10·log10(mag² · HISTORY / baseline_sum) — see
     // fft_burst_tagger.c). Don't subtract noise_db.
     detected_burst_t out = {
-        .start_sample_idx = (uint32_t)b->start,
+        .start_sample_idx = b->start, // T44: keep full 64-bit cumulative index
         .length_samples   = length_u32,
         .rel_freq_hz      = rel_freq_hz,
         .peak_snr_db      = b->magnitude_db,

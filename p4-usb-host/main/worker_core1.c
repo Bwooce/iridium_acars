@@ -632,8 +632,8 @@ void worker_task(void *arg)
     while (1) {
         if (xQueueReceive(burst_queue, &burst, portMAX_DELAY)) {
             int64_t burst_t0 = esp_timer_get_time();
-            ESP_LOGD(TAG, "Worker burst: start=%lu len=%lu rel=%+.0f Hz SNR=%.1f dB",
-                     (unsigned long)burst.start_sample_idx,
+            ESP_LOGD(TAG, "Worker burst: start=%llu len=%lu rel=%+.0f Hz SNR=%.1f dB",
+                     (unsigned long long)burst.start_sample_idx,
                      (unsigned long)burst.length_samples,
                      (double)burst.rel_freq_hz,
                      (double)burst.peak_snr_db);
@@ -658,11 +658,14 @@ void worker_task(void *arg)
             // We use a conservative envelope (length + pre-pad) so the
             // check matches what signal_buffer_invalidate_range +
             // signal_buffer_read_chunk will touch later.
-            uint32_t check_start = burst.start_sample_idx - WB_PRE_PAD_SAMPLES;
+            // T44: check_start is the 64-bit absolute (cumulative) index for
+            // burst_valid; the ring-offset callers below take (uint32_t)ext_start,
+            // which is congruent mod total_cap so the ring mapping is unchanged.
+            uint64_t check_start = burst.start_sample_idx - WB_PRE_PAD_SAMPLES;
             uint32_t check_len   = burst.length_samples + WB_PRE_PAD_SAMPLES;
             if (!signal_buffer_burst_valid(check_start, check_len)) {
-                ESP_LOGW(TAG, "stale burst: start=%lu len=%lu (head wrapped) — drop",
-                         (unsigned long)burst.start_sample_idx,
+                ESP_LOGW(TAG, "stale burst: start=%llu len=%lu (head wrapped) — drop",
+                         (unsigned long long)burst.start_sample_idx,
                          (unsigned long)burst.length_samples);
                 s_bursts_skipped++;
                 continue;
@@ -701,7 +704,7 @@ void worker_task(void *arg)
             // reads directly from circular_buf via
             // signal_buffer_read_chunk, saving the extract-stage
             // PSRAM write (~3 ms/burst on the smoke corpus).
-            uint32_t ext_start = burst.start_sample_idx - WB_PRE_PAD_SAMPLES;
+            uint32_t ext_start = (uint32_t)check_start; // ring offset (mod total_cap)
             int64_t  t_ext0    = esp_timer_get_time();
             signal_buffer_invalidate_range(ext_start, ext_len);
             int64_t t_ext1 = esp_timer_get_time();
@@ -803,8 +806,8 @@ void worker_task(void *arg)
             // WB_PRE_PAD_SAMPLES on both sides) and drop rather than
             // hand a possibly-torn burst to the pipeline.
             if (!signal_buffer_burst_valid(check_start, check_len)) {
-                ESP_LOGW(TAG, "stale burst: start=%lu len=%lu (head wrapped during read) — drop",
-                         (unsigned long)burst.start_sample_idx,
+                ESP_LOGW(TAG, "stale burst: start=%llu len=%lu (head wrapped during read) — drop",
+                         (unsigned long long)burst.start_sample_idx,
                          (unsigned long)burst.length_samples);
                 s_bursts_skipped++;
                 continue;

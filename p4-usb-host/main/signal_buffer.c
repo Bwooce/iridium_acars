@@ -37,6 +37,35 @@ _Static_assert(0,
 static int16_t *circular_buf = NULL;
 static uint32_t head         = 0; // in complex samples
 
+// T44: 64-bit monotonic cumulative complex-sample counter. `head` alone is
+// modulo total_cap, so burst_valid()'s ring-relative arithmetic cannot see
+// an extra whole-ring lap of producer progress and a truly stale burst can
+// alias back to an apparently-fresh distance. This counter carries full
+// lap information so burst_valid() can compare absolute positions.
+//
+// Written only by the producer (signal_buffer_push, Core 0); read by the
+// worker (Core 1, via burst_valid). A 64-bit load is two 32-bit reads on
+// this RV32 core and could tear at the ~28-min hi-word rollover; a too-small
+// torn value would wrongly pass a stale burst. Guard with a single-writer
+// seqlock (odd seq = write in flight) — same __sync_synchronize() fence
+// pattern usbring.c uses for its producer/consumer handoff.
+static volatile uint32_t s_head_total_seq = 0;
+static uint64_t          s_head_total     = 0; // guarded by s_head_total_seq
+
+static uint64_t read_head_total(void)
+{
+    uint32_t s1, s2;
+    uint64_t v;
+    do {
+        s1 = s_head_total_seq;
+        __sync_synchronize();
+        v = s_head_total;
+        __sync_synchronize();
+        s2 = s_head_total_seq;
+    } while ((s1 & 1u) || s1 != s2);
+    return v;
+}
+
 // AXI-GDMA async memcpy. signal_buffer_push fires PSRAM writes off to this
 // channel so Core 0 doesn't block on the ~800 us PSRAM transfer per cycle.
 // AXI master is the right choice here: USB DWC OTG-HS sits on AHB; using
@@ -177,7 +206,9 @@ esp_err_t signal_buffer_init()
                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!circular_buf) return ESP_ERR_NO_MEM;
     memset(circular_buf, 0, SIGNAL_BUF_SIZE);
-    head = 0;
+    head             = 0;
+    s_head_total     = 0;
+    s_head_total_seq = 0;
 
     async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
     cfg.backlog               = 4;  // up to 4 outstanding transfers
@@ -442,6 +473,15 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
 
     head = signal_buffer_next_head(head, (uint32_t)aligned_count, total_cap);
 
+    // T44: publish the 64-bit cumulative counter under the seqlock, in
+    // lockstep with `head` (same single exit site, so the T2 index invariant
+    // holds for both — every push advances both counters by aligned_count).
+    s_head_total_seq++; // -> odd: write in flight
+    __sync_synchronize();
+    s_head_total += aligned_count;
+    __sync_synchronize();
+    s_head_total_seq++; // -> even: consistent
+
     // Update carry with the tail of THIS push's source (samples we deferred).
     if (new_carry_count) {
         size_t tail_offset_complex = n_samples - new_carry_count;
@@ -460,36 +500,27 @@ uint32_t signal_buffer_head(void)
     return head;
 }
 
-bool signal_buffer_burst_valid(uint32_t start_idx, uint32_t length)
+bool signal_buffer_burst_valid(uint64_t start_idx, uint32_t length)
 {
     const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
     if (length == 0 || length >= total_cap) return false;
 
-    // T44 (assessed, not fixed here): both `head` and `start_idx` are
-    // ring-relative positions modulo total_cap (~1M complex samples,
-    // ~420 ms of producer time at 2.5 Msps). The check below can only
-    // measure "distance since end" modulo one full lap -- if the
-    // producer has actually lapped the ring an extra whole total_cap
-    // (or more) since start_idx was captured, that extra distance is
-    // invisible to this arithmetic and a truly stale burst can alias
-    // back to a small, apparently-fresh `since_end`. Closing this needs
-    // a monotonically increasing 64-bit sample counter threaded through
-    // the callers that hand start_idx to this function (the tagger and
-    // worker_core1.c), not just this file, so start_idx itself carries
-    // enough range to disambiguate laps -- a wider cross-file API
-    // change outside this task's file scope (only signal_buffer.c) and
-    // too risky to improvise without touching those call sites in
-    // lockstep. Left as-is; no behavior change here, this is the
-    // maximally-correct check obtainable from ring-relative-only
-    // inputs. In practice this needs a full extra lap of worker stall
-    // (~420 ms) to misfire, far beyond normal tagger→worker latency.
-    //
-    // Distance from the burst's END (in producer order) to the current
-    // head, modulo wrap. If this exceeds (total_cap - length), the
-    // producer has lapped onto the burst's window — data is gone.
-    uint32_t end       = (start_idx + length) % total_cap;
-    uint32_t since_end = (head - end + total_cap) % total_cap;
-    return since_end <= (total_cap - length);
+    // T44: absolute-index staleness. `start_idx` is the tagger's 64-bit
+    // cumulative complex-sample index (dsp_processor.c passes b->start
+    // un-truncated); s_head_total is the producer's matching 64-bit
+    // cumulative count (same origin/count to within the <=15-sample push
+    // carry, which the worker's WB_PRE_PAD envelope already absorbs).
+    // Comparing in absolute space means an extra whole-ring lap of producer
+    // progress since start_idx was captured can no longer alias back to an
+    // apparently-fresh distance — the failure mode of the old
+    // mod-total_cap-only arithmetic (which needed a full ~420 ms worker
+    // stall to misfire). For any tagger->worker latency below one lap this
+    // yields the identical verdict to the old check; it differs only in the
+    // stale-beyond-one-lap case it now correctly rejects.
+    uint64_t ht      = read_head_total();
+    uint64_t end_abs = start_idx + length;
+    if (end_abs > ht) return false;       // window not fully produced yet
+    return (ht - start_idx) <= total_cap; // oldest sample not yet lapped
 }
 
 // Invalidate one contiguous byte range of the ring, expanded outward to

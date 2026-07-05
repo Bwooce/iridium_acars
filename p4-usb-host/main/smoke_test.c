@@ -136,9 +136,9 @@ static void on_burst(const detected_burst_t *burst)
     // priming-noise-spike false positives (~1 frame ≈ 0.8 ms).
     float length_ms = (float)burst->length_samples / 2560.0f;
     ESP_LOGI(TAG, "callback: burst peak_bin=%d snr=%.2f dB "
-                  "start=%lu len=%lu samples (%.2f ms)",
+                  "start=%llu len=%lu samples (%.2f ms)",
              burst->peak_bin, burst->peak_snr_db,
-             (unsigned long)burst->start_sample_idx,
+             (unsigned long long)burst->start_sample_idx,
              (unsigned long)burst->length_samples,
              length_ms);
 }
