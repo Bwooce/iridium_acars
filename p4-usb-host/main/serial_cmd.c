@@ -1,5 +1,6 @@
 #include "serial_cmd.h"
 #include "app_config.h"
+#include "scanner.h"
 #include "wifi_link.h"
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -208,6 +209,37 @@ static void cmd_nettest(const char *unicast_ip)
     uart_puts("nettest done\r\n");
 }
 
+static void cmd_hop(char *args)
+{
+    char *hz_s = strtok(args, " \t");
+    char *save = strtok(NULL, " \t");
+    if (!hz_s) {
+        uart_puts("ERR usage: hop <hz> [save]\r\n");
+        return;
+    }
+    uint32_t  hz      = (uint32_t)strtoul(hz_s, NULL, 10);
+    bool      persist = (save && strcmp(save, "save") == 0);
+    esp_err_t e       = scanner_hop(hz, persist);
+    if (e == ESP_OK)
+        uart_puts("OK hopped (settling ~0.5s)\r\n");
+    else if (e == ESP_ERR_INVALID_STATE)
+        uart_puts("ERR SDR not streaming yet\r\n");
+    else
+        uart_puts("ERR retune failed\r\n");
+}
+
+static void cmd_scan(char *args)
+{
+    uint32_t start = SCAN_START_HZ, stop = SCAN_STOP_HZ, step = SCAN_STEP_HZ, dwell = SCAN_DWELL_MS;
+    char    *a;
+    if ((a = strtok(args, " \t"))) start = (uint32_t)strtoul(a, NULL, 10);
+    if ((a = strtok(NULL, " \t"))) stop = (uint32_t)strtoul(a, NULL, 10);
+    if ((a = strtok(NULL, " \t"))) step = (uint32_t)strtoul(a, NULL, 10);
+    if ((a = strtok(NULL, " \t"))) dwell = (uint32_t)strtoul(a, NULL, 10);
+    uart_puts("OK scanning (see log for map)\r\n");
+    scanner_scan(start, stop, step, dwell);
+}
+
 static void dispatch(char *line)
 {
     // Trim trailing whitespace
@@ -234,6 +266,18 @@ static void dispatch(char *line)
         cmd_nettest(ip ? ip : "");
         return;
     }
+    if (strcmp(cmd, "hop") == 0) {
+        cmd_hop(strtok(NULL, ""));
+        return;
+    }
+    if (strcmp(cmd, "scan") == 0) {
+        cmd_scan(strtok(NULL, ""));
+        return;
+    }
+    if (strcmp(cmd, "map") == 0) {
+        scanner_print_last_map();
+        return;
+    }
 
     char *key = strtok(NULL, " \t");
     if (!key) {
@@ -254,7 +298,7 @@ static void dispatch(char *line)
         return;
     }
 
-    uart_puts("ERR unknown command (set/get/config/reboot)\r\n");
+    uart_puts("ERR unknown command (set/get/config/reboot/hop/scan/map/nettest)\r\n");
 }
 
 static void serial_cmd_task(void *arg)
