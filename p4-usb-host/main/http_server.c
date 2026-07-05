@@ -47,11 +47,11 @@ static httpd_handle_t s_server = NULL;
 // before embedding them in JSON (M17).
 static size_t json_escape(char *out, size_t outsz, const char *in);
 
-// Pre-allocated DMA-INT read buffer for /capture/file. Allocated at
-// http_server_start (early in app_main) so it survives DMA-INT
-// fragmentation from USB pool + tagger. Without this, the download
-// handler's lazy 4 KB DMA-INT alloc fails, falls back to PSRAM, and
-// the SDMMC read into PSRAM hits the stash path which is also tight.
+// Pre-allocated PSRAM read buffer for /capture/file (T49b: was DMA-INT,
+// moved to PSRAM to return 4 KB to the tight USB-pool budget). SDMMC
+// reads into it via the driver's bounce path; fine for this rare manual
+// download. Still pre-allocated at http_server_start so the handler
+// never does a lazy per-download alloc.
 static uint8_t *s_download_buf = NULL;
 #define DOWNLOAD_BUF_BYTES 4096
 
@@ -1515,13 +1515,18 @@ esp_err_t http_server_start(void)
 {
     if (s_server) return ESP_OK;
 
-    // Pre-allocate the download buffer here, BEFORE the USB pool
-    // and tagger have a chance to fragment DMA-INT. See
-    // s_download_buf decl for the why.
+    // T49b: moved from DMA-INT to PSRAM to give the USB transfer pool
+    // back 4 KB of the critically-tight DMA-internal budget (the pool
+    // was short of its 8 transfers; the convert/resample tile needs the
+    // room). The SDMMC read into a PSRAM buffer uses the driver's bounce
+    // ("stash") path instead of DMA-ing directly — acceptable because
+    // /capture/file is a rare, manual, already-stream-disruptive
+    // operation, not the hot path. Still pre-allocated here (before the
+    // pool/tagger) so the download handler never does a lazy alloc.
     s_download_buf = heap_caps_aligned_alloc(64, DOWNLOAD_BUF_BYTES,
-                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_download_buf) {
-        ESP_LOGI(TAG, "pre-allocated %d-byte DMA-INT download buf @ %p",
+        ESP_LOGI(TAG, "pre-allocated %d-byte PSRAM download buf @ %p",
                  DOWNLOAD_BUF_BYTES, s_download_buf);
     } else {
         ESP_LOGW(TAG, "download buf alloc failed — /capture/file will 500");

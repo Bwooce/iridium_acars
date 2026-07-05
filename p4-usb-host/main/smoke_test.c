@@ -552,19 +552,16 @@ void smoke_test_run(void)
     //   3. uw_correlator PIE float-FFT scratch (16 KB) — the WORKER's
     //      decode FFT. Under DRAM pressure its lazy alloc spills to
     //      RTCRAM where the PIE unit mis-decodes (RAW recall ~95%->~6%).
-    //   4. Three PIE FIR delay lines (T56): uw_correlator's D13
+    //   4. ingest_core1's convert+resample tile (4 KB, T49b) — the
+    //      INGEST convert+resample fusion's PIE MAC input.
+    //   5. Three PIE FIR delay lines (T56): uw_correlator's D13
     //      envelope-LP FIR + RRC I/Q FIRs, and worker_core1's wideband
-    //      decim FIR I/Q. Same RTCRAM-spill hazard as #3, just for
-    //      dsps_fird_s16_arp4's memalign'd delay line instead of a
-    //      heap_caps-allocated FFT scratch.
+    //      decim FIR I/Q. Same RTCRAM-spill hazard, for
+    //      dsps_fird_s16_arp4's memalign'd delay line.
     resample_256_to_250_alloc_coeffs();
     fft_sc16_2048_init();
     uw_correlator_prealloc_pie_fft();
-    // Same hazard, three more PIE FIR delay lines (T56): D13 envelope-LP
-    // FIR + RRC I/Q FIRs (uw_correlator) and the wideband decim FIR I/Q
-    // (worker_core1's s_decim). All three were still lazy-allocated on
-    // the first burst, so their address depended on heap fragmentation
-    // at that point -- pin them here too, while DRAM is still plentiful.
+    ingest_core1_prealloc_tile();
     uw_correlator_prealloc_fir();
     worker_core1_prealloc_fir();
     HEAP_LOG("post-pie-buffers");

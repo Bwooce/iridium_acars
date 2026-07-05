@@ -187,6 +187,36 @@ add_executable(test_resample_split
 target_include_directories(test_resample_split PRIVATE ${COMMON_DIR})
 target_link_libraries(test_resample_split PRIVATE m)
 
+# T49b (chain B, perf-decoupling design 2026-07-04): bit-exact validation
+# of the convert+resample tile fusion used by ingest_core1.c's ingest_task
+# hot path. Drives resample_256_to_250_process_explicit from raw uint8
+# bytes through <= TILE_COMPLEX-sample tiles (sibling of
+# test_resample_split.c, which covers the parallel Worker A/B split
+# instead of this sequential single-thread tiling). Includes an
+# always-on negative control (a state-resetting broken tiling MUST be
+# detected) and a --demo-fail red-path mode.
+add_executable(test_resample_tile
+    test_resample_tile.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+)
+target_include_directories(test_resample_tile PRIVATE ${COMMON_DIR})
+target_link_libraries(test_resample_tile PRIVATE m)
+
+# T49b root-cause artifact: arithmetic-level proof that the device-only
+# PIE polyphase MAC (resample_arp4.S) is chunk-continuable. Re-implements
+# the exact fixed-point kernel in C (host has no PIE) and shows it is
+# bit-exact across all tile sizes, while a hypothetical per-call
+# tail-rounding bug (negative control) diverges with the "smaller tiles =
+# worse" signature. Refutes the "PIE tail accumulates per call" hypothesis.
+add_executable(test_resample_pie_model
+    test_resample_pie_model.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+)
+target_include_directories(test_resample_pie_model PRIVATE ${COMMON_DIR})
+target_link_libraries(test_resample_pie_model PRIVATE m)
+
 # Phase 3.6.M: wideband fft_burst_tagger smoke test. Feeds the ALBQ
 # raw fixture through the tagger and checks the burst-count + bin
 # distribution looks sane (≥30 bursts emitted, multiple bins hit, EMA
@@ -659,6 +689,8 @@ add_test(NAME ibc_decode           COMMAND test_ibc_decode)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME resample_split        COMMAND test_resample_split)
+add_test(NAME resample_tile         COMMAND test_resample_tile)
+add_test(NAME resample_pie_model    COMMAND test_resample_pie_model)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 add_test(NAME window_multiply_golden COMMAND test_window_multiply_golden)
 # direct_if_decim intentionally NOT auto-registered: needs

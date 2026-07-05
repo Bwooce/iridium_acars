@@ -303,6 +303,11 @@ static void action_start_stream(class_driver_t *driver_obj)
     // here too: left to the worker's lazy first call it spills to RTCRAM
     // under DRAM pressure and silently mis-decodes (the ~95%->~6% cliff).
     uw_correlator_prealloc_pie_fft();
+    // T49b: ingest_core1's convert+resample staging tile (4 KB) is also
+    // a PIE-read buffer (resample_arp4.S's MAC input) -- pin it here too
+    // while DRAM is plentiful. ingest_core1_init() re-checks and fails
+    // fatally if this didn't land in DRAM.
+    ingest_core1_prealloc_tile();
     // Same hazard, three more PIE FIR delay lines (T56): D13 envelope-LP
     // FIR + RRC I/Q FIRs (uw_correlator) and the wideband decim FIR I/Q
     // (worker_core1's s_decim). All three were still lazy-allocated on

@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -7,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "ingest_core1.h"
 #include "signal_buffer.h"
 #include "resample_256_to_250.h"
@@ -18,9 +20,54 @@ static const char *TAG = "INGEST";
 // T49a: raw USB bytes no longer have a slot-owned buffer -- they live
 // in the usbring PSRAM ring (esp_libusb.c/usbring.c) and are handed to
 // ingest_task as a (ptr, bytes) pair per dispatch. See dispatch_msg_t.
-static int16_t *s_conv[INGEST_NUM_SLOTS];           // PSRAM heap-alloc'd
+// T49b: there is no more s_conv[] (2 x 32 KB PSRAM). The convert step
+// now writes into a single small internal-SRAM tile (s_tile below) and
+// feeds the resampler directly from it, chunk by chunk, eliminating the
+// convert-into-PSRAM / resample-reads-it-all-back round trip. See
+// ingest_core1_prealloc_tile() and ingest_task's convert+resample loop.
 static int16_t *s_resamp[INGEST_NUM_SLOTS];         // resampled int16 Q15 @ 2.5 MSPS (downstream feed, internal SRAM)
 static size_t   s_resamp_n_int16[INGEST_NUM_SLOTS]; // int16 element count in s_resamp
+
+// T49b: single internal-SRAM staging tile shared by every dispatch
+// (ingest_task is the only reader/writer, single-threaded, so no
+// per-slot copy is needed). See ingest_core1_prealloc_tile()'s doc
+// comment in ingest_core1.h for the heap-position hazard this guards
+// against.
+static int16_t *s_tile    = NULL;
+static bool     s_tile_ok = false;
+
+void ingest_core1_prealloc_tile(void)
+{
+    if (s_tile != NULL) return; // idempotent
+    size_t largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t free_before    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t tile_bytes     = (size_t)INGEST_TILE_COMPLEX * 2 * sizeof(int16_t);
+    s_tile                = (int16_t *)heap_caps_aligned_alloc(64, tile_bytes, MALLOC_CAP_INTERNAL);
+    if (!s_tile) {
+        ESP_LOGE(TAG, "convert/resample tile alloc FAILED (need %u B INTERNAL; "
+                      "had free=%zu largest=%zu)",
+                 (unsigned)tile_bytes, free_before, largest_before);
+        return;
+    }
+    // Hard guard: the PIE vector unit (resample_arp4.S's MAC, reading
+    // this tile as input) garbles data on non-DRAM (RTCRAM/TCM). Refuse
+    // a non-DRAM tile rather than mis-decode silently -- see
+    // project_heap_position_decode_bug.md.
+    if (!esp_ptr_in_dram(s_tile)) {
+        ESP_LOGE(TAG, "convert/resample tile landed OUTSIDE DRAM at %p "
+                      "(RTCRAM/TCM fallback under DRAM pressure; free=%zu "
+                      "largest=%zu) -- PIE resample MAC would MIS-DECODE. "
+                      "Call ingest_core1_prealloc_tile() earlier in boot.",
+                 s_tile, free_before, largest_before);
+        heap_caps_free(s_tile);
+        s_tile = NULL;
+        return;
+    }
+    s_tile_ok = true;
+    ESP_LOGI(TAG, "convert/resample tile OK in DRAM at %p (%u B, INTERNAL "
+                  "free_before=%zu largest_before=%zu)",
+             s_tile, (unsigned)tile_bytes, free_before, largest_before);
+}
 
 // 125/128 polyphase rational resampler state. Caller-managed —
 // process_explicit() reads/updates these in place each dispatch.
@@ -221,27 +268,36 @@ static void ingest_task(void *arg)
         // We do NOT take s_free here — that would deadlock since
         // class_driver already holds it.
 
-        // 1. Convert raw uint8 -> int16 Q15.
+        // 1+2. T49b: fuse convert (uint8 -> int16 Q15) and resample
+        // through a single small internal-SRAM tile, looping over
+        // <= INGEST_TILE_COMPLEX-sample chunks. Replaces the old
+        // two-pass convert-into-PSRAM-s_conv / resample-reads-it-all-
+        // back round trip (~19.5 MB/s of avoidable PSRAM traffic per
+        // docs/perf-decoupling-design-2026-07-04.md §T49b) with:
+        // convert a chunk into s_tile (internal SRAM), then feed it
+        // straight to the resampler, whose persistent (delay, wpos,
+        // start_pos) state carries the polyphase walk across chunks
+        // exactly as it carried across whole dispatches before --
+        // test_resample_split.c / test_resample_tile.c prove this kind
+        // of chunking is bit-exact.
         //   out[i] = (int16_t)((b[i] << 8) ^ 0x8000)
-        // Same formula as the in-class_driver path before this offload.
-        // 4x unrolled, 32-bit-at-a-time. `src` used to be s_raw[slot], a
-        // dedicated 64-byte-aligned buffer; it is now a pointer straight
-        // into the usbring PSRAM ring (T49a), whose physical offset can
-        // land on ANY byte alignment (e.g. after a short USB transfer
-        // leaves an odd byte count at the ring's wrap point) -- so the
-        // 4-byte group is read via memcpy into a local, not a `uint32_t*`
-        // reinterpret-cast, to avoid an unaligned-access fault. `dst` is
-        // still the dedicated 64-byte-aligned s_conv[slot] PSRAM buffer.
+        // Same formula as before T49a/T49b. `src` points straight into
+        // the usbring PSRAM ring (T49a); its physical offset can land
+        // on ANY byte alignment (e.g. after a short USB transfer leaves
+        // an odd byte count at the ring's wrap point), so the 4-byte
+        // group is read via memcpy into a local, not a `uint32_t*`
+        // reinterpret-cast, to avoid an unaligned-access fault. `s_tile`
+        // is the dedicated 64-byte-aligned internal-SRAM tile (see
+        // ingest_core1_prealloc_tile).
         int64_t t0                    = esp_timer_get_time();
         const uint8_t *__restrict src = msg.ptr;
-        int16_t *__restrict dst       = s_conv[msg.slot];
         size_t n                      = msg.bytes;
 
         // AGC sampling (D16): scan the first 256 bytes for the
-        // maximum deviation from the mid-point (uint8 127). One
-        // pass through a tiny prefix, cheap, gives a peak signal
-        // estimate for the AGC task to decide whether the tuner
-        // is saturating. Doesn't change the convert math — just
+        // maximum deviation from the mid-point (uint8 127). Reads raw
+        // src bytes directly -- independent of conversion/tiling, so
+        // it runs once per dispatch, ahead of (and unaffected by) the
+        // tile loop below. Doesn't change the convert math — just
         // observes.
         size_t  agc_n   = n < 256 ? n : 256;
         uint8_t agc_max = 0;
@@ -255,124 +311,200 @@ static void ingest_task(void *arg)
         }
         s_agc_dispatches++;
 
-        size_t n4 = n & ~(size_t)3;
-        size_t i  = 0;
-        for (; i < n4; i += 4) {
-            uint32_t b4;
-            memcpy(&b4, src + i, sizeof(b4)); // safe unaligned load, see comment above
-            dst[i + 0] = (int16_t)((((b4 >> 0) & 0xff) << 8) ^ 0x8000);
-            dst[i + 1] = (int16_t)((((b4 >> 8) & 0xff) << 8) ^ 0x8000);
-            dst[i + 2] = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
-            dst[i + 3] = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
-        }
-        for (; i < n; i++) {
-            dst[i] = (int16_t)(((src[i] << 8) ^ 0x8000));
-        }
-        int64_t t1 = esp_timer_get_time();
-        s_acc_convert_us += (uint64_t)(t1 - t0);
+        int64_t t_agc       = esp_timer_get_time();
+        int64_t convert_us  = t_agc - t0; // AGC scan time bundled in, as before T49b
+        int64_t resample_us = 0;
 
-        // The convert loop above is the LAST read of msg.ptr (the ring
-        // region). Signal raw_done now so class_driver can
-        // usbring_consume() it and peek the ring for the next dispatch
-        // — this must happen before resample/push (which don't touch
-        // the ring) so the ring reclaim isn't gated on the slower
-        // resample+signal_buffer_push stage. See ingest_core1.h's
-        // ingest_core1_wait_raw_done() doc comment.
-        xSemaphoreGive(s_raw_done[msg.slot]);
-
-        // 2. Resample 2.56 → 2.5 MSPS (125/128 polyphase). gri's
-        // wideband tagger / direct_if_decim are tuned at 2.5 MSPS;
-        // performing this once here keeps the entire downstream chain
-        // (signal_buffer, dsp_processor, worker) at the gri-aligned
-        // rate. Input is n/2 complex samples (interleaved IQ in
-        // s_conv); output is ~n/2 × 125/128 complex into s_resamp.
-        int n_in_complex = (int)(n / 2);
-        int split_pct    = s_split_pct;
-        int mid          = (n_in_complex * split_pct) / 100;
+        int n_in_complex_total = (int)(n / 2);
+        int split_pct          = s_split_pct;
+        int mid                = (n_in_complex_total * split_pct) / 100;
         if (mid < 9) mid = 0; // need ≥ 9 samples to seed Worker B's delay
         int16_t *out = s_resamp[msg.slot];
         int      n_out_complex;
 
         if (mid == 0) {
-            // Inline single-thread path on Core 1 (split=0 default).
-            // ingest_task's stack lives in internal SRAM (default
-            // xTaskCreatePinnedToCore), so the stack-local batch
-            // scratch lands in internal SRAM and the PIE MAC sh's
-            // are fast — the function then flushes 32-byte bursts
-            // into the PSRAM out buffer. See _process_explicit doc
-            // for the cost rationale.
-            int16_t batch_scratch[RS25_BATCH_COMPLEX * 2]
-                __attribute__((aligned(16)));
-            n_out_complex = resample_256_to_250_process_explicit(
-                s_persist_delay_i, s_persist_delay_q,
-                &s_persist_wpos, &s_persist_start_pos,
-                dst, n_in_complex,
-                out, n_in_complex,
-                batch_scratch);
+            // Default hot path (split=0). Convert+resample <=
+            // INGEST_TILE_COMPLEX-sample chunks through s_tile,
+            // threading the SAME persistent resampler state across
+            // chunks (and across dispatches, as before). raw_done is
+            // given the moment the LAST tile's convert step finishes
+            // -- that's the last read of msg.ptr, same contract as
+            // before T49b, just later in wall-clock terms than the old
+            // convert-everything-first ordering (an inherent
+            // consequence of fusing convert+resample -- watch
+            // consumer_waits / rb_full_drops in the device soak for
+            // any pipelining shift).
+            n_out_complex      = 0;
+            int  complex_done  = 0;
+            bool gave_raw_done = false;
+            while (complex_done < n_in_complex_total) {
+                int tile_complex = n_in_complex_total - complex_done;
+                if (tile_complex > INGEST_TILE_COMPLEX) tile_complex = INGEST_TILE_COMPLEX;
+                size_t tile_bytes = (size_t)tile_complex * 2;
+
+                int64_t tc0                    = esp_timer_get_time();
+                const uint8_t *__restrict tsrc = src + (size_t)complex_done * 2;
+                int16_t *__restrict tdst       = s_tile;
+                size_t tb4                     = tile_bytes & ~(size_t)3;
+                size_t ti                      = 0;
+                for (; ti < tb4; ti += 4) {
+                    uint32_t b4;
+                    memcpy(&b4, tsrc + ti, sizeof(b4)); // safe unaligned load, see comment above
+                    tdst[ti + 0] = (int16_t)((((b4 >> 0) & 0xff) << 8) ^ 0x8000);
+                    tdst[ti + 1] = (int16_t)((((b4 >> 8) & 0xff) << 8) ^ 0x8000);
+                    tdst[ti + 2] = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
+                    tdst[ti + 3] = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
+                }
+                for (; ti < tile_bytes; ti++) {
+                    tdst[ti] = (int16_t)(((tsrc[ti] << 8) ^ 0x8000));
+                }
+                complex_done += tile_complex;
+                int64_t tc1 = esp_timer_get_time();
+                convert_us += (tc1 - tc0);
+
+                // Last read of msg.ptr happened in the convert step
+                // above (this tile's byte reads) -- give raw_done now,
+                // before resampling this tile, so ring reclaim isn't
+                // gated on it. See ingest_core1.h's
+                // ingest_core1_wait_raw_done() doc comment.
+                if (!gave_raw_done && complex_done >= n_in_complex_total) {
+                    xSemaphoreGive(s_raw_done[msg.slot]);
+                    gave_raw_done = true;
+                }
+
+                int16_t batch_scratch[RS25_BATCH_COMPLEX * 2]
+                    __attribute__((aligned(16)));
+                int64_t tr0        = esp_timer_get_time();
+                int     n_out_tile = resample_256_to_250_process_explicit(
+                    s_persist_delay_i, s_persist_delay_q,
+                    &s_persist_wpos, &s_persist_start_pos,
+                    s_tile, tile_complex,
+                    out + 2 * n_out_complex, tile_complex,
+                    batch_scratch);
+                int64_t tr1 = esp_timer_get_time();
+                resample_us += (tr1 - tr0);
+                n_out_complex += n_out_tile;
+            }
+            if (!gave_raw_done) {
+                // n_in_complex_total == 0 (degenerate 0/1-byte
+                // dispatch) -- the loop above never ran, so msg.ptr was
+                // never read at all; already safe to reclaim.
+                xSemaphoreGive(s_raw_done[msg.slot]);
+            }
         } else {
-            // Split path — Worker A on Core 0 takes the first `mid`
-            // inputs; Worker B on Core 1 takes the rest. Both run
-            // concurrently. Worker B's initial (delay, wpos,
-            // start_pos) is computed from the closed-form polyphase
-            // walk so it can start immediately, no serial pre-pass.
-            memcpy(s_worker_a.delay_i, s_persist_delay_i, sizeof(s_persist_delay_i));
-            memcpy(s_worker_a.delay_q, s_persist_delay_q, sizeof(s_persist_delay_q));
-            s_worker_a.wpos         = s_persist_wpos;
-            s_worker_a.start_pos    = s_persist_start_pos;
-            s_worker_a.in_iq        = dst;
-            s_worker_a.n_in_complex = mid;
-            s_worker_a.out_iq       = out;
-            s_worker_a.max_out      = mid;
-            s_worker_a.coord_task   = xTaskGetCurrentTaskHandle();
+            // Split path retired by T49b. s_split_pct has no live
+            // runtime setter anywhere in this tree (the comment above
+            // referencing ingest_core1_set_split_pct() is stale -- no
+            // such function exists) so s_split_pct is hardwired 0 and
+            // mid is always 0: this branch never executes in
+            // production. It needs full-buffer random access into the
+            // converted input (Worker A/B slice dst[0..mid) /
+            // dst[mid..n_in_complex_total), Worker B seeds from
+            // dst[mid-9..mid-1]), which the small T49b streaming tile
+            // can't provide by construction -- so, since this path is
+            // dead, it does its own one-off convert into a dedicated
+            // PSRAM scratch instead of sharing the hot tiled path. If
+            // this is ever revived, give it real tiling support first
+            // (see docs/perf-decoupling-design-2026-07-04.md §T49b).
+            int      n_in_complex = n_in_complex_total;
+            int64_t  tc0          = esp_timer_get_time();
+            int16_t *dst          = (int16_t *)heap_caps_aligned_alloc(
+                64, n * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!dst) {
+                ESP_LOGE(TAG, "split path: legacy convert scratch alloc "
+                              "failed (%u B) -- dropping this dispatch's "
+                              "split output",
+                         (unsigned)(n * sizeof(int16_t)));
+                n_out_complex = 0;
+                xSemaphoreGive(s_raw_done[msg.slot]); // src is never read below
+            } else {
+                size_t n4 = n & ~(size_t)3;
+                size_t i  = 0;
+                for (; i < n4; i += 4) {
+                    uint32_t b4;
+                    memcpy(&b4, src + i, sizeof(b4));
+                    dst[i + 0] = (int16_t)((((b4 >> 0) & 0xff) << 8) ^ 0x8000);
+                    dst[i + 1] = (int16_t)((((b4 >> 8) & 0xff) << 8) ^ 0x8000);
+                    dst[i + 2] = (int16_t)((((b4 >> 16) & 0xff) << 8) ^ 0x8000);
+                    dst[i + 3] = (int16_t)((((b4 >> 24) & 0xff) << 8) ^ 0x8000);
+                }
+                for (; i < n; i++) {
+                    dst[i] = (int16_t)(((src[i] << 8) ^ 0x8000));
+                }
+                xSemaphoreGive(s_raw_done[msg.slot]);
+                int64_t tc1 = esp_timer_get_time();
+                convert_us += (tc1 - tc0);
 
-            // Seed Worker B's delay buffer with the 9 newest input
-            // samples (mid-1, mid-2, ..., mid-9) in newest-first
-            // order at delay[0..8], with mirror copies at
-            // delay[16..24] so the first MAC iteration sees them at
-            // delay[wpos+1..wpos+8] after the wpos decrement.
-            int n_emits_a = rs_n_emits(s_persist_start_pos, mid);
-            for (int k = 0; k < 9; k++) {
-                int     src_idx            = mid - 1 - k;
-                int16_t i_s                = dst[2 * src_idx + 0];
-                int16_t q_s                = dst[2 * src_idx + 1];
-                s_worker_b.delay_i[k]      = i_s;
-                s_worker_b.delay_i[k + 16] = i_s;
-                s_worker_b.delay_q[k]      = q_s;
-                s_worker_b.delay_q[k + 16] = q_s;
+                int64_t tr0 = esp_timer_get_time();
+                // Worker A on Core 0 takes the first `mid` inputs;
+                // Worker B on Core 1 takes the rest. Both run
+                // concurrently. Worker B's initial (delay, wpos,
+                // start_pos) is computed from the closed-form polyphase
+                // walk so it can start immediately, no serial pre-pass.
+                memcpy(s_worker_a.delay_i, s_persist_delay_i, sizeof(s_persist_delay_i));
+                memcpy(s_worker_a.delay_q, s_persist_delay_q, sizeof(s_persist_delay_q));
+                s_worker_a.wpos         = s_persist_wpos;
+                s_worker_a.start_pos    = s_persist_start_pos;
+                s_worker_a.in_iq        = dst;
+                s_worker_a.n_in_complex = mid;
+                s_worker_a.out_iq       = out;
+                s_worker_a.max_out      = mid;
+                s_worker_a.coord_task   = xTaskGetCurrentTaskHandle();
+
+                // Seed Worker B's delay buffer with the 9 newest input
+                // samples (mid-1, mid-2, ..., mid-9) in newest-first
+                // order at delay[0..8], with mirror copies at
+                // delay[16..24] so the first MAC iteration sees them at
+                // delay[wpos+1..wpos+8] after the wpos decrement.
+                int n_emits_a = rs_n_emits(s_persist_start_pos, mid);
+                for (int k = 0; k < 9; k++) {
+                    int     src_idx            = mid - 1 - k;
+                    int16_t i_s                = dst[2 * src_idx + 0];
+                    int16_t q_s                = dst[2 * src_idx + 1];
+                    s_worker_b.delay_i[k]      = i_s;
+                    s_worker_b.delay_i[k + 16] = i_s;
+                    s_worker_b.delay_q[k]      = q_s;
+                    s_worker_b.delay_q[k + 16] = q_s;
+                }
+                for (int k = 9; k < 16; k++) {
+                    s_worker_b.delay_i[k]      = 0;
+                    s_worker_b.delay_i[k + 16] = 0;
+                    s_worker_b.delay_q[k]      = 0;
+                    s_worker_b.delay_q[k + 16] = 0;
+                }
+                s_worker_b.wpos         = 0;
+                s_worker_b.start_pos    = s_persist_start_pos + 128 * n_emits_a - 125 * mid;
+                s_worker_b.in_iq        = dst + 2 * mid;
+                s_worker_b.n_in_complex = n_in_complex - mid;
+                s_worker_b.out_iq       = out + 2 * n_emits_a;
+                s_worker_b.max_out      = n_in_complex - mid;
+                s_worker_b.coord_task   = xTaskGetCurrentTaskHandle();
+
+                xTaskNotifyGive(s_worker_a.task);
+                xTaskNotifyGive(s_worker_b.task);
+                // pdFALSE = decrement-on-exit (counting-semaphore semantics),
+                // so two back-to-back gives don't collapse into one take.
+                ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+                ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+
+                n_out_complex = s_worker_a.n_out + s_worker_b.n_out;
+
+                // Persist Worker B's end state for the next chunk.
+                memcpy(s_persist_delay_i, s_worker_b.delay_i, sizeof(s_persist_delay_i));
+                memcpy(s_persist_delay_q, s_worker_b.delay_q, sizeof(s_persist_delay_q));
+                s_persist_start_pos = s_worker_b.start_pos;
+                s_persist_wpos      = s_worker_b.wpos;
+
+                int64_t tr1 = esp_timer_get_time();
+                resample_us += (tr1 - tr0);
+                heap_caps_free(dst);
             }
-            for (int k = 9; k < 16; k++) {
-                s_worker_b.delay_i[k]      = 0;
-                s_worker_b.delay_i[k + 16] = 0;
-                s_worker_b.delay_q[k]      = 0;
-                s_worker_b.delay_q[k + 16] = 0;
-            }
-            s_worker_b.wpos         = 0;
-            s_worker_b.start_pos    = s_persist_start_pos + 128 * n_emits_a - 125 * mid;
-            s_worker_b.in_iq        = dst + 2 * mid;
-            s_worker_b.n_in_complex = n_in_complex - mid;
-            s_worker_b.out_iq       = out + 2 * n_emits_a;
-            s_worker_b.max_out      = n_in_complex - mid;
-            s_worker_b.coord_task   = xTaskGetCurrentTaskHandle();
-
-            xTaskNotifyGive(s_worker_a.task);
-            xTaskNotifyGive(s_worker_b.task);
-            // pdFALSE = decrement-on-exit (counting-semaphore semantics),
-            // so two back-to-back gives don't collapse into one take.
-            ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-            ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-
-            n_out_complex = s_worker_a.n_out + s_worker_b.n_out;
-
-            // Persist Worker B's end state for the next chunk.
-            memcpy(s_persist_delay_i, s_worker_b.delay_i, sizeof(s_persist_delay_i));
-            memcpy(s_persist_delay_q, s_worker_b.delay_q, sizeof(s_persist_delay_q));
-            s_persist_start_pos = s_worker_b.start_pos;
-            s_persist_wpos      = s_worker_b.wpos;
         }
         int n_out_int16            = n_out_complex * 2;
         s_resamp_n_int16[msg.slot] = (size_t)n_out_int16;
-        int64_t t1b                = esp_timer_get_time();
-        s_acc_resample_us += (uint64_t)(t1b - t1);
+        s_acc_convert_us += (uint64_t)convert_us;
+        s_acc_resample_us += (uint64_t)resample_us;
+        int64_t t1b = esp_timer_get_time();
 
         // 3. Push resampled samples into the PSRAM circular buffer.
         // signal_buffer_push is itself async (AXI-GDMA from Step 2) so the
@@ -382,7 +514,7 @@ static void ingest_task(void *arg)
         signal_buffer_push(s_resamp[msg.slot], (size_t)n_out_complex);
         int64_t t2 = esp_timer_get_time();
         s_acc_sbpush_us += (uint64_t)(t2 - t1b);
-        s_acc_push_us += (uint64_t)(t2 - t1);
+        s_acc_push_us += (uint64_t)resample_us + (uint64_t)(t2 - t1b);
 
         s_acc_dispatches++;
         xSemaphoreGive(s_ready[msg.slot]);
@@ -391,6 +523,20 @@ static void ingest_task(void *arg)
 
 esp_err_t ingest_core1_init(void)
 {
+    // T49b: allocate/verify the convert+resample tile FIRST, before any
+    // other heap-touching init here, same reasoning as
+    // resample_256_to_250_alloc_coeffs()'s early-alloc dance -- this is
+    // normally already done by the boot-time dance (class_driver.c /
+    // smoke_test.c), so this is just the lazy-fallback + hard-fail path.
+    // A missing/misplaced tile means the PIE resample MAC would silently
+    // mis-decode (see ingest_core1_prealloc_tile's doc comment) -- treat
+    // that as fatal-for-streaming rather than proceeding.
+    ingest_core1_prealloc_tile();
+    if (!s_tile_ok) {
+        ESP_LOGE(TAG, "convert/resample tile unavailable -- aborting ingest init (fatal)");
+        return ESP_ERR_NO_MEM;
+    }
+
     // Allocate ping-pong buffers.
     //
     // T49a: there is no more s_raw[] here. It used to be a 2 * 16 KB
@@ -402,16 +548,10 @@ esp_err_t ingest_core1_init(void)
     // directly funding the USB transfer pool's pre-stream budget (see
     // esp_libusb.c's "Pre-stream DMA-internal heap: free=" log).
     //
-    // s_conv[]: CPU-only path -- written by the uint8->int16 convert
-    //   loop (above this fn), read by resample_256_to_250_process.
-    //   No DMA engine touches it. Previously flagged
-    //   MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA "for safety" but that
-    //   over-restriction starved the USB transfer pool of internal
-    //   DMA SRAM (esp_libusb's bulk-IN allocations failed at
-    //   start_stream with ESP_ERR_NO_MEM). Moved to PSRAM; freed
-    //   64 KB DMA-internal (2 slots * 32 KB). Cost: CPU writes go
-    //   to PSRAM @ ~100 MB/s vs ~700 MB/s internal SRAM -> ~160 us
-    //   extra per 16 ms slot, ~1% real-time overhead.
+    // T49b: there is no more s_conv[] (2 * 32 KB PSRAM) either -- the
+    // convert step now writes straight into s_tile (internal SRAM,
+    // allocated above) and feeds the resampler from it a tile at a
+    // time. See ingest_task's convert+resample loop.
     //
     // s_resamp[]: AXI-GDMA reads from here into signal_buffer (also
     //   PSRAM). AXI handles PSRAM sources fine. CPU touch is one
@@ -423,19 +563,10 @@ esp_err_t ingest_core1_init(void)
                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-        // s_conv lives in PSRAM. We explored moving it to internal
-        // SRAM (L2-cache contention bypass for Worker A) and that
-        // required reducing L2 cache from 256→128 KB to free heap
-        // headroom — measured cost: -13% LIVE_SDR throughput (4.57
-        // → 3.97 MB/s), +160% USB handle_events latency, +62%
-        // sbpush. Net regression. Sticking with PSRAM s_conv.
-        s_conv[i]   = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         s_resamp[i] = heap_caps_aligned_alloc(64, INGEST_SLOT_ELEMS * sizeof(int16_t),
                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-        if (!s_conv[i] || !s_resamp[i]) {
-            ESP_LOGE(TAG, "Slot %d alloc failed (conv=%p resamp=%p)",
-                     i, s_conv[i], s_resamp[i]);
+        if (!s_resamp[i]) {
+            ESP_LOGE(TAG, "Slot %d alloc failed (resamp=%p)", i, s_resamp[i]);
             goto slot_cleanup;
         }
         s_resamp_n_int16[i] = 0;
@@ -457,9 +588,7 @@ esp_err_t ingest_core1_init(void)
         // the caller treats any failure as fatal-for-streaming and the
         // system is headed for an operator/watchdog reboot anyway.)
         for (int j = 0; j <= i; j++) {
-            free(s_conv[j]);
             free(s_resamp[j]);
-            s_conv[j]   = NULL;
             s_resamp[j] = NULL;
             if (s_ready[j]) vSemaphoreDelete(s_ready[j]);
             if (s_free[j]) vSemaphoreDelete(s_free[j]);

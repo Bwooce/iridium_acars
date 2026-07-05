@@ -13,13 +13,47 @@
 #define INGEST_NUM_SLOTS 2
 #define INGEST_SLOT_ELEMS (16 * 1024) /* int16 elements per slot (32 KB each) */
 
+// T49b: size of the internal-SRAM staging tile the convert+resample loop
+// processes at a time, in complex samples (4 KB = 1024 complex * 2 int16).
+// Deliberately MINIMAL, well below the design doc's original 8-16 KB range:
+// the DMA-INT budget is critically tight (pre-stream free ~44 KB, USB pool
+// already short of its 8 transfers) and this tile is NEW internal-SRAM
+// pressure on top of that (deleting s_conv[] only frees PSRAM). An 8 KB
+// tile dropped the pool 5->4 transfers and boot-crashed the device (store
+// fault in the tagger FFT); 4 KB keeps the pool at its working 5-transfer
+// point. The resampler is chunk-continuable at any tile size (bit-exact —
+// see tests/host/test_resample_tile.c), so this only trades a little loop
+// overhead for the smaller footprint. Do not grow this without
+// re-measuring "Pre-stream DMA-internal heap: free=" and the pool count.
+#define INGEST_TILE_COMPLEX 1024
+
 // Initialise the ingest task on Core 1 plus the ping-pong infrastructure.
 // Allocates converted/resampled buffers in PSRAM, creates the queue and
 // per-slot semaphores, spawns the task. (T49a: there is no more raw
 // buffer allocation here — the raw USB bytes live in the usbring PSRAM
 // ring, esp_libusb.c/usbring.c, and are handed to ingest_core1_dispatch
-// as a pointer instead of being copied into a slot-owned buffer.)
+// as a pointer instead of being copied into a slot-owned buffer.) Calls
+// ingest_core1_prealloc_tile() as a lazy fallback if the boot-time
+// early-alloc dance hasn't already done so; fails with ESP_ERR_NO_MEM
+// if the tile isn't available (see ingest_core1_prealloc_tile's doc
+// comment — this must never proceed with the tile missing/misplaced).
 esp_err_t ingest_core1_init(void);
+
+// T49b: early one-time allocation of the internal-SRAM convert/resample
+// staging tile. This buffer is the resample PIE MAC's (resample_arp4.S,
+// via resample_256_to_250_process_explicit) INPUT — a PIE-read buffer.
+// On this chip, a PIE working buffer that lands outside main DRAM (e.g.
+// RTCRAM 0x5010_xxxx, which MALLOC_CAP_INTERNAL can silently fall back
+// to under heap pressure) makes the PIE unit silently mis-decode — see
+// memory note project_heap_position_decode_bug.md. Call this FIRST in
+// boot, in the same early-alloc dance as resample_256_to_250_alloc_coeffs()
+// / fft_sc16_2048_init() / uw_correlator_prealloc_pie_fft() (class_driver.c
+// action_start_stream, smoke_test.c's pipeline bring-up), while DRAM is
+// plentiful. Idempotent. Hard-guards the allocation with esp_ptr_in_dram()
+// and logs the resulting address; a non-DRAM placement is a loud
+// ESP_LOGE, not a silent fallback — ingest_core1_init() treats a missing/
+// misplaced tile as a fatal ESP_ERR_NO_MEM.
+void ingest_core1_prealloc_tile(void);
 
 // Reserve the next output slot for this dispatch cycle. Blocks until
 // that slot's previous DSP consumer has freed it (typically immediate).
