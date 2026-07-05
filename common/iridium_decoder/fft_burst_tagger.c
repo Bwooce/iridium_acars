@@ -378,6 +378,18 @@ void fft_burst_tagger_flush(fft_burst_tagger_t *t,
         t->burst_mask[k] = 1;
 }
 
+void fft_burst_tagger_reset_baseline(fft_burst_tagger_t *t)
+{
+    if (!t) return;
+    memset(t->baseline_history, 0, sizeof(int32_t) * N * FBT_HISTORY_SIZE);
+    memset(t->baseline_sum, 0, sizeof(t->baseline_sum));
+    for (int i = 0; i < N; i++)
+        t->burst_mask[i] = 1;
+    t->history_index  = 0;
+    t->history_primed = false;
+    t->n_bursts       = 0;
+}
+
 void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start)
 {
     t->d_index = start;

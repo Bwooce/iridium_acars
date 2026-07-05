@@ -146,6 +146,13 @@ bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 void fft_burst_tagger_flush(fft_burst_tagger_t *t,
                             fbt_burst_t *out_gone_bursts, int *n_gone);
 
+// Reset the per-bin noise-floor EMA and clear active bursts so the tagger
+// re-learns the floor over FBT_HISTORY_SIZE steps (used after a live LO
+// retune — the old band's floor is meaningless at the new center). step()
+// returns false until re-primed. d_index and burst_id are preserved so
+// sample-position and burst-id continuity are unbroken.
+void fft_burst_tagger_reset_baseline(fft_burst_tagger_t *t);
+
 // Diagnostic — read accumulated per-stage wall-times (µs) since the
 // last call, plus the number of steps that contributed. Order:
 //   out[0] = window_multiply

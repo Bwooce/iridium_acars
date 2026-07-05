@@ -439,6 +439,19 @@ add_executable(test_tagger_vs_manifest
 )
 target_include_directories(test_tagger_vs_manifest PRIVATE ${COMMON_DIR})
 target_link_libraries(test_tagger_vs_manifest PRIVATE m)
+
+# Control-plane check for the live-retune baseline reset entry point
+# (freq-scanner Phase 1, Task 1): after priming, reset_baseline() must
+# return the tagger to the un-primed state so it re-learns the noise
+# floor at the new LO center.
+add_executable(test_scanner_tagger_reset
+    test_scanner_tagger_reset.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_scanner_tagger_reset PRIVATE ${COMMON_DIR})
+target_link_libraries(test_scanner_tagger_reset PRIVATE m)
+
 target_include_directories(test_pipeline_wideband_albq PRIVATE
     ${COMMON_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
@@ -692,6 +705,7 @@ add_test(NAME resample_split        COMMAND test_resample_split)
 add_test(NAME resample_tile         COMMAND test_resample_tile)
 add_test(NAME resample_pie_model    COMMAND test_resample_pie_model)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
+add_test(NAME test_scanner_tagger_reset COMMAND test_scanner_tagger_reset)
 add_test(NAME window_multiply_golden COMMAND test_window_multiply_golden)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
