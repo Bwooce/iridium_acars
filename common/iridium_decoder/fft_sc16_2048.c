@@ -28,6 +28,7 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h" // esp_ptr_in_dram — s_w_table/s_fft_scratch placement guard
 #endif
 
 #define N FFT_SC16_2048_N // 2048
@@ -60,6 +61,21 @@ void fft_sc16_2048_init(void)
     s_fft_scratch = (int16_t *)heap_caps_aligned_alloc(16, 2 * N * sizeof(int16_t),
                                                        MALLOC_CAP_INTERNAL);
     if (!s_w_table || !s_fft_scratch) return; // alloc failed; FFT will no-op
+    // Hard guard: the PIE vector unit garbles data on non-DRAM
+    // (RTCRAM/TCM). Refuse a non-DRAM placement rather than mis-decode
+    // silently -- mirrors uw_correlator's pie_fft_fc32_init /
+    // uw_correlator_prealloc_fir guards.
+    if (!esp_ptr_in_dram(s_w_table) || !esp_ptr_in_dram(s_fft_scratch)) {
+        ESP_LOGE("FFT2048", "s_w_table=%p s_fft_scratch=%p landed OUTSIDE DRAM -> "
+                            "PIE FFT would MIS-DECODE. Call fft_sc16_2048_init() "
+                            "earlier in boot.",
+                 s_w_table, s_fft_scratch);
+        heap_caps_free(s_w_table);
+        heap_caps_free(s_fft_scratch);
+        s_w_table     = NULL;
+        s_fft_scratch = NULL;
+        return; // FFT will no-op (s_inited stays false)
+    }
     // dsps_fft2r_init_sc16 ignores the size arg when buffer is NULL and
     // uses CONFIG_DSP_MAX_FFT_SIZE (= 4096), producing cos(2π·i/4096)
     // twiddles — wrong for our 2048-pt FFT (the inner loop reads w[j]

@@ -13,6 +13,8 @@
 // as the portable C inner loop below, so the swap is mechanical
 // and produces equivalent output to the host's direct_if_decim_process_split.
 #include "dsps_fir.h"
+#include "esp_log.h"
+#include "esp_memory_utils.h" // esp_ptr_in_dram — FIR delay-line placement guard
 #define USE_DSPS_FIRD_ARP4 1
 #endif
 
@@ -124,7 +126,27 @@ void direct_if_decim_init(direct_if_decim_t *d)
                            DIDECIM_NTAPS, DIDECIM_DECIM, 0, 0);
         dsps_fird_init_s16(&d->fir_dsp_q, d->taps, NULL,
                            DIDECIM_NTAPS, DIDECIM_DECIM, 0, 0);
-        d->fir_dsp_inited = 1;
+        // Same placement hazard as uw_correlator's PIE FIRs: the
+        // arp4 path's memalign'd delay line must land in main DRAM,
+        // or dsps_fird_s16_arp4's vld.128 silently mis-decodes
+        // (project_heap_position_decode_bug). Refuse -- loudly --
+        // rather than mark this usable with a bad buffer. Call
+        // direct_if_decim_init() (via worker_core1_prealloc_fir(),
+        // from the boot-time early-alloc dance) BEFORE other heap
+        // consumers to avoid this.
+        if (!esp_ptr_in_dram(d->fir_dsp_i.delay) || !esp_ptr_in_dram(d->fir_dsp_q.delay)) {
+            ESP_LOGE("DIDECIM", "wideband decim FIR delay landed OUTSIDE DRAM "
+                                "(i=%p q=%p) -> PIE FIR would MIS-DECODE. Call "
+                                "worker_core1_prealloc_fir() earlier in boot.",
+                     d->fir_dsp_i.delay, d->fir_dsp_q.delay);
+            dsps_fird_s16_aexx_free(&d->fir_dsp_i);
+            dsps_fird_s16_aexx_free(&d->fir_dsp_q);
+            // leave d->fir_dsp_inited = 0 so a later init() call retries
+        } else {
+            ESP_LOGI("DIDECIM", "wideband decim FIR delay OK in DRAM (i=%p q=%p)",
+                     d->fir_dsp_i.delay, d->fir_dsp_q.delay);
+            d->fir_dsp_inited = 1;
+        }
     } else {
         // Re-init across calls: zero the internal delay lines. The
         // delay pointer was set up by the first init; we just clear

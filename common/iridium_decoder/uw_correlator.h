@@ -148,6 +148,22 @@ int uw_correlator_find_burst_start(const int16_t *burst,
 // the first successful call.
 void uw_correlator_prealloc_pie_fft(void);
 
+// Pre-allocate/pin the three PIE FIR delay lines used by this module
+// (D13 envelope-LP FIR + RRC matched-filter I/Q FIRs) in DRAM. MUST be
+// called from the same boot-time early-alloc dance as
+// uw_correlator_prealloc_pie_fft(), before the USB/DSP init that
+// fragments internal SRAM. Left to each FIR's lazy first-call init,
+// the delay line (allocated internally by dsps_fird_init_s16 via
+// memalign) can land in RTCRAM under DRAM pressure, where the PIE
+// vld.128 instructions silently mis-decode
+// (project_heap_position_decode_bug). Idempotent, no-op after the
+// first successful call. Host build: not defined (device-only PIE FIR
+// path), matching uw_correlator_prealloc_pie_fft — callers on host
+// never need it.
+#if defined(ESP_PLATFORM)
+void uw_correlator_prealloc_fir(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

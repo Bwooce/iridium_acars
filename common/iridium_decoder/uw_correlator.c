@@ -104,6 +104,8 @@ static const int8_t SYNC_UL_SIGN[SYNC_LENGTH] = {
 #ifdef ESP_PLATFORM
 #include "dsps_fir.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_memory_utils.h" // esp_ptr_in_dram — FIR delay-line placement guard
 // D13 start-finder LP filter PIE state. Padded to 184 taps for the
 // `coeffs_len % 8 == 0` PIE gate; the +1 zero is at array index [0]
 // (= late end of the impulse response after dsps_fird's reversal),
@@ -1681,6 +1683,95 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 // sync-search FFT operates only on the trimmed window after D13.
 #define START_SEARCH_MAX 2560
 
+// D13 Kaiser LP taps (Q15). Hoisted to file scope (was a function-
+// local static inside uw_correlator_find_burst_start) so
+// start_lp_fir_pie_init() below -- and, through it,
+// uw_correlator_prealloc_fir() -- can trigger this computation from
+// the boot-time early-alloc dance, before any burst arrives. Pure
+// math, no heap touched, no runtime inputs: safe to run at boot.
+static int16_t s_start_lp_w_q15[START_LP_NTAPS];
+static bool    s_start_lp_w_q15_inited = false;
+
+static void start_lp_compute_w_q15(void)
+{
+    if (s_start_lp_w_q15_inited) return;
+    // Cutoff fc/fs = 2.5/250 = 0.01, matching gr-iridium's
+    // firdes.low_pass_2(1, 250k, 2.5k, 5k, 60dB). D13 runs on the
+    // post-resample 250 ksps stream from burst_pipeline, so the
+    // cutoff is 2500 / 250000 = 0.01.
+    const float PI          = 3.14159265358979323846f;
+    const float fc_norm     = 0.01f; // 2.5 kHz / 250 kHz
+    const float inv_i0_beta = 1.0f / bessel_i0(START_LP_KAISER_BETA);
+    const int   half        = START_LP_NTAPS / 2;
+    float       w_f[START_LP_NTAPS];
+    float       wsum = 0.0f;
+    for (int k = 0; k < START_LP_NTAPS; k++) {
+        float t    = (float)(k - half);
+        float sinc = (t == 0.0f)
+                         ? 2.0f * fc_norm
+                         : sinf(2.0f * PI * fc_norm * t) / (PI * t);
+        // Kaiser window: I0(β·sqrt(1-(2k/(N-1)-1)²)) / I0(β)
+        float u   = 2.0f * (float)k / (float)(START_LP_NTAPS - 1) - 1.0f;
+        float arg = START_LP_KAISER_BETA * sqrtf(1.0f - u * u);
+        float kw  = bessel_i0(arg) * inv_i0_beta;
+        w_f[k]    = sinc * kw;
+        wsum += w_f[k];
+    }
+    if (wsum != 0.0f) {
+        for (int k = 0; k < START_LP_NTAPS; k++)
+            w_f[k] /= wsum;
+    }
+    // Sum-normalised → max tap ≈ 0.05–0.1 → Q15 ≈ 1600–3300,
+    // well inside int16. Sum of Q15 taps = 2^15, so the inner
+    // MAC's >>15 restores the input scale.
+    for (int k = 0; k < START_LP_NTAPS; k++) {
+        float v = w_f[k] * (float)INT16_MAX;
+        if (v > (float)INT16_MAX) v = (float)INT16_MAX;
+        if (v < (float)INT16_MIN) v = (float)INT16_MIN;
+        s_start_lp_w_q15[k] = (int16_t)lrintf(v);
+    }
+    s_start_lp_w_q15_inited = true;
+}
+
+#ifdef ESP_PLATFORM
+// Boot-time-safe companion to the lazy `s_start_lp_fir_inited` block
+// inside uw_correlator_find_burst_start (below). Builds the padded
+// tap array from the (pure-math) Kaiser taps above and pins
+// s_start_lp_fir's PIE delay line (allocated internally by
+// dsps_fird_init_s16 via memalign) in DRAM. Guarded the same way as
+// pie_fft_fc32_init: refuse -- loudly -- a delay line that lands
+// outside DRAM rather than let the PIE asm mis-decode silently.
+// Idempotent; safe to call from uw_correlator_prealloc_fir() during
+// boot AND (as a no-op after that) from the lazy first-burst path.
+static void start_lp_fir_pie_init(void)
+{
+    if (s_start_lp_fir_inited) return;
+    start_lp_compute_w_q15();
+    // Tap layout: zero at index [0], orig 183 at [1..183]. After
+    // dsps_fird's time-reversal the zero lands at the late end of
+    // the impulse response → exactly 91-sample group delay.
+    s_start_lp_taps_padded[0] = 0;
+    for (int k = 0; k < START_LP_NTAPS; k++) {
+        s_start_lp_taps_padded[k + 1] = s_start_lp_w_q15[k];
+    }
+    // shift = 0 → dsps_fird applies `acc >> 15`, matching the Q15
+    // tap quantisation (sum of Q15 taps = 32768 → unity DC gain).
+    dsps_fird_init_s16(&s_start_lp_fir, s_start_lp_taps_padded, NULL,
+                       START_LP_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
+                       /*shift=*/0);
+    if (!esp_ptr_in_dram(s_start_lp_fir.delay)) {
+        ESP_LOGE("UWCORR", "D13 LP FIR delay landed OUTSIDE DRAM at %p -> "
+                           "PIE FIR would MIS-DECODE. Call "
+                           "uw_correlator_prealloc_fir() earlier in boot.",
+                 s_start_lp_fir.delay);
+        dsps_fird_s16_aexx_free(&s_start_lp_fir);
+        return; // leave s_start_lp_fir_inited = 0 -> caller falls back to scalar
+    }
+    ESP_LOGI("UWCORR", "D13 LP FIR delay OK in DRAM at %p", s_start_lp_fir.delay);
+    s_start_lp_fir_inited = 1;
+}
+#endif // ESP_PLATFORM
+
 int uw_correlator_find_burst_start(const int16_t *burst_2sps,
                                    int n_complex, int search_max)
 {
@@ -1725,46 +1816,12 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
         mag2[n] = m2;
     }
 
-    // Kaiser LP taps in Q15. Cutoff fc/fs = 2.5/250 = 0.01, matching
-    // gr-iridium's firdes.low_pass_2(1, 250k, 2.5k, 5k, 60dB). D13
-    // runs on the post-resample 250 ksps stream from burst_pipeline,
-    // so the cutoff is 2500 / 250000 = 0.01.
-    static int16_t w_q15[START_LP_NTAPS];
-    static bool    s_start_lp_inited = false;
-    int            half              = START_LP_NTAPS / 2;
-    if (!s_start_lp_inited) {
-        const float PI          = 3.14159265358979323846f;
-        const float fc_norm     = 0.01f; // 2.5 kHz / 250 kHz
-        const float inv_i0_beta = 1.0f / bessel_i0(START_LP_KAISER_BETA);
-        float       w_f[START_LP_NTAPS];
-        float       wsum = 0.0f;
-        for (int k = 0; k < START_LP_NTAPS; k++) {
-            float t    = (float)(k - half);
-            float sinc = (t == 0.0f)
-                             ? 2.0f * fc_norm
-                             : sinf(2.0f * PI * fc_norm * t) / (PI * t);
-            // Kaiser window: I0(β·sqrt(1-(2k/(N-1)-1)²)) / I0(β)
-            float u   = 2.0f * (float)k / (float)(START_LP_NTAPS - 1) - 1.0f;
-            float arg = START_LP_KAISER_BETA * sqrtf(1.0f - u * u);
-            float kw  = bessel_i0(arg) * inv_i0_beta;
-            w_f[k]    = sinc * kw;
-            wsum += w_f[k];
-        }
-        if (wsum != 0.0f) {
-            for (int k = 0; k < START_LP_NTAPS; k++)
-                w_f[k] /= wsum;
-        }
-        // Sum-normalised → max tap ≈ 0.05–0.1 → Q15 ≈ 1600–3300,
-        // well inside int16. Sum of Q15 taps = 2^15, so the inner
-        // MAC's >>15 restores the input scale.
-        for (int k = 0; k < START_LP_NTAPS; k++) {
-            float v = w_f[k] * (float)INT16_MAX;
-            if (v > (float)INT16_MAX) v = (float)INT16_MAX;
-            if (v < (float)INT16_MIN) v = (float)INT16_MIN;
-            w_q15[k] = (int16_t)lrintf(v);
-        }
-        s_start_lp_inited = true;
-    }
+    // Kaiser LP taps in Q15 — computed by start_lp_compute_w_q15()
+    // (file scope, hoisted above so uw_correlator_prealloc_fir() can
+    // also trigger it from boot). Idempotent; no-op after the first
+    // call from either caller.
+    start_lp_compute_w_q15();
+    int half = START_LP_NTAPS / 2;
     // Apply (valid mode): smooth[n] valid for n in [half, search_max-half-1].
     // gr-iridium uses filterN which writes only valid samples — they
     // never look at edge samples. We do the same. Edge samples are
@@ -1815,7 +1872,7 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
                 if (n >= half && n + half < search_max) {
                     int64_t acc = 0;
                     for (int k = 0; k < START_LP_NTAPS; k++) {
-                        acc += (int64_t)w_q15[k] * (int64_t)mag2[n - half + k];
+                        acc += (int64_t)s_start_lp_w_q15[k] * (int64_t)mag2[n - half + k];
                     }
                     acc >>= 15;
                     if (acc > INT32_MAX) acc = INT32_MAX;
@@ -1838,20 +1895,27 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
     for (int n = search_max; n < fir_len; n++)
         mag2_i16[n] = 0;
 
+    if (!s_start_lp_fir_inited) start_lp_fir_pie_init();
     if (!s_start_lp_fir_inited) {
-        // Tap layout: zero at index [0], orig 183 at [1..183]. After
-        // dsps_fird's time-reversal the zero lands at the late end of
-        // the impulse response → exactly 91-sample group delay.
-        s_start_lp_taps_padded[0] = 0;
-        for (int k = 0; k < START_LP_NTAPS; k++) {
-            s_start_lp_taps_padded[k + 1] = w_q15[k];
+        // PIE FIR guard failed (delay line landed outside DRAM; see
+        // start_lp_fir_pie_init) -- fall back to the scalar LP rather
+        // than touch a dangling/garbage fir state. Same inline
+        // convolution as the mag2_i16 PSRAM-OOM fallback above.
+        for (int n = 0; n < search_max; n++) {
+            if (n >= half && n + half < search_max) {
+                int64_t acc = 0;
+                for (int k = 0; k < START_LP_NTAPS; k++) {
+                    acc += (int64_t)s_start_lp_w_q15[k] * (int64_t)mag2[n - half + k];
+                }
+                acc >>= 15;
+                if (acc > INT32_MAX) acc = INT32_MAX;
+                if (acc < 0) acc = 0;
+                smooth[n] = (int32_t)acc;
+            } else {
+                smooth[n] = 0;
+            }
         }
-        // shift = 0 → dsps_fird applies `acc >> 15`, matching the Q15
-        // tap quantisation (sum of Q15 taps = 32768 → unity DC gain).
-        dsps_fird_init_s16(&s_start_lp_fir, s_start_lp_taps_padded, NULL,
-                           START_LP_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
-                           /*shift=*/0);
-        s_start_lp_fir_inited = 1;
+        goto d13_argmax;
     }
     // Reset streaming state between unrelated bursts.
     for (int n = 0; n < START_LP_NTAPS_PADDED; n++)
@@ -1878,7 +1942,7 @@ d13_argmax:;
         if (n >= half && n + half < search_max) {
             int64_t acc = 0;
             for (int k = 0; k < START_LP_NTAPS; k++) {
-                acc += (int64_t)w_q15[k] * (int64_t)mag2[n - half + k];
+                acc += (int64_t)s_start_lp_w_q15[k] * (int64_t)mag2[n - half + k];
             }
             acc >>= 15;
             if (acc > INT32_MAX) acc = INT32_MAX;
@@ -1944,6 +2008,72 @@ d13_argmax:;
     return start;
 }
 
+#ifdef ESP_PLATFORM
+// Boot-time-safe companion to the lazy `s_rrc_fir_inited` block inside
+// uw_correlator_apply_rrc (below). sync_init() (pure math, idempotent,
+// no runtime inputs) populates s_rrc_taps_q14; this builds the padded
+// tap array from it and pins s_rrc_fir_i/_q's PIE delay lines
+// (allocated internally by dsps_fird_init_s16 via memalign) in DRAM.
+// Guarded the same way as pie_fft_fc32_init: refuse -- loudly -- a
+// delay line that lands outside DRAM rather than let the PIE asm
+// mis-decode silently. Idempotent; safe to call from
+// uw_correlator_prealloc_fir() during boot AND (as a no-op after
+// that) from the lazy first-burst path.
+static void rrc_fir_pie_init(void)
+{
+    if (s_rrc_fir_inited) return;
+    sync_init(); // ensures s_rrc_taps_q14 is populated
+    // Tap-array layout: zeros at indices [0..4], original 51 taps
+    // at [5..55]. In dsps_fird's convention y[m] = sum taps[N-1-i] *
+    // x[m-i], reversed indexing means the zeros end up at the LATE
+    // end of the impulse response. The convolution then runs over
+    // i=0..50 (active) and i=51..55 (zero) and y_stream[m] =
+    // sum_{j=0..50} orig[j] * x[m-50+j], i.e. centred at x[m-25].
+    // That's exactly a 25-sample group delay vs the scalar centred-
+    // zero-pad (y_scalar[k] = ... * x[k-25+t]). We feed an extra
+    // 25 trailing zeros so stream output[25 + k] is the equivalent
+    // of scalar output[k] for k = 0 .. n_complex-1.
+    for (int i = 0; i < RRC_NTAPS_PADDED; i++)
+        s_rrc_taps_padded[i] = 0;
+    for (int i = 0; i < RRC_NTAPS; i++) {
+        s_rrc_taps_padded[RRC_NTAPS_PADDED - RRC_NTAPS + i] = s_rrc_taps_q14[i];
+    }
+    // shift = 1 → dsps_fird applies `acc >> (15 - shift) = acc >> 14`,
+    // matching the Q14 tap quantisation. delay buffer = NULL:
+    // dsps_fird_init_s16 on arp4 ignores it and allocates an aligned
+    // one internally (see dsps_fird_init_s16.c).
+    dsps_fird_init_s16(&s_rrc_fir_i, s_rrc_taps_padded, NULL,
+                       RRC_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
+                       /*shift=*/1);
+    dsps_fird_init_s16(&s_rrc_fir_q, s_rrc_taps_padded, NULL,
+                       RRC_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
+                       /*shift=*/1);
+    bool ok = true;
+    if (!esp_ptr_in_dram(s_rrc_fir_i.delay)) {
+        ESP_LOGE("UWCORR", "RRC FIR (I) delay landed OUTSIDE DRAM at %p -> "
+                           "PIE FIR would MIS-DECODE. Call "
+                           "uw_correlator_prealloc_fir() earlier in boot.",
+                 s_rrc_fir_i.delay);
+        ok = false;
+    }
+    if (!esp_ptr_in_dram(s_rrc_fir_q.delay)) {
+        ESP_LOGE("UWCORR", "RRC FIR (Q) delay landed OUTSIDE DRAM at %p -> "
+                           "PIE FIR would MIS-DECODE. Call "
+                           "uw_correlator_prealloc_fir() earlier in boot.",
+                 s_rrc_fir_q.delay);
+        ok = false;
+    }
+    if (!ok) {
+        dsps_fird_s16_aexx_free(&s_rrc_fir_i);
+        dsps_fird_s16_aexx_free(&s_rrc_fir_q);
+        return; // leave s_rrc_fir_inited = 0 -> caller falls back to scalar
+    }
+    ESP_LOGI("UWCORR", "RRC FIR delay OK in DRAM at %p / %p",
+             s_rrc_fir_i.delay, s_rrc_fir_q.delay);
+    s_rrc_fir_inited = 1;
+}
+#endif // ESP_PLATFORM
+
 void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
                              int n_complex)
 {
@@ -1953,34 +2083,8 @@ void uw_correlator_apply_rrc(const int16_t *burst_in, int16_t *burst_out,
     // PIE path: split-deinterleave + dsps_fird_s16_arp4 (decim=1) + reinterleave.
     // Same pattern as direct_if_decim_process_split — 8-lane Q15 SIMD inner loop.
     // Lazy first-call init: build padded taps, ensure scratch capacity, init firs.
-    if (!s_rrc_fir_inited) {
-        // Tap-array layout: zeros at indices [0..4], original 51 taps
-        // at [5..55]. In dsps_fird's convention y[m] = sum taps[N-1-i] *
-        // x[m-i], reversed indexing means the zeros end up at the LATE
-        // end of the impulse response. The convolution then runs over
-        // i=0..50 (active) and i=51..55 (zero) and y_stream[m] =
-        // sum_{j=0..50} orig[j] * x[m-50+j], i.e. centred at x[m-25].
-        // That's exactly a 25-sample group delay vs the scalar centred-
-        // zero-pad (y_scalar[k] = ... * x[k-25+t]). We feed an extra
-        // 25 trailing zeros so stream output[25 + k] is the equivalent
-        // of scalar output[k] for k = 0 .. n_complex-1.
-        for (int i = 0; i < RRC_NTAPS_PADDED; i++)
-            s_rrc_taps_padded[i] = 0;
-        for (int i = 0; i < RRC_NTAPS; i++) {
-            s_rrc_taps_padded[RRC_NTAPS_PADDED - RRC_NTAPS + i] = s_rrc_taps_q14[i];
-        }
-        // shift = 1 → dsps_fird applies `acc >> (15 - shift) = acc >> 14`,
-        // matching the Q14 tap quantisation. delay buffer = NULL:
-        // dsps_fird_init_s16 on arp4 ignores it and allocates an aligned
-        // one internally (see dsps_fird_init_s16.c).
-        dsps_fird_init_s16(&s_rrc_fir_i, s_rrc_taps_padded, NULL,
-                           RRC_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
-                           /*shift=*/1);
-        dsps_fird_init_s16(&s_rrc_fir_q, s_rrc_taps_padded, NULL,
-                           RRC_NTAPS_PADDED, /*decim=*/1, /*start_pos=*/0,
-                           /*shift=*/1);
-        s_rrc_fir_inited = 1;
-    }
+    if (!s_rrc_fir_inited) rrc_fir_pie_init();
+    if (!s_rrc_fir_inited) goto rrc_scalar_fallback; // guard failed -> scalar path below
     // We feed n_complex + RRC_GROUP_DELAY trailing zeros and use
     // output[RRC_GROUP_DELAY .. RRC_GROUP_DELAY + n_complex - 1], so
     // scratch must accommodate the extra 25 trailing zero samples.
@@ -2124,6 +2228,22 @@ rrc_scalar_fallback:; // empty stmt — falls through to scalar below
         burst_out[out_idx * 2 + 1] = (int16_t)im;
     }
 }
+
+#ifdef ESP_PLATFORM
+// Public entry point for the boot-time early-alloc dance. Pins the
+// three PIE FIR delay lines (D13 envelope-LP + RRC I/Q) in DRAM while
+// it is plentiful, so their lazy first-call inits (inside
+// uw_correlator_find_burst_start / uw_correlator_apply_rrc) never
+// spill into RTCRAM. Idempotent -- each underlying *_pie_init() is
+// itself guarded by its own `_inited` flag, so calling this again
+// (e.g. the worker's lazy path re-triggering it) is a clean no-op.
+// See start_lp_fir_pie_init / rrc_fir_pie_init above.
+void uw_correlator_prealloc_fir(void)
+{
+    start_lp_fir_pie_init();
+    rrc_fir_pie_init();
+}
+#endif // ESP_PLATFORM
 
 float uw_correlator_estimate_cfo(const int16_t *burst, int n_complex)
 {

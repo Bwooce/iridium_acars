@@ -806,6 +806,22 @@ void worker_task(void *arg)
     }
 }
 
+// Boot-time early-alloc dance entry point: pins s_decim's PIE FIR
+// delay lines (wideband decim FIR, I+Q) in DRAM while it is plentiful.
+// direct_if_decim_init() is fully self-contained (builds its own taps
+// from constants, no config from worker_core1_init needed), so this
+// is a thin wrapper -- no need to fold worker_core1_init's other
+// allocations (burst queue, chunk/scratch buffers) forward too; those
+// aren't PIE-touched and aren't part of this heap-position hazard.
+// worker_core1_init() below calls direct_if_decim_init(&s_decim)
+// again; that second call is a cheap idempotent no-op for the FIR
+// state (see the fir_dsp_inited guard in direct_if_decim_init) that
+// just re-derives the (identical) taps and resets the delay lines.
+void worker_core1_prealloc_fir(void)
+{
+    direct_if_decim_init(&s_decim);
+}
+
 esp_err_t worker_core1_init(void)
 {
 // Burst queue depth 1024, storage in PSRAM. Each detected_burst_t

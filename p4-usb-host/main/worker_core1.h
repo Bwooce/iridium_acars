@@ -7,6 +7,16 @@
 esp_err_t worker_core1_init();
 void      worker_core1_push_burst(const detected_burst_t *burst);
 
+// Pre-allocate/pin the wideband decim FIR's PIE delay lines (I+Q) in
+// DRAM. Part of the boot-time early-alloc dance (see
+// uw_correlator_prealloc_pie_fft / uw_correlator_prealloc_fir);
+// MUST be called before other heap-touching init so the delay lines
+// don't spill into RTCRAM under DRAM pressure
+// (project_heap_position_decode_bug). Idempotent; worker_core1_init()
+// calling direct_if_decim_init(&s_decim) again afterwards is a no-op
+// for this state.
+void worker_core1_prealloc_fir(void);
+
 // Diagnostic stats for the burst worker. Each call returns the values
 // accumulated since the previous call and resets the internal counters.
 typedef struct {

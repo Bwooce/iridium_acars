@@ -303,6 +303,13 @@ static void action_start_stream(class_driver_t *driver_obj)
     // here too: left to the worker's lazy first call it spills to RTCRAM
     // under DRAM pressure and silently mis-decodes (the ~95%->~6% cliff).
     uw_correlator_prealloc_pie_fft();
+    // Same hazard, three more PIE FIR delay lines (T56): D13 envelope-LP
+    // FIR + RRC I/Q FIRs (uw_correlator) and the wideband decim FIR I/Q
+    // (worker_core1's s_decim). All three were still lazy-allocated on
+    // the first burst, so their address depended on heap fragmentation
+    // at that point -- pin them here too, while DRAM is still plentiful.
+    uw_correlator_prealloc_fir();
+    worker_core1_prealloc_fir();
     // The pipeline inits can fail (ESP_ERR_NO_MEM). Proceeding with a
     // half-built pipeline either crashes (acquire on a NULL semaphore)
     // or runs silently dead (signal_buffer_push no-ops without its

@@ -11,6 +11,7 @@
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h" // esp_ptr_in_dram — s_coeffs_pp placement guard
 #define RS25_HOT IRAM_ATTR
 #else
 #define RS25_HOT
@@ -203,13 +204,27 @@ void resample_256_to_250_alloc_coeffs(void)
         s_coeffs_pp = (int16_t *)heap_caps_aligned_alloc(
             16, RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t),
             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (s_coeffs_pp) {
-            ESP_LOGI("RS25", "s_coeffs_pp allocated at %p (size=%u B) [early]",
-                     s_coeffs_pp,
-                     (unsigned)(RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t)));
-        } else {
+        if (!s_coeffs_pp) {
             ESP_LOGE("RS25", "s_coeffs_pp INTERNAL alloc FAILED");
+            return;
         }
+        // Hard guard: the PIE vector unit garbles data on non-DRAM
+        // (RTCRAM/TCM). Refuse a non-DRAM placement rather than
+        // mis-decode silently -- mirrors uw_correlator's
+        // pie_fft_fc32_init / uw_correlator_prealloc_fir guards.
+        if (!esp_ptr_in_dram(s_coeffs_pp)) {
+            ESP_LOGE("RS25", "s_coeffs_pp landed OUTSIDE DRAM at %p -> PIE asm "
+                             "would MIS-DECODE. Call "
+                             "resample_256_to_250_alloc_coeffs() earlier in boot.",
+                     s_coeffs_pp);
+            heap_caps_free(s_coeffs_pp);
+            s_coeffs_pp = NULL; // downstream: resample_256_to_250_init treats
+                                // this as fatal (PIE asm would crash otherwise)
+            return;
+        }
+        ESP_LOGI("RS25", "s_coeffs_pp allocated at %p (size=%u B) [early]",
+                 s_coeffs_pp,
+                 (unsigned)(RS25_PADDED_TAPS * RS25_INTERP * sizeof(int16_t)));
     }
 #endif
 }
