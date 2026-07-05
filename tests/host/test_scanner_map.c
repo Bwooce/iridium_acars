@@ -26,5 +26,21 @@ int main(void)
     assert(scanner_pos_narrowband_rate(&p[1]) == 4.5f);
     assert(scanner_rank_hottest(p, 3) == 1);
     assert(scanner_rank_hottest(p, 0) == -1);
+
+    // Edge case: dwell_ms == 0 must yield rate 0.0 (div-by-zero guard).
+    scanner_pos_t zdw = {1616000000u, 5, 10, 12.0f, 0};
+    assert(scanner_pos_narrowband_rate(&zdw) == 0.0f);
+
+    // Edge case: tie on narrowband rate must return the LOWEST index.
+    scanner_pos_t tie[2] = {
+        {1616000000u, 4, 10, 12.0f, 2000}, // 2.0/s
+        {1618500000u, 4, 10, 12.0f, 2000}, // 2.0/s (tie)
+    };
+    assert(scanner_rank_hottest(tie, 2) == 0);
+
+    // Edge case: scanner_enumerate_centers must clamp output to max when natural count exceeds it.
+    uint32_t clamp[3];
+    assert(scanner_enumerate_centers(0u, 100u, 10u, clamp, 3) == 3); // natural count 11, clamped to 3
+
     return 0;
 }
