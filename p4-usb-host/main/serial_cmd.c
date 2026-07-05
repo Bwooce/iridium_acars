@@ -293,10 +293,19 @@ void serial_cmd_init(void)
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_param_config(CMD_UART, &cfg);
+    esp_err_t err = uart_param_config(CMD_UART, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "uart_param_config failed: %s", esp_err_to_name(err));
+        return;
+    }
+
     // tx_buffer_size=0: TX writes block until the FIFO drains (fine for
     // low-rate command responses).  RX buffer 512 bytes.
-    uart_driver_install(CMD_UART, 512, 0, 0, NULL, 0);
+    err = uart_driver_install(CMD_UART, 512, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
+        return;
+    }
 
     xTaskCreate(serial_cmd_task, "serial_cmd", TASK_STACK, NULL, 3, NULL);
     ESP_LOGI(TAG, "serial command task started");

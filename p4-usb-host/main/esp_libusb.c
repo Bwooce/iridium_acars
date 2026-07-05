@@ -111,6 +111,16 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
     usb_transfer_t *transfer = NULL;
     esp_err_t       r;
 
+    // NOTE (T43): 64 is the Full-Speed bulk MPS; High-Speed bulk endpoints
+    // use 512. This rounds `length` up to a *smaller* multiple than the
+    // real MPS on an HS link, which is fine for allocating a buffer >=
+    // length but is not the endpoint's actual wMaxPacketSize. Left as-is:
+    // esp_libusb_bulk_transfer()/rtlsdr_read_sync() have no callers in this
+    // firmware (the real streaming IN path is class_driver.c's own bulk
+    // submission, which doesn't use this helper), so there's no live bug
+    // here today — but if this function grows a caller, look up the
+    // endpoint's wMaxPacketSize (via the device's config descriptor) rather
+    // than hardcoding it.
     sizePacket = usb_round_up_to_mps(length, 64);
     if (usb_host_transfer_alloc(sizePacket, 0, &transfer) != ESP_OK ||
         transfer == NULL) {
@@ -210,6 +220,12 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     adsbdev->transfer->callback      = transfer_read_cb;
     adsbdev->is_done                 = false;
     adsbdev->response_buf            = calloc(sizePacket, sizeof(uint8_t));
+    if (!adsbdev->response_buf) {
+        ESP_LOGE("LIBUSB", "control_transfer: response_buf calloc(%u) failed", (unsigned)sizePacket);
+        usb_host_transfer_free(adsbdev->transfer);
+        adsbdev->transfer = NULL;
+        goto done;
+    }
 
     if (bm_req_type == CTRL_OUT) {
         for (uint8_t i = 0; i < wLength; i++) {

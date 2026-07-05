@@ -119,8 +119,17 @@ static void emit(const status_snapshot_t *s)
     // multiplying it by THIS WINDOW's processed count is an
     // approximation of "would this rate be sustainable" — exact if
     // per-burst times are stable, slightly off during a transient.
-    double dsp_pct    = 100.0 * (double)s->dsp_total_time_us / (double)s->window_us;
-    double worker_pct = 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / (double)s->window_us;
+    //
+    // window_us can be 0 on a degenerate window; guard the divide the
+    // same way he_pct/tc_pct above do, otherwise dsp_pct/worker_pct go
+    // to inf and the %u cast further down is UB.
+    double window_us_div = (s->window_us > 0) ? (double)s->window_us : 1.0;
+    double dsp_pct       = (s->window_us > 0)
+                               ? 100.0 * (double)s->dsp_total_time_us / window_us_div
+                               : 0.0;
+    double worker_pct    = (s->window_us > 0)
+                               ? 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / window_us_div
+                               : 0.0;
 
     ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame, cap=%.1f%% "
                   "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
@@ -175,8 +184,16 @@ static void emit(const status_snapshot_t *s)
     // indicator — drops only start once we cross 100 %, so seeing
     // "worker_cap=92%" lets the operator anticipate saturation a few
     // seconds before the first dropped burst.
-    double dsp_pct    = 100.0 * (double)s->dsp_total_time_us / (double)s->window_us;
-    double worker_pct = 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / (double)s->window_us;
+    //
+    // window_us can be 0 on a degenerate window; guard the divide (this
+    // branch also feeds the (unsigned) cast below, which is UB on inf).
+    double window_us_div = (s->window_us > 0) ? (double)s->window_us : 1.0;
+    double dsp_pct       = (s->window_us > 0)
+                               ? 100.0 * (double)s->dsp_total_time_us / window_us_div
+                               : 0.0;
+    double worker_pct    = (s->window_us > 0)
+                               ? 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / window_us_div
+                               : 0.0;
 
     // bch_decoded = real Iridium frame decodes (BCH pass AND classify
     // known type — task #111). bch_unknown = BCH false positives (random

@@ -1275,7 +1275,18 @@ static esp_err_t capture_start_post(httpd_req_t *req)
 {
     char body[128] = {0};
     int  len       = req->content_len;
-    if (len > 0 && len < (int)sizeof(body)) {
+    if (len >= (int)sizeof(body)) {
+        // Oversized body: previously this fell straight through with an
+        // empty body (as if no JSON was posted) instead of reporting the
+        // problem. Reject explicitly, mirroring config_post's oversized-body
+        // handling above. esp_http_server drains any unread body bytes for
+        // us once the handler returns (httpd_req_delete), so this doesn't
+        // leave the connection mid-body for the next keep-alive request.
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "body too large\n", HTTPD_RESP_USE_STRLEN);
+    }
+    if (len > 0) {
         int got = httpd_req_recv(req, body, len);
         if (got <= 0)
             body[0] = '\0';

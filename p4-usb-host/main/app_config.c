@@ -167,6 +167,13 @@ esp_err_t app_config_init(void)
     }
     s_cfg.out_port = out_port;
     nvs_get_str_or(h, "ota_url", s_cfg.ota_url, APP_CONFIG_OTA_URL_LEN, "");
+    // gm is whatever byte was stored in NVS — validate against the
+    // known enum range before the cast; a stale/corrupt/foreign value
+    // must not become an out-of-range gain_mode_t.
+    if (gm > (uint8_t)GAIN_MODE_SOFTWARE_AGC) {
+        ESP_LOGW(TAG, "NVS gain_mode=%u out of range; using default", gm);
+        gm = (uint8_t)DEFAULT_GAIN_MODE;
+    }
     s_cfg.gain_mode = (gain_mode_t)gm;
     s_cfg.bias_tee  = (bool)bt;
 

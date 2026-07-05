@@ -26,14 +26,16 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "esp_rom_sys.h"  // for esp_rom_delay_us — replaces Linux usleep_range
+#include "esp_rom_sys.h" // for esp_rom_delay_us — replaces Linux usleep_range
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h" // for vTaskDelay — used for the ~10 ms PLL settle wait
 
 #include "rtlsdr_i2c.h"
 #include "tuner_r82xx.h"
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
-#define MHZ(x) ((x)*1000 * 1000)
-#define KHZ(x) ((x)*1000)
+#define MHZ(x) ((x) * 1000 * 1000)
+#define KHZ(x) ((x) * 1000)
 
 /*
  * Static constants
@@ -48,33 +50,33 @@
  * is required before any other PLL debugging makes sense. */
 #define DEFAULT_IF_VGA_VAL 11
 static const uint8_t r82xx_init_array[NUM_REGS] = {
-    0x80,                       /* Reg 0x05 */
-    0x13,                       /* Reg 0x06 */
-    0x70,                       /* Reg 0x07 */
-    0xc0,                       /* Reg 0x08 */
-    0x40,                       /* Reg 0x09 */
-    0xdb,                       /* Reg 0x0a */
-    0x6b,                       /* Reg 0x0b */
-    0xe0 | DEFAULT_IF_VGA_VAL,  /* Reg 0x0c — VGA gain */
-    0x53,                       /* Reg 0x0d */
-    0x75,                       /* Reg 0x0e */
-    0x68,                       /* Reg 0x0f */
-    0x6c,                       /* Reg 0x10 */
-    0xbb,                       /* Reg 0x11 — PLL charge-pump current (was 0x83) */
-    0x80,                       /* Reg 0x12 */
-    VER_NUM & 0x3f,             /* Reg 0x13 */
-    0x0f,                       /* Reg 0x14 */
-    0x00,                       /* Reg 0x15 */
-    0xc0,                       /* Reg 0x16 */
-    0x30,                       /* Reg 0x17 */
-    0x48,                       /* Reg 0x18 */
-    0xec,                       /* Reg 0x19 */
-    0x60,                       /* Reg 0x1a */
-    0x00,                       /* Reg 0x1b */
-    0x24,                       /* Reg 0x1c */
-    0xdd,                       /* Reg 0x1d */
-    0x0e,                       /* Reg 0x1e */
-    0x40,                       /* Reg 0x1f */
+    0x80,                      /* Reg 0x05 */
+    0x13,                      /* Reg 0x06 */
+    0x70,                      /* Reg 0x07 */
+    0xc0,                      /* Reg 0x08 */
+    0x40,                      /* Reg 0x09 */
+    0xdb,                      /* Reg 0x0a */
+    0x6b,                      /* Reg 0x0b */
+    0xe0 | DEFAULT_IF_VGA_VAL, /* Reg 0x0c — VGA gain */
+    0x53,                      /* Reg 0x0d */
+    0x75,                      /* Reg 0x0e */
+    0x68,                      /* Reg 0x0f */
+    0x6c,                      /* Reg 0x10 */
+    0xbb,                      /* Reg 0x11 — PLL charge-pump current (was 0x83) */
+    0x80,                      /* Reg 0x12 */
+    VER_NUM & 0x3f,            /* Reg 0x13 */
+    0x0f,                      /* Reg 0x14 */
+    0x00,                      /* Reg 0x15 */
+    0xc0,                      /* Reg 0x16 */
+    0x30,                      /* Reg 0x17 */
+    0x48,                      /* Reg 0x18 */
+    0xec,                      /* Reg 0x19 */
+    0x60,                      /* Reg 0x1a */
+    0x00,                      /* Reg 0x1b */
+    0x24,                      /* Reg 0x1c */
+    0xdd,                      /* Reg 0x1d */
+    0x0e,                      /* Reg 0x1e */
+    0x40,                      /* Reg 0x1f */
 };
 
 /* Tuner frequency ranges */
@@ -285,8 +287,7 @@ static void shadow_store(struct r82xx_priv *priv, uint8_t reg, const uint8_t *va
 {
     int r = reg - REG_SHADOW_START;
 
-    if (r < 0)
-    {
+    if (r < 0) {
         len += r;
         r = 0;
     }
@@ -306,8 +307,7 @@ static int r82xx_write(struct r82xx_priv *priv, uint8_t reg, const uint8_t *val,
     /* Store the shadow registers */
     shadow_store(priv, reg, val, len);
 
-    do
-    {
+    do {
         if (len > priv->cfg->max_i2c_msg_len - 1)
             size = priv->cfg->max_i2c_msg_len - 1;
         else
@@ -320,8 +320,7 @@ static int r82xx_write(struct r82xx_priv *priv, uint8_t reg, const uint8_t *val,
         rc = rtlsdr_i2c_write_fn(priv->rtl_dev, priv->cfg->i2c_addr,
                                  priv->buf, size + 1);
 
-        if (rc != size + 1)
-        {
+        if (rc != size + 1) {
             fprintf(stderr, "%s: i2c wr failed=%d reg=%02x len=%d\n",
                     __FUNCTION__, rc, reg, size);
             if (rc < 0)
@@ -375,7 +374,7 @@ static uint8_t r82xx_bitrev(uint8_t byte)
 
 static int r82xx_read(struct r82xx_priv *priv, uint8_t reg, uint8_t *val, int len)
 {
-    int rc, i;
+    int      rc, i;
     uint8_t *p = &priv->buf[1];
 
     /* The R82XX always returns registers starting from 0x00 on read; the
@@ -387,12 +386,11 @@ static int r82xx_read(struct r82xx_priv *priv, uint8_t reg, uint8_t *val, int le
      * with no following data) and may have been disturbing its I2C state
      * machine, causing reads to return stale/identical bytes. The fix is
      * to remove that write and just read directly. */
-    priv->buf[0] = reg;  /* kept for parity with upstream; not transmitted */
+    priv->buf[0] = reg; /* kept for parity with upstream; not transmitted */
 
     rc = rtlsdr_i2c_read_fn(priv->rtl_dev, priv->cfg->i2c_addr, p, len);
 
-    if (rc != len)
-    {
+    if (rc != len) {
         fprintf(stderr, "%s: i2c rd failed=%d reg=%02x len=%d\n",
                 __FUNCTION__, rc, reg, len);
         if (rc < 0)
@@ -414,14 +412,13 @@ static int r82xx_read(struct r82xx_priv *priv, uint8_t reg, uint8_t *val, int le
 static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
 {
     const struct r82xx_freq_range *range;
-    int rc;
-    unsigned int i;
-    uint8_t val;
+    int                            rc;
+    unsigned int                   i;
+    uint8_t                        val;
 
     /* Get the proper frequency range */
     freq = freq / 1000000;
-    for (i = 0; i < ARRAY_SIZE(freq_ranges) - 1; i++)
-    {
+    for (i = 0; i < ARRAY_SIZE(freq_ranges) - 1; i++) {
         if (freq < freq_ranges[i + 1].freq)
             break;
     }
@@ -443,8 +440,7 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
         return rc;
 
     /* XTAL CAP & Drive */
-    switch (priv->xtal_cap_sel)
-    {
+    switch (priv->xtal_cap_sel) {
     case XTAL_LOW_CAP_30P:
     case XTAL_LOW_CAP_20P:
         val = range->xtal_cap20p | 0x08;
@@ -475,26 +471,26 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
 
 static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 {
-    int rc, i;
+    int      rc, i;
     unsigned sleep_time = 10000;
     uint64_t vco_freq;
     uint32_t vco_fra; /* VCO contribution by SDM (kHz) */
     uint32_t vco_min = 1770000;
     uint32_t vco_max = vco_min * 2;
     uint32_t freq_khz, pll_ref, pll_ref_khz;
-    uint16_t n_sdm = 2;
-    uint16_t sdm = 0;
-    uint8_t mix_div = 2;
-    uint8_t div_buf = 0;
-    uint8_t div_num = 0;
-    uint8_t vco_power_ref = 2;
-    uint8_t refdiv2 = 0;
-    uint8_t ni, si, nint, vco_fine_tune, val;
-    uint8_t data[5];
+    uint16_t n_sdm         = 2;
+    uint16_t sdm           = 0;
+    uint8_t  mix_div       = 2;
+    uint8_t  div_buf       = 0;
+    uint8_t  div_num       = 0;
+    uint8_t  vco_power_ref = 2;
+    uint8_t  refdiv2       = 0;
+    uint8_t  ni, si, nint, vco_fine_tune, val;
+    uint8_t  data[5];
 
     /* Frequency in kHz */
-    freq_khz = (freq + 500) / 1000;
-    pll_ref = priv->cfg->xtal;
+    freq_khz    = (freq + 500) / 1000;
+    pll_ref     = priv->cfg->xtal;
     pll_ref_khz = (priv->cfg->xtal + 500) / 1000;
 
     rc = r82xx_write_reg_mask(priv, 0x10, refdiv2, 0x10);
@@ -512,14 +508,11 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
         return rc;
 
     /* Calculate divider */
-    while (mix_div <= 64)
-    {
+    while (mix_div <= 64) {
         if (((freq_khz * mix_div) >= vco_min) &&
-            ((freq_khz * mix_div) < vco_max))
-        {
+            ((freq_khz * mix_div) < vco_max)) {
             div_buf = mix_div;
-            while (div_buf > 2)
-            {
+            while (div_buf > 2) {
                 div_buf = div_buf >> 1;
                 div_num++;
             }
@@ -547,11 +540,10 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
         return rc;
 
     vco_freq = (uint64_t)freq * (uint64_t)mix_div;
-    nint = vco_freq / (2 * pll_ref);
-    vco_fra = (vco_freq - 2 * pll_ref * nint) / 1000;
+    nint     = vco_freq / (2 * pll_ref);
+    vco_fra  = (vco_freq - 2 * pll_ref * nint) / 1000;
 
-    if (nint > ((128 / vco_power_ref) - 1))
-    {
+    if (nint > ((128 / vco_power_ref) - 1)) {
         fprintf(stderr, "[R82XX] No valid PLL values for %lu Hz!\n", freq);
         return -1;
     }
@@ -574,11 +566,9 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
         return rc;
 
     /* sdm calculator */
-    while (vco_fra > 1)
-    {
-        if (vco_fra > (2 * pll_ref_khz / n_sdm))
-        {
-            sdm = sdm + 32768 / (n_sdm / 2);
+    while (vco_fra > 1) {
+        if (vco_fra > (2 * pll_ref_khz / n_sdm)) {
+            sdm     = sdm + 32768 / (n_sdm / 2);
             vco_fra = vco_fra - 2 * pll_ref_khz / n_sdm;
             if (n_sdm >= 0x8000)
                 break;
@@ -600,14 +590,17 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
             (unsigned long)freq, (unsigned)pll_ref, (unsigned)mix_div,
             (unsigned)nint, (unsigned)si, (unsigned)vco_fra, (unsigned)sdm);
 
-    for (i = 0; i < 2; i++)
-    {
+    for (i = 0; i < 2; i++) {
         // Linux: usleep_range(sleep_time, sleep_time + 1000)
         // sleep_time = 10000 us (10 ms), enough for the R82xx PLL to settle
         // before reading the lock bit. Without this delay the read happens
         // before the PLL has converged and the lock bit reports 0 even on
         // a working tuner.
-        esp_rom_delay_us(sleep_time);
+        // This runs on the r82xx_set_freq() (runtime retune) path, so a
+        // 10 ms busy-spin here would stall whatever task/core calls it.
+        // Yield instead of busy-spinning; +1 tick guards against rounding
+        // sleep_time/1000 down to 0 ticks.
+        vTaskDelay(pdMS_TO_TICKS(sleep_time / 1000) + 1);
 
         /* Check if PLL has locked */
         rc = r82xx_read(priv, 0x00, data, 3);
@@ -622,8 +615,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
         if (data[2] & 0x40)
             break;
 
-        if (!i)
-        {
+        if (!i) {
             /* Didn't lock. Increase VCO current */
             rc = r82xx_write_reg_mask(priv, 0x12, 0x60, 0xe0);
             if (rc < 0)
@@ -631,8 +623,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
         }
     }
 
-    if (!(data[2] & 0x40))
-    {
+    if (!(data[2] & 0x40)) {
         fprintf(stderr, "[R82XX] PLL not locked!\n");
         priv->has_lock = 0;
         return 0;
@@ -648,81 +639,76 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
 static int r82xx_sysfreq_sel(struct r82xx_priv *priv, uint32_t freq,
                              enum r82xx_tuner_type type,
-                             uint32_t delsys)
+                             uint32_t              delsys)
 {
-    int rc;
+    int     rc;
     uint8_t mixer_top, lna_top, cp_cur, div_buf_cur, lna_vth_l, mixer_vth_l;
     uint8_t air_cable1_in, cable2_in, pre_dect, lna_discharge, filter_cur;
 
-    switch (delsys)
-    {
+    switch (delsys) {
     case SYS_DVBT:
         if ((freq == 506000000) || (freq == 666000000) ||
-            (freq == 818000000))
-        {
-            mixer_top = 0x14;   /* mixer top:14 , top-1, low-discharge */
-            lna_top = 0xe5;     /* detect bw 3, lna top:4, predet top:2 */
-            cp_cur = 0x28;      /* 101, 0.2 */
+            (freq == 818000000)) {
+            mixer_top   = 0x14; /* mixer top:14 , top-1, low-discharge */
+            lna_top     = 0xe5; /* detect bw 3, lna top:4, predet top:2 */
+            cp_cur      = 0x28; /* 101, 0.2 */
             div_buf_cur = 0x20; /* 10, 200u */
-        }
-        else
-        {
-            mixer_top = 0x24;   /* mixer top:13 , top-1, low-discharge */
-            lna_top = 0xe5;     /* detect bw 3, lna top:4, predet top:2 */
-            cp_cur = 0x38;      /* 111, auto */
+        } else {
+            mixer_top   = 0x24; /* mixer top:13 , top-1, low-discharge */
+            lna_top     = 0xe5; /* detect bw 3, lna top:4, predet top:2 */
+            cp_cur      = 0x38; /* 111, auto */
             div_buf_cur = 0x30; /* 11, 150u */
         }
-        lna_vth_l = 0x53;   /* lna vth 0.84	,  vtl 0.64 */
-        mixer_vth_l = 0x75; /* mixer vth 1.04, vtl 0.84 */
+        lna_vth_l     = 0x53; /* lna vth 0.84	,  vtl 0.64 */
+        mixer_vth_l   = 0x75; /* mixer vth 1.04, vtl 0.84 */
         air_cable1_in = 0x00;
-        cable2_in = 0x00;
-        pre_dect = 0x40;
+        cable2_in     = 0x00;
+        pre_dect      = 0x40;
         lna_discharge = 14;
-        filter_cur = 0x40; /* 10, low */
+        filter_cur    = 0x40; /* 10, low */
         break;
     case SYS_DVBT2:
-        mixer_top = 0x24;   /* mixer top:13 , top-1, low-discharge */
-        lna_top = 0xe5;     /* detect bw 3, lna top:4, predet top:2 */
-        lna_vth_l = 0x53;   /* lna vth 0.84	,  vtl 0.64 */
-        mixer_vth_l = 0x75; /* mixer vth 1.04, vtl 0.84 */
+        mixer_top     = 0x24; /* mixer top:13 , top-1, low-discharge */
+        lna_top       = 0xe5; /* detect bw 3, lna top:4, predet top:2 */
+        lna_vth_l     = 0x53; /* lna vth 0.84	,  vtl 0.64 */
+        mixer_vth_l   = 0x75; /* mixer vth 1.04, vtl 0.84 */
         air_cable1_in = 0x00;
-        cable2_in = 0x00;
-        pre_dect = 0x40;
+        cable2_in     = 0x00;
+        pre_dect      = 0x40;
         lna_discharge = 14;
-        cp_cur = 0x38;      /* 111, auto */
-        div_buf_cur = 0x30; /* 11, 150u */
-        filter_cur = 0x40;  /* 10, low */
+        cp_cur        = 0x38; /* 111, auto */
+        div_buf_cur   = 0x30; /* 11, 150u */
+        filter_cur    = 0x40; /* 10, low */
         break;
     case SYS_ISDBT:
-        mixer_top = 0x24;   /* mixer top:13 , top-1, low-discharge */
-        lna_top = 0xe5;     /* detect bw 3, lna top:4, predet top:2 */
-        lna_vth_l = 0x75;   /* lna vth 1.04	,  vtl 0.84 */
-        mixer_vth_l = 0x75; /* mixer vth 1.04, vtl 0.84 */
+        mixer_top     = 0x24; /* mixer top:13 , top-1, low-discharge */
+        lna_top       = 0xe5; /* detect bw 3, lna top:4, predet top:2 */
+        lna_vth_l     = 0x75; /* lna vth 1.04	,  vtl 0.84 */
+        mixer_vth_l   = 0x75; /* mixer vth 1.04, vtl 0.84 */
         air_cable1_in = 0x00;
-        cable2_in = 0x00;
-        pre_dect = 0x40;
+        cable2_in     = 0x00;
+        pre_dect      = 0x40;
         lna_discharge = 14;
-        cp_cur = 0x38;      /* 111, auto */
-        div_buf_cur = 0x30; /* 11, 150u */
-        filter_cur = 0x40;  /* 10, low */
+        cp_cur        = 0x38; /* 111, auto */
+        div_buf_cur   = 0x30; /* 11, 150u */
+        filter_cur    = 0x40; /* 10, low */
         break;
-    default:                /* DVB-T 8M */
-        mixer_top = 0x24;   /* mixer top:13 , top-1, low-discharge */
-        lna_top = 0xe5;     /* detect bw 3, lna top:4, predet top:2 */
-        lna_vth_l = 0x53;   /* lna vth 0.84	,  vtl 0.64 */
-        mixer_vth_l = 0x75; /* mixer vth 1.04, vtl 0.84 */
+    default:                  /* DVB-T 8M */
+        mixer_top     = 0x24; /* mixer top:13 , top-1, low-discharge */
+        lna_top       = 0xe5; /* detect bw 3, lna top:4, predet top:2 */
+        lna_vth_l     = 0x53; /* lna vth 0.84	,  vtl 0.64 */
+        mixer_vth_l   = 0x75; /* mixer vth 1.04, vtl 0.84 */
         air_cable1_in = 0x00;
-        cable2_in = 0x00;
-        pre_dect = 0x40;
+        cable2_in     = 0x00;
+        pre_dect      = 0x40;
         lna_discharge = 14;
-        cp_cur = 0x38;      /* 111, auto */
-        div_buf_cur = 0x30; /* 11, 150u */
-        filter_cur = 0x40;  /* 10, low */
+        cp_cur        = 0x38; /* 111, auto */
+        div_buf_cur   = 0x30; /* 11, 150u */
+        filter_cur    = 0x40; /* 10, low */
         break;
     }
 
-    if (priv->cfg->use_predetect)
-    {
+    if (priv->cfg->use_predetect) {
         rc = r82xx_write_reg_mask(priv, 0x06, pre_dect, 0x40);
         if (rc < 0)
             return rc;
@@ -765,8 +751,7 @@ static int r82xx_sysfreq_sel(struct r82xx_priv *priv, uint32_t freq,
      * Set LNA
      */
 
-    if (type != TUNER_ANALOG_TV)
-    {
+    if (type != TUNER_ANALOG_TV) {
         /* LNA TOP: lowest */
         rc = r82xx_write_reg_mask(priv, 0x1d, 0, 0x38);
         if (rc < 0)
@@ -812,9 +797,7 @@ static int r82xx_sysfreq_sel(struct r82xx_priv *priv, uint32_t freq,
         rc = r82xx_write_reg_mask(priv, 0x1a, 0x20, 0x30);
         if (rc < 0)
             return rc;
-    }
-    else
-    {
+    } else {
         /* PRE_DECT off */
         rc = r82xx_write_reg_mask(priv, 0x06, 0, 0x40);
         if (rc < 0)
@@ -851,31 +834,31 @@ static int r82xx_sysfreq_sel(struct r82xx_priv *priv, uint32_t freq,
     return 0;
 }
 
-static int r82xx_set_tv_standard(struct r82xx_priv *priv,
-                                 unsigned bw,
+static int r82xx_set_tv_standard(struct r82xx_priv    *priv,
+                                 unsigned              bw,
                                  enum r82xx_tuner_type type,
-                                 uint32_t delsys)
+                                 uint32_t              delsys)
 
 {
-    int rc, i;
+    int      rc, i;
     uint32_t if_khz, filt_cal_lo;
-    uint8_t data[5];
-    uint8_t filt_gain, img_r, filt_q, hp_cor, ext_enable, loop_through;
-    uint8_t lt_att, flt_ext_widest, polyfil_cur;
-    int need_calibration;
+    uint8_t  data[5];
+    uint8_t  filt_gain, img_r, filt_q, hp_cor, ext_enable, loop_through;
+    uint8_t  lt_att, flt_ext_widest, polyfil_cur;
+    int      need_calibration;
 
     /* BW < 6 MHz */
-    if_khz = 3570;
-    filt_cal_lo = 56000;   /* 52000->56000 */
-    filt_gain = 0x10;      /* +3db, 6mhz on */
-    img_r = 0x00;          /* image negative */
-    filt_q = 0x10;         /* r10[4]:low q(1'b1) */
-    hp_cor = 0x6b;         /* 1.7m disable, +2cap, 1.0mhz */
-    ext_enable = 0x60;     /* r30[6]=1 ext enable; r30[5]:1 ext at lna max-1 */
-    loop_through = 0x01;   /* r5[7], lt off */
-    lt_att = 0x00;         /* r31[7], lt att enable */
-    flt_ext_widest = 0x00; /* r15[7]: flt_ext_wide off */
-    polyfil_cur = 0x60;    /* r25[6:5]:min */
+    if_khz         = 3570;
+    filt_cal_lo    = 56000; /* 52000->56000 */
+    filt_gain      = 0x10;  /* +3db, 6mhz on */
+    img_r          = 0x00;  /* image negative */
+    filt_q         = 0x10;  /* r10[4]:low q(1'b1) */
+    hp_cor         = 0x6b;  /* 1.7m disable, +2cap, 1.0mhz */
+    ext_enable     = 0x60;  /* r30[6]=1 ext enable; r30[5]:1 ext at lna max-1 */
+    loop_through   = 0x01;  /* r5[7], lt off */
+    lt_att         = 0x00;  /* r31[7], lt att enable */
+    flt_ext_widest = 0x00;  /* r15[7]: flt_ext_wide off */
+    polyfil_cur    = 0x60;  /* r25[6:5]:min */
 
     /* Initialize the shadow registers */
     memcpy(priv->regs, r82xx_init_array, sizeof(r82xx_init_array));
@@ -891,12 +874,11 @@ static int r82xx_set_tv_standard(struct r82xx_priv *priv,
         return rc;
 
     /* for LT Gain test */
-    if (type != TUNER_ANALOG_TV)
-    {
+    if (type != TUNER_ANALOG_TV) {
         rc = r82xx_write_reg_mask(priv, 0x1d, 0x00, 0x38);
         if (rc < 0)
             return rc;
-        esp_rom_delay_us(1000);  // Linux: usleep_range(1000, 2000)
+        esp_rom_delay_us(1000); // Linux: usleep_range(1000, 2000)
     }
     priv->int_freq = if_khz * 1000;
 
@@ -904,10 +886,8 @@ static int r82xx_set_tv_standard(struct r82xx_priv *priv,
     /* as we call this function only once in rtlsdr, force calibration */
     need_calibration = 1;
 
-    if (need_calibration)
-    {
-        for (i = 0; i < 2; i++)
-        {
+    if (need_calibration) {
+        for (i = 0; i < 2; i++) {
             /* Set filt_cap */
             rc = r82xx_write_reg_mask(priv, 0x0b, hp_cor, 0x60);
             if (rc < 0)
@@ -932,7 +912,7 @@ static int r82xx_set_tv_standard(struct r82xx_priv *priv,
             if (rc < 0)
                 return rc;
 
-            esp_rom_delay_us(1000);  // Linux: usleep_range(1000, 2000)
+            esp_rom_delay_us(1000); // Linux: usleep_range(1000, 2000)
 
             /* Stop Trigger */
             rc = r82xx_write_reg_mask(priv, 0x0b, 0x00, 0x10);
@@ -1005,8 +985,8 @@ static int r82xx_set_tv_standard(struct r82xx_priv *priv,
 
     /* Store current standard. If it changes, re-calibrate the tuner */
     priv->delsys = delsys;
-    priv->type = type;
-    priv->bw = bw;
+    priv->type   = type;
+    priv->bw     = bw;
 
     return 0;
 }
@@ -1014,7 +994,7 @@ static int r82xx_set_tv_standard(struct r82xx_priv *priv,
 static int r82xx_read_gain(struct r82xx_priv *priv)
 {
     uint8_t data[4];
-    int rc;
+    int     rc;
 
     rc = r82xx_read(priv, 0x00, data, sizeof(data));
     if (rc < 0)
@@ -1042,9 +1022,8 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
 {
     int rc;
 
-    if (set_manual_gain)
-    {
-        int i, total_gain = 0;
+    if (set_manual_gain) {
+        int     i, total_gain = 0;
         uint8_t mix_index = 0, lna_index = 0;
         uint8_t data[4];
 
@@ -1067,8 +1046,7 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
         if (rc < 0)
             return rc;
 
-        for (i = 0; i < 15; i++)
-        {
+        for (i = 0; i < 15; i++) {
             if (total_gain >= gain)
                 break;
 
@@ -1089,9 +1067,7 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
         rc = r82xx_write_reg_mask(priv, 0x07, mix_index, 0x0f);
         if (rc < 0)
             return rc;
-    }
-    else
-    {
+    } else {
         /* LNA */
         rc = r82xx_write_reg_mask(priv, 0x05, 0, 0x10);
         if (rc < 0)
@@ -1119,64 +1095,50 @@ static const int r82xx_if_low_pass_bw_table[] = {
 #define FILT_HP_BW2 380000
 int r82xx_set_bandwidth(struct r82xx_priv *priv, int bw, uint32_t rate)
 {
-    int rc;
+    int          rc;
     unsigned int i;
-    int real_bw = 0;
-    uint8_t reg_0a;
-    uint8_t reg_0b;
+    int          real_bw = 0;
+    uint8_t      reg_0a;
+    uint8_t      reg_0b;
 
-    if (bw > 7000000)
-    {
+    if (bw > 7000000) {
         // BW: 8 MHz
-        reg_0a = 0x10;
-        reg_0b = 0x0b;
+        reg_0a         = 0x10;
+        reg_0b         = 0x0b;
         priv->int_freq = 4570000;
-    }
-    else if (bw > 6000000)
-    {
+    } else if (bw > 6000000) {
         // BW: 7 MHz
-        reg_0a = 0x10;
-        reg_0b = 0x2a;
+        reg_0a         = 0x10;
+        reg_0b         = 0x2a;
         priv->int_freq = 4570000;
-    }
-    else if (bw > r82xx_if_low_pass_bw_table[0] + FILT_HP_BW1 + FILT_HP_BW2)
-    {
+    } else if (bw > r82xx_if_low_pass_bw_table[0] + FILT_HP_BW1 + FILT_HP_BW2) {
         // BW: 6 MHz
-        reg_0a = 0x10;
-        reg_0b = 0x6b;
+        reg_0a         = 0x10;
+        reg_0b         = 0x6b;
         priv->int_freq = 3570000;
-    }
-    else
-    {
-        reg_0a = 0x00;
-        reg_0b = 0x80;
+    } else {
+        reg_0a         = 0x00;
+        reg_0b         = 0x80;
         priv->int_freq = 2300000;
 
-        if (bw > r82xx_if_low_pass_bw_table[0] + FILT_HP_BW1)
-        {
+        if (bw > r82xx_if_low_pass_bw_table[0] + FILT_HP_BW1) {
             bw -= FILT_HP_BW2;
             priv->int_freq += FILT_HP_BW2;
             real_bw += FILT_HP_BW2;
-        }
-        else
-        {
+        } else {
             reg_0b |= 0x20;
         }
 
-        if (bw > r82xx_if_low_pass_bw_table[0])
-        {
+        if (bw > r82xx_if_low_pass_bw_table[0]) {
             bw -= FILT_HP_BW1;
             priv->int_freq += FILT_HP_BW1;
             real_bw += FILT_HP_BW1;
-        }
-        else
-        {
+        } else {
             reg_0b |= 0x40;
         }
 
         // find low-pass filter
-        for (i = 0; i < ARRAY_SIZE(r82xx_if_low_pass_bw_table); ++i)
-        {
+        for (i = 0; i < ARRAY_SIZE(r82xx_if_low_pass_bw_table); ++i) {
             if (bw > r82xx_if_low_pass_bw_table[i])
                 break;
         }
@@ -1202,9 +1164,9 @@ int r82xx_set_bandwidth(struct r82xx_priv *priv, int bw, uint32_t rate)
 
 int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 {
-    int rc = -1;
+    int      rc      = -1;
     uint32_t lo_freq = freq + priv->int_freq;
-    uint8_t air_cable1_in;
+    uint8_t  air_cable1_in;
 
     rc = r82xx_set_mux(priv, lo_freq);
     if (rc < 0)
@@ -1221,10 +1183,9 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
     air_cable1_in = (freq > MHZ(345)) ? 0x00 : 0x60;
 
     if ((priv->cfg->rafael_chip == CHIP_R828D) &&
-        (air_cable1_in != priv->input))
-    {
+        (air_cable1_in != priv->input)) {
         priv->input = air_cable1_in;
-        rc = r82xx_write_reg_mask(priv, 0x05, air_cable1_in, 0x60);
+        rc          = r82xx_write_reg_mask(priv, 0x05, air_cable1_in, 0x60);
     }
 
 err:
@@ -1289,9 +1250,9 @@ int r82xx_standby(struct r82xx_priv *priv)
 
 static int r82xx_xtal_check(struct r82xx_priv *priv)
 {
-    int rc;
+    int          rc;
     unsigned int i;
-    uint8_t data[3], val;
+    uint8_t      data[3], val;
 
     /* Initialize the shadow registers */
     memcpy(priv->regs, r82xx_init_array, sizeof(r82xx_init_array));
@@ -1317,14 +1278,13 @@ static int r82xx_xtal_check(struct r82xx_priv *priv)
         return rc;
 
     /* Try several xtal capacitor alternatives */
-    for (i = 0; i < ARRAY_SIZE(r82xx_xtal_capacitor); i++)
-    {
+    for (i = 0; i < ARRAY_SIZE(r82xx_xtal_capacitor); i++) {
         rc = r82xx_write_reg_mask(priv, 0x10,
                                   r82xx_xtal_capacitor[i][0], 0x1b);
         if (rc < 0)
             return rc;
 
-        esp_rom_delay_us(5000);  // Linux: usleep_range(5000, 6000)
+        esp_rom_delay_us(5000); // Linux: usleep_range(5000, 6000)
 
         rc = r82xx_read(priv, 0x00, data, sizeof(data));
         if (rc < 0)

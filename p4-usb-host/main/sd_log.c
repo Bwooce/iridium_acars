@@ -154,12 +154,16 @@ static size_t json_escape(char *out, size_t outsz, const char *in)
 // (excluding the NUL).
 static size_t format_msg_line(char *out, size_t cap, const acars_msg_t *m)
 {
-    char esc[2 * MSG_RING_TXT_MAX + 8];
+    // json_escape's worst case is \u00XX (6 chars) per input byte, not
+    // 2x — a 2x buffer silently truncates any text with several control
+    // bytes. Size for the true worst case (+1 for the NUL json_escape
+    // itself writes).
+    char esc[6 * MSG_RING_TXT_MAX + 1];
     json_escape(esc, sizeof(esc), m->txt);
     // msg_num / flight_id come off the air too — a quote in either would
     // break the NDJSON line just as surely as one in txt (M17).
-    char esc_msgnum[2 * sizeof(m->msg_num) + 1];
-    char esc_flight[2 * sizeof(m->flight_id) + 1];
+    char esc_msgnum[6 * sizeof(m->msg_num) + 1];
+    char esc_flight[6 * sizeof(m->flight_id) + 1];
     json_escape(esc_msgnum, sizeof(esc_msgnum), m->msg_num);
     json_escape(esc_flight, sizeof(esc_flight), m->flight_id);
 
@@ -219,8 +223,11 @@ static void writer_task(void *arg)
 {
     (void)arg;
     acars_msg_t m;
-    char        line[2048]; // worst case ~600 B; 2K is generous
-    int64_t     last_flush = esp_timer_get_time();
+    char        line[2048]; // typical case ~600 B; format_msg_line's
+                            // snprintf is cap-bounded so a pathological
+                            // all-control-byte txt truncates safely
+                            // rather than overflowing
+    int64_t last_flush = esp_timer_get_time();
 
     while (1) {
         BaseType_t got = xQueueReceive(s_q, &m, pdMS_TO_TICKS(1000));
@@ -250,7 +257,6 @@ static void writer_task(void *arg)
                 if (len > 0) {
                     size_t wr = fwrite(line, 1, len, s_log);
                     if (wr == len) {
-                        update_stats_ok(len);
                         // Commit immediately. Decodes are rare and
                         // precious; on FATFS fflush() alone only pushes
                         // the stdio buffer into the sector cache — the
@@ -258,8 +264,19 @@ static void writer_task(void *arg)
                         // until f_sync, so a crash/power-loss would lose
                         // the line and it wouldn't even appear in
                         // /sd/list. fsync() forces FATFS f_sync (#102).
-                        fflush(s_log);
-                        fsync(fileno(s_log));
+                        // Check both return values and only count the
+                        // message as written once it's actually
+                        // committed — a silent fflush/fsync failure used
+                        // to still bump messages_written.
+                        int flush_rc = fflush(s_log);
+                        int sync_rc  = (flush_rc == 0) ? fsync(fileno(s_log)) : -1;
+                        if (flush_rc == 0 && sync_rc == 0) {
+                            update_stats_ok(len);
+                        } else {
+                            ESP_LOGW(TAG, "commit failed (fflush=%d fsync=%d) errno=%d",
+                                     flush_rc, sync_rc, errno);
+                            update_stats_err();
+                        }
                     } else {
                         ESP_LOGW(TAG, "fwrite short: %u/%u — disk full?",
                                  (unsigned)wr, (unsigned)len);
@@ -482,8 +499,14 @@ static esp_err_t open_log_file(void)
         return ESP_FAIL;
     }
     setvbuf(s_log, NULL, _IOFBF, 4096); // 4 KB FILE buffer — coalesce writes
+    // s_stats is read concurrently (by copy) under s_stats_mu from
+    // sd_log_get_stats (httpd) — take it for the write so a reader can't
+    // observe a torn log_path (open_log_file runs under s_log_mu, so lock
+    // order here matches the s_log_mu -> s_stats_mu order used elsewhere).
+    if (s_stats_mu) xSemaphoreTake(s_stats_mu, portMAX_DELAY);
     strlcpy(s_stats.log_path, path, sizeof(s_stats.log_path));
     s_stats.log_open = true;
+    if (s_stats_mu) xSemaphoreGive(s_stats_mu);
     ESP_LOGI(TAG, "ACARS log open: %s", path);
     return ESP_OK;
 }
