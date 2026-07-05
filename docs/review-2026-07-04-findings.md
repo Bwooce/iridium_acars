@@ -317,3 +317,24 @@ re-read the source and confirmed the defect.
   HTML form + `form_field` parse (mirror the `bias_tee` checkbox), pick a sensible widget
   (dropdown TUNER_AGC/MANUAL/SOFTWARE_AGC + a manual-gain number box). Gate on confirming the
   SOFTWARE_AGC approach actually recovers decodes with the better antenna.
+  NOTE (2026-07-05): SOFTWARE_AGC did NOT help — it only reduces gain on ADC near-clipping
+  (peak_dev > 110), and this overload is not clipping-driven. Real bottleneck is the detector
+  (see T59).
+
+- [ ] **T59** graceful overload handling (detector congestion collapse). Observed 2026-07-05
+  with a better antenna+LNA: the fft_burst_tagger (dsp_feed) saturates at dsp_cap=98%, falls
+  behind real-time, and by the time it dispatches a burst the ring has overwritten that
+  burst's samples → signal_buffer_burst_valid rejects it → worker skips 100% of bursts
+  (processed=0) while sitting at worker_cap=0%. Maximum work, zero output — a livelock. The
+  worker is NOT the bottleneck (idle, spare capacity); the detector starving it of fresh work
+  is. Treatments, most-impactful first:
+  (1) Load-shed at the detector to keep it real-time — adaptively raise the effective
+      threshold / cap peaks or active-bursts per tile when dsp_cap is high, so the tagger
+      stays real-time and emits FRESH bursts. (Static tag_thr raise is the manual version but
+      it's boot-only today — dsp_processor.c:210 reads it once at create.)
+  (2) Freshness-first queue — the burst queue (worker_core1.c) is FIFO and xQueueSend drops
+      the NEWEST when full (~line 1007); under overload that's backwards. Prefer newest
+      (drop-oldest / LIFO) so worker effort lands on decodable bursts.
+  (3) Reject already-stale bursts before enqueue — cheap early-out in dispatch.
+  Also make tag_thr live-reloadable (re-read cfg per tile or on a config-changed flag) so (1)
+  and manual threshold tuning don't need a reboot.
