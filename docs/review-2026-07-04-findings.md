@@ -80,9 +80,17 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   correct + bit-exact, but decode-neutral needs a >=8 KB tile which doesn't fit the
   silicon-locked DMA-INT budget (USB pool can't move to PSRAM: APM-560/MSPI errata).
   Non-bottleneck. **T49c** (resample writes into signal_buffer scratch) — not started.
+- Batch 8 (2026-07-05) — P3 low-severity sweep, DONE + pushed (db20f7a DSP-path,
+  d67a452 non-DSP). ~19 fixes, all proven decode-NEUTRAL (RAW GOLDEN bit-identical
+  to baseline via A/B). **T45's WB_PRE_PAD 288->320 BACKED OUT** — it degraded decode
+  (BER 1.39%->2.42%, exact 44->43, div 1->3) recovering only harmless safety-padding
+  samples; caught via the GOLDEN bucket/BER breakdown (matched count alone hid it).
+  Partial/skip: T25 (host-only, device matches vendored esp-dsp), T30 (3/4; static
+  scratch left to avoid a PSRAM-stall regression), T43 (NULL-check done, dead-code
+  removal follow-up), T44 (double-give done, 64-bit-head follow-up), T46 (already fixed).
 - Remaining open: T14 (OTA auth — the notable security gap), T15/T16 (frame_link, HW not
   brought up), T18–T20 (USB hot-unplug/teardown — need physical unplug, not on this bench),
-  T24–T47 (P3 low-severity batch, ~24 items), T49c + T50 kernel,
+  T49c + T50 kernel, T43 dead-code removal + T44 64-bit-head (P3 follow-ups),
   T21b (minor SD drain-loop follow-up).
 
 **Live-device verification (2026-07-04, device on LAN at 192.168.1.235, build 5e18864):**
@@ -219,45 +227,45 @@ re-read the source and confirmed the defect.
 
 ## P3 — Low
 
-- [ ] **T24** `burst_pipeline.c:411` — DC removal int16 wrap near rails; use q15_saturate.
-- [ ] **T25** `direct_if_decim.c:203` — host acc starts 0 vs device 0x7fff round const +
+- [x] **T24** `burst_pipeline.c:411` — DC removal int16 wrap near rails; use q15_saturate.
+- [~] **T25** `direct_if_decim.c:203` — host acc starts 0 vs device 0x7fff round const +
   unsaturated stores → ~1 LSB host/device parity drift; drops `n_in%10` remainder.
-- [ ] **T26** `resample_256_to_250.c:136` — silent malloc-fail leaves coeffs unwritten.
-- [ ] **T27** `fft_sc16_2048.c:62` — alloc-fail path no ESP_LOGE → silent no-op tagger.
-- [ ] **T28** `fft_burst_tagger.c:340` — flush() doesn't drain in-flight helper / reset
+- [x] **T26** `resample_256_to_250.c:136` — silent malloc-fail leaves coeffs unwritten.
+- [x] **T27** `fft_sc16_2048.c:62` — alloc-fail path no ESP_LOGE → silent no-op tagger.
+- [x] **T28** `fft_burst_tagger.c:340` — flush() doesn't drain in-flight helper / reset
   pipe_in_flight (latent; helper disabled).
-- [ ] **T29** `sym_timing.c:159` — unclamped negative v drives strobe_idx backwards (module unwired).
-- [ ] **T30** `uw_correlator.c` — PIE-FFT partial-alloc leak (:480), silent no-op on init
+- [x] **T29** `sym_timing.c:159` — unclamped negative v drives strobe_idx backwards (module unwired).
+- [~] **T30** `uw_correlator.c` — PIE-FFT partial-alloc leak (:480), silent no-op on init
   fail emits confident wrong result (:494), non-reentrant static scratch (:1313),
   r*r+i*i UB at -32768 (:1665).
-- [ ] **T31** `bch_decoder.c:49` — lazy init sets inited=true before syn_ra filled →
+- [x] **T31** `bch_decoder.c:49` — lazy init sets inited=true before syn_ra filled →
   cross-core reader accepts garbage as 0-errs. Fix: set flag last.
-- [ ] **T32** `iridium_bch.c:10` — bits_to_u32 truncates n_bits>32; all-zero always passes
+- [x] **T32** `iridium_bch.c:10` — bits_to_u32 truncates n_bits>32; all-zero always passes
   (matches upstream; feeds BC/RA false-positive stats).
-- [ ] **T33** `sbd_reassembler.c:225` — noise msg_cnt (≤255) opens sessions dying only by
+- [x] **T33** `sbd_reassembler.c:225` — noise msg_cnt (≤255) opens sessions dying only by
   5 s timeout → 8-slot table saturates, drops real multi-frame; session match ignores type (:70).
-- [ ] **T34** `tuner_r82xx.c:603` — usleep_range → esp_rom_delay_us busy-spins ≤2×10 ms in
+- [x] **T34** `tuner_r82xx.c:603` — usleep_range → esp_rom_delay_us busy-spins ≤2×10 ms in
   PLL lock; latent, a runtime retune stalls Core 0. Fix: vTaskDelay.
-- [ ] **T35** `frame_decoder.c:135` — get_rolling_rates double-counts most recent hour
+- [x] **T35** `frame_decoder.c:135` — get_rolling_rates double-counts most recent hour
   (24 h figure up to 2× inflated, spans up to 25 h).
-- [ ] **T36** `sd_log.c:157` — esc buffer 2× assumption vs 6× `\u00XX` → silent truncation ~519 B.
-- [ ] **T37** `sd_log.c:485` — s_stats.log_path/log_open written without s_stats_mu (torn read);
+- [x] **T36** `sd_log.c:157` — esc buffer 2× assumption vs 6× `\u00XX` → silent truncation ~519 B.
+- [x] **T37** `sd_log.c:485` — s_stats.log_path/log_open written without s_stats_mu (torn read);
   fflush/fsync unchecked (:261), messages_written increments pre-commit.
-- [ ] **T38** `worker_core1.c:619` — burst_valid TOCTOU: producer advances head during
+- [x] **T38** `worker_core1.c:619` — burst_valid TOCTOU: producer advances head during
   multi-ms read, marginal bursts partially overwritten. Fix: re-validate after read.
-- [ ] **T39** `status_logger.c:122` — dsp_pct/worker_pct divide by window_us without zero
+- [x] **T39** `status_logger.c:122` — dsp_pct/worker_pct divide by window_us without zero
   guard → inf → int cast UB.
-- [ ] **T40** `app_config.c:170` — gain_mode from NVS not range-validated before enum cast.
-- [ ] **T41** `serial_cmd.c:296` — uart driver init return codes ignored.
-- [ ] **T42** `http_server.c:1233` — capture_start body >128 B left unread → keep-alive
+- [x] **T40** `app_config.c:170` — gain_mode from NVS not range-validated before enum cast.
+- [x] **T41** `serial_cmd.c:296` — uart driver init return codes ignored.
+- [x] **T42** `http_server.c:1233` — capture_start body >128 B left unread → keep-alive
   desync. Fix: return 413.
-- [ ] **T43** `esp_libusb.c:158` — response_buf calloc unchecked; MPS hardcoded 64 (:85, HS=512).
-- [ ] **T44** `signal_buffer.c:359` — burst_valid aliases past one ring lap (~420 ms); needs
+- [~] **T43** `esp_libusb.c:158` — response_buf calloc unchecked; MPS hardcoded 64 (:85, HS=512).
+- [~] **T44** `signal_buffer.c:359` — burst_valid aliases past one ring lap (~420 ms); needs
   64-bit cumulative head. DMA-timeout double-give semaphore (:241, never fired).
-- [ ] **T45** `worker_core1.c:713` — final decim chunk 8 mod 10 (make WB_PRE_PAD 320);
+- [x] **T45** `worker_core1.c:713` — final decim chunk 8 mod 10 (make WB_PRE_PAD 320);
   gold static_assert (:138); non-atomic volatile hist RMW (:79).
-- [ ] **T46** `frame_queue.c` — full 2064 B memcpy per push/pop regardless of n_bits (~5× waste).
-- [ ] **T47** `ira_decode.c`/`ibc_decode.c` — missing `frame->type` assertion (ida/ims have it).
+- [x] **T46** `frame_queue.c` — full 2064 B memcpy per push/pop regardless of n_bits (~5× waste).
+- [x] **T47** `ira_decode.c`/`ibc_decode.c` — missing `frame->type` assertion (ida/ims have it).
 
 ## OPT — optimisation / throughput
 
