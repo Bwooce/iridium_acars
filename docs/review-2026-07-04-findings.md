@@ -302,3 +302,18 @@ re-read the source and confirmed the defect.
   bits tail per frame.
 - [x] **T54** `signal_buffer.c:153` — root-cause why async-memcpy takes split-RX path when
   src/dst/len all 64-aligned; eliminating it makes stash_fails structurally zero (T2/DMA-INT).
+
+## Enhancements (post-review, from live bench work)
+
+- [ ] **T58** `http_server.c` config form + `config_post` — expose **gain_mode / gain_dbx10**
+  (and likely **tag_thr**) in the web `/config` UI. Today they are serial-only
+  (`serial_cmd.c`: `set gain_mode|gain_dbx10|tag_thr`), so switching to SOFTWARE_AGC or
+  trimming front-end gain requires a UART session. Motivation (2026-07-05 bench): a better
+  antenna + external LNA on hardware TUNER_AGC overdrove the front end — detect stage
+  saturated (dsp_cap 98%), USB ring dropping ~21/s, worker fell behind so bursts went stale
+  and burst_valid dropped them → 0 decodes despite SNR now reaching 31 dB. Fix was
+  `set gain_mode 2` (SOFTWARE_AGC, auto-reduces gain on saturation) over serial. Making that
+  a UI setting means operators can do it without serial. Add the field to the args struct +
+  HTML form + `form_field` parse (mirror the `bias_tee` checkbox), pick a sensible widget
+  (dropdown TUNER_AGC/MANUAL/SOFTWARE_AGC + a manual-gain number box). Gate on confirming the
+  SOFTWARE_AGC approach actually recovers decodes with the better antenna.
