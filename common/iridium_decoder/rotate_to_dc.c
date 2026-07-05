@@ -227,8 +227,10 @@ void rotate_to_dc_q15_simd_ref_at(int16_t *iq, int n_complex,
 // owns the outer per-chunk loop (renorm + phasor advance + de/inter-
 // leave) so we can iterate on the inner kernel without re-doing the
 // boilerplate. Same numerical contract as rotate_to_dc_q15_simd_ref_at
-// within Q15 saturation rounding; validated on target via the
-// scalar-vs-PIE diff diagnostic in smoke_test (see ROT_SIMD_DIAG).
+// within Q15 saturation rounding. (Prior note here referenced a
+// "ROT_SIMD_DIAG" smoke diagnostic that does not exist in the tree —
+// removed. On-target correctness was instead confirmed 2026-07-05 via a
+// RAW-smoke A/B on the scratch placement; see the scratch comment below.)
 #ifdef ESP_PLATFORM
 #define ROT_SIMD_ARP4_AVAILABLE 1
 
@@ -254,11 +256,14 @@ void rotate_to_dc_q15_simd_arp4_at(int16_t *iq, int n_complex,
     int n_chunks   = n_complex / ROT_SIMD_LANES;
     int tail_start = n_chunks * ROT_SIMD_LANES;
 
-    // Stack-resident, 16-byte aligned scratch — PIE vld.128 needs
-    // alignment, and we set the unaligned cfg bit anyway as a safety
-    // net (see rotate_to_dc_arp4.S). The deinterleave + interleave
-    // cost is ~16 cycles/chunk vs the ~8-lane SIMD inner kernel's
-    // ~12 cycles/chunk; net per-chunk ~30 cycles vs scalar ~210.
+    // Stack-resident, 16-byte aligned scratch. This lives on worker_task's
+    // PSRAM-backed stack, yet the PIE vld.128/vst.128 kernel reads/writes it
+    // correctly: VERIFIED decode-neutral on 2026-07-05 by moving these to
+    // internal .bss and re-running the RAW smoke — GOLDEN matched=62 both
+    // ways, no change. So the documented "PIE mis-services PSRAM" rule is
+    // about large, sustained transfers (FFT/FIR multi-KB scratch), NOT these
+    // tiny per-chunk 16-byte lane transfers. Keeping them on the stack avoids
+    // spending scarce internal SRAM for zero decode benefit.
     int16_t I_lane[ROT_SIMD_LANES] __attribute__((aligned(16)));
     int16_t Q_lane[ROT_SIMD_LANES] __attribute__((aligned(16)));
     int16_t cs_lane[ROT_SIMD_LANES] __attribute__((aligned(16)));
