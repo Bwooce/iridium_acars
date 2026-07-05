@@ -713,6 +713,12 @@ add_test(NAME rotate_to_dc          COMMAND test_rotate_to_dc)
 add_test(NAME libacars_link        COMMAND test_libacars_link)
 add_test(NAME pipeline_drift_snr   COMMAND test_pipeline_drift_snr)
 
+add_executable(test_scanner_map test_scanner_map.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main/scanner_map.c)
+target_include_directories(test_scanner_map PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
+add_test(NAME test_scanner_map COMMAND test_scanner_map)
+
 # Mendeley Iridium dataset burst-pipeline coverage (task #130). Only
 # built+registered if the generated fixture is present. Run
 #   python3 tests/scripts/fetch_mendeley_iridium.py
