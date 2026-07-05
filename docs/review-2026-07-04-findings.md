@@ -54,9 +54,36 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   Neither is DSP-path (no smoke trailer). On-device: boots clean, WiFi associates + IP,
   stream stable 4.88 MB/s. Follow-up: T21b — the CAP_STATE_STOPPING drain loop has the
   same short-write gap (lower risk, runs once before fclose).
-- Remaining open: T14, T15, T16, T18–T20, T24–T50 (T13/T21 done; T21b minor follow-up).
-  Note T18/T19 (USB hot-unplug/teardown) need physical unplug testing not available on
-  the current bench; T48–T50 (throughput/PIE) deferred — no impact while not throughput-bound.
+- Batch 7 (2026-07-05) — the perf-decoupling + PIE-placement session. DONE + pushed:
+  **T48** (split class_driver into usb_pump/dsp_feed tasks, commit fbcf30e); **T49a**
+  (zero-copy usbring replacing the IDF ringbuffer + s_raw deletion, commit 473b81b);
+  **T50 harness** (bit-exact golden gate for the window multiply, 3bf50a3 — PIE kernel
+  itself still banked). **T55 (NEW, the headline): PIE-FFT-scratch RTCRAM-spill decode
+  bug** — uw_correlator's fc32 FFT scratch was lazily spilling to RTCRAM under DRAM
+  pressure, silently cratering clean-signal decode to ~6% recall (mistaken for antenna
+  for months); fixed by early-alloc DRAM pinning + esp_ptr_in_dram guard, and the RAW
+  smoke re-gated on GOLDEN-matched recall (was `classified>=5`, which had been calibrated
+  to the corrupted baseline). Recall 6%→95% (commit 473b81b). See
+  `project_heap_position_decode_bug` + `docs/perf-decoupling-design-2026-07-04.md`.
+  **T57 (NEW): rotate_to_dc PSRAM-stack PIE scratch — VERIFIED FINE** (A/B: internal vs
+  PSRAM gave identical decode; the "PIE mis-services PSRAM" rule is only for large
+  sustained transfers, not small per-chunk vld/vst); corrected a false "ROT_SIMD_DIAG"
+  validation comment (ab5d58d). Also: full PIE-buffer placement audit (in memory);
+  resampler proven chunk-continuable (test on wip/t49b-tile-fuse); wideband front-end
+  design sketch (`docs/wideband-frontend-design-2026-07-05.md` — full-band real-time is
+  compute-infeasible on P4; capture→offline is the realistic play).
+- IN PROGRESS: **T56 (NEW): pin the 3 lazy PIE FIR delay lines** (D13-LP / RRC / decim
+  in uw_correlator + direct_if_decim) early in the boot dance + backfill esp_ptr_in_dram
+  guards on s_coeffs_pp/s_fft_scratch. The residual ~3-frame layout-lottery sensitivity
+  that remained after T55. Marginal decode (robustness), makes decode layout-invariant.
+- PARKED: **T49b** (convert/resample SRAM tile fuse) on branch wip/t49b-tile-fuse —
+  correct + bit-exact, but decode-neutral needs a >=8 KB tile which doesn't fit the
+  silicon-locked DMA-INT budget (USB pool can't move to PSRAM: APM-560/MSPI errata).
+  Non-bottleneck. **T49c** (resample writes into signal_buffer scratch) — not started.
+- Remaining open: T14 (OTA auth — the notable security gap), T15/T16 (frame_link, HW not
+  brought up), T18–T20 (USB hot-unplug/teardown — need physical unplug, not on this bench),
+  T24–T47 (P3 low-severity batch, ~24 items), T49b/c + T50 kernel + T56 (in progress),
+  T21b (minor SD drain-loop follow-up).
 
 **Live-device verification (2026-07-04, device on LAN at 192.168.1.235, build 5e18864):**
 - **T2 wrap-desync — PROVEN via fault injection.** Built with CONFIG_FAULT_INJECT=y,
@@ -108,6 +135,15 @@ re-read the source and confirmed the defect.
   SD stall; (b) file is `_IONBF` so the "periodic flush" `fflush` at :243/:291 are
   no-ops and there's no `fsync` → power-loss loses whole file. Fix: atomic
   space-check + drop whole burst; add throttled `fsync`.
+- [x] **T55** `uw_correlator.c:477` — bug, DONE (473b81b), the biggest decode finding.
+  The fc32 PIE FFT scratch (16 KB) is lazy-allocated on the worker's first burst with
+  `MALLOC_CAP_INTERNAL`; under DRAM pressure it silently spilled to RTCRAM (0x5010_xxxx),
+  where the PIE vector unit mis-decodes → clean-signal RAW-smoke recall cratered to ~6%
+  (matched 4/65) and was mistaken for antenna/RF for months. Fix: `uw_correlator_prealloc_pie_fft()`
+  pins it in DRAM from the boot dance + an `esp_ptr_in_dram` guard fails loudly on a
+  non-DRAM placement. ALSO re-gated the RAW smoke on GOLDEN-matched (≥40) instead of
+  `classified≥5` (which counted UNKNOWN/BCH false positives and had been calibrated to the
+  corrupted baseline — it passed the bug for months). Recall 6.2%→95.4%, deterministic.
 
 ## Follow-up test coverage (tracked 2026-07-04)
 
@@ -225,13 +261,24 @@ re-read the source and confirmed the defect.
 
 ## OPT — optimisation / throughput
 
-- [ ] **T48** `class_driver.c:343` — the ~5 MB/s ceiling is structural: lock-stepped
-  handle_events→drain 16 KB→blocking dsp_feed. Levers: drain multi-block per feed,
-  32-64 KB blocks, move feed off read path.
-- [ ] **T49** `esp_libusb.c:216,414` + `ingest_core1.c:235` — every byte crosses PSRAM
-  3-4× (~19 MB/s avoidable). Remove consumer copy (RingbufferReceiveUpTo returns ptr),
-  fuse convert→resample via SRAM staging, PIE-vectorise convert.
-- [ ] **T50** `fft_burst_tagger.c:364` — window_multiply 2048 scalar Q15 muls/step → PIE 8-lane.
+- [x] **T48** `class_driver.c` — DONE (fbcf30e). Split into usb_pump (prio 7, event-only)
+  + dsp_feed (prio 6) Core-0 tasks; slot protocol moved verbatim; latency/structure fix
+  (Core 0 saturates ~8 MB/s so no MB/s gain at 4.88, as designed). Smoke-verified.
+- [~] **T49** `esp_libusb.c` + `ingest_core1.c` — SPLIT: **T49a DONE** (473b81b) zero-copy
+  usbring replacing the IDF ringbuffer (consumer copy removed, s_raw deleted, +32 KB DMA-INT).
+  **T49b PARKED** (wip/t49b-tile-fuse) convert→resample SRAM-tile fuse — bit-exact but the
+  decode-neutral tile size (>=8 KB) doesn't fit the DMA-INT budget. **T49c** (resample→
+  signal_buffer scratch) not started.
+- [~] **T50** `fft_burst_tagger.c:364` — window_multiply → PIE 8-lane. **Harness DONE**
+  (3bf50a3, bit-exact golden gate); **PIE kernel banked** (device-attended, ~6-10% of DSP
+  frame). Resample chunk-continuity proven via a sibling model test.
+- [~] **T56** `uw_correlator.c` + `direct_if_decim.c` — IN PROGRESS. Pin the 3 lazy PIE FIR
+  delay lines (D13-LP `s_start_lp_fir`, RRC `s_rrc_fir_i/q`, decim `s_decim.fir_dsp_i/q`)
+  in the boot early-alloc dance + backfill esp_ptr_in_dram guards on s_coeffs_pp/s_fft_scratch.
+  Fixes the residual ~3-frame heap-layout decode lottery left after T55.
+- [x] **T57** `rotate_to_dc.c` — DONE (ab5d58d, doc-only). Verified the every-burst PIE
+  rotate on worker_task's PSRAM stack is decode-neutral (A/B internal vs PSRAM = identical
+  matched=62); corrected a comment claiming a non-existent `ROT_SIMD_DIAG` validation.
 - [x] **T51** `worker_core1.c:591` — per-burst ESP_LOGI in dequeue hot path steals worker
   CPU during burst storms.
 - [x] **T52** `sd_capture.c:504` — takes s_stats_mu every USB-ingest call to read cap/target;
