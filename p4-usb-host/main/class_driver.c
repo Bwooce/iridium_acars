@@ -24,6 +24,7 @@
 #include "worker_core1.h"
 #include "ingest_core1.h"
 #include "resample_256_to_250.h"
+#include "scanner.h"
 #include "fft_sc16_2048.h"
 #include "uw_correlator.h"
 #include "app_config.h"
@@ -355,6 +356,7 @@ static void action_start_stream(class_driver_t *driver_obj)
     if (!s_dsp) {
         ESP_LOGE(TAG, "dsp_processor_create failed");
     }
+    scanner_init(s_dsp);
 
     ESP_LOGI(TAG, "Starting Async Stream...");
     esp_libusb_start_stream(driver_obj, 0x81);
