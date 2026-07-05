@@ -74,23 +74,41 @@ static SemaphoreHandle_t s_pq_items = NULL; // counts occupied slots (worker wai
 //   0  = admitted by EVICTING the weakest (net slot count unchanged, no give)
 //  -1  = dropped (buffer full and this burst is weaker than everything in it)
 // Caller holds s_pq_lock.
+// T60 priority score: prefer NARROWBAND (Iridium-like) bursts, SNR as
+// tie-breaker. A real Iridium burst spans ~one 41.67 kHz channel (~34 bins at
+// this FFT); broadband RFI spreads far wider. "Loudest" alone feeds the worker
+// interference when the RF floor has strong broadband RFI (bench 2026-07-05:
+// 28-31 dB interference dominates while real 12-24 dB Iridium gets shed).
+// Pushing wide bursts below all narrow ones lets the scarce decode budget land
+// on the decodable ones. width_bins==0 (unmeasured) counts as narrow — safe
+// default (process, don't shed). Does not touch detection (still gri-aligned).
+#define BURST_NARROW_MAX_BINS 48 // one channel (~34) + margin
+static inline float burst_priority(const detected_burst_t *b)
+{
+    float p = b->peak_snr_db;
+    if ((int)BURST_WIDTH_BINS(b) > BURST_NARROW_MAX_BINS) p -= 1000.0f;
+    return p;
+}
+
 static int pq_insert_locked(const detected_burst_t *b)
 {
     if (s_pq_count < BURST_PQ_CAP) {
         s_pq[s_pq_count++] = *b;
         return 1;
     }
-    // Full: find the weakest slot; replace it only if the newcomer is stronger.
+    // Full: find the lowest-priority slot; replace only if the newcomer
+    // outranks it (narrowband-first, then SNR).
     int   min_i = 0;
-    float min_s = s_pq[0].peak_snr_db;
+    float min_s = burst_priority(&s_pq[0]);
     for (int i = 1; i < BURST_PQ_CAP; i++) {
-        if (s_pq[i].peak_snr_db < min_s) {
-            min_s = s_pq[i].peak_snr_db;
+        float pi = burst_priority(&s_pq[i]);
+        if (pi < min_s) {
+            min_s = pi;
             min_i = i;
         }
     }
-    if (b->peak_snr_db > min_s) {
-        s_pq[min_i] = *b; // evict weakest (its occupied-slot give still stands)
+    if (burst_priority(b) > min_s) {
+        s_pq[min_i] = *b; // evict lowest-priority (its occupied-slot give stands)
         return 0;
     }
     return -1;
@@ -101,10 +119,11 @@ static int pq_insert_locked(const detected_burst_t *b)
 static void pq_extract_max_locked(detected_burst_t *out)
 {
     int   max_i = 0;
-    float max_s = s_pq[0].peak_snr_db;
+    float max_s = burst_priority(&s_pq[0]);
     for (int i = 1; i < s_pq_count; i++) {
-        if (s_pq[i].peak_snr_db > max_s) {
-            max_s = s_pq[i].peak_snr_db;
+        float pi = burst_priority(&s_pq[i]);
+        if (pi > max_s) {
+            max_s = pi;
             max_i = i;
         }
     }
@@ -599,9 +618,10 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
     }
 
     decoded_frame_t frame = bres->frame;
-    ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits)",
+    ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits) snr=%.1f dB width=%u bins",
              frame.direction == DIR_DOWNLINK ? "DL" : "UL",
-             frame.n_bits);
+             frame.n_bits, (double)wctx->burst->peak_snr_db,
+             (unsigned)BURST_WIDTH_BINS(wctx->burst));
 
     int  e1_bch = -1, e2_bch = -1;
     bool chase_used = false;

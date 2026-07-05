@@ -45,8 +45,18 @@ typedef struct {
     float    peak_snr_db;      // magnitude_db - noise_db
     float    magnitude_db;
     float    noise_db;
-    int      peak_bin; // FFT bin, 0..FFT_SIZE-1 (diagnostic)
+    // peak_bin packs TWO 11-bit values to keep this struct byte-identical
+    // (growing it shifts the worker's s_pq[] and can perturb PIE state under
+    // preemption): low 16 bits = FFT bin (0..FFT_SIZE-1); high 16 bits = T60
+    // spectral width in bins (~34 = one Iridium channel; wide = broadband RFI).
+    // Read via BURST_PEAK_BIN(b) / BURST_WIDTH_BINS(b). The (int16_t) cast at
+    // the PDU pack site already yields the low 16 (bin) for free.
+    int peak_bin;
 } detected_burst_t;
+
+#define BURST_PEAK_BIN(b) ((b)->peak_bin & 0xFFFF)
+#define BURST_WIDTH_BINS(b) (((b)->peak_bin >> 16) & 0xFFFF)
+#define BURST_PACK_BIN_WIDTH(bin, width) (((bin) & 0xFFFF) | (((width) & 0xFFFF) << 16))
 
 typedef void (*burst_detected_cb_t)(const detected_burst_t *burst);
 

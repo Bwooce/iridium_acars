@@ -153,7 +153,9 @@ static void dispatch_gone_burst(dsp_processor_t *p, const fbt_burst_t *b)
         .peak_snr_db      = b->magnitude_db,
         .magnitude_db     = b->magnitude_db,
         .noise_db         = b->noise_db,
-        .peak_bin         = b->center_bin,
+        // T60: pack center_bin (low 16) + width_bins (high 16) — keeps
+        // detected_burst_t byte-identical (no PIE-position perturbation).
+        .peak_bin = BURST_PACK_BIN_WIDTH(b->center_bin, b->width_bins),
     };
     p->user_cb(&out);
 }

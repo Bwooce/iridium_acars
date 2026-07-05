@@ -553,7 +553,7 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
         if (t->n_bursts >= FBT_MAX_BURSTS) break;
 
         fbt_burst_t *b = &t->bursts[t->n_bursts++];
-        b->id          = t->burst_id;
+        b->id          = (uint32_t)t->burst_id;
         t->burst_id += 10;
         b->center_bin  = bin;
         b->start       = t->d_index - t->burst_pre_len;
@@ -573,6 +573,27 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
         b->magnitude_db = 10.0f * log10f(rel * (float)t->window_enbw + 1e-12f);
         b->noise_db     = 10.0f * log10f(
                                   (float)t->baseline_sum[bin] / (float)FBT_HISTORY_SIZE + 1e-12f);
+
+        // T60: measure spectral width = contiguous bins above threshold around
+        // the peak. Real Iridium ≈ one 41.67 kHz channel (~34 bins); broadband
+        // RFI spreads far wider. The worker PQ prefers narrowband bursts.
+        // Scan is CAPPED at ±WIDTH_SCAN_CAP: we only need to distinguish narrow
+        // from wide, and an unbounded O(N) scan per burst (up to 64/tile) blew
+        // the Core-0 DSP budget. A capped width saturates at the cap for any
+        // broadband signal, which is all the priority needs.
+        {
+#define WIDTH_SCAN_CAP 96 // ~2× the narrow threshold — enough to classify
+            int w_lo = bin, w_hi = bin;
+            while (w_lo > 0 && (bin - w_lo) < WIDTH_SCAN_CAP &&
+                   above_threshold(t->magnitude_shifted[w_lo - 1],
+                                   t->baseline_sum[w_lo - 1], t->threshold_q15))
+                w_lo--;
+            while (w_hi < N - 1 && (w_hi - bin) < WIDTH_SCAN_CAP &&
+                   above_threshold(t->magnitude_shifted[w_hi + 1],
+                                   t->baseline_sum[w_hi + 1], t->threshold_q15))
+                w_hi++;
+            b->width_bins = w_hi - w_lo + 1;
+        }
 
         mask_burst(t, bin);
 

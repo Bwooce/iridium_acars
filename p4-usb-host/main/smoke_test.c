@@ -122,13 +122,14 @@ static volatile float s_per_bin_max_snr[BIN_PEAK_TRACK_N];
 static void on_burst(const detected_burst_t *burst)
 {
     s_bursts_detected++;
+    int peak_bin = (int)BURST_PEAK_BIN(burst); // T60: unpack (bin in low 16)
     if (burst->peak_snr_db > s_strongest_snr_db) {
         s_strongest_snr_db   = burst->peak_snr_db;
-        s_strongest_peak_bin = burst->peak_bin;
+        s_strongest_peak_bin = peak_bin;
     }
-    if (burst->peak_bin >= 0 && burst->peak_bin < BIN_PEAK_TRACK_N) {
-        if (burst->peak_snr_db > s_per_bin_max_snr[burst->peak_bin]) {
-            s_per_bin_max_snr[burst->peak_bin] = burst->peak_snr_db;
+    if (peak_bin >= 0 && peak_bin < BIN_PEAK_TRACK_N) {
+        if (burst->peak_snr_db > s_per_bin_max_snr[peak_bin]) {
+            s_per_bin_max_snr[peak_bin] = burst->peak_snr_db;
         }
     }
     // Log length (samples and approx milliseconds at 2.56 MSPS) to make
@@ -137,7 +138,7 @@ static void on_burst(const detected_burst_t *burst)
     float length_ms = (float)burst->length_samples / 2560.0f;
     ESP_LOGI(TAG, "callback: burst peak_bin=%d snr=%.2f dB "
                   "start=%llu len=%lu samples (%.2f ms)",
-             burst->peak_bin, burst->peak_snr_db,
+             peak_bin, burst->peak_snr_db,
              (unsigned long long)burst->start_sample_idx,
              (unsigned long)burst->length_samples,
              length_ms);

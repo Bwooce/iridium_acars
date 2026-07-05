@@ -55,7 +55,15 @@
 
 // One detected burst (output record).
 typedef struct {
-    uint64_t id;           // monotonically increasing, +10 per detection
+    // id shrunk to 32-bit (no downstream reader) so width_bins fits in the
+    // freed 4 bytes — keeps sizeof(fbt_burst_t) BYTE-IDENTICAL. Growing this
+    // struct (it's inlined 64× via bursts[FBT_MAX_BURSTS] in the tagger)
+    // shifts internal-SRAM allocations and trips the P4 PIE position-
+    // sensitivity bug — see the staged_new/staged_gone note in the .c.
+    uint32_t id;           // monotonically increasing, +10 per detection (diag)
+    int      width_bins;   // T60: contiguous above-threshold bins around the
+                           // peak at detection (~34 = one Iridium channel;
+                           // broadband RFI is far wider). For the worker PQ.
     uint64_t start;        // absolute sample index in caller's frame
                            //  (= d_index - burst_pre_len, see gri:306)
     uint64_t last_active;  // last FFT step where the burst was seen above threshold
