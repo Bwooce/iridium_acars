@@ -348,3 +348,35 @@ re-read the source and confirmed the defect.
   (3) Reject already-stale bursts before enqueue — cheap early-out in dispatch.
   Also make tag_thr live-reloadable (re-read cfg per tile or on a config-changed flag) so (1)
   and manual threshold tuning don't need a reboot.
+
+  STATUS 2026-07-05 (mostly landed): shipped (2) as an **SNR priority queue** (146bd56:
+  bounded 64-slot buffer, evict-weakest, decode-strongest-first) + **capture-position
+  timestamps** (its prerequisite) + a **band-occupancy freq histogram** (25166e0). Live
+  result: turned the 0-decode congestion collapse into real decoding — worker_cap 0→65-215%,
+  stale drops 9921→23, and under extreme bench RFI (~646/s) the PQ sheds **99.4% at insert**
+  with the worker never overwhelmed (drops=0). Fixed a load-dependent crash the PQ exposed —
+  the 1536 B ISR stack overflowed under the cross-core IPC churn (963fd5a → 4096; see
+  [[feedback_isr_stack_overflow_under_load]]). REMAINING GAP: the priority KEY is raw SNR, and
+  at this bench the loudest signal (28-31 dB) is broadband interference that doesn't decode, so
+  the PQ feeds the worker interference and sheds the real (12-24 dB) Iridium — see T60. The
+  detector-side load-shed (1) and live tag_thr (T58) are still open.
+
+- [ ] **T60** smarter priority key (separate real Iridium from broadband interference). The
+  T59 PQ ranks by peak_snr_db, but "loudest ≠ most decodable" when the RF floor has strong
+  broadband RFI (bench 2026-07-05: 28-31 dB interference dominates; real Iridium sits at
+  12-24 dB and gets shed; ~0.7% of the strongest bursts decode). Candidate keys, cheapest
+  first: (a) **narrowband-ness** — Iridium channels are ~41.67 kHz; broadband RFI is wide.
+  Plumb the tagger's burst bin-width (fft_burst_tagger tracks active bins) into
+  detected_burst_t and prefer narrow bursts. Strongest single discriminator. (b) **duration
+  match** — real bursts ~8-90 ms simplex (≤250 ms multi-frame duplex); score by fit to that
+  window using existing length_samples. (c) **adaptive SNR window** — learn the SNR band where
+  BCH actually passes and prioritise it (feedback loop). Combine into a score, keep SNR as a
+  tie-breaker. Does NOT touch detection (still gri-aligned) — only decode-budget allocation.
+
+- [ ] **T61** dynamic decode depth (go deeper when load is low). The worker is NOT saturated
+  now (worker_cap 0-68%, drops=0) — it has spare capacity but the PQ feeds it few decodable
+  bursts. When the burst rate is low, spend the spare budget on DEEPER decode (chase-decode,
+  wider UW search, more retries) to catch marginal real bursts; when high, stay shallow to keep
+  up. Gate the per-burst effort on current queue depth / recent load. Complements T60 (fix
+  WHAT we decode first, then HOW deep). Lower priority than T60 — selection, not capacity, is
+  today's limiter.
