@@ -72,17 +72,17 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   resampler proven chunk-continuable (test on wip/t49b-tile-fuse); wideband front-end
   design sketch (`docs/wideband-frontend-design-2026-07-05.md` — full-band real-time is
   compute-infeasible on P4; capture→offline is the realistic play).
-- IN PROGRESS: **T56 (NEW): pin the 3 lazy PIE FIR delay lines** (D13-LP / RRC / decim
+- **T56 DONE (53327e7): pinned the 3 lazy PIE FIR delay lines** (D13-LP / RRC / decim
   in uw_correlator + direct_if_decim) early in the boot dance + backfill esp_ptr_in_dram
-  guards on s_coeffs_pp/s_fft_scratch. The residual ~3-frame layout-lottery sensitivity
-  that remained after T55. Marginal decode (robustness), makes decode layout-invariant.
+  guards on s_coeffs_pp/s_fft_scratch. Fixed the residual ~3-frame layout-lottery (proven:
+  the 4 KB T49b tile decoded 59 without the pins, 62 with — end-to-end confirmation).
 - PARKED: **T49b** (convert/resample SRAM tile fuse) on branch wip/t49b-tile-fuse —
   correct + bit-exact, but decode-neutral needs a >=8 KB tile which doesn't fit the
   silicon-locked DMA-INT budget (USB pool can't move to PSRAM: APM-560/MSPI errata).
   Non-bottleneck. **T49c** (resample writes into signal_buffer scratch) — not started.
 - Remaining open: T14 (OTA auth — the notable security gap), T15/T16 (frame_link, HW not
   brought up), T18–T20 (USB hot-unplug/teardown — need physical unplug, not on this bench),
-  T24–T47 (P3 low-severity batch, ~24 items), T49b/c + T50 kernel + T56 (in progress),
+  T24–T47 (P3 low-severity batch, ~24 items), T49c + T50 kernel,
   T21b (minor SD drain-loop follow-up).
 
 **Live-device verification (2026-07-04, device on LAN at 192.168.1.235, build 5e18864):**
@@ -266,13 +266,13 @@ re-read the source and confirmed the defect.
   (Core 0 saturates ~8 MB/s so no MB/s gain at 4.88, as designed). Smoke-verified.
 - [~] **T49** `esp_libusb.c` + `ingest_core1.c` — SPLIT: **T49a DONE** (473b81b) zero-copy
   usbring replacing the IDF ringbuffer (consumer copy removed, s_raw deleted, +32 KB DMA-INT).
-  **T49b PARKED** (wip/t49b-tile-fuse) convert→resample SRAM-tile fuse — bit-exact but the
-  decode-neutral tile size (>=8 KB) doesn't fit the DMA-INT budget. **T49c** (resample→
+  **T49b DONE** (ed4ef38) convert→resample 4 KB SRAM-tile fuse — decode-neutral
+  (unblocked by T56 FIR pinning + HTTP-buf-to-PSRAM reclaim); saves ~19.5 MB/s PSRAM. **T49c** (resample→
   signal_buffer scratch) not started.
 - [~] **T50** `fft_burst_tagger.c:364` — window_multiply → PIE 8-lane. **Harness DONE**
   (3bf50a3, bit-exact golden gate); **PIE kernel banked** (device-attended, ~6-10% of DSP
   frame). Resample chunk-continuity proven via a sibling model test.
-- [~] **T56** `uw_correlator.c` + `direct_if_decim.c` — IN PROGRESS. Pin the 3 lazy PIE FIR
+- [x] **T56** `uw_correlator.c` + `direct_if_decim.c` — DONE (53327e7). Pin the 3 lazy PIE FIR
   delay lines (D13-LP `s_start_lp_fir`, RRC `s_rrc_fir_i/q`, decim `s_decim.fir_dsp_i/q`)
   in the boot early-alloc dance + backfill esp_ptr_in_dram guards on s_coeffs_pp/s_fft_scratch.
   Fixes the residual ~3-frame heap-layout decode lottery left after T55.
