@@ -86,12 +86,13 @@ Full per-file notes: `.claude/jobs/*/tmp/findings_{dsp,decode,usb,worker,net}.md
   (BER 1.39%->2.42%, exact 44->43, div 1->3) recovering only harmless safety-padding
   samples; caught via the GOLDEN bucket/BER breakdown (matched count alone hid it).
   Partial/skip: T25 (host-only, device matches vendored esp-dsp), T30 (3/4; static
-  scratch left to avoid a PSRAM-stall regression), T43 (NULL-check done, dead-code
-  removal follow-up), T44 (double-give done, 64-bit-head follow-up), T46 (already fixed).
+  scratch left to avoid a PSRAM-stall regression), T46 (already fixed).
+- Batch 9 (2026-07-05) — T43 + T44 follow-ups landed: 2906fe6 (T43 dead sync bulk path
+  removed, non-DSP, build-verified), 8a19ce3 (T44 64-bit head, Smoke-verified RAW
+  matched=62/65 exact=44 BER=1.39% — behavior-neutral on the corpus). Pushed b6ddddc..8a19ce3.
 - Remaining open: T14 (OTA auth — the notable security gap), T15/T16 (frame_link, HW not
   brought up), T18–T20 (USB hot-unplug/teardown — need physical unplug, not on this bench),
-  T49c + T50 kernel, T43 dead-code removal + T44 64-bit-head (P3 follow-ups),
-  T21b (minor SD drain-loop follow-up).
+  T49c + T50 kernel, T21b (minor SD drain-loop follow-up).
 
 **Live-device verification (2026-07-04, device on LAN at 192.168.1.235, build 5e18864):**
 - **T2 wrap-desync — PROVEN via fault injection.** Built with CONFIG_FAULT_INJECT=y,
@@ -259,9 +260,15 @@ re-read the source and confirmed the defect.
 - [x] **T41** `serial_cmd.c:296` — uart driver init return codes ignored.
 - [x] **T42** `http_server.c:1233` — capture_start body >128 B left unread → keep-alive
   desync. Fix: return 413.
-- [~] **T43** `esp_libusb.c:158` — response_buf calloc unchecked; MPS hardcoded 64 (:85, HS=512).
-- [~] **T44** `signal_buffer.c:359` — burst_valid aliases past one ring lap (~420 ms); needs
-  64-bit cumulative head. DMA-timeout double-give semaphore (:241, never fired).
+- [x] **T43** `esp_libusb.c:158` — response_buf calloc unchecked (fixed earlier); MPS hardcode
+  60 (:85) + the whole dead sync bulk path (rtlsdr_read_sync + esp_libusb_bulk_transfer,
+  zero callers) removed in 2906fe6. Build-verified; streaming sanity via the production reflash.
+- [x] **T44** `signal_buffer.c` — burst_valid aliased past one ring lap (~420 ms). Fixed in
+  8a19ce3: 64-bit monotonic s_head_total (seqlock-published), tagger's cumulative index carried
+  un-truncated, absolute-space staleness check. Smoke-verified RAW matched=62/65 exact=44 BER=1.39%
+  (behavior-neutral on the corpus; only the stale-beyond-one-lap case changes). head_total advances
+  at the single head exit site → T2 index invariant holds for both. DMA-timeout double-give (:241)
+  was the earlier partial; never fired.
 - [x] **T45** `worker_core1.c:713` — final decim chunk 8 mod 10 (make WB_PRE_PAD 320);
   gold static_assert (:138); non-atomic volatile hist RMW (:79).
 - [x] **T46** `frame_queue.c` — full 2064 B memcpy per push/pop regardless of n_bits (~5× waste).
