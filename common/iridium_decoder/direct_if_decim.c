@@ -222,7 +222,18 @@ static int didecim_real_fir(didecim_fir_state_t *fs, const int16_t *taps,
         // Inner product: delay[pos..N) × coeffs[N-1..N-1-(N-pos)]
         // then delay[0..pos) × coeffs[N-1-(N-pos)..0]. The reverse
         // walk on coeffs matches the linear FIR convention.
-        int64_t acc       = 0;
+        // T25: esp-dsp's dsps_fird_init_s16 sets rounding_val=0x7fff
+        // (ROUNDING_VALUE in dsps_fird_init_s16.c) and both
+        // dsps_fird_s16_ansi and the arp4 PIE kernel (esp.ld.xacc.ip
+        // loading the same rounding_buff) preload the accumulator with
+        // it before the MAC sum, not 0. This host reference used to
+        // start at 0, a ~0.5 LSB systematic bias vs the on-device
+        // filter -- verified against the vendored esp-dsp 1.8.1 source
+        // (dsps_fird_s16_arp4.S falls back to calling dsps_fird_s16_ansi
+        // directly whenever coeffs_len isn't a multiple of 8, so the two
+        // are meant to be numerically identical; DIDECIM_NTAPS=144 takes
+        // the arp4 path in production).
+        int64_t acc       = 0x7fff;
         int     coeff_pos = N - 1;
         for (int n = fs->pos; n < N; n++) {
             acc += (int32_t)taps[coeff_pos--] * (int32_t)fs->delay[n];
@@ -230,6 +241,28 @@ static int didecim_real_fir(didecim_fir_state_t *fs, const int16_t *taps,
         for (int n = 0; n < fs->pos; n++) {
             acc += (int32_t)taps[coeff_pos--] * (int32_t)fs->delay[n];
         }
+        // NOTE (T25, not changed): the review also flagged the store
+        // below as "unsaturated" and asked to align it with
+        // resample_256_to_250's q15_saturate. Checked against the same
+        // vendored source: neither dsps_fird_s16_ansi.c nor the arp4.S
+        // kernel (esp.srs.s.xacc -> plain shift-store, no saturating
+        // variant) saturates this store either -- both truncate exactly
+        // like this raw cast. Adding q15_saturate ONLY here would make
+        // this host reference diverge from the real on-device output on
+        // any input that overflows, which is the opposite of this
+        // function's purpose (host/device parity for cross-validation).
+        // Left as a plain cast to match upstream. Same reasoning covers
+        // the "n_in % 10 remainder dropped" item: dsps_fird_s16_ansi's
+        // own d_pos handling (`fir->d_pos = 0;` unconditionally each
+        // iteration) drops the same trailing remainder with no
+        // automatic carry across calls, so this function already
+        // matches device semantics. The only caller in this codebase
+        // (worker_core1.c) chunks in DECIM_CHUNK_IN=4000-sample pieces
+        // (a multiple of DIDECIM_DECIM=10) and calls
+        // direct_if_decim_reset_state() once per burst before the chunk
+        // loop, so a non-multiple-of-10 remainder can only occur on the
+        // last chunk of a burst's padded window and is discarded before
+        // the next burst anyway -- already harmless in practice.
         out[written++] = (int16_t)(acc >> 15);
     }
     return written;

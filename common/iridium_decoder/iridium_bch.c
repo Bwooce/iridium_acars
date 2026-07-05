@@ -9,6 +9,13 @@
 // codeword for poly=1207/1897/3545.
 static uint32_t bits_to_u32(const uint8_t *bits, size_t n_bits)
 {
+    // T32: guard the documented n_bits <= 32 contract instead of silently
+    // truncating. All current callers pass n_bits <= 31 (the largest BCH
+    // codeword we handle -- see iridium_bch.h); clamp defensively so a
+    // future caller passing something larger gets a bounded (if wrong)
+    // result instead of quietly losing the high bits with no signal.
+    // This does not change the result for any valid (n_bits <= 32) input.
+    if (n_bits > 32) n_bits = 32;
     uint32_t v = 0;
     for (size_t i = 0; i < n_bits; i++) {
         v = (v << 1) | (bits[i] & 1);
@@ -32,6 +39,12 @@ uint32_t iridium_bch_ndivide(uint32_t poly, const uint8_t *bits, size_t n_bits)
 {
     if (!bits || n_bits == 0) return 0;
     uint32_t num = bits_to_u32(bits, n_bits);
+    // T32: an all-zero codeword divides to remainder 0 -- i.e. it always
+    // reports "clean" -- same as upstream iridium-toolkit/bch.py:nndivide
+    // (0 // poly == 0). Intentional and load-bearing: BC/RA header
+    // false-positive-rate stats are measured against this exact
+    // behavior. Do NOT special-case it; a change here would shift those
+    // stats without a matching upstream change.
     if (num == 0) return 0;
 
     int      num_len  = u32_bit_length(num);

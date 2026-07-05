@@ -137,9 +137,21 @@ void frame_decoder_get_rolling_rates(uint32_t *out_1h, uint32_t *out_24h)
     uint32_t sum_1h = 0, sum_24h = 0;
     for (int i = 0; i < DRATE_MIN_BUCKETS; i++)
         sum_1h += s_drate_min[i];
-    for (int i = 0; i < DRATE_HR_BUCKETS; i++)
+    // T35: s_drate_hr[s_drate_hr_head] is the most-recently-archived
+    // hour, captured from the SAME minute ring that sum_1h above is
+    // still rolling over (the ring always holds the last 60 minutes,
+    // straddling the hour boundary). Summing all DRATE_HR_BUCKETS
+    // buckets and then adding sum_1h double-counts that most-recent
+    // hour (up to 2x when little history exists yet) and stretches the
+    // reported span to ~25h. Skip the head bucket here so the 23 older,
+    // non-overlapping hourly buckets plus the live rolling 1h add up to
+    // a true last-24h window.
+    uint8_t hr_head = s_drate_hr_head;
+    for (int i = 0; i < DRATE_HR_BUCKETS; i++) {
+        if (i == hr_head) continue;
         sum_24h += s_drate_hr[i];
-    // 24h totals don't include the in-progress hour — include the 1h
+    }
+    // 24h totals (above) exclude the in-progress hour — add the 1h
     // buckets to give the caller the actual last-24h coverage.
     sum_24h += sum_1h;
     if (out_1h) *out_1h = sum_1h;

@@ -164,6 +164,17 @@ int sym_timing_process(sym_timing_t  *st,
             int_step--;
         }
         strobe_idx += int_step;
+        // T29: an unclamped negative loop-filter output (large negative
+        // v, e.g. from a noise transient before the loop has locked)
+        // can make int_step negative enough to push strobe_idx below 0.
+        // The array reads above only guard the upper bound
+        // (strobe_idx + 1 >= n_complex); a negative index would read
+        // in_2sps out of bounds. Clamp here rather than upstream: this
+        // module isn't wired into the live pipeline (qpsk_demod.c keeps
+        // it for offline tuning only), so this can't change any
+        // production decode behaviour, but it's cheap and correct for
+        // the host tuning/trace tool and any future caller.
+        if (strobe_idx < 0) strobe_idx = 0;
         if (strobe_idx + 1 >= n_complex) break;
 
         prev_strobe  = y_curr;

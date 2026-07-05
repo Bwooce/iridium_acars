@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <limits.h>
 #if __has_include("esp_attr.h")
 #include "esp_attr.h"
@@ -44,11 +45,17 @@ static uint32_t gf2_remainder(uint32_t poly, uint32_t val)
 // accept every syndrome < 1024 as "success, 0 errors corrected" on
 // uncorrected garbage. Init order is only a convention (class_driver /
 // smoke_test call init first); enforce it with lazy init instead.
-static bool s_bch_inited = false;
+//
+// T31: the flag is published with a release store AFTER syn_ra is
+// fully populated, and read with an acquire load, so a cross-core
+// reader that observes s_bch_inited == true is guaranteed (per the
+// release/acquire pairing) to also observe the fully-written table --
+// not a partially-filled one from a still-in-progress init on another
+// core.
+static atomic_bool s_bch_inited = false;
 
 void bch_decoder_init()
 {
-    s_bch_inited = true;
     for (int i = 0; i < 1024; i++) {
         syn_ra[i].errs    = -1;
         syn_ra[i].locator = 0;
@@ -75,6 +82,10 @@ void bch_decoder_init()
             }
         }
     }
+
+    // Publish last: syn_ra is fully populated above, so any reader that
+    // observes this store (acquire-paired below) sees the complete table.
+    atomic_store_explicit(&s_bch_inited, true, memory_order_release);
 }
 
 static uint32_t bits_to_uint(const uint8_t *bits, int n)
@@ -87,7 +98,7 @@ static uint32_t bits_to_uint(const uint8_t *bits, int n)
 
 int bch_decode_block(const uint8_t *block31, uint8_t *out_data)
 {
-    if (!s_bch_inited) bch_decoder_init();
+    if (!atomic_load_explicit(&s_bch_inited, memory_order_acquire)) bch_decoder_init();
     uint32_t val      = bits_to_uint(block31, 31);
     uint32_t syndrome = gf2_remainder(BCH_POLY_RA, val);
 

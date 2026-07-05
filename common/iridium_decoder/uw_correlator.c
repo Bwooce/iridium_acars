@@ -501,8 +501,19 @@ static void pie_fft_fc32_init(void)
         MALLOC_CAP_INTERNAL);
     if (!s_pie_fft_scratch || !s_pie_fft_w_table) {
         ESP_LOGE("UWCORR", "PIE FFT scratch alloc FAILED (need 16KB+4KB INTERNAL; "
-                           "had free=%zu largest=%zu) -> FFT no-op, WILL MIS-DECODE",
+                           "had free=%zu largest=%zu) -> FFT unavailable, caller must bail",
                  free_before, largest_before);
+        // T30: don't leak whichever of the two allocs DID succeed --
+        // free it before returning so a later retry (or process exit)
+        // doesn't leave it dangling with s_pie_fft_inited still false.
+        if (s_pie_fft_scratch) {
+            heap_caps_free(s_pie_fft_scratch);
+            s_pie_fft_scratch = NULL;
+        }
+        if (s_pie_fft_w_table) {
+            heap_caps_free(s_pie_fft_w_table);
+            s_pie_fft_w_table = NULL;
+        }
         return;
     }
     // Hard guard: the PIE vector unit garbles data on non-DRAM (RTCRAM/TCM).
@@ -533,11 +544,17 @@ void uw_correlator_prealloc_pie_fft(void)
     pie_fft_fc32_init();
 }
 
-// In-place float FFT on de-interleaved re[]/im[] arrays.
-static void pie_fft_fc32_2048(float *re, float *im)
+// In-place float FFT on de-interleaved re[]/im[] arrays. Returns false
+// if the PIE scratch isn't available (init failed) -- T30: this used
+// to silently no-op and leave re[]/im[] as time-domain data, which the
+// caller would then treat as a valid spectrum and report a confident
+// (but meaningless) UW result instead of "no result". Callers must
+// check the return value and bail out with an already-invalid
+// uw_corr_result_t rather than continue.
+static bool pie_fft_fc32_2048(float *re, float *im)
 {
     if (!s_pie_fft_inited) pie_fft_fc32_init();
-    if (!s_pie_fft_inited) return; // alloc failed -> no-op (will mis-decode)
+    if (!s_pie_fft_inited) return false; // alloc failed -- see pie_fft_fc32_init's ESP_LOGE
 
     int64_t t0 = esp_timer_get_time();
     // Interleave re/im into internal-SRAM scratch.
@@ -558,18 +575,22 @@ static void pie_fft_fc32_2048(float *re, float *im)
     g_pie_fft_outer_us += (uint64_t)((t1 - t0) + (t3 - t2));
     g_pie_fft_inner_us += (uint64_t)(t2 - t1);
     g_pie_fft_calls += 1;
+    return true;
 }
 
 // IFFT via conjugate-FFT-conjugate. gri convention: no 1/N scaling
 // (matched-filter peak finder operates on magnitude² and absorbs the
-// constant scale).
-static void pie_ifft_fc32_2048(float *re, float *im)
+// constant scale). Returns false (see pie_fft_fc32_2048) if the PIE
+// scratch is unavailable; conjugates im[] back before returning either
+// way so the caller's buffer isn't left half-mutated.
+static bool pie_ifft_fc32_2048(float *re, float *im)
 {
     for (int i = 0; i < CORR_FFT_N; i++)
         im[i] = -im[i];
-    pie_fft_fc32_2048(re, im);
+    bool ok = pie_fft_fc32_2048(re, im);
     for (int i = 0; i < CORR_FFT_N; i++)
         im[i] = -im[i];
+    return ok;
 }
 #endif // ESP_PLATFORM
 
@@ -1364,6 +1385,20 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     // ~12 ms/call of memory stalls inside the TDF_UW substage (PIE FFT
     // itself is ~1.5 ms × 3 = 4.5 ms, so the rest was I/O wait on
     // 16 KB-per-stage spectrum data going through L2 cache from PSRAM).
+    //
+    // T30 (non-reentrant static scratch, skipped): these `static`
+    // buffers are shared/non-reentrant -- a second concurrent call to
+    // uw_correlator_find would corrupt both callers' results. Today
+    // there is exactly one caller path (worker_core1's single worker
+    // task, calling burst_pipeline sequentially per burst -- verified
+    // no other call site outside host tests). Not fixing this here:
+    // moving these off `static` would put them on the calling task's
+    // stack, which for worker_core1 is PSRAM-backed
+    // (xTaskCreatePinnedToCoreWithCaps(..., MALLOC_CAP_SPIRAM)) --
+    // exactly the placement the comment above says was measured at
+    // ~12 ms/call slower. That's a real perf regression for a
+    // currently-unreachable concurrency bug; a proper fix (per-caller
+    // scratch or a lock) needs its own review, not a P3 drive-by.
     static float fburst_re[CORR_FFT_N] __attribute__((aligned(16)));
     static float fburst_im[CORR_FFT_N] __attribute__((aligned(16)));
     static float fifft_re[CORR_FFT_N] __attribute__((aligned(16)));
@@ -1378,7 +1413,15 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
 #if defined(ESP_PLATFORM)
     // Task #58: PIE FFT swap. Bit-equivalent to radix2_fft_f32 per the
     // diff harness (task #67); ~10 ms/burst faster on the 3 FFTs.
-    pie_fft_fc32_2048(fburst_re, fburst_im);
+    if (!pie_fft_fc32_2048(fburst_re, fburst_im)) {
+        // T30: PIE FFT scratch unavailable -- out_result already holds
+        // the safe defaults set at function entry (UW_DIR_UNKNOWN,
+        // peak_value=0). Bail loudly instead of matched-filtering
+        // untransformed time-domain data and reporting it as a
+        // confident (but meaningless) UW hit.
+        ESP_LOGE("UWCORR", "uw_correlator_find: PIE FFT unavailable -- returning invalid result");
+        return;
+    }
 #else
     radix2_fft_f32(fburst_re, fburst_im, CORR_FFT_N, CORR_FFT_LOG,
                    s_corr_brev, s_corr_tw_re_f, s_corr_tw_im_f);
@@ -1398,7 +1441,10 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     }
 #if defined(ESP_PLATFORM)
     g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
-    pie_ifft_fc32_2048(fifft_re, fifft_im);
+    if (!pie_ifft_fc32_2048(fifft_re, fifft_im)) {
+        ESP_LOGE("UWCORR", "uw_correlator_find: PIE IFFT (DL) unavailable -- returning invalid result");
+        return; // out_result still holds the safe defaults from function entry
+    }
     _t0 = esp_timer_get_time();
 #else
     radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
@@ -1435,7 +1481,10 @@ void uw_correlator_find(const int16_t *burst_2sps, int n_complex,
     }
 #if defined(ESP_PLATFORM)
     g_uw_specmul_us += (uint64_t)(esp_timer_get_time() - _t0);
-    pie_ifft_fc32_2048(fifft_re, fifft_im);
+    if (!pie_ifft_fc32_2048(fifft_re, fifft_im)) {
+        ESP_LOGE("UWCORR", "uw_correlator_find: PIE IFFT (UL) unavailable -- returning invalid result");
+        return; // out_result still holds the safe defaults from function entry
+    }
     _t0 = esp_timer_get_time();
 #else
     radix2_ifft_f32(fifft_re, fifft_im, CORR_FFT_N, CORR_FFT_LOG,
@@ -1809,11 +1858,19 @@ int uw_correlator_find_burst_start(const int16_t *burst_2sps,
     if (search_max > START_SEARCH_MAX) search_max = START_SEARCH_MAX;
 
     for (int n = 0; n < search_max; n++) {
-        int32_t r  = (int32_t)burst_2sps[n * 2 + 0];
-        int32_t i  = (int32_t)burst_2sps[n * 2 + 1];
-        int32_t m2 = r * r + i * i;
-        if (m2 < 0) m2 = INT32_MAX; // overflow guard (extreme case)
-        mag2[n] = m2;
+        int32_t r = (int32_t)burst_2sps[n * 2 + 0];
+        int32_t i = (int32_t)burst_2sps[n * 2 + 1];
+        // T30: r*r+i*i computed in int32 is signed-overflow UB at the
+        // extreme corner r=i=-32768 -- each square is 2^30 (fits), but
+        // the sum is exactly 2^31, one past INT32_MAX. The old
+        // `if (m2 < 0) m2 = INT32_MAX` guard relied on that overflow
+        // wrapping to a negative value, which C does not guarantee.
+        // Widen to int64 first so the sum is always well-defined, then
+        // saturate -- same intended result (INT32_MAX at the boundary),
+        // now reached without UB.
+        int64_t m2_wide = (int64_t)r * r + (int64_t)i * i;
+        int32_t m2      = (m2_wide > INT32_MAX) ? INT32_MAX : (int32_t)m2_wide;
+        mag2[n]         = m2;
     }
 
     // Kaiser LP taps in Q15 — computed by start_lp_compute_w_q15()

@@ -60,7 +60,22 @@ void fft_sc16_2048_init(void)
                                                        MALLOC_CAP_INTERNAL);
     s_fft_scratch = (int16_t *)heap_caps_aligned_alloc(16, 2 * N * sizeof(int16_t),
                                                        MALLOC_CAP_INTERNAL);
-    if (!s_w_table || !s_fft_scratch) return; // alloc failed; FFT will no-op
+    if (!s_w_table || !s_fft_scratch) {
+        // T27: this used to fail silently -- s_inited stays false so
+        // every later fft_sc16_2048() call quietly no-ops (comment at
+        // its call site already says "caller sees no-op"), which reads
+        // to a live operator as the tagger going idle for no visible
+        // reason. Log loudly, matching the DRAM-placement guard below.
+        ESP_LOGE("FFT2048", "alloc failed: s_w_table=%p (%d B) s_fft_scratch=%p (%d B) "
+                            "-> FFT will no-op, tagger CFO/UW search silently disabled",
+                 s_w_table, (int)(N * sizeof(int16_t)),
+                 s_fft_scratch, (int)(2 * N * sizeof(int16_t)));
+        heap_caps_free(s_w_table);
+        heap_caps_free(s_fft_scratch);
+        s_w_table     = NULL;
+        s_fft_scratch = NULL;
+        return; // alloc failed; FFT will no-op
+    }
     // Hard guard: the PIE vector unit garbles data on non-DRAM
     // (RTCRAM/TCM). Refuse a non-DRAM placement rather than mis-decode
     // silently -- mirrors uw_correlator's pie_fft_fc32_init /

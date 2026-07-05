@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 
@@ -143,7 +144,26 @@ static void make_resample_coeffs(int16_t *coeffs)
     // returns). Allocate on the heap for the design pass only; freed
     // before this function returns.
     double *w = (double *)malloc(sizeof(double) * RS25_DELAY_SIZE * RS25_INTERP);
-    if (!w) return;
+    if (!w) {
+        // T26: used to return with `coeffs` untouched (whatever the
+        // caller's buffer happened to hold -- zero for a static/global
+        // instance, but garbage for a stack-allocated one), silently
+        // handing the resampler a bogus filter. Fail loudly, matching
+        // the s_coeffs_pp alloc-fail guards below, and leave a
+        // deterministic all-zero (no-op) filter rather than whatever
+        // was in the caller's memory.
+#if defined(ESP_PLATFORM)
+        ESP_LOGE("RS25", "make_resample_coeffs: design-pass malloc failed (%u B) "
+                         "-- coeffs zeroed, resampler will emit silence",
+                 (unsigned)(sizeof(double) * RS25_DELAY_SIZE * RS25_INTERP));
+#else
+        fprintf(stderr, "RS25: make_resample_coeffs design-pass malloc failed (%u B) "
+                        "-- coeffs zeroed, resampler will emit silence\n",
+                (unsigned)(sizeof(double) * RS25_DELAY_SIZE * RS25_INTERP));
+#endif
+        memset(coeffs, 0, sizeof(int16_t) * RS25_DELAY_SIZE * RS25_INTERP);
+        return;
+    }
     double sum_phase[RS25_INTERP];
     for (int p = 0; p < INTERP; p++)
         sum_phase[p] = 0.0;

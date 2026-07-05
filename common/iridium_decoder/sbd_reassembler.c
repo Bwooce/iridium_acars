@@ -5,6 +5,20 @@
 
 #define SBD_TIMEOUT_US (5ULL * 1000000ULL) // 5 s
 
+// msg_cnt comes straight off the air (prehdr[3] or prehdr[15]) with no
+// upstream range check, so BCH-false-positive noise that happens to
+// classify() as an SBD type can hand us any byte 0-255. Each apparent
+// "first frame" with msg_cnt>1 opens one of only SBD_MAX_SESSIONS slots
+// that then only closes via the 5 s timeout — under a steady trickle of
+// noise that saturates the table and starves real multi-frame traffic.
+// A legitimate multi-frame message can't realistically need more than
+// this many fragments: SBD_MAX_PAYLOAD (320 B) divided by the largest
+// possible per-fragment body (IDA payload cap of 24 B, minus 2 B type +
+// up to 7 B prehdr + 3 B sub-header) still needs well under 32
+// fragments. Bounding msg_cnt here rejects most garbage values before a
+// session is ever opened, without touching real traffic.
+#define SBD_MSG_CNT_MAX 32
+
 const char *sbd_type_wire_name(sbd_type_t t)
 {
     switch (t) {
@@ -65,14 +79,19 @@ static int find_free_session(sbd_reassembler_t *ctx)
     return -1;
 }
 
-// Find an active session whose msg_no_next matches msgno and direction
-// matches. Mirrors upstream's reverse-search through self.multi.
+// Find an active session whose msg_no_next matches msgno, direction
+// matches, and type matches. Mirrors upstream's reverse-search through
+// self.multi, plus a type check upstream leaves as a TODO ("could check
+// if 'typ' seems right") — without it, two co-incident noise-opened
+// sessions of different wire types but the same msg_no_next/uplink can
+// cross-contaminate each other's payload.
 static int find_matching_session(sbd_reassembler_t *ctx,
-                                 uint8_t msgno, bool uplink)
+                                 uint8_t msgno, bool uplink, sbd_type_t typ)
 {
     for (int i = SBD_MAX_SESSIONS - 1; i >= 0; i--) {
         sbd_session_t *s = &ctx->sessions[i];
-        if (s->active && s->msg_no_next == msgno && s->uplink == uplink) {
+        if (s->active && s->msg_no_next == msgno && s->uplink == uplink &&
+            s->type == typ) {
             return i;
         }
     }
@@ -222,7 +241,7 @@ int sbd_reassembler_feed(sbd_reassembler_t   *ctx,
         return 1;
     }
     // 3. msg_cnt > 1: multi-frame — start or extend session
-    if (msg_cnt > 1 && msg_no == 1) {
+    if (msg_cnt > 1 && msg_cnt <= SBD_MSG_CNT_MAX && msg_no == 1) {
         // First frame of multi-packet: open a new session.
         int idx = find_free_session(ctx);
         if (idx < 0) {
@@ -248,7 +267,7 @@ int sbd_reassembler_feed(sbd_reassembler_t   *ctx,
     }
     if (msg_no > 1) {
         // Continuation — find the session waiting for this msg_no.
-        int idx = find_matching_session(ctx, (uint8_t)msg_no, uplink);
+        int idx = find_matching_session(ctx, (uint8_t)msg_no, uplink, typ);
         if (idx < 0) {
             ctx->cnt_broken++;
             return 0;

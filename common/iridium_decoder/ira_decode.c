@@ -61,6 +61,13 @@ int ira_decode(const iridium_frame_t *frame, ira_decoded_t *out)
     if (!frame || !out) return -1;
     memset(out, 0, sizeof(*out));
 
+    // T47: mirror ida_decode/ims_decode's defensive classification check.
+    // Caller must have already classified the frame as IR_FRAME_RA; all
+    // current call sites already guarantee this (frame_decoder.c only
+    // calls ira_decode() from the IR_FRAME_RA switch case), so this is
+    // pure defense-in-depth and doesn't change behavior for any real
+    // caller.
+    if (frame->type != IR_FRAME_RA) return -1;
     if (frame->n_bits < UW_BITS + RA_HEAD) return -1;
     const uint8_t *p = frame->bits + UW_BITS;
 

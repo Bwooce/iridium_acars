@@ -83,6 +83,14 @@ int ibc_decode(const iridium_frame_t *frame, ibc_decoded_t *out)
     memset(out, 0, sizeof(*out));
     out->block1_subtype = -1;
 
+    // T47: mirror ida_decode/ims_decode's defensive classification check.
+    // Caller must have already classified the frame as IR_FRAME_BC; all
+    // current call sites already guarantee this (frame_decoder.c only
+    // calls ibc_decode() from the IR_FRAME_BC switch case), so this is
+    // pure defense-in-depth and doesn't change behavior for any real
+    // caller.
+    if (frame->type != IR_FRAME_BC) return -1;
+
     // Frame body starts after the 24-bit UW. Need header (6) + 4 blocks (256).
     if (frame->n_bits < UW_BITS + IBC_BODY_BITS) {
         return -1;

@@ -75,10 +75,16 @@ static _Atomic uint32_t s_bursts_bch_chase_recovered = 0; // Chase-2 soft decode
 // Closes the design-review gap "can't tell antenna-empty from
 // demod-broken from /status alone." SNR bins are 1 dB wide [0..32);
 // BCH bins are a 4×4 joint of e1 × e2 codes (-1 = failed, 0..2 = corrected).
+// T45: _Atomic (not volatile) for the same reason as the counters
+// above -- hist_*_record's `array[bin]++` is a read-modify-write;
+// worker_core1_get_histograms() reads these concurrently from the
+// httpd task. A plain volatile RMW is a data race (UB) even though
+// there's a single writer, and matches the exact pattern this file
+// already fixed for s_bursts_queued et al.
 #define HIST_SNR_BINS 32
-static volatile uint32_t s_hist_snr[HIST_SNR_BINS]; // bin i = bursts with floor(SNR_dB) == i
-#define HIST_BCH_BINS 16                            // (e1+1)*4 + (e2+1), e ∈ {-1..2}
-static volatile uint32_t s_hist_bch[HIST_BCH_BINS];
+static _Atomic uint32_t s_hist_snr[HIST_SNR_BINS]; // bin i = bursts with floor(SNR_dB) == i
+#define HIST_BCH_BINS 16                           // (e1+1)*4 + (e2+1), e ∈ {-1..2}
+static _Atomic uint32_t s_hist_bch[HIST_BCH_BINS];
 
 static inline void hist_snr_record(float snr_db)
 {
@@ -399,16 +405,47 @@ void worker_core1_golden_print_summary(void)
 // WB_PRE_PAD_SAMPLES; making that subtraction a multiple of 16
 // complex samples (= 64 bytes) keeps the extract address aligned
 // for esp_cache_msync. DIDECIM_NTAPS is 144 (gri-aligned 141 + 3
-// zero-pad for PIE 8-alignment); 144 already lines up on 16-cplx,
-// but we keep 288 as a margin to absorb any future Kaiser-design
-// revisions without re-checking alignment.
-#define WB_PRE_PAD_SAMPLES 288                         // 18 × 16, ≥ DIDECIM_NTAPS - 1
+// zero-pad for PIE 8-alignment); 144 already lines up on 16-cplx.
+//
+// T45: was 288 (18 × 16), which is 16-cplx aligned but NOT a multiple
+// of DIDECIM_DECIM (=10): 288 mod 10 = 8. Since safe_len below is
+// rounded to a multiple of 80 (= LCM(10, 16)), ext_len = safe_len +
+// WB_PRE_PAD_SAMPLES inherited that same "8 mod 10" remainder. The
+// streaming decim loop's LAST chunk then had a non-multiple-of-10
+// tail that direct_if_decim_process_split silently drops (n_out =
+// n_in / DIDECIM_DECIM, integer division, and there's no next chunk
+// to carry the remainder into) -- up to 9 raw samples lost off the
+// very end of the extraction window every burst. That end is deep in
+// WB_EXTRACT_SAFETY trailing padding, past the real burst content, so
+// it didn't affect decode -- but it's a real dropped-sample bug, not
+// just a latent one. 320 (= 20 × 16 = 4 × 80) is a multiple of 80, so
+// it satisfies the cache/decim alignment as strictly as safe_len does
+// and ext_len is always an exact multiple of DIDECIM_DECIM with no
+// tail loss. Still ≥ DIDECIM_NTAPS - 1 (143) with margin to spare.
+//
+// T45 REVERTED (2026-07-05): bumping this 288→320 was NOT decode-neutral.
+// The dropped tail samples are in WB_EXTRACT_SAFETY past the burst (as the
+// comment above says — they don't matter), but WB_PRE_PAD is the *pre-roll*:
+// +32 leading samples shifts the whole extraction window, moving the
+// decim phase / D13-start / UW alignment. Measured: RAW GOLDEN overall BER
+// 1.39%→2.42%, exact matches 44→43, divergent 1→3. The "tail-loss fix"
+// wasn't worth an alignment shift that degrades every burst's bits. Keep 288.
+#define WB_PRE_PAD_SAMPLES 288
 #define WB_MAX_BURST_SAMPLES ((int)(FS_DETECT_HZ / 4)) // 250 ms = 625000
 #define WB_EXTRACT_SAFETY 1024
 #define WB_EXTRACT_MAX (WB_MAX_BURST_SAMPLES + WB_PRE_PAD_SAMPLES + WB_EXTRACT_SAFETY)
 
 // 250 ksps output is at most WB_EXTRACT_MAX / 10 + 1.
 #define WB_DECIM_MAX ((WB_EXTRACT_MAX / DIDECIM_DECIM) + 8)
+
+// (T45's WB_PRE_PAD % DIDECIM_DECIM static_assert removed with the 320
+// revert — 288 % 10 != 0 by design; the harmless tail-sample drop is
+// accepted in exchange for decode-alignment stability. See the define.)
+_Static_assert(WB_PRE_PAD_SAMPLES % 16 == 0,
+               "WB_PRE_PAD_SAMPLES must be 16-complex aligned (64 B) for "
+               "esp_cache_msync on the extracted PSRAM range");
+_Static_assert(WB_PRE_PAD_SAMPLES >= DIDECIM_NTAPS - 1,
+               "WB_PRE_PAD_SAMPLES must cover the decim FIR's group delay");
 
 // Per-chunk size for the streaming decim. The PIE FIR scratch needs
 // to be in INTERNAL SRAM (dsps_fird_s16_arp4's `esp.vld.128.ip` can't
@@ -641,12 +678,11 @@ void worker_task(void *arg)
             //     the extracted PSRAM range doesn't reject the call
             //     with ESP_ERR_INVALID_ARG (cache line = 64 bytes on P4)
             // LCM(10, 16) = 80. Rounding safe_len down to a multiple of
-            // 80 satisfies both. WB_PRE_PAD_SAMPLES is already 16-cplx
-            // aligned (= 288 = 18 * 16, also a multiple of 80? no — 288
-            // mod 80 = 48 — but combined-with rule still works: we need
-            // ext_len % 16 == 0, and 288 is 16-aligned, so safe_len need
-            // only be 16-aligned; the 80 rounding is the strictest needed
-            // for the joint constraint).
+            // 80 satisfies both, and (T45) WB_PRE_PAD_SAMPLES is ALSO a
+            // multiple of 80 (see its definition above), so
+            // ext_len = safe_len + WB_PRE_PAD_SAMPLES stays a multiple
+            // of 80 too -- both alignments hold for ext_len, not just
+            // safe_len.
             //
             // Before this rounding only 1-in-8 valid safe_len values
             // were cache-aligned; the rest silently failed msync and
@@ -753,6 +789,26 @@ void worker_task(void *arg)
             sd_capture_record_burst_end();
             int64_t t_dec1 = esp_timer_get_time();
             s_t_decim_us += (uint64_t)(t_dec1 - t_dec0);
+
+            // T38: re-check burst_valid AFTER the read loop above. The
+            // read is a multi-ms operation (chunked over ext_len /
+            // DECIM_CHUNK_IN calls to signal_buffer_read_chunk); the
+            // producer (ingest, Core 0) can advance the ring head
+            // during that window and start overwriting the tail of the
+            // range we're reading from mid-read, at which point the
+            // pre-read check at the top of this block is stale and we
+            // may have just decimated a mix of real and overwritten
+            // samples. Mirror the same conservative envelope used
+            // there (check_start/check_len already cover
+            // WB_PRE_PAD_SAMPLES on both sides) and drop rather than
+            // hand a possibly-torn burst to the pipeline.
+            if (!signal_buffer_burst_valid(check_start, check_len)) {
+                ESP_LOGW(TAG, "stale burst: start=%lu len=%lu (head wrapped during read) — drop",
+                         (unsigned long)burst.start_sample_idx,
+                         (unsigned long)burst.length_samples);
+                s_bursts_skipped++;
+                continue;
+            }
 
             if (n_250k <= 64) {
                 ESP_LOGD(TAG, "direct_if_decim produced %d samples — too short",

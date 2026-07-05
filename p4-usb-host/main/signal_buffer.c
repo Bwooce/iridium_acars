@@ -126,6 +126,34 @@ static IRAM_ATTR bool dma_done_cb(async_memcpy_handle_t mcp,
     return hp_woken == pdTRUE;
 }
 
+// T44 (partial): every submit-failure recovery branch in signal_buffer_push
+// gives s_dma_done back synchronously (see the big comment at that call
+// site for why). If the xSemaphoreTake() above timed out first (counted by
+// s_dma_timeouts, which "has never fired in production" per that field's
+// comment), the take never actually consumed a previous give -- so a STALE
+// DMA's completion callback can still be pending and could fire after this
+// synchronous give, making the next xSemaphoreGive() here a double-give.
+// FreeRTOS binary semaphores already tolerate this safely (a Give at
+// count==1 just returns pdFALSE; no overflow, no corruption), so this was
+// never a crash risk -- only a silently-absorbed one, which is why it has
+// "never fired" by the only signal anyone was watching (s_dma_timeouts).
+// Make the redundant-give case observable instead of silently swallowed.
+static volatile uint32_t s_dma_give_races = 0;
+
+static inline void give_dma_done_once(const char *why)
+{
+    if (uxSemaphoreGetCount(s_dma_done) != 0) {
+        s_dma_give_races++;
+        if ((s_dma_give_races & 0x3f) == 1) { // rate-limit to ~1/64
+            ESP_LOGW(TAG, "dma_done semaphore already given (race #%u, %s) — "
+                          "skipping redundant give",
+                     (unsigned)s_dma_give_races, why);
+        }
+        return;
+    }
+    xSemaphoreGive(s_dma_done);
+}
+
 esp_err_t signal_buffer_init()
 {
     // Suppress the IDF GDMA noise that fires once per failed cache-
@@ -384,7 +412,7 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
             esp_cache_msync(dst_base + head_bytes, aligned_bytes,
                             ESP_CACHE_MSYNC_FLAG_DIR_C2M);
             s_stash_alloc_recoveries++;
-            xSemaphoreGive(s_dma_done);
+            give_dma_done_once("simple-path recovery");
             // fall through to head + carry update — data IS in ring
         } else if (!wrap_first_submitted) {
             // Neither segment reached GDMA: nothing is in flight, so it
@@ -397,7 +425,7 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
             memcpy(dst_base, ((uint8_t *)s_align_scratch) + bytes_to_end, remainder);
             esp_cache_msync(dst_base, remainder, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
             s_stash_alloc_recoveries++;
-            xSemaphoreGive(s_dma_done);
+            give_dma_done_once("wrap-path recovery, both segments");
             // fall through to head + carry update — data IS in ring
         } else {
             // First segment's GDMA may still be in flight; cannot safely
@@ -406,7 +434,7 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
             // fall through WITHOUT a CPU recovery — this chunk's ring
             // contents may be stale/garbage for the second segment's
             // span, but head still advances (see block comment above).
-            xSemaphoreGive(s_dma_done);
+            give_dma_done_once("wrap-path recovery, first segment in flight");
             // fall through to head + carry update — audio in this window
             // may be wrong; the index invariant is preserved regardless
         }
@@ -437,6 +465,25 @@ bool signal_buffer_burst_valid(uint32_t start_idx, uint32_t length)
     const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
     if (length == 0 || length >= total_cap) return false;
 
+    // T44 (assessed, not fixed here): both `head` and `start_idx` are
+    // ring-relative positions modulo total_cap (~1M complex samples,
+    // ~420 ms of producer time at 2.5 Msps). The check below can only
+    // measure "distance since end" modulo one full lap -- if the
+    // producer has actually lapped the ring an extra whole total_cap
+    // (or more) since start_idx was captured, that extra distance is
+    // invisible to this arithmetic and a truly stale burst can alias
+    // back to a small, apparently-fresh `since_end`. Closing this needs
+    // a monotonically increasing 64-bit sample counter threaded through
+    // the callers that hand start_idx to this function (the tagger and
+    // worker_core1.c), not just this file, so start_idx itself carries
+    // enough range to disambiguate laps -- a wider cross-file API
+    // change outside this task's file scope (only signal_buffer.c) and
+    // too risky to improvise without touching those call sites in
+    // lockstep. Left as-is; no behavior change here, this is the
+    // maximally-correct check obtainable from ring-relative-only
+    // inputs. In practice this needs a full extra lap of worker stall
+    // (~420 ms) to misfire, far beyond normal tagger→worker latency.
+    //
     // Distance from the burst's END (in producer order) to the current
     // head, modulo wrap. If this exceeds (total_cap - length), the
     // producer has lapped onto the burst's window — data is gone.

@@ -351,6 +351,20 @@ void fft_burst_tagger_destroy(fft_burst_tagger_t *t)
 void fft_burst_tagger_flush(fft_burst_tagger_t *t,
                             fbt_burst_t *out_gone, int *n_gone)
 {
+#if defined(ESP_PLATFORM)
+    // T28: drain a helper run in flight before resetting burst state
+    // below, mirroring the drain in fft_burst_tagger_step(). Guarded on
+    // s_pipe_helper_task (same guard the step()'s pipelined branch
+    // uses) so this is a true no-op while the helper is disabled at
+    // init (current build): pipe_in_flight can only be set true inside
+    // that same guarded branch, so with the helper off it's already
+    // always false and this block never executes today. Kept ready
+    // for if the helper is ever re-enabled (see fft_burst_tagger_init).
+    if (s_pipe_helper_task && t->pipe_in_flight) {
+        ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+        t->pipe_in_flight = false;
+    }
+#endif
     int max     = (n_gone && *n_gone > 0) ? *n_gone : 0;
     int emitted = 0;
     for (int b = 0; b < t->n_bursts && emitted < max; b++) {

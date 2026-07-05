@@ -444,11 +444,21 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
             sum_re += iq250[i * 2 + 0];
             sum_im += iq250[i * 2 + 1];
         }
+        // The mean of n_complex int16 samples is itself always within
+        // int16 range (a convex combination of in-range values can't
+        // exceed it), so this narrowing cast can't wrap.
         int16_t dc_re = (int16_t)(sum_re / n_complex);
         int16_t dc_im = (int16_t)(sum_im / n_complex);
         for (int i = 0; i < n_complex; i++) {
-            iq250[i * 2 + 0] -= dc_re;
-            iq250[i * 2 + 1] -= dc_im;
+            // T24: a sample already sitting at/near a rail (e.g. an
+            // ADC-clipped burst) minus a same-sign dc_re/dc_im can
+            // step outside int16 range; the old raw `-=` truncated
+            // instead of clamping, aliasing to the opposite rail.
+            // q15_saturate only engages in that already-out-of-range
+            // case -- normal in-range signal with headroom below full
+            // scale is bit-identical to the old subtraction.
+            iq250[i * 2 + 0] = q15_saturate((int32_t)iq250[i * 2 + 0] - dc_re);
+            iq250[i * 2 + 1] = q15_saturate((int32_t)iq250[i * 2 + 1] - dc_im);
         }
     }
 
