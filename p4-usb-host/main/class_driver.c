@@ -226,6 +226,13 @@ int class_driver_get_tuner_gain_dbx10(void)
 {
     return s_last_gain_dbx10;
 }
+
+esp_err_t class_driver_retune(uint32_t hz)
+{
+    if (!rtldev) return ESP_ERR_INVALID_STATE;
+    int r = rtlsdr_set_center_freq(rtldev, hz);
+    return (r == 0) ? ESP_OK : ESP_FAIL;
+}
 static class_driver_t s_driver_obj = {0};
 
 static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg)
