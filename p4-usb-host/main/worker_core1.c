@@ -168,6 +168,23 @@ static inline void hist_bch_record(int e1, int e2)
     s_hist_bch[(a + 1) * 4 + (b + 1)]++;
 }
 
+// Band-occupancy histogram (T59 tuning aid): EVERY detected burst bucketed by
+// its rel_freq_hz across the FS_DETECT_HZ span, recorded at push time (before
+// the priority queue) so it shows the whole band — a strong interferer piles
+// up in one bucket, real Iridium spreads. Bucket b spans
+// [-FS/2 + b·FS/N, -FS/2 + (b+1)·FS/N) Hz relative to the LO.
+#define HIST_FREQ_BINS 40
+static _Atomic uint32_t s_hist_freq[HIST_FREQ_BINS];
+
+static inline void hist_freq_record(float rel_freq_hz)
+{
+    int bin = (int)((rel_freq_hz + (float)FS_DETECT_HZ / 2.0f) /
+                    ((float)FS_DETECT_HZ / (float)HIST_FREQ_BINS));
+    if (bin < 0) bin = 0;
+    if (bin >= HIST_FREQ_BINS) bin = HIST_FREQ_BINS - 1;
+    s_hist_freq[bin]++;
+}
+
 // Per-stage timing accumulators, summed over processed bursts only.
 static _Atomic uint64_t s_t_extract_us  = 0;
 static _Atomic uint64_t s_t_rotate_us   = 0;
@@ -1084,6 +1101,7 @@ void worker_core1_push_burst(const detected_burst_t *burst)
 {
     if (!s_pq_lock) return;
     s_bursts_queued++;
+    hist_freq_record(burst->rel_freq_hz); // band occupancy of ALL detections
     xSemaphoreTake(s_pq_lock, portMAX_DELAY);
     int r = pq_insert_locked(burst);
     if (s_pq_count > (int)s_queue_high_water) s_queue_high_water = s_pq_count;
@@ -1111,8 +1129,14 @@ void worker_core1_get_histograms(worker_histograms_t *out)
         out->bch[i] = s_hist_bch[i];
         total_bch += s_hist_bch[i];
     }
-    out->snr_total = total_snr;
-    out->bch_total = total_bch;
+    uint32_t total_freq = 0;
+    for (int i = 0; i < HIST_FREQ_BINS; i++) {
+        out->freq[i] = s_hist_freq[i];
+        total_freq += s_hist_freq[i];
+    }
+    out->snr_total  = total_snr;
+    out->bch_total  = total_bch;
+    out->freq_total = total_freq;
 }
 
 void worker_core1_get_stats(worker_stats_t *out)

@@ -331,13 +331,14 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
     worker_histograms_t h = {0};
     worker_core1_get_histograms(&h);
 
-    char body[1024];
+    char body[2048];
     int  n = 0;
     int  m;
     m = snprintf(body + n, sizeof(body) - n,
-                 "{\"snr_total\":%u,\"bch_total\":%u,"
+                 "{\"snr_total\":%u,\"bch_total\":%u,\"freq_total\":%u,"
                  "\"snr_bin_dB_width\":1,\"snr\":[",
-                 (unsigned)h.snr_total, (unsigned)h.bch_total);
+                 (unsigned)h.snr_total, (unsigned)h.bch_total,
+                 (unsigned)h.freq_total);
     if (m > 0) {
         n += m;
         if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
@@ -365,6 +366,26 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
         if (n >= (int)sizeof(body) - 1) break;
         m = snprintf(body + n, sizeof(body) - n,
                      "%s%u", i ? "," : "", (unsigned)h.bch[i]);
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
+    }
+    // freq layout (T59): band occupancy of ALL detections. bin i spans
+    // [-FS/2 + i·62500, ...) Hz relative to the LO (FS=2.5 MHz, 40 bins).
+    if (n < (int)sizeof(body) - 1) {
+        m = snprintf(body + n, sizeof(body) - n,
+                     "],\"freq_bin_Hz_width\":62500,\"freq_bin0_Hz\":-1250000,"
+                     "\"freq\":[");
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
+    }
+    for (int i = 0; i < 40; i++) {
+        if (n >= (int)sizeof(body) - 1) break;
+        m = snprintf(body + n, sizeof(body) - n,
+                     "%s%u", i ? "," : "", (unsigned)h.freq[i]);
         if (m > 0) {
             n += m;
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;

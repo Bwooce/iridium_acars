@@ -52,8 +52,10 @@ void worker_core1_get_stats(worker_stats_t *out);
 typedef struct {
     uint32_t snr[32];
     uint32_t bch[16];
+    uint32_t freq[40]; // band occupancy: ALL detections bucketed by rel_freq
     uint32_t snr_total;
     uint32_t bch_total;
+    uint32_t freq_total;
 } worker_histograms_t;
 void worker_core1_get_histograms(worker_histograms_t *out);
 
