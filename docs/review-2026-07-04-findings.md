@@ -335,6 +335,16 @@ re-read the source and confirmed the defect.
   (2) Freshness-first queue — the burst queue (worker_core1.c) is FIFO and xQueueSend drops
       the NEWEST when full (~line 1007); under overload that's backwards. Prefer newest
       (drop-oldest / LIFO) so worker effort lands on decodable bursts.
+      PREREQUISITE — capture-position timestamps: today the PDU/message timestamp is stamped
+      at DECODE time (worker_core1.c:605 pdu.timestamp_us = esp_timer_get_time(); same at
+      frame_decoder.c:523). LIFO would then hand out timestamps in processing order → a burst
+      captured earlier but decoded later gets a LATER stamp = corrupted ordering. Fix: derive
+      the timestamp from burst.start_sample_idx (the T44 64-bit cumulative sample index):
+      timestamp_us = stream_start_epoch_us + start_sample_idx * 1e6 / FS_DETECT_HZ, anchored
+      by the esp_timer value captured at stream start. Then any processing order preserves
+      correct capture-time stamps; also removes the current decode-latency jitter (tens of ms,
+      worse under load) even in FIFO. Downstream consumers that assume in-order ARRIVAL need a
+      small reorder buffer, but the timestamp VALUES stay correct.
   (3) Reject already-stale bursts before enqueue — cheap early-out in dispatch.
   Also make tag_thr live-reloadable (re-read cfg per tile or on a config-changed flag) so (1)
   and manual threshold tuning don't need a reboot.
