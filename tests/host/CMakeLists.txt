@@ -517,6 +517,33 @@ add_executable(test_tagger_latch_release
 target_include_directories(test_tagger_latch_release PRIVATE ${COMMON_DIR})
 target_link_libraries(test_tagger_latch_release PRIVATE m)
 
+# Live-RF-conditions regression gate (2026-07-07): the ALBQ end-to-end
+# chain of test_pipeline_wideband_resampled with a deterministic CW +
+# tone-flood overlay that forces the P1 force-close / squelch / noise-
+# reset paths to fire at live rates, gating on the decode count of the
+# original fixture bursts. Covers the hole that let 2ee1d6f pass every
+# host test while decoding zero bursts over the air.
+add_executable(test_tagger_live_conditions
+    test_tagger_live_conditions.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_tagger_live_conditions PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_tagger_live_conditions PRIVATE m)
+
 target_include_directories(test_pipeline_wideband_albq PRIVATE
     ${COMMON_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
@@ -957,6 +984,7 @@ add_test(NAME resample_pie_model    COMMAND test_resample_pie_model)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 add_test(NAME test_scanner_tagger_reset COMMAND test_scanner_tagger_reset)
 add_test(NAME tagger_latch_release  COMMAND test_tagger_latch_release)
+add_test(NAME tagger_live_conditions COMMAND test_tagger_live_conditions)
 add_test(NAME window_multiply_golden COMMAND test_window_multiply_golden)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
