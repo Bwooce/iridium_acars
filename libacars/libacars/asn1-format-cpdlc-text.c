@@ -518,6 +518,14 @@ static LA_ASN1_FORMATTER_FUNC(la_asn1_format_FANSLongitude_as_text) {
 // for that because the same type is used inside the SEQ-OF which would cause
 // the label to be printed for each element in the sequence). The same applies
 // to la_asn1_format_FANSATCDownlinkMessage_as_text.
+//
+// Best-effort decode audit (design
+// docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md §5,
+// item 2): aTCMessageheader and aTCuplinkmsgelementId/aTCDownlinkmsgelementid
+// are embedded by value in FANSATC{Uplink,Downlink}Message_t (see the
+// generated .h -- never pointers, so never NULL even on a partial/
+// calloc'd decode); only the *_seqOf members are OPTIONAL pointers, and
+// those already have the "!= NULL" guard below. No gap found.
 static LA_ASN1_FORMATTER_FUNC(la_asn1_format_FANSATCUplinkMessage_as_text) {
 	FANSATCUplinkMessage_t const *msg = p.sptr;
 	if(p.label != NULL) {

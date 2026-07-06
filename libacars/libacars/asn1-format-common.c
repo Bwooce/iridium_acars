@@ -18,6 +18,35 @@
 #include <libacars/vstring.h>                   // la_vstring, la_vstring_append_sprintf(), LA_ISPRINTF
 #include <libacars/json.h>                      // la_json_*()
 
+/*
+ * Best-effort decode formatter audit (design
+ * docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md §5),
+ * done ahead of enabling best_effort_decode -- these six walkers are the
+ * only funnel every CPDLC ASN.1 formatter (both text and json dispatch
+ * tables in asn1-format-cpdlc-{text,json}.c) is reached through, so
+ * auditing them here covers the whole tree:
+ *
+ *   1. CHOICE walkers bounds-check "present" against elements_count
+ *      (la_format_CHOICE_as_text/json below) -- already present, covers
+ *      the §3 CHOICE-race hazard (a partial tree's "present" is either
+ *      the PR_NOTHING==0 sentinel, caught by "present > 0", or a real,
+ *      range-valid alternative index). No gap found.
+ *   2. Bespoke top-level formatters (asn1-format-cpdlc-text.c's
+ *      FANSATCUplinkMessage/FANSATCDownlinkMessage) already guard their
+ *      only OPTIONAL pointer members (*_seqOf); their other members are
+ *      embedded by value, never NULL. No gap found.
+ *   3. Every leaf scalar formatter in both dispatch tables is reached
+ *      exclusively via one of these six walkers (la_format_SEQUENCE_*,
+ *      la_format_SEQUENCE_OF_*, la_format_CHOICE_* below), which
+ *      uniformly null-check ATF_POINTER members before recursing --
+ *      mechanical, verified by inspection of both formatter tables. No
+ *      gap found.
+ *
+ * Conclusion: no new guards were needed. The bit-flip fuzz (design §6b)
+ * enforces this conclusion under ASan/UBSan on every corrupted-input
+ * path these walkers can reach.
+ */
+
 char const *la_asn1_value2enum(asn_TYPE_descriptor_t *td, long value) {
 	if(td == NULL) return NULL;
 	asn_INTEGER_enum_map_t const *enum_map = INTEGER_map_value2enum(td->specifics, value);
@@ -78,6 +107,15 @@ void la_format_CHOICE_as_text(la_asn1_formatter_params p, la_dict const *choice_
 		}
 		p.indent++;
 	}
+	// Best-effort decode audit (design
+	// docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md §5,
+	// item 1): this bounds check already covers the CHOICE-race hazard
+	// from §3 -- a partial-tree "present" left over a failed decode is
+	// either the sentinel PR_NOTHING == 0 (caught by "present > 0") on a
+	// SEQUENCE member never reached, or a real, range-valid alternative
+	// index whose *contents* may be partial/garbage (that risk is what
+	// the ATF_POINTER null-check and the recursive cb() call below
+	// handle, plus the bit-flip fuzz). No gap found; left unchanged.
 	if(present > 0 && present <= p.td->elements_count) {
 		asn_TYPE_member_t *elm = &p.td->elements[present-1];
 		void const *memb_ptr;
@@ -109,6 +147,8 @@ void la_format_CHOICE_as_json(la_asn1_formatter_params p, la_dict const *choice_
 		char const *descr = la_dict_search(choice_labels, present);
 		la_json_append_string(p.vstr, "choice_label", descr != NULL ? descr : "");
 	}
+	// Best-effort decode audit: same bounds check, same conclusion as the
+	// text formatter's twin above (design §5 item 1) -- no gap found.
 	if(present > 0 && present <= p.td->elements_count) {
 		asn_TYPE_member_t *elm = &p.td->elements[present-1];
 		void const *memb_ptr;
