@@ -32,33 +32,24 @@ static const char *TAG = "DSP_PROC";
 
 // Tagger threshold over the EMA baseline.
 //
-// Host wideband test results across the threshold/window sweep:
-//   thr  | window | tagged | decoded | % of gri-65
-//   ----|--------|--------|---------|-------------
-//   10  | fixed  |  133   |   58    |   89%
-//   10  | gone   |  133   |   60    |   92%   ← host peak
-//   12  | gone   |   74   |   57    |   88%
-//   14  | gone   |   70   |   57    |   88%
+// Our threshold scale sits ~4 dB BELOW gr-iridium's for the same
+// detection behaviour (ENBW/normalisation difference in our tagger;
+// see fft_burst_tagger.c:131-141). Measured 2026-07-06 on the ALBQ
+// fixture, where gri's reference 65 bursts were produced at gri-18 dB
+// (apps/iridium-extractor:130 default):
+//   ours-14 -> 57/65 decoded;  ours-18 -> 38/65 (over-suppressed).
+// So gri-parity default = 14 on our scale.
 //
-// 10 dB is the closest gri-aligned match given our tagger ENBW
-// handling (see fft_burst_tagger.c:131-141 and
-// test_pipeline_wideband_albq.c). Smoke at 10 dB: matched 61 -> 63,
-// recall 93.8% -> 96.9%, dropped=0/147.
-//
-// History: 14 dB was a perf workaround through 2026-05-24 morning.
-// At 10 dB the worker couldn't keep up under bench-noise conditions
-// (tagger fires ~145/sec on noise spikes); the worker monopolised
-// Core 1 long enough to starve frame_decoder past the 5 s task
-// watchdog, and the firmware aborted. The fix wasn't perf — task
-// #58 had already cut Core 1 ingest cost ~10% which was plenty —
-// it was a priority inversion: worker (5) preempted frame_decoder
-// (4) and status_logger (1). Dropping worker to 3 (below decoder)
-// and bumping logger to 6 lets the scheduler keep the WDT-watched
-// task alive and the observability lines flowing even when the
-// worker has a backlog. With those in place, live USB rate at
-// 10 dB measured higher than at 14 dB (4.5 vs 4.0 MB/s) because
-// Core 1 spends less time worker-monopolised.
-#define FBT_THRESHOLD_DB 10.0f
+// History: this was 10.0f from 2026-05-24 to 2026-07-06, chosen by a
+// host fixture-recall sweep (10 dB scored 60/65 vs 57/65 at 14). That
+// +3-frame fixture gain violated the "every numeric comes from gri"
+// rule and cost a ~3000x noise false-positive rate live: ~730 junk
+// bursts/s on bench RF, saturating the worker (>=99.9% of all bursts
+// shed, ~0.66/s processed) and engaging the frozen-baseline latch.
+// The 2026-07-06 live A/B (P1 squelch/force-close + threshold) is in
+// docs/superpowers/ANALYSIS-2026-07-06-path-to-first-acars.md.
+// NVS `tag_thr` overrides this default at detector create.
+#define FBT_THRESHOLD_DB 14.0f
 
 // Burst window padding in INPUT samples (at FS_DETECT_HZ). gri's
 // defaults: pre = 2*fft_size = 4096, post = sample_rate * 16e-3 =
