@@ -83,10 +83,54 @@ static SemaphoreHandle_t s_pq_items = NULL; // counts occupied slots (worker wai
 // on the decodable ones. width_bins==0 (unmeasured) counts as narrow — safe
 // default (process, don't shed). Does not touch detection (still gri-aligned).
 #define BURST_NARROW_MAX_BINS 48 // one channel (~34) + margin
+
+// P1.5c: TOP-LEVEL duration class. Bench 2026-07-06 (see
+// docs/superpowers/ANALYSIS-2026-07-06-path-to-first-acars.md) found the PQ
+// monopolized by 19-22 dB impulsive broadband junk that's only active for
+// 1-3 tagger FFT-steps (<=3*FBT_FFT_SIZE=6144 raw samples, <=2.5 ms) while
+// real, decodable Iridium bursts (>=MIN_FRAME_LENGTH_NORMAL=131 symbols,
+// gr-iridium/lib/iridium.h:18) get shed. Width/SNR alone (T60, above)
+// doesn't fix this: junk can be narrow too.
+//
+// detected_burst_t.length_samples is NOT the raw active RF duration — it's
+// stop-start out of fft_burst_tagger, and start/stop are always padded by
+// the tagger's fixed lead/hangover margins (dsp_processor.c:
+// FBT_BURST_PRE_LEN = 2*FBT_FFT_SIZE = 4096, FBT_BURST_POST_LEN = 40000
+// samples) around whatever it tracked as "active". So EVERY reported
+// length includes that ~44096-sample (17.6 ms) floor, real or not — this
+// file's own note below (~line 758) already documents the resulting range
+// as "~30 ms (single frame) to ~250 ms (multi-frame)". A naive
+// symbols->samples conversion (13100, see below) would sit UNDER that
+// floor and never discriminate anything; the gate must be the full
+// single-frame minimum INCLUDING the mandatory pad.
+//
+// Derivation (samples, at the tagger's FS_DETECT_HZ = 2.5 Msps input rate):
+//   MIN_FRAME_LENGTH_NORMAL (131 symbols) @ SYMBOLS_PER_SECOND=25000
+//     (gr-iridium/lib/iridium.h:10,18) -> 131*(2500000/25000) = 13100
+//     samples (5.24 ms) — this is the same >= check gr-iridium performs at
+//     burst_downmix_impl.cc:502 before it will attempt CFO/UW search.
+//   + mandatory tagger pad (FBT_BURST_PRE_LEN + FBT_BURST_POST_LEN)
+//     = 4096 + 40000 = 44096 samples
+//   = 57196 samples: the true floor for a genuine single-frame burst.
+//   - one FFT-step (2048 samples) tolerance for tagger threshold-crossing
+//     jitter at the frame's leading/trailing edge (an envelope dip near
+//     the noise floor can cost a step of "active" tracking without the
+//     burst actually being shorter) -> 55148 samples (~22.1 ms).
+// A 1-3 step junk burst tops out around pad + 2*FBT_FFT_SIZE = 48192
+// samples (its last_active only advances one FFT-step per additional step
+// of activity beyond the first), so this still leaves ~7000 samples of
+// separation above the junk ceiling.
+#define BURST_DURATION_CLASS_MIN_SAMPLES 55148
+// Penalty dwarfs the width penalty (1000) so duration strictly dominates
+// ordering; width/SNR ordering (T60) is preserved WITHIN each class. This
+// is priority/allocation only — a short burst is never dropped or
+// filtered by this term alone, only ranked below plausible-length ones.
+#define BURST_DURATION_CLASS_PENALTY 100000.0f
 static inline float burst_priority(const detected_burst_t *b)
 {
     float p = b->peak_snr_db;
     if ((int)BURST_WIDTH_BINS(b) > BURST_NARROW_MAX_BINS) p -= 1000.0f;
+    if (b->length_samples < BURST_DURATION_CLASS_MIN_SAMPLES) p -= BURST_DURATION_CLASS_PENALTY;
     return p;
 }
 
