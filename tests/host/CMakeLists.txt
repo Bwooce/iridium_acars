@@ -452,6 +452,18 @@ add_executable(test_scanner_tagger_reset
 target_include_directories(test_scanner_tagger_reset PRIVATE ${COMMON_DIR})
 target_link_libraries(test_scanner_tagger_reset PRIVATE m)
 
+# P1 frozen-baseline latch release: synthetic persistent carrier /
+# burst-flood scenarios proving the three gri protections ported from
+# fft_burst_tagger_impl.cc:263-355 (max-burst-len force-close, forced
+# baseline refresh, burst squelch) actually release the latch.
+add_executable(test_tagger_latch_release
+    test_tagger_latch_release.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_tagger_latch_release PRIVATE ${COMMON_DIR})
+target_link_libraries(test_tagger_latch_release PRIVATE m)
+
 target_include_directories(test_pipeline_wideband_albq PRIVATE
     ${COMMON_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
@@ -778,6 +790,7 @@ add_test(NAME resample_tile         COMMAND test_resample_tile)
 add_test(NAME resample_pie_model    COMMAND test_resample_pie_model)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 add_test(NAME test_scanner_tagger_reset COMMAND test_scanner_tagger_reset)
+add_test(NAME tagger_latch_release  COMMAND test_tagger_latch_release)
 add_test(NAME window_multiply_golden COMMAND test_window_multiply_golden)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
