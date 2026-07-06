@@ -171,9 +171,13 @@ done:
 void stream_transfer_cb(usb_transfer_t *transfer)
 {
     class_adsb_dev *dev = adsbdev;
+    // This URB just completed -> it is no longer in flight.
+    atomic_fetch_sub_explicit(&s_live_xfers, 1, memory_order_relaxed);
     if (!dev->streaming) {
-        atomic_fetch_sub_explicit(&s_live_xfers, 1, memory_order_relaxed);
-        usb_host_transfer_free(transfer);
+        // PARK: keep the transfer allocated (do NOT free) and do not
+        // resubmit. It stays idle in dev->transfers[] until
+        // esp_libusb_resume_stream re-submits the same object. This avoids
+        // re-alloc churn against the tight DMA-internal heap.
         return;
     }
 
@@ -231,6 +235,7 @@ void stream_transfer_cb(usb_transfer_t *transfer)
             last_err = usb_host_transfer_submit(transfer);
             if (last_err == ESP_OK) {
                 submitted = true;
+                atomic_fetch_add_explicit(&s_live_xfers, 1, memory_order_relaxed);
                 break;
             }
             s_xfer_resubmit_errors++;
@@ -428,25 +433,32 @@ int esp_libusb_pause_stream(class_driver_t *driver_obj)
     return 0;
 }
 
-// Task 7 (stream-pause retune): resume after esp_libusb_pause_stream().
-// Deliberately does NOT call esp_libusb_start_stream() — reuses the
-// existing usbring allocation (usbring_reset(), not usbring_init())
-// and only re-submits a fresh batch of transfers.
+// Task 8 (park transfers): resume after esp_libusb_pause_stream().
+// Deliberately does NOT call esp_libusb_start_stream() or
+// submit_stream_transfers() — those alloc new transfers, and the
+// DMA-internal heap is too tight to re-alloc the whole pool on every
+// hop. Instead, re-submit the SAME already-allocated dev->transfers[]
+// objects that were parked (not freed) by stream_transfer_cb during
+// the pause drain. No allocation happens here.
 int esp_libusb_resume_stream(class_driver_t *driver_obj, unsigned char endpoint)
 {
+    (void)endpoint; // transfers already carry their endpoint from boot submit
     class_adsb_dev *dev = adsbdev;
     if (!dev) return -1;
-
-    usb_device_handle_t dev_hdl = driver_obj->dev_hdl ? driver_obj->dev_hdl : dev->dev_hdl;
-    if (!dev_hdl) {
-        ESP_LOGE("LIBUSB", "Cannot resume stream: NULL device handle");
-        return -1;
-    }
 
     usbring_reset();
     dev->streaming    = true;
     s_stream_start_us = esp_timer_get_time();
-    return submit_stream_transfers(driver_obj, dev_hdl, endpoint);
+    int n             = 0;
+    for (int i = 0; i < ASYNC_TRANSFER_COUNT; i++) {
+        if (!dev->transfers[i]) continue; // slot was never allocated (boot alloc cap)
+        if (usb_host_transfer_submit(dev->transfers[i]) == ESP_OK) {
+            atomic_fetch_add_explicit(&s_live_xfers, 1, memory_order_relaxed);
+            n++;
+        }
+    }
+    ESP_LOGI("LIBUSB", "stream resumed: %d transfers re-submitted", n);
+    return (n > 0) ? 0 : -1; // success if at least one URB is back in flight
 }
 
 int esp_libusb_read_stream(const uint8_t **out_ptr, size_t max_length, size_t *received)
