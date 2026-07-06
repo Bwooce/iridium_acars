@@ -665,6 +665,45 @@ target_compile_options(decode_burst_capture PRIVATE
 )
 target_link_libraries(decode_burst_capture PRIVATE m)
 
+# Positive control for the IDA -> SBD -> ACARS tail glue (acars_tail.c),
+# the shared helper decode_burst_capture uses on LW.DA frames. Feeds a
+# synthetic-but-valid multi-fragment SBD message wrapping a
+# CRC-correct ACARS frame through sbd_reassembler_feed() and
+# la_acars_parse_and_reassemble(), asserting the exact ACARS text
+# round-trips. Needs the same minimum libacars source set as
+# test_libacars_link (LIBACARS_* vars set above).
+add_executable(test_acars_tail_synthetic
+    test_acars_tail_synthetic.c
+    acars_tail.c
+    ${COMMON_DIR}/sbd_reassembler.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_acars_tail_synthetic PRIVATE
+    ${COMMON_DIR}
+    ${LIBACARS_UPSTREAM}
+    ${LIBACARS_IDF_DIR}
+)
+target_compile_options(test_acars_tail_synthetic PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+
 add_executable(test_pipeline_direct_if_albq
     test_pipeline_direct_if_albq.c
     ${COMMON_DIR}/burst_pipeline.c
@@ -732,6 +771,7 @@ add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME ibc_decode           COMMAND test_ibc_decode)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
+add_test(NAME acars_tail_synthetic COMMAND test_acars_tail_synthetic)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME resample_split        COMMAND test_resample_split)
 add_test(NAME resample_tile         COMMAND test_resample_tile)
