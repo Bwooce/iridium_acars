@@ -47,7 +47,7 @@ static void test_filtered_non_sbd(void)
     ida_decoded_t ida;
     make_ida(&ida, bytes, sizeof(bytes));
     sbd_message_t out;
-    int           rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
+    int           rc = sbd_reassembler_feed(&ctx, ida.payload, ida.payload_len, false, 1000000, &out);
     CHECK(rc == -1, "rc=%d", rc);
     CHECK(ctx.cnt_filtered == 1, "cnt_filtered=%u", ctx.cnt_filtered);
 }
@@ -70,7 +70,7 @@ static void test_hello_mailbox_check(void)
     ida_decoded_t ida;
     make_ida(&ida, bytes, sizeof(bytes));
     sbd_message_t out;
-    int           rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
+    int           rc = sbd_reassembler_feed(&ctx, ida.payload, ida.payload_len, false, 1000000, &out);
     CHECK(rc == 1, "rc=%d (expected 1)", rc);
     CHECK(out.type == SBD_TYPE_HELLO_0600, "type=%d", out.type);
     CHECK(ctx.cnt_short == 1, "cnt_short=%u", ctx.cnt_short);
@@ -110,7 +110,7 @@ static void test_single_frame_dl(void)
     ida_decoded_t ida;
     make_ida(&ida, bytes, i);
     sbd_message_t out;
-    int           rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
+    int           rc = sbd_reassembler_feed(&ctx, ida.payload, ida.payload_len, false, 1000000, &out);
     CHECK(rc == 1, "rc=%d", rc);
     CHECK(out.type == SBD_TYPE_DATA_DL_7608, "type=%d", out.type);
     CHECK(out.payload_len == 4, "payload_len=%u", out.payload_len);
@@ -166,11 +166,11 @@ static void test_multi_frame_assembly(void)
     sbd_message_t out;
 
     make_ida(&ida, f1, i);
-    int rc = sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
+    int rc = sbd_reassembler_feed(&ctx, ida.payload, ida.payload_len, false, 1000000, &out);
     CHECK(rc == 0, "frame 1 rc=%d (expected 0=partial)", rc);
 
     make_ida(&ida, f2, j);
-    rc = sbd_reassembler_feed(&ctx, &ida, false, 1100000, &out);
+    rc = sbd_reassembler_feed(&ctx, ida.payload, ida.payload_len, false, 1100000, &out);
     CHECK(rc == 1, "frame 2 rc=%d (expected 1=complete)", rc);
     CHECK(out.payload_len == 4, "payload_len=%u (expected 4)", out.payload_len);
     CHECK(out.payload[0] == 0x11 && out.payload[1] == 0x22 &&
@@ -209,7 +209,7 @@ static void test_session_timeout(void)
     ida_decoded_t ida;
     sbd_message_t out;
     make_ida(&ida, f1, i);
-    sbd_reassembler_feed(&ctx, &ida, false, 1000000, &out);
+    sbd_reassembler_feed(&ctx, ida.payload, ida.payload_len, false, 1000000, &out);
 
     int active = 0;
     for (int s = 0; s < SBD_MAX_SESSIONS; s++) {

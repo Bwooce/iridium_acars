@@ -30,6 +30,10 @@ idf_component_register(
         "ida_decode.c"
         # Phase D part 5: SBD multi-frame reassembler.
         "sbd_reassembler.c"
+        # Phase A (ACARS smoke): cross-burst IDA (LW.DA) fragment
+        # reassembler -- chains da_cont/da_ctr-linked physical bursts
+        # into one complete SBD envelope before sbd_reassembler_feed().
+        "ida_reassembler.c"
         # Phase D15: IBC (Iridium Broadcast) body parser -- extracts
         # sv_id / beam_id / slot + bc_type=1 iri_time. Lets the frame
         # decoder log "which satellite / which beam / what time" for

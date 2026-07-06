@@ -111,26 +111,27 @@ void sbd_reassembler_tick(sbd_reassembler_t *ctx, uint64_t now_us)
     }
 }
 
-int sbd_reassembler_feed(sbd_reassembler_t   *ctx,
-                         const ida_decoded_t *ida,
-                         bool                 uplink,
-                         uint64_t             now_us,
-                         sbd_message_t       *out_msg)
+int sbd_reassembler_feed(sbd_reassembler_t *ctx,
+                         const uint8_t     *payload,
+                         int                payload_len,
+                         bool               uplink,
+                         uint64_t           now_us,
+                         sbd_message_t     *out_msg)
 {
-    if (!ctx || !ida) return -1;
-    if (ida->payload_len < 5) {
+    if (!ctx || !payload) return -1;
+    if (payload_len < 5) {
         ctx->cnt_filtered++;
         return -1;
     }
-    sbd_type_t typ = classify(ida->payload, ida->payload_len, uplink);
+    sbd_type_t typ = classify(payload, payload_len, uplink);
     if (typ == SBD_TYPE_UNKNOWN) {
         ctx->cnt_filtered++;
         return -1;
     }
 
     // Consume the 2-byte type prefix.
-    const uint8_t *p = ida->payload + 2;
-    int            n = ida->payload_len - 2;
+    const uint8_t *p = payload + 2;
+    int            n = payload_len - 2;
 
     // Parse prehdr + extract msg_count / msg_no per upstream sbd.py.
     int            msg_cnt         = -1; // unknown / single-frame

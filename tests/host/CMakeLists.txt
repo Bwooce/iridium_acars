@@ -646,6 +646,7 @@ add_executable(decode_burst_capture
     ${COMMON_DIR}/iridium_frame.c
     ${COMMON_DIR}/iridium_bch.c
     ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/ida_reassembler.c
     ${COMMON_DIR}/sbd_reassembler.c
     ${LIBACARS_SRC}/acars.c
     ${LIBACARS_SRC}/libacars.c
@@ -687,6 +688,7 @@ target_link_libraries(decode_burst_capture PRIVATE m)
 add_executable(test_acars_tail_synthetic
     test_acars_tail_synthetic.c
     acars_tail.c
+    ${COMMON_DIR}/ida_reassembler.c
     ${COMMON_DIR}/sbd_reassembler.c
     ${LIBACARS_SRC}/acars.c
     ${LIBACARS_SRC}/libacars.c
@@ -708,6 +710,48 @@ target_include_directories(test_acars_tail_synthetic PRIVATE
     ${LIBACARS_IDF_DIR}
 )
 target_compile_options(test_acars_tail_synthetic PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+
+# Real-capture proof (Phase A ACARS smoke): feeds the 2026-07-06
+# HydraSDR milestone capture's real ACARS frames (fixture_acars_frames.h,
+# built by tests/scripts/build_acars_fixture.py) through
+# ida_reassembler_feed() -> sbd_reassembler_feed() ->
+# la_acars_parse_and_reassemble(), asserting the exact fields against
+# the independent iridium-toolkit reference. See test_acars_tail_real.c
+# for why this is a REAL capture and how it differs in scope from
+# test_acars_tail_synthetic.
+add_executable(test_acars_tail_real
+    test_acars_tail_real.c
+    acars_tail.c
+    ${COMMON_DIR}/ida_reassembler.c
+    ${COMMON_DIR}/sbd_reassembler.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_acars_tail_real PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+    ${LIBACARS_UPSTREAM}
+    ${LIBACARS_IDF_DIR}
+)
+target_compile_options(test_acars_tail_real PRIVATE
     -D_XOPEN_SOURCE=600
     -D_POSIX_C_SOURCE=200809L
     -D_DEFAULT_SOURCE
@@ -784,6 +828,7 @@ add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME ibc_decode           COMMAND test_ibc_decode)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME acars_tail_synthetic COMMAND test_acars_tail_synthetic)
+add_test(NAME acars_tail_real      COMMAND test_acars_tail_real)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME resample_split        COMMAND test_resample_split)
 add_test(NAME resample_tile         COMMAND test_resample_tile)

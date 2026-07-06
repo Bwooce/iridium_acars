@@ -75,12 +75,17 @@ typedef struct {
 typedef struct {
     burst_summary_t    bs;
     sbd_reassembler_t *sbd;
+    ida_reassembler_t *ida_reasm;
     la_reasm_ctx      *reasm;
     uint64_t           burst_t_us; // capture-header timestamp for
                                    // this burst; used as a stand-in
                                    // for the worker's per-frame
                                    // timestamp (not tracked at this
                                    // offline granularity).
+    uint32_t burst_freq_hz;        // rel_freq_hz from the capture
+                                   // header, fed to ida_reasm as a
+                                   // best-effort per-burst channel
+                                   // identity (see ida_reassembler.h).
 } decode_ctx_t;
 
 static void print_hex(const uint8_t *buf, size_t n)
@@ -120,8 +125,10 @@ static void on_frame(burst_pipeline_result_t *res, void *ctx_)
                 int           rc_ida = ida_decode(&f, &ida);
                 if (rc_ida == 0 && ida.ok && ida.header_ok && ida.crc_ok) {
                     acars_tail_result_t tail;
-                    int                 rc_tail = acars_tail_feed(ctx->sbd, ctx->reasm, &ida,
+                    int                 rc_tail = acars_tail_feed(ctx->sbd, ctx->reasm,
+                                                                  ctx->ida_reasm, &ida,
                                                                   dir == IR_FRM_DIR_UPLINK,
+                                                                  ctx->burst_freq_hz,
                                                                   ctx->burst_t_us, &tail);
                     if (rc_tail == 1 && tail.sbd_ready) {
                         bs->sbd_messages++;
@@ -207,9 +214,12 @@ int main(int argc, char **argv)
     }
 
     // IDA -> SBD -> ACARS tail state, persistent across bursts/frames
-    // (mirrors frame_decoder.c's s_sbd / s_reasm_ctx globals).
+    // (mirrors frame_decoder.c's s_sbd / s_ida_reasm / s_reasm_ctx
+    // globals).
     sbd_reassembler_t sbd;
     sbd_reassembler_init(&sbd);
+    ida_reassembler_t ida_reasm;
+    ida_reassembler_init(&ida_reasm);
     la_reasm_ctx *reasm = la_reasm_ctx_new();
     if (!reasm) {
         fprintf(stderr, "la_reasm_ctx_new() failed\n");
@@ -269,8 +279,10 @@ int main(int argc, char **argv)
 
         decode_ctx_t dctx       = {0};
         dctx.sbd                = &sbd;
+        dctx.ida_reasm          = &ida_reasm;
         dctx.reasm              = reasm;
         dctx.burst_t_us         = h.t_us;
+        dctx.burst_freq_hz      = (uint32_t)(h.rel_freq_hz < 0 ? -h.rel_freq_hz : h.rel_freq_hz);
         int              frames = burst_pipeline_process_burst(iq250, n250, on_frame, &dctx);
         burst_summary_t *bs     = &dctx.bs;
         if (frames > 0) bursts_decode_ok++;

@@ -107,6 +107,8 @@ static void test_acars_tail_roundtrip(void)
 
     sbd_reassembler_t ctx;
     sbd_reassembler_init(&ctx);
+    ida_reassembler_t ida_reasm;
+    ida_reassembler_init(&ida_reasm);
     la_reasm_ctx *reasm = la_reasm_ctx_new();
     CHECK(reasm != NULL, "la_reasm_ctx_new() returned NULL");
     if (!reasm) return;
@@ -138,7 +140,8 @@ static void test_acars_tail_roundtrip(void)
         ida_decoded_t ida;
         make_ida(&ida, bytes, n);
 
-        int rc = acars_tail_feed(&ctx, reasm, &ida, /*uplink=*/false,
+        int rc = acars_tail_feed(&ctx, reasm, &ida_reasm, &ida, /*uplink=*/false,
+                                 /*freq_hz=*/1621500000u,
                                  1000000ULL + (uint64_t)frag * 100000ULL, &tail);
         if (frag < msg_cnt) {
             CHECK(rc == 0, "fragment %d/%d: rc=%d (expected 0=partial)", frag, msg_cnt, rc);
