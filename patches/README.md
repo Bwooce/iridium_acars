@@ -9,6 +9,7 @@ IDF patches — apply after cloning / updating the IDF:
 ```sh
 cd esp-idf
 git apply ../patches/0001-esp_dma_utils-defer-stash-alloc-until-overflow-confirmed.patch
+git apply ../patches/0003-freertos-riscv-coproc-save-area-in-internal-ram-for-psram-stacks.patch
 ```
 
 Managed-component patches — apply from the repo root after the
@@ -89,3 +90,45 @@ contains zero `esp.lp.setup` instructions.
 NOTE: this changes device-DSP behavior but lives outside the
 pre-push hook's `DSP_PATHS` list — a device smoke run
 (`Smoke-verified:` evidence) is still mandatory before trusting it.
+
+## 0003 — freertos/riscv: coprocessor save areas in internal RAM for PSRAM stacks
+
+**Files:** `components/freertos/FreeRTOS-Kernel/portable/riscv/port.c`,
+`components/riscv/include/riscv/rvruntime-frames.h`
+**IDF version:** v6.1 (vendored `release/v6.1` checkout). Re-verify on IDF updates.
+
+FreeRTOS on the P4 saves coprocessor (FPU/HWLP/PIE) contexts lazily: the
+first coprocessor instruction after losing ownership traps as an illegal
+instruction, and `rtos_save_pie_coproc` (portasm.S) saves the previous
+owner's PIE registers into a save area that `pxPortGetCoprocArea`
+(port.c) carves from the *owner task's stack bottom*. Our PIE-owning
+tasks (`worker_core1`, `rs_worker_a/b`) have PSRAM stacks
+(`xTaskCreatePinnedToCoreWithCaps(..., MALLOC_CAP_SPIRAM)`), so the PIE
+context was saved with `esp.vst.128.ip` 128-bit vector stores INTO
+PSRAM — and this project has repeatedly documented PIE 128-bit ld/st
+misbehaving depending on target memory region (`fft_sc16_2048.c:51`,
+`uw_correlator.c:460`). This is the surviving mechanism for the
+device-smoke RAW GOLDEN HP-WDT hang at the PIE lazy-save path after
+HWLP removal (patch 0002) and the rev-0 silicon workarounds both failed
+to fix it.
+
+Fix: when a task's stack is in external RAM
+(`esp_ptr_external_ram`), pre-allocate a small internal-RAM pool
+(`heap_caps_aligned_alloc(16, ~400 B, MALLOC_CAP_INTERNAL)`) at task
+creation (`uxInitialiseCoprocSaveArea`, called from
+`pxPortInitialiseStack`) and let the lazy carve use that pool instead of
+the stack. The allocation MUST be eager: the lazy carve runs inside the
+illegal-instruction trap with interrupts masked, where the heap is not
+usable. The pool is sized for all three coprocessor areas (FPU 132 B +
+HWLP 24 B + PIE 216 B + per-area alignment) so it can never overflow.
+Freed in `vPortCleanUpCoprocArea` (task-context TCB cleanup). On
+allocation failure it falls back to the previous stack-carving behaviour
+with a one-shot warning. Tasks with internal-RAM stacks are unaffected.
+
+The new `sa_intpool` field is appended to `RvCoprocSaveArea`; portasm.S
+only reads the `RV_COPROC_ENABLE`/`RV_COPROC_SA` offsets, which are
+unchanged.
+
+Verification: apply on the bench checkout, rebuild + flash, then
+`scripts/smoke_run.sh raw` must complete (no HP-WDT hang) with GOLDEN
+matched>=40.

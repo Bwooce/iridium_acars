@@ -1,0 +1,152 @@
+diff --git a/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c b/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
+index e6edd6a185..40f6edb7a8 100644
+--- a/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
++++ b/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
+@@ -56,6 +56,7 @@
+ #include "portmacro.h"
+ #include "port_systick.h"
+ #include "esp_memory_utils.h"
++#include "esp_heap_caps.h"
+ #if CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER
+ #include "esp_timer.h"
+ #endif
+@@ -270,6 +271,17 @@ static void vPortTaskWrapper(TaskFunction_t pxCode, void *pvParameters)
+ 
+ #if ( SOC_CPU_COPROC_NUM > 0 )
+ 
++#if CONFIG_SPIRAM
++/* iridium_acars patch: size of the internal-RAM pool that replaces stack carving for
++ * the coprocessor save areas of tasks whose stack lives in external RAM. Sized for
++ * every coprocessor of the target plus worst-case alignment padding for each, so the
++ * lazy carve in pxPortGetCoprocArea can never overflow it regardless of use order. */
++#define RV_COPROC_POOL_SIZE  (RV_COPROC0_SIZE + RV_COPROC1_SIZE + RV_COPROC2_SIZE + \
++                              RV_COPROC0_ALIGN + RV_COPROC1_ALIGN + RV_COPROC2_ALIGN)
++/* Pool base alignment: largest coprocessor save area alignment (PIE requires 16) */
++#define RV_COPROC_POOL_ALIGN 16
++#endif /* CONFIG_SPIRAM */
++
+ /**
+  * @brief Retrieve or allocate coprocessors save area from the given pxTopOfStack address.
+  *
+@@ -291,6 +303,27 @@ FORCE_INLINE_ATTR UBaseType_t uxInitialiseCoprocSaveArea(UBaseType_t uxStackPoin
+ {
+     RvCoprocSaveArea* sa = pxRetrieveCoprocSaveAreaFromStackPointer(uxStackPointer);
+     memset(sa, 0, sizeof(RvCoprocSaveArea));
++#if CONFIG_SPIRAM
++    /* iridium_acars patch: when the task stack (and therefore the coprocessor save
++     * areas normally carved from its lowest addresses) is in external RAM, eagerly
++     * allocate an internal-RAM pool for the save areas instead. The PIE context is
++     * saved/restored with 128-bit vector accesses (esp.vst.128.ip/esp.vld.128.ip)
++     * that must not target PSRAM. This must happen here, at task-creation time:
++     * the lazy save area carve runs inside the illegal-instruction trap handler
++     * (rtos_save_*_coproc) with interrupts masked, where the heap must not be used. */
++    if (esp_ptr_external_ram(sa)) {
++        sa->sa_intpool = heap_caps_aligned_alloc(RV_COPROC_POOL_ALIGN, RV_COPROC_POOL_SIZE,
++                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
++        if (sa->sa_intpool == NULL) {
++            /* Fall back to carving from the (external) stack: previous behaviour */
++            static bool s_coproc_pool_alloc_warned = false;
++            if (!s_coproc_pool_alloc_warned) {
++                s_coproc_pool_alloc_warned = true;
++                ESP_EARLY_LOGW("freertos", "No internal RAM for coproc save area pool, falling back to task stack");
++            }
++        }
++    }
++#endif /* CONFIG_SPIRAM */
+     return (UBaseType_t) sa;
+ }
+ 
+@@ -303,6 +336,16 @@ static void vPortCleanUpCoprocArea(void *pvTCB)
+     const UBaseType_t bottomstack = (UBaseType_t) task->pxDummy8;
+     RvCoprocSaveArea* sa = pxRetrieveCoprocSaveAreaFromStackPointer(bottomstack);
+ 
++#if CONFIG_SPIRAM
++    /* iridium_acars patch: free the internal-RAM save area pool allocated at task
++     * creation for external-RAM stacks. This hook runs from prvDeleteTCB (idle task
++     * or the vTaskDelete caller), a normal task context where the heap is usable. */
++    if (sa->sa_intpool != NULL) {
++        heap_caps_free(sa->sa_intpool);
++        sa->sa_intpool = NULL;
++    }
++#endif /* CONFIG_SPIRAM */
++
+     /* If the Task ever saved the original stack pointer, restore it before returning */
+     if (sa->sa_allocator != 0) {
+         /* Restore the original lowest address of the stack in the TCB */
+@@ -797,7 +840,17 @@ RvCoprocSaveArea* pxPortGetCoprocArea(StaticTask_t* task, bool allocate, int cop
+     if (sa->sa_allocator == 0) {
+         /* Since the lowest stack address shall not be used as `sp` anymore, we will modify it */
+         sa->sa_tcbstack = task->pxDummy6;
+-        sa->sa_allocator = (UBaseType_t) task->pxDummy6;
++#if CONFIG_SPIRAM
++        /* iridium_acars patch: carve the save areas from the internal-RAM pool
++         * (pre-allocated at task creation) instead of the external-RAM stack.
++         * PIE 128-bit vector stores/loads must not target PSRAM. */
++        if (sa->sa_intpool != NULL) {
++            sa->sa_allocator = (UBaseType_t) sa->sa_intpool;
++        } else
++#endif /* CONFIG_SPIRAM */
++        {
++            sa->sa_allocator = (UBaseType_t) task->pxDummy6;
++        }
+     }
+ 
+     /* Check if coprocessor area is allocated */
+@@ -813,18 +866,27 @@ RvCoprocSaveArea* pxPortGetCoprocArea(StaticTask_t* task, bool allocate, int cop
+         sa->sa_allocator = (sa->sa_allocator + coproc_sa_align[coproc] - 1) & ~(coproc_sa_align[coproc] - 1);
+         sa->sa_coprocs[coproc] = (void*) (sa->sa_allocator);
+         sa->sa_allocator += coproc_sa_sizes[coproc];
+-        /* Update the lowest address of the stack to prevent FreeRTOS performing overflow/watermark checks on the coprocessors contexts */
+-        task->pxDummy6 = (void*) (sa->sa_allocator);
+-        /* Make sure the Task stack pointer is not pointing to the coprocessor context area, in other words, make
+-         * sure we don't have a stack overflow */
+-        void* task_sp = task->pxDummy1;
+-        if (task_sp <= task->pxDummy6) {
+-            /* In theory we need to call vApplicationStackOverflowHook to trigger the stack overflow callback,
+-             * but in practice, since we are already in an exception handler, this won't work, so let's manually
+-             * trigger an exception with the previous coprocessor owner's TCB */
+-            g_panic_abort = true;
+-            g_panic_abort_details = (char *) "ERROR: Stack overflow while saving coprocessor context!\n";
+-            xt_unhandled_exception(task_sp);
++#if CONFIG_SPIRAM
++        if (sa->sa_intpool != NULL) {
++            /* iridium_acars patch: save areas live in the internal-RAM pool, which is
++             * sized for every coprocessor plus per-area alignment padding, so it cannot
++             * overflow. Leave the task's stack bounds (pxStack) untouched. */
++        } else
++#endif /* CONFIG_SPIRAM */
++        {
++            /* Update the lowest address of the stack to prevent FreeRTOS performing overflow/watermark checks on the coprocessors contexts */
++            task->pxDummy6 = (void*) (sa->sa_allocator);
++            /* Make sure the Task stack pointer is not pointing to the coprocessor context area, in other words, make
++             * sure we don't have a stack overflow */
++            void* task_sp = task->pxDummy1;
++            if (task_sp <= task->pxDummy6) {
++                /* In theory we need to call vApplicationStackOverflowHook to trigger the stack overflow callback,
++                 * but in practice, since we are already in an exception handler, this won't work, so let's manually
++                 * trigger an exception with the previous coprocessor owner's TCB */
++                g_panic_abort = true;
++                g_panic_abort_details = (char *) "ERROR: Stack overflow while saving coprocessor context!\n";
++                xt_unhandled_exception(task_sp);
++            }
+         }
+     }
+     return sa;
+diff --git a/components/riscv/include/riscv/rvruntime-frames.h b/components/riscv/include/riscv/rvruntime-frames.h
+index 29ee7f37f6..53e1138967 100644
+--- a/components/riscv/include/riscv/rvruntime-frames.h
++++ b/components/riscv/include/riscv/rvruntime-frames.h
+@@ -266,6 +266,13 @@ STRUCT_FIELD  (void*, 4, RV_COPROC_TCB_STACK, sa_tcbstack)
+ STRUCT_FIELD  (long, 4, RV_COPROC_ALLOCATOR, sa_allocator)
+ /* Pointer to the coprocessors save areas */
+ STRUCT_AFIELD (void*, 4, RV_COPROC_SA, sa_coprocs, SOC_CPU_COPROC_NUM)
++/* Internal-RAM pool used for the coprocessor save areas when the task stack lives in
++ * external RAM. The PIE save/restore uses 128-bit vector loads/stores (esp.vst.128.ip)
++ * which must not target PSRAM. Allocated eagerly at task creation (the lazy save runs
++ * in the illegal-instruction trap where the heap must not be used), freed with the TCB.
++ * NULL when the stack is internal or the allocation failed (fall back to stack carving).
++ * -- iridium_acars patch */
++STRUCT_FIELD  (void*, 4, RV_COPROC_INT_POOL, sa_intpool)
+ STRUCT_END(RvCoprocSaveArea)
+ 
+ 
