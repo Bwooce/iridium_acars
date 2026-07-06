@@ -48,33 +48,48 @@ typedef struct {
     char const    *name;
     char const    *arinc_text; // "/GSADDR.IMI.<air_reg><hex...>"
     fixture_kind_t kind;
+    la_msg_dir     dir;
 } fixture_t;
 
 // design §6a citations:
 //   CPDLC (3): libacars/examples/cpdlc_get_position.c:33,37-39
 //   ADS-C (4): libacars/examples/adsc_get_position.c:26,30-32
+// UPLINK-ADSC is synthetic (no uplink example ships with libacars): a
+// periodic contract request (tag 0x07), contract number 5, with six
+// sub-tags covering every request-sub-tag parser shape -- reporting
+// interval (0x0B, 1B), flight ID modulus (0x0C, 1B), vertical speed
+// event (0x12, 1B), altitude range (0x13, 4B), waypoint-change report
+// (0x14, empty/no parser), aircraft intent (0x15, 2B). It exists
+// because all example fixtures are downlink, so the uplink tag table
+// and la_adsc_contract_request_parse's nested sub-tag loop were never
+// fuzzed -- which hid a real formatter crash (see
+// test_adsc_review_repros). Trailing "FFFF" is a dummy ARINC CRC:
+// arinc.c computes crc_ok but never gates parsing on it.
 static const fixture_t FIXTURES[] = {
     {"SOUCAYA", "/SOUCAYA.AT1."
                 "HL8251243F880C3D903BB412903604FE326C2479F4A64F7F62528B1A9CF8382738186AC28B16668E013DF464D8A7F0",
-     FIXTURE_CPDLC},
+     FIXTURE_CPDLC, LA_MSG_DIR_AIR2GND},
     {"MSTEC7X", "/MSTEC7X.AT1."
                 "VT-ANKA094D88C3D903BB465D0723053B2E5123CFA53279400014B0894A2C6A73CBD8F52447AF1244CB4C9B94600089D65C84314892694587510528B1A9CF41169D440C1AB36A08B42",
-     FIXTURE_CPDLC},
+     FIXTURE_CPDLC, LA_MSG_DIR_AIR2GND},
     {"MELCAYA", "/MELCAYA.AT1."
                 "ZK-OKC253C21CC3D903BA178F96618F0B28024B83127CD7886A12E9D85266B927584A9169C1A8EEB2800EEA7",
-     FIXTURE_CPDLC},
+     FIXTURE_CPDLC, LA_MSG_DIR_AIR2GND},
     {"BOMASAI", "/BOMASAI.ADS."
                 "VT-ANB072501A070A988CA73248F0E5DC10200000F5EE1ABC000102B885E0A19F5",
-     FIXTURE_ADSC},
+     FIXTURE_ADSC, LA_MSG_DIR_AIR2GND},
     {"AUHASMO", "/AUHASMO.ADS."
                 "A6-PFE0724D9586A36C92B2DCF1F0E74A8E4807C0F7219AF407C10422E9E08A1C4",
-     FIXTURE_ADSC},
+     FIXTURE_ADSC, LA_MSG_DIR_AIR2GND},
     {"CTUE1YA", "/CTUE1YA.ADS."
                 "HB-JNB1424AB686D9308CA2EBA1D0D24A2C06C1B48CA004A248050667908CA004BF6",
-     FIXTURE_ADSC},
+     FIXTURE_ADSC, LA_MSG_DIR_AIR2GND},
     {"YQXE2YA", "/YQXE2YA.ADS."
                 "SP-LRH1424FD087806C0B527769F0D2500B877ED00B5401E2516707755C01340B768",
-     FIXTURE_ADSC},
+     FIXTURE_ADSC, LA_MSG_DIR_AIR2GND},
+    {"UPLINK-ADSC", "/AKLCDYA.ADS."
+                    "ZKNNC107050B8A0C021205130FA003E81415030AFFFF",
+     FIXTURE_ADSC, LA_MSG_DIR_GND2AIR},
 };
 #define NUM_FIXTURES (int)(sizeof(FIXTURES) / sizeof(FIXTURES[0]))
 
@@ -82,11 +97,11 @@ static const fixture_t FIXTURES[] = {
 // non-empty rendering, both with best_effort_decode OFF (today's baseline).
 static void test_positive_control_mode_off(void)
 {
-    printf("Test: positive control, 7 intact fixtures decode cleanly (mode OFF)\n");
+    printf("Test: positive control, %d intact fixtures decode cleanly (mode OFF)\n", NUM_FIXTURES);
 
     for (int i = 0; i < NUM_FIXTURES; i++) {
         fixture_t const *fx   = &FIXTURES[i];
-        la_proto_node   *node = la_arinc_parse(fx->arinc_text, LA_MSG_DIR_AIR2GND);
+        la_proto_node   *node = la_arinc_parse(fx->arinc_text, fx->dir);
         CHECK(node != NULL, "%s: la_arinc_parse returned NULL", fx->name);
         if (node == NULL) {
             continue;
@@ -123,7 +138,7 @@ static void test_positive_control_mode_off(void)
 // returning.
 static void render_fixture(fixture_t const *fx, char **text_out, char **json_out)
 {
-    la_proto_node *node = la_arinc_parse(fx->arinc_text, LA_MSG_DIR_AIR2GND);
+    la_proto_node *node = la_arinc_parse(fx->arinc_text, fx->dir);
     if (node == NULL) {
         *text_out = NULL;
         *json_out = NULL;
@@ -180,10 +195,10 @@ static void test_positive_control_mode_on_matches_off(void)
 // ON -- keep the tags parsed before the break, tag msg->partial, and
 // record failed_tag/err_offset; with the flag OFF, behaviour must match
 // today exactly (err set, no partial labelling). Also exercises the
-// la_adsc_tag_parse leak fix (t->type set before parsing): under a
-// plain (non-ASan) build this only proves the fields come out right:
-// the actual leak-freed-or-not is what the ASan fuzz build (later
-// commit) verifies.
+// la_adsc_tag_parse leak fix (failed-tag data freed at the failure
+// site): under a plain (non-ASan) build this only proves the fields
+// come out right; the actual leak-freed-or-not is what the ASan build
+// verifies.
 static void test_adsc_truncated_payload(void)
 {
     printf("Test: truncated ADS-C payload -> partial labelling when flag ON\n");
@@ -243,17 +258,95 @@ static void test_adsc_truncated_payload(void)
     la_config_set_bool("best_effort_decode", false); // restore default
 }
 
+// Regression tests for the two proven repros from the 2026-07-07
+// top-tier review of this branch.
+static void test_adsc_review_repros(void)
+{
+    printf("Test: review repros -- contract-request formatter crash + flag-OFF fabricated data\n");
+
+    // Repro 1 (crash): uplink contract request (tag 0x07) whose sub-tag
+    // 0x0B (reporting interval) is truncated to zero group bytes. With
+    // the earlier type-before-parse leak fix, the failed sub-tag ended
+    // up with type set + data NULL, and
+    // la_adsc_contract_request_format_text() handed the NULL data
+    // straight to la_adsc_reporting_interval_format_text() -> NULL
+    // deref. Must render cleanly (no crash under ASan) in both modes.
+    //
+    // Repro 2 (flag-OFF contract violation): downlink noncompliance
+    // notification (tag 0x05) declaring 2 groups but carrying only 1.
+    // The parser fails after populating half of t->data; rendering that
+    // partially-populated allocation fabricated a calloc-zero "Tag 0"
+    // group -- with the flag OFF, where output must be bit-for-bit
+    // upstream's. Upstream renders exactly "-- Unparseable tag 5" +
+    // "-- Malformed ADS-C message".
+    struct {
+        char const    *name;
+        uint8_t const *payload;
+        int            len;
+        la_msg_dir     dir;
+        char const    *expect_off_text; // exact flag-OFF rendering (upstream-equivalent)
+    } const repros[] = {
+        {"uplink 07 01 0B", (uint8_t const[]){0x07, 0x01, 0x0B}, 3, LA_MSG_DIR_GND2AIR,
+         "-- Unparseable tag 7\n-- Malformed ADS-C message\n"},
+        {"downlink 05 01 02 07 40", (uint8_t const[]){0x05, 0x01, 0x02, 0x07, 0x40}, 5, LA_MSG_DIR_AIR2GND,
+         "-- Unparseable tag 5\n-- Malformed ADS-C message\n"},
+    };
+
+    for (size_t r = 0; r < sizeof(repros) / sizeof(repros[0]); r++) {
+        for (int mode = 0; mode < 2; mode++) {
+            bool const flag = (mode == 1);
+            la_config_set_bool("best_effort_decode", flag);
+            la_proto_node *node = la_adsc_parse(repros[r].payload, repros[r].len,
+                                                repros[r].dir, ARINC_MSG_ADS);
+            CHECK(node != NULL, "%s: NULL node", repros[r].name);
+            if (node == NULL) {
+                continue;
+            }
+            la_adsc_msg_t const *m = node->data;
+            CHECK(m->err == true, "%s: err not set (flag=%d)", repros[r].name, flag);
+            CHECK(m->partial == flag, "%s: partial=%d, expected %d", repros[r].name, m->partial, flag);
+
+            // Formatting must not crash (repro 1's NULL deref) and must
+            // never surface fabricated group data (repro 2's "Tag 0").
+            la_vstring *tv = la_proto_tree_format_text(NULL, node);
+            CHECK(tv != NULL, "%s: NULL text render (flag=%d)", repros[r].name, flag);
+            if (tv != NULL) {
+                if (!flag) {
+                    CHECK(strcmp(tv->str, repros[r].expect_off_text) == 0,
+                          "%s: flag-OFF text differs from upstream-equivalent:\n%s",
+                          repros[r].name, tv->str);
+                } else {
+                    CHECK(strstr(tv->str, "PARTIAL/UNTRUSTED") != NULL,
+                          "%s: no partial banner with flag ON", repros[r].name);
+                }
+                CHECK(strstr(tv->str, "Tag 0") == NULL,
+                      "%s: fabricated zero-group data rendered (flag=%d)", repros[r].name, flag);
+                la_vstring_destroy(tv, true);
+            }
+            la_vstring *jv = la_proto_tree_format_json(NULL, node);
+            CHECK(jv != NULL, "%s: NULL json render (flag=%d)", repros[r].name, flag);
+            if (jv != NULL) la_vstring_destroy(jv, true);
+
+            la_proto_tree_destroy(node);
+        }
+    }
+    la_config_set_bool("best_effort_decode", false); // restore default
+}
+
 // Returns the exact bytes production code feeds to la_cpdlc_parse() /
 // la_adsc_parse(): hex-decodes the payload after the fixed
-// "/GSADDR.IMI.<air_reg>" prefix (1+7+1+3+1+7 = 20 chars, true for all 7
-// fixtures -- 7-char ground address, 3-char IMI, 7-char air_reg) and
-// strips the trailing 2-byte CRC, mirroring la_arinc_parse()
-// (arinc.c: air_reg(7), la_slurp_hexstring(), then
+// "/GSADDR.IMI<air_reg>" prefix (1+7+1+3+7 = 19 chars, true for all
+// fixtures -- 7-char ground address, 3-char IMI, then the 7-char
+// air_reg field which INCLUDES the dot separator: arinc.c copies
+// LA_ARINC_AIR_REG_LEN bytes from payload+LA_ARINC_IMI_LEN, ie. from
+// the '.' right after "AT1"/"ADS" -- observe "air_addr":".ZK-NNC" in
+// the JSON output) and strips the trailing 2-byte CRC, mirroring
+// la_arinc_parse() (la_slurp_hexstring(), then
 // `buflen -= LA_ARINC_CRC_LEN`). Caller frees *buf via free() (matches
 // LA_XCALLOC/free pairing used throughout libacars).
 static size_t get_fixture_payload(fixture_t const *fx, uint8_t **buf)
 {
-    char const *hexpart_lit = fx->arinc_text + 20;
+    char const *hexpart_lit = fx->arinc_text + 19;
     char       *hexpart     = strdup(hexpart_lit);
     size_t      n           = la_slurp_hexstring(hexpart, buf);
     free(hexpart);
@@ -263,32 +356,49 @@ static size_t get_fixture_payload(fixture_t const *fx, uint8_t **buf)
     return n - 2; // strip CRC
 }
 
-// design §6b: flip every bit of every one of the 7 fixtures' actual
-// decode buffers (~2,048 iterations total -- close to the design's
-// ~2,250 estimate) with best_effort_decode ON, under ASan+UBSan
-// (HOST_TESTS_ASAN). Assertions:
+// Collects the tag values of an ADS-C parse's tag_list in order.
+// Returns the count; writes up to max values into out.
+static int collect_adsc_tags(la_proto_node *node, uint8_t *out, int max)
+{
+    la_adsc_msg_t const *m = node->data;
+    int                  n = 0;
+    for (la_list *l = m->tag_list; l != NULL && n < max; l = la_list_next(l)) {
+        out[n++] = ((la_adsc_tag_t const *)l->data)->tag;
+    }
+    return n;
+}
+
+// design §6b: flip every bit of every fixture's actual decode buffer
+// (~2,240 iterations total, vs the design's ~2,250 estimate) with
+// best_effort_decode ON, under ASan+UBSan (HOST_TESTS_ASAN). Assertions:
 //   - no sanitizer hits (enforced externally by the ASan build itself --
 //     a crash here means the whole ctest run fails)
-//   - every RC_FAIL (err == true) yields either PARTIAL output or a
-//     clean "Unparseable"/"Malformed" rendering -- never a NULL/garbage
-//     render
-//   - every RC_OK-full flip (err == false) renders IDENTICALLY whether
-//     best_effort_decode is ON or OFF -- the flag must never change
-//     behaviour on a message that fully decoded
-//   - ADS-C only: value-byte flips in fixed-length groups must not
-//     desync framing. Operationalized via a ground-truth table built by
-//     truncating the ORIGINAL (unflipped) buffer at every length and
-//     recording where that truncation's decode gives up (msg->err_offset)
-//     -- that marks the start of "the tag containing this byte
-//     position". A real flip's failure (if any) must not land on an
-//     EARLIER tag than that ground truth, ie. corruption must not
-//     cascade backward through already-parsed tags.
+//   - every failed decode yields either PARTIAL output or a clean
+//     "Unparseable"/"Malformed" rendering -- never a NULL/garbage render
+//   - every flip that still fully decodes renders IDENTICALLY (text AND
+//     json) whether best_effort_decode is ON or OFF -- the flag must
+//     never change behaviour on a message that fully decoded
+//   - ADS-C framing survival (design §6b's "value-byte flips in
+//     fixed-length groups must NOT desync framing (subsequent group
+//     tags still decode)"): for downlink fixtures, a flip at any
+//     NON-tag-byte position must still parse to a FULL success with a
+//     tag sequence identical to the original's -- the corrupted value
+//     cannot move any subsequent tag boundary because every group in
+//     these fixtures is fixed-length (asserted below: no tag 4 NACK /
+//     tag 5 noncompliance, the downlink variable-length exceptions).
+//     Tag-byte flips are exempt (a flipped tag value legitimately
+//     reframes or kills the parse -- the documented exception), as is
+//     the uplink fixture (contract-request sub-tag lists are the third
+//     documented variable-framing exception). Tag-byte positions are
+//     derived from a truncation sweep of the ORIGINAL buffer: byte b
+//     starts a tag iff b == 0 or a decode truncated to exactly b bytes
+//     succeeds (b is then a clean inter-tag boundary).
 static void test_bitflip_fuzz(void)
 {
-    printf("Test: bit-flip fuzz, every bit of all 7 fixtures (best_effort_decode ON)\n");
+    printf("Test: bit-flip fuzz, every bit of all %d fixtures (best_effort_decode ON)\n", NUM_FIXTURES);
     la_config_set_bool("best_effort_decode", true);
 
-    long total_iters = 0, rc_ok_full = 0, rc_fail = 0, partials = 0;
+    long total_iters = 0, rc_ok_full = 0, rc_fail = 0, partials = 0, framing_checked = 0;
 
     for (int i = 0; i < NUM_FIXTURES; i++) {
         fixture_t const *fx   = &FIXTURES[i];
@@ -300,18 +410,39 @@ static void test_bitflip_fuzz(void)
             continue;
         }
 
-        // ADS-C ground truth: tag_start_at[b] = byte offset of the tag
-        // that a decode truncated to (b+1) bytes fails inside of (or, in
-        // the rare case that truncation lands exactly on a trailing
-        // boundary, the truncation length itself).
-        size_t *tag_start_at = NULL;
-        if (fx->kind == FIXTURE_ADSC) {
-            tag_start_at = calloc(len, sizeof(size_t));
-            for (size_t trunc = 1; trunc <= len; trunc++) {
-                la_proto_node *n = la_adsc_parse(orig, (int)trunc, LA_MSG_DIR_AIR2GND, ARINC_MSG_ADS);
+        // ADS-C ground truth for the framing assertion (downlink only).
+        uint8_t orig_tags[64];
+        int     orig_tag_cnt   = 0;
+        bool   *is_tag_byte    = NULL;
+        bool    strong_framing = false;
+        if (fx->kind == FIXTURE_ADSC && fx->dir == LA_MSG_DIR_AIR2GND) {
+            // Original tag sequence (also the fixed-length precondition:
+            // tags 4/5 are the downlink variable-length groups; the
+            // strong framing assertion is only valid without them).
+            la_proto_node *on = la_adsc_parse(orig, (int)len, fx->dir, ARINC_MSG_ADS);
+            CHECK(on != NULL && ((la_adsc_msg_t const *)on->data)->err == false,
+                  "%s: original payload no longer parses cleanly", fx->name);
+            orig_tag_cnt   = collect_adsc_tags(on, orig_tags, (int)(sizeof orig_tags));
+            strong_framing = true;
+            for (int k = 0; k < orig_tag_cnt; k++) {
+                if (orig_tags[k] == 4 || orig_tags[k] == 5) {
+                    strong_framing = false; // variable-length group present
+                }
+            }
+            la_proto_tree_destroy(on);
+
+            // Tag-byte map via truncation: a truncation of L bytes
+            // parses cleanly iff L is an inter-tag boundary, so byte
+            // offset b starts a tag iff b == 0 or truncation to b
+            // succeeds.
+            is_tag_byte    = calloc(len, sizeof(bool));
+            is_tag_byte[0] = true;
+            for (size_t trunc = 1; trunc < len; trunc++) {
+                la_proto_node *n = la_adsc_parse(orig, (int)trunc, fx->dir, ARINC_MSG_ADS);
                 if (n != NULL) {
-                    la_adsc_msg_t const *m  = n->data;
-                    tag_start_at[trunc - 1] = (m->err && m->partial) ? m->err_offset : trunc;
+                    if (((la_adsc_msg_t const *)n->data)->err == false) {
+                        is_tag_byte[trunc] = true;
+                    }
                     la_proto_tree_destroy(n);
                 }
             }
@@ -324,8 +455,8 @@ static void test_bitflip_fuzz(void)
             mut[bit / 8] ^= (uint8_t)(1u << (7 - (bit % 8)));
 
             la_proto_node *node = (fx->kind == FIXTURE_CPDLC)
-                                      ? la_cpdlc_parse(mut, (int)len, LA_MSG_DIR_AIR2GND)
-                                      : la_adsc_parse(mut, (int)len, LA_MSG_DIR_AIR2GND, ARINC_MSG_ADS);
+                                      ? la_cpdlc_parse(mut, (int)len, fx->dir)
+                                      : la_adsc_parse(mut, (int)len, fx->dir, ARINC_MSG_ADS);
 
             bool err = true, partial = false;
             if (node != NULL) {
@@ -348,27 +479,50 @@ static void test_bitflip_fuzz(void)
             // so this reduces to the plain !err check there.)
             bool full_success = !err && !partial;
 
+            // Framing-survival assertion (see the test header comment).
+            if (fx->kind == FIXTURE_ADSC && strong_framing && !is_tag_byte[bit / 8]) {
+                framing_checked++;
+                CHECK(full_success,
+                      "%s bit %zu: value-byte flip desynced framing (parse failed)", fx->name, bit);
+                if (node != NULL && full_success) {
+                    uint8_t mut_tags[64];
+                    int     mut_cnt = collect_adsc_tags(node, mut_tags, (int)(sizeof mut_tags));
+                    CHECK(mut_cnt == orig_tag_cnt && memcmp(mut_tags, orig_tags, (size_t)orig_tag_cnt) == 0,
+                          "%s bit %zu: value-byte flip changed the tag sequence", fx->name, bit);
+                }
+            }
+
             if (full_success) {
                 rc_ok_full++;
                 la_vstring *v_on    = la_proto_tree_format_text(NULL, node);
+                la_vstring *j_on    = la_proto_tree_format_json(NULL, node);
                 char       *text_on = v_on != NULL ? strdup(v_on->str) : NULL;
+                char       *json_on = j_on != NULL ? strdup(j_on->str) : NULL;
                 if (v_on != NULL) la_vstring_destroy(v_on, true);
+                if (j_on != NULL) la_vstring_destroy(j_on, true);
                 la_proto_tree_destroy(node);
 
                 la_config_set_bool("best_effort_decode", false);
                 la_proto_node *node_off = (fx->kind == FIXTURE_CPDLC)
-                                              ? la_cpdlc_parse(mut, (int)len, LA_MSG_DIR_AIR2GND)
-                                              : la_adsc_parse(mut, (int)len, LA_MSG_DIR_AIR2GND, ARINC_MSG_ADS);
+                                              ? la_cpdlc_parse(mut, (int)len, fx->dir)
+                                              : la_adsc_parse(mut, (int)len, fx->dir, ARINC_MSG_ADS);
                 la_config_set_bool("best_effort_decode", true);
                 la_vstring *v_off    = node_off != NULL ? la_proto_tree_format_text(NULL, node_off) : NULL;
+                la_vstring *j_off    = node_off != NULL ? la_proto_tree_format_json(NULL, node_off) : NULL;
                 char       *text_off = v_off != NULL ? strdup(v_off->str) : NULL;
+                char       *json_off = j_off != NULL ? strdup(j_off->str) : NULL;
                 if (v_off != NULL) la_vstring_destroy(v_off, true);
+                if (j_off != NULL) la_vstring_destroy(j_off, true);
                 if (node_off != NULL) la_proto_tree_destroy(node_off);
 
                 CHECK(text_on != NULL && text_off != NULL && strcmp(text_on, text_off) == 0,
-                      "%s bit %zu: RC_OK-full rendering differs ON vs OFF", fx->name, bit);
+                      "%s bit %zu: full-success text rendering differs ON vs OFF", fx->name, bit);
+                CHECK(json_on != NULL && json_off != NULL && strcmp(json_on, json_off) == 0,
+                      "%s bit %zu: full-success json rendering differs ON vs OFF", fx->name, bit);
                 free(text_on);
                 free(text_off);
+                free(json_on);
+                free(json_off);
             } else {
                 rc_fail++;
                 if (partial) partials++;
@@ -377,29 +531,23 @@ static void test_bitflip_fuzz(void)
                 CHECK(v != NULL, "%s bit %zu: NULL/empty rendering on non-full-success", fx->name, bit);
                 if (v != NULL) la_vstring_destroy(v, true);
 
-                if (fx->kind == FIXTURE_ADSC && node != NULL && partial) {
-                    la_adsc_msg_t const *m            = node->data;
-                    size_t               ground_truth = tag_start_at[bit / 8];
-                    CHECK(m->err_offset >= ground_truth,
-                          "%s bit %zu: ADS-C framing desync (err_offset=%zu < tag start %zu)",
-                          fx->name, bit, m->err_offset, ground_truth);
-                }
-
                 if (node != NULL) la_proto_tree_destroy(node);
             }
 
             free(mut);
         }
 
-        free(tag_start_at);
+        free(is_tag_byte);
         free(orig);
     }
 
     la_config_set_bool("best_effort_decode", false); // restore default
 
-    printf("  %ld iterations: %ld RC_OK(full), %ld RC_FAIL (%ld yielded PARTIAL output)\n",
-           total_iters, rc_ok_full, rc_fail, partials);
+    printf("  %ld iterations: %ld full-success, %ld failed/partial (%ld yielded PARTIAL output), "
+           "%ld strong framing checks\n",
+           total_iters, rc_ok_full, rc_fail, partials, framing_checked);
     CHECK(total_iters > 2000, "fewer bit-flip iterations than expected: %ld", total_iters);
+    CHECK(framing_checked > 500, "framing-survival assertion barely exercised: %ld", framing_checked);
 }
 
 // design §6c: the real ZK-NNC FANS-1/A message from the 2026-07-06
@@ -498,6 +646,7 @@ int main(void)
     test_positive_control_mode_off();
     test_positive_control_mode_on_matches_off();
     test_adsc_truncated_payload();
+    test_adsc_review_repros();
     test_bitflip_fuzz();
     test_zknnc_acceptance();
     printf("\n=== %d passed, %d failed ===\n", passed, failed);

@@ -86,7 +86,15 @@ per_get_few_bits(asn_per_data_t *pd, int nbits) {
 	else if(off <= 24)
 		accum = ((buf[0] << 16) + (buf[1] << 8) + buf[2]) >> (24 - off);
 	else if(off <= 31)
-		accum = ((buf[0] << 24) + (buf[1] << 16)
+		/*
+		 * buf[0] promotes to (signed) int, so shifting a byte with the
+		 * top bit set left by 24 lands in the sign bit -- undefined
+		 * behaviour in C, flagged by UBSan (iridium_acars local fix,
+		 * see patches/README.md; found by the best-effort-decode
+		 * bit-flip fuzz). Do the shift in uint32_t; accum is uint32_t
+		 * anyway, so the result is bit-identical.
+		 */
+		accum = (((uint32_t)buf[0] << 24) + (buf[1] << 16)
 			+ (buf[2] << 8) + (buf[3])) >> (32 - off);
 	else if(nbits <= 31) {
 		asn_per_data_t tpd = *pd;
