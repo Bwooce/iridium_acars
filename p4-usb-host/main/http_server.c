@@ -28,6 +28,7 @@
 #include "dsp_processor.h"
 #include "signal_buffer.h"
 #include "ingest_core1.h"
+#include "burst_pipeline.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -330,8 +331,11 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
 {
     worker_histograms_t h = {0};
     worker_core1_get_histograms(&h);
+    uint32_t bp_stage_us[10] = {0};
+    uint32_t bp_first_calls = 0, bp_retry_calls = 0;
+    burst_pipeline_get_stage_us(bp_stage_us, &bp_first_calls, &bp_retry_calls); // P1.5c
 
-    char body[2048];
+    char body[3072]; // P1.5c: grew from 2048 to fit snr_pushed/duration_pushed/stage_us
     int  n = 0;
     int  m;
     m = snprintf(body + n, sizeof(body) - n,
@@ -391,8 +395,64 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
         }
     }
+    // P1.5c: push-side SNR + duration-class histograms — same bin layout
+    // as snr[] above, but recorded for EVERY burst pushed to the worker
+    // PQ (not just what got popped), so the evicted/shed population is
+    // visible. duration_pushed[0]=impulse-length, [1]=plausible-length
+    // (BURST_DURATION_CLASS_MIN_SAMPLES, worker_core1.c).
     if (n < (int)sizeof(body) - 1) {
-        m = snprintf(body + n, sizeof(body) - n, "]}\n");
+        m = snprintf(body + n, sizeof(body) - n,
+                     "],\"snr_pushed_total\":%u,\"duration_pushed_total\":%u,"
+                     "\"snr_pushed\":[",
+                     (unsigned)h.snr_pushed_total, (unsigned)h.duration_pushed_total);
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+        if (n >= (int)sizeof(body) - 1) break;
+        m = snprintf(body + n, sizeof(body) - n,
+                     "%s%u", i ? "," : "", (unsigned)h.snr_pushed[i]);
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
+    }
+    if (n < (int)sizeof(body) - 1) {
+        m = snprintf(body + n, sizeof(body) - n,
+                     "],\"duration_pushed_index\":\"0=impulse-length,1=plausible-length\","
+                     "\"duration_pushed\":[%u,%u]",
+                     (unsigned)h.duration_pushed[0], (unsigned)h.duration_pushed[1]);
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
+    }
+    // P1.5c: burst_pipeline per-stage wall-time accumulators (read-and-
+    // reset; caller computes rates from repeated polls). Order matches
+    // burst_pipeline_get_stage_us's doc comment: D13, CFO, PREROT, RRC,
+    // first try_decode_frame, retry-loop total, TDF_UW, TDF_PREROT,
+    // TDF_DECIM, TDF_QPSK.
+    if (n < (int)sizeof(body) - 1) {
+        m = snprintf(body + n, sizeof(body) - n,
+                     ",\"stage_us_index\":\"D13,CFO,PREROT,RRC,TDF_first,TDF_retry,"
+                     "TDF_UW,TDF_PREROT,TDF_DECIM,TDF_QPSK\","
+                     "\"stage_us\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
+                     "\"stage_first_calls\":%u,\"stage_retry_calls\":%u",
+                     (unsigned)bp_stage_us[0], (unsigned)bp_stage_us[1],
+                     (unsigned)bp_stage_us[2], (unsigned)bp_stage_us[3],
+                     (unsigned)bp_stage_us[4], (unsigned)bp_stage_us[5],
+                     (unsigned)bp_stage_us[6], (unsigned)bp_stage_us[7],
+                     (unsigned)bp_stage_us[8], (unsigned)bp_stage_us[9],
+                     (unsigned)bp_first_calls, (unsigned)bp_retry_calls);
+        if (m > 0) {
+            n += m;
+            if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+        }
+    }
+    if (n < (int)sizeof(body) - 1) {
+        m = snprintf(body + n, sizeof(body) - n, "}\n");
         if (m > 0) {
             n += m;
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;

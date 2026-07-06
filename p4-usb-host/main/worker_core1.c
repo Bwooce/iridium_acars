@@ -216,12 +216,32 @@ static _Atomic uint32_t s_hist_snr[HIST_SNR_BINS]; // bin i = bursts with floor(
 #define HIST_BCH_BINS 16                           // (e1+1)*4 + (e2+1), e ∈ {-1..2}
 static _Atomic uint32_t s_hist_bch[HIST_BCH_BINS];
 
-static inline void hist_snr_record(float snr_db)
+// P1.5c observability: s_hist_snr above only ever sees POPPED bursts (the
+// worker extracted them off the PQ) — the population EVICTED/dropped at
+// push time (arguably the more interesting one, post-T60/P1.5c) is
+// invisible. Mirror the same bin layout on the push side, recorded for
+// EVERY burst handed to worker_core1_push_burst (same point as
+// hist_freq_record below — "ALL detections", before the stale-reject
+// early-return), plus a 2-bin duration-class split so the "evicted
+// because too short" story is visible without needing a live serial log.
+static _Atomic uint32_t s_hist_snr_pushed[HIST_SNR_BINS];
+#define HIST_DURATION_BINS 2 // 0 = below BURST_DURATION_CLASS_MIN_SAMPLES, 1 = at/above
+static _Atomic uint32_t s_hist_duration_pushed[HIST_DURATION_BINS];
+
+static inline void hist_snr_record_into(_Atomic uint32_t *hist, float snr_db)
 {
     int bin = (int)snr_db;
     if (bin < 0) bin = 0;
     if (bin >= HIST_SNR_BINS) bin = HIST_SNR_BINS - 1;
-    s_hist_snr[bin]++;
+    hist[bin]++;
+}
+static inline void hist_snr_record(float snr_db)
+{
+    hist_snr_record_into(s_hist_snr, snr_db);
+}
+static inline void hist_duration_record_pushed(uint32_t length_samples)
+{
+    s_hist_duration_pushed[length_samples >= BURST_DURATION_CLASS_MIN_SAMPLES ? 1 : 0]++;
 }
 static inline void hist_bch_record(int e1, int e2)
 {
@@ -1165,7 +1185,9 @@ void worker_core1_push_burst(const detected_burst_t *burst)
 {
     if (!s_pq_lock) return;
     s_bursts_queued++;
-    hist_freq_record(burst->rel_freq_hz); // band occupancy of ALL detections
+    hist_freq_record(burst->rel_freq_hz);                        // band occupancy of ALL detections
+    hist_snr_record_into(s_hist_snr_pushed, burst->peak_snr_db); // P1.5c: SNR of ALL detections
+    hist_duration_record_pushed(burst->length_samples);          // P1.5c: duration class of ALL detections
 
     // P1 stale-reject at PUSH: don't queue bursts that are already
     // unrecoverable — they would only be popped and dropped by the
@@ -1227,9 +1249,23 @@ void worker_core1_get_histograms(worker_histograms_t *out)
         out->freq[i] = s_hist_freq[i];
         total_freq += s_hist_freq[i];
     }
-    out->snr_total  = total_snr;
-    out->bch_total  = total_bch;
-    out->freq_total = total_freq;
+    // P1.5c: push-side SNR + duration-class histograms (ALL detections,
+    // not just what the worker popped) — see s_hist_snr_pushed comment.
+    uint32_t total_snr_pushed = 0;
+    for (int i = 0; i < HIST_SNR_BINS; i++) {
+        out->snr_pushed[i] = s_hist_snr_pushed[i];
+        total_snr_pushed += s_hist_snr_pushed[i];
+    }
+    uint32_t total_duration_pushed = 0;
+    for (int i = 0; i < HIST_DURATION_BINS; i++) {
+        out->duration_pushed[i] = s_hist_duration_pushed[i];
+        total_duration_pushed += s_hist_duration_pushed[i];
+    }
+    out->snr_total             = total_snr;
+    out->bch_total             = total_bch;
+    out->freq_total            = total_freq;
+    out->snr_pushed_total      = total_snr_pushed;
+    out->duration_pushed_total = total_duration_pushed;
 }
 
 void worker_core1_get_stats(worker_stats_t *out)

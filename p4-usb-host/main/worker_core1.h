@@ -49,13 +49,26 @@ void worker_core1_get_stats(worker_stats_t *out);
 //   bch[16]  bin ((e1+1)*4 + (e2+1)) for e in {-1=fail, 0,1,2=corrected}.
 // snr_total = sum(snr); bch_total = sum(bch). UW Hamming histogram is
 // deliberately deferred (requires decoded_frame_t API change to plumb).
+//
+// P1.5c: snr/bch/freq above are POP-side (or, for freq, all detections) —
+// snr[] specifically only sees bursts the worker actually extracted off
+// the PQ. snr_pushed[]/duration_pushed[] are recorded for EVERY burst
+// handed to worker_core1_push_burst (before the stale-reject and PQ
+// eviction), so the population the PQ sheds is visible too:
+//   snr_pushed[32]      same bin layout as snr[], but ALL pushes
+//   duration_pushed[2]  0 = length_samples < BURST_DURATION_CLASS_MIN_SAMPLES
+//                       (impulse-length), 1 = at/above (plausible-length)
 typedef struct {
     uint32_t snr[32];
     uint32_t bch[16];
     uint32_t freq[40]; // band occupancy: ALL detections bucketed by rel_freq
+    uint32_t snr_pushed[32];
+    uint32_t duration_pushed[2];
     uint32_t snr_total;
     uint32_t bch_total;
     uint32_t freq_total;
+    uint32_t snr_pushed_total;
+    uint32_t duration_pushed_total;
 } worker_histograms_t;
 void worker_core1_get_histograms(worker_histograms_t *out);
 
