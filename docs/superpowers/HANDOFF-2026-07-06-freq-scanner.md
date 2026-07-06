@@ -83,6 +83,40 @@ PIE fix or an honest `Smoke-skip:` decision — a human call.
 - T8: `fi_urb` fault-injection path doesn't restore `s_live_xfers` (test-only drift);
   `esp_libusb_pause_stream` comment still says "frees" (stale).
 
+## SDD run state — PAUSED, not finished (resume here)
+
+This branch was built with the subagent-driven-development (SDD) workflow. The run
+is **paused, not complete** — the ledger below is a live recovery map (its on-disk
+copy at `.superpowers/sdd/progress.md` is git-ignored; this committed copy survives
+`git clean`). To resume: re-enter SDD (`superpowers:subagent-driven-development`),
+skip the tasks marked complete, and continue from the outstanding steps.
+
+**Tasks (all implemented + per-task-reviewed clean):**
+- Task 1: fft_burst_tagger reset_baseline (1829473..7b8090f)
+- Task 2: scanner_map pure logic + host test (7b8090f..9cc99c4)
+- Task 3: dsp_processor narrowband-density counters (9cc99c4..62c594e)
+- Task 4: class_driver_retune accessor (62c594e..9cdea46)
+- Task 5: scanner hop/scan orchestration (9cdea46..bf7bd92)
+- Task 6: hop/scan/map serial commands (bf7bd92..2819109; device-verified after 7/8)
+- Task 7: stream-pause retune on usb_pump + robustness fix (2819109..5fb83d7)
+- Task 8: park transfers across pause/resume (d392249)
+
+**Outstanding SDD steps (NOT done):**
+1. **Final whole-branch review** — package at `.superpowers/sdd/review-7f77955..d392249.diff`
+   (regenerate with `git diff 7f77955..d392249` if the scratch is gone). Dispatch a
+   capable reviewer over the whole scanner diff before merge.
+2. **finishing-a-development-branch** — never run.
+3. **"Task 9" (deferred by user decision): DMA-internal budget** for scan reliability
+   (see the deferred list above). This is the real gate on the scanner being useful.
+
+**Minor findings roll-up for the final review** (carried from per-task reviews):
+- T3: density tap after `if(!user_cb)return` (latent, no live impact).
+- T7: dsp_feed/usbring_reset race (data glitch not crash); `actions` bitmask
+  non-atomic 3rd writer; ACTION_RETUNE log-width cosmetic.
+- T8: fi_urb fault-injection counter drift (test-only); pause_stream comment stale.
+- KNOWN LIMIT (deferred): rapid scan exhausts DMA-internal heap → hop
+  timeouts / EP-stall / OOM. Manual hop reliable.
+
 ## Architecture (scanner)
 
 - `p4-usb-host/main/scanner.{c,h}` — control-plane module: `scanner_hop`,
