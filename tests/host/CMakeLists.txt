@@ -24,6 +24,25 @@ if(HOST_TESTS_UBSAN)
     )
 endif()
 
+# ASan+UBSan: full memory-safety + undefined-behavior instrumentation for
+# the libacars best-effort decode work (2026-07-07 design doc, §6b bit-flip
+# fuzz). Wider than HOST_TESTS_UBSAN above (which only covers
+# signed-integer-overflow/shift/bounds for the DSP hot paths) -- this is
+# needed to validate the ASN.1 uPER / ADS-C best-effort decode paths
+# against corrupted input (constr_CHOICE/constr_SEQUENCE partial-tree
+# traversal on RC_FAIL). Off by default for the same reason as
+# HOST_TESTS_UBSAN. Enable with `cmake -DHOST_TESTS_ASAN=ON`.
+option(HOST_TESTS_ASAN "Build host tests with -fsanitize=address,undefined" OFF)
+if(HOST_TESTS_ASAN)
+    add_compile_options(
+        -fsanitize=address,undefined
+        -fno-sanitize-recover=all
+    )
+    add_link_options(
+        -fsanitize=address,undefined
+    )
+endif()
+
 # Pull production sources directly from common/iridium_decoder/ so the
 # host tests exercise the exact code that runs on the target. The
 # decoder lives in common/ so it can be shared with the future worker
@@ -553,6 +572,60 @@ target_compile_options(test_libacars_link PRIVATE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
 )
+
+# libacars best-effort decode (2026-07-07 design, Phase H / §6d): a
+# host-only build of the CPDLC (ASN.1 uPER) + ADS-C sub-decoders, which no
+# current target compiles (common/libacars_idf/ deliberately stubs them out
+# -- see its CMakeLists.txt comment -- device enablement is a later phase).
+# Source set mirrors what libacars/build/ links for the "acars_core" +
+# "asn1" objects, minus MIAM/OHMA/media-adv (stay stubbed; would need
+# zlib/jansson/libxml2). asn1/ is globbed rather than hand-listed: it's a
+# single vendored drop of 490 pure-C FANS ASN.1 module files with no
+# external deps (design §1), so there's no risk of silently picking up
+# something requiring zlib/jansson/libxml2.
+file(GLOB LIBACARS_ASN1_SRCS ${LIBACARS_SRC}/asn1/*.c)
+set(LIBACARS_BEST_EFFORT_SRCS
+    ${LIBACARS_SRC}/arinc.c
+    ${LIBACARS_SRC}/cpdlc.c
+    ${LIBACARS_SRC}/adsc.c
+    ${LIBACARS_SRC}/bitstream.c
+    ${LIBACARS_SRC}/asn1-util.c
+    ${LIBACARS_SRC}/asn1-format-common.c
+    ${LIBACARS_SRC}/asn1-format-cpdlc-text.c
+    ${LIBACARS_SRC}/asn1-format-cpdlc-json.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_ASN1_SRCS}
+)
+
+add_executable(test_libacars_best_effort
+    test_libacars_best_effort.c
+    ${LIBACARS_BEST_EFFORT_SRCS}
+)
+target_include_directories(test_libacars_best_effort PRIVATE
+    ${LIBACARS_UPSTREAM}        # for <libacars/...> includes
+    ${LIBACARS_IDF_DIR}         # for "config.h"
+)
+target_compile_options(test_libacars_best_effort PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+    -Wno-unused-variable
+)
+target_link_libraries(test_libacars_best_effort PRIVATE m)
+add_test(NAME libacars_best_effort COMMAND test_libacars_best_effort)
 
 # D8: fine carrier frequency estimator (companion to D7's channelizer).
 add_executable(test_freq_estimator
