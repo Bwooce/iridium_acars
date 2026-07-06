@@ -104,6 +104,7 @@ typedef struct {
     uint32_t gone_bursts; // tagger bursts ended in this window
     uint32_t step_us;     // total fft_burst_tagger_step wall time
     uint32_t tag_steps;   // tagger steps in this window
+    uint32_t coalesced;   // gone bursts suppressed by the P1.5 coalescer (0 unless coal_n >= 2)
 } dsp_stage_stats_t;
 
 void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out);

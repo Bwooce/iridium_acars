@@ -51,6 +51,8 @@ static void cmd_config(void)
     uart_puts(buf);
     snprintf(buf, sizeof(buf), "tag_thr=%.2f\r\n", (double)c.tagger_threshold_db);
     uart_puts(buf);
+    snprintf(buf, sizeof(buf), "coal_n=%u\r\n", (unsigned)c.coalesce_min_bursts);
+    uart_puts(buf);
     snprintf(buf, sizeof(buf), "ota_url=%s\r\n", c.ota_url);
     uart_puts(buf);
 }
@@ -82,6 +84,8 @@ static void cmd_get(const char *key)
         snprintf(buf, sizeof(buf), "%d\r\n", (int)c.bias_tee);
     else if (strcmp(key, "tag_thr") == 0)
         snprintf(buf, sizeof(buf), "%.2f\r\n", (double)c.tagger_threshold_db);
+    else if (strcmp(key, "coal_n") == 0)
+        snprintf(buf, sizeof(buf), "%u\r\n", (unsigned)c.coalesce_min_bursts);
     else if (strcmp(key, "ota_url") == 0)
         snprintf(buf, sizeof(buf), "%s\r\n", c.ota_url);
     else {
@@ -116,6 +120,8 @@ static void cmd_set(const char *key, const char *val)
         rc = app_config_set_bias_tee(atoi(val) != 0);
     else if (strcmp(key, "tag_thr") == 0)
         rc = app_config_set_tagger_threshold_db((float)atof(val));
+    else if (strcmp(key, "coal_n") == 0)
+        rc = app_config_set_coalesce_min_bursts((uint8_t)atoi(val));
     else if (strcmp(key, "ota_url") == 0)
         rc = app_config_set_ota_url(val);
     else {

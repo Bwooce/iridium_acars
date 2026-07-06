@@ -146,10 +146,11 @@ static void emit(const status_snapshot_t *s)
     {
         uint32_t ts = s->dsp.tag_steps ? s->dsp.tag_steps : 1;
         ESP_LOGI(TAG,
-                 "fbt: new=%u gone=%u frames=%u step_us=%u "
+                 "fbt: new=%u gone=%u coal=%u frames=%u step_us=%u "
                  "wind=%.0f fft=%.0f mag=%.0f det=%.0f base=%.0f "
                  "(us/step, steps=%u)",
                  (unsigned)s->dsp.new_bursts, (unsigned)s->dsp.gone_bursts,
+                 (unsigned)s->dsp.coalesced,
                  (unsigned)s->dsp.frames, (unsigned)s->dsp.step_us,
                  s->dsp.wind_us, s->dsp.fft_us, s->dsp.mag_us,
                  s->dsp.detect_us, s->dsp.baseline_us, (unsigned)ts);

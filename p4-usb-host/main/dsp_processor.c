@@ -110,6 +110,12 @@ struct dsp_processor {
     _Atomic(uint32_t) acc_nb_bursts;   // width <= DSP_NARROWBAND_MAX_BINS
     _Atomic(uint32_t) acc_dens_bursts; // all gone bursts in the window
     _Atomic(uint64_t) acc_snr_milli;   // sum of SNR(dB) * 1000
+
+    // P1.5 same-instant gone-burst coalescer (NON-GRI heuristic; see
+    // dispatch_gone_batch). 0/1 = disabled (default). Snapshot of the
+    // NVS "coal_n" config value at create.
+    uint8_t           coalesce_min;
+    _Atomic(uint32_t) acc_coalesced; // gone bursts suppressed by the coalescer
 };
 
 // Process "default" instance for cross-task diagnostic getters that
@@ -166,6 +172,65 @@ static void dispatch_gone_burst(dsp_processor_t *p, const fbt_burst_t *b)
     p->user_cb(&out);
 }
 
+// Dispatch a batch of gone bursts (one tagger step's worth, or the
+// flush residue), optionally coalescing same-instant multi-bin events
+// first.
+//
+// P1.5 companion heuristic — NON-GRI: gr-iridium has no equivalent
+// (its tagged_burst_to_pdu dispatches every gone burst). Bench soak
+// 2026-07-06/07: the junk load is impulsive and band-wide — ONE
+// impulse tags MANY narrow bursts with near-identical start times
+// across the band, each of which costs the worker a triage pass.
+// When >= coalesce_min gone bursts share a start within one FFT step
+// (FBT_FFT_SIZE = 2048 samples), keep only the strongest
+// (magnitude_db) and drop the rest, counting them in acc_coalesced
+// (`fbt: coal=` in the status log). A real Iridium burst occupies ONE
+// channel, so a same-instant many-bin cluster is interference by
+// construction — but simultaneous bursts on different channels from
+// different satellites ARE physically possible, which is why this
+// ships DEFAULT OFF (NVS coal_n = 0) for an explicit A/B.
+//
+// Scope limit: within one gone batch only (stateless). Cluster
+// members whose gone events straddle a step boundary are not
+// coalesced — acceptable for an off-by-default load-shedder aimed at
+// single-impulse events whose members share one last_active step.
+static void dispatch_gone_batch(dsp_processor_t *p, const fbt_burst_t *b, int n)
+{
+    if (p->coalesce_min >= 2 && n >= (int)p->coalesce_min) {
+        bool drop[FBT_GONE_BUF_SIZE] = {false};
+        for (int i = 0; i < n; i++) {
+            if (drop[i]) continue;
+            int idx[FBT_GONE_BUF_SIZE];
+            int m = 0;
+            for (int j = 0; j < n; j++) {
+                if (drop[j]) continue;
+                uint64_t d = b[i].start > b[j].start ? b[i].start - b[j].start
+                                                     : b[j].start - b[i].start;
+                if (d < FBT_FFT_SIZE) idx[m++] = j; // includes j == i
+            }
+            if (m < (int)p->coalesce_min) continue;
+            int best = idx[0];
+            for (int k = 1; k < m; k++) {
+                if (b[idx[k]].magnitude_db > b[best].magnitude_db) best = idx[k];
+            }
+            for (int k = 0; k < m; k++) {
+                if (idx[k] != best) drop[idx[k]] = true;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            if (drop[i]) {
+                atomic_fetch_add_explicit(&p->acc_coalesced, 1u,
+                                          memory_order_relaxed);
+                continue;
+            }
+            dispatch_gone_burst(p, &b[i]);
+        }
+        return;
+    }
+    for (int i = 0; i < n; i++)
+        dispatch_gone_burst(p, &b[i]);
+}
+
 // Process one FFT-aligned chunk: hand it to the tagger, advance the
 // sample index, dispatch gone-burst events.
 static void process_chunk(dsp_processor_t *p, const int16_t *chunk_iq)
@@ -183,8 +248,7 @@ static void process_chunk(dsp_processor_t *p, const int16_t *chunk_iq)
     atomic_fetch_add_explicit(&p->acc_step_us, (uint64_t)(t1 - t0), memory_order_relaxed);
 
     if (ok) {
-        for (int i = 0; i < n_gone; i++)
-            dispatch_gone_burst(p, &gone_bursts[i]);
+        dispatch_gone_batch(p, gone_bursts, n_gone);
         atomic_fetch_add_explicit(&p->acc_new_bursts, (uint32_t)n_new, memory_order_relaxed);
         atomic_fetch_add_explicit(&p->acc_gone_bursts, (uint32_t)n_gone, memory_order_relaxed);
     }
@@ -203,8 +267,7 @@ void dsp_processor_flush(dsp_processor_t *p)
     fbt_burst_t flushed[FBT_GONE_BUF_SIZE];
     int         n = FBT_GONE_BUF_SIZE;
     fft_burst_tagger_flush(p->tagger, flushed, &n);
-    for (int i = 0; i < n; i++)
-        dispatch_gone_burst(p, &flushed[i]);
+    dispatch_gone_batch(p, flushed, n);
     atomic_fetch_add_explicit(&p->acc_gone_bursts, (uint32_t)n, memory_order_relaxed);
     ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
@@ -218,8 +281,9 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     float thr = cfg.tagger_threshold_db;
     if (thr <= 0.0f || thr > 30.0f) thr = FBT_THRESHOLD_DB; // sanity
     ESP_LOGI(TAG,
-             "Creating wideband fft_burst_tagger (N=%d, fs=%u Hz, thr=%.1f dB)",
-             FBT_FFT_SIZE, (unsigned)FS_DETECT_HZ, (double)thr);
+             "Creating wideband fft_burst_tagger (N=%d, fs=%u Hz, thr=%.1f dB, coal_n=%u)",
+             FBT_FFT_SIZE, (unsigned)FS_DETECT_HZ, (double)thr,
+             (unsigned)cfg.coalesce_min_bursts);
 
     // 4 MB baseline_history in PSRAM. Internal SRAM doesn't have room
     // (int32 × FFT_SIZE × HISTORY_SIZE = 2048 × 512 × 4 = 4 MB).
@@ -258,6 +322,7 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     p->user_cb          = cb;
     p->baseline_history = baseline_history;
     p->tagger           = tagger;
+    p->coalesce_min     = cfg.coalesce_min_bursts; // 0/1 = off (default)
 
     fft_burst_tagger_set_start(p->tagger, 0);
     s_default = p; // publish for cross-task diagnostic readers
@@ -340,6 +405,7 @@ void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)
     out->gone_bursts = acc_gone_snap;
     out->step_us     = (uint32_t)acc_step_us_snap;
     out->tag_steps   = tag_steps;
+    out->coalesced   = atomic_exchange_explicit(&p->acc_coalesced, 0, memory_order_relaxed);
 }
 
 void dsp_processor_read_reset_density(dsp_processor_t *p, dsp_density_t *out)

@@ -46,6 +46,18 @@ typedef struct {
     bool  bias_tee;            // RTL-SDR v4 bias tee on/off
     float tagger_threshold_db; // FFT burst tagger SNR threshold
 
+    // P1.5 companion heuristic (NON-GRI; gr-iridium has no equivalent):
+    // same-instant multi-bin gone-burst coalescing in dsp_processor.
+    // One band-wide impulse tags MANY narrow bursts with near-identical
+    // start times; when >= this many gone-bursts in one tagger step
+    // share a start within one FFT step (2048 samples), only the
+    // strongest is dispatched to the worker and the rest are dropped
+    // (counted in the fbt: coal= diagnostic). 0 (default) or 1 =
+    // DISABLED — burst-for-burst identical to gr-iridium's dispatch.
+    // Applied at detector create; reboot (or scanner re-create) to
+    // change. NVS key "coal_n".
+    uint8_t coalesce_min_bursts;
+
     char     station_id[APP_CONFIG_STATION_ID_LEN]; // for upstream/log identification
     char     wifi_ssid[APP_CONFIG_WIFI_SSID_LEN];   // for D17 C6 wireless
     char     wifi_psk[APP_CONFIG_WIFI_PSK_LEN];     // for D17 C6 wireless
@@ -79,6 +91,7 @@ esp_err_t app_config_set_gain_mode(gain_mode_t mode);
 esp_err_t app_config_set_gain_db_x10(int16_t v);
 esp_err_t app_config_set_bias_tee(bool on);
 esp_err_t app_config_set_tagger_threshold_db(float db);
+esp_err_t app_config_set_coalesce_min_bursts(uint8_t n);
 esp_err_t app_config_set_station_id(const char *id);
 esp_err_t app_config_set_wifi_ssid(const char *ssid);
 esp_err_t app_config_set_wifi_psk(const char *psk);

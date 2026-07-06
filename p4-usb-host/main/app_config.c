@@ -25,6 +25,7 @@ static const char *NVS_NS = "iridium";
 #define DEFAULT_GAIN_DB_X10 350 // 35.0 dB (rec'd for live)
 #define DEFAULT_BIAS_TEE false
 #define DEFAULT_TAGGER_THRESHOLD_DB 10.0f
+#define DEFAULT_COALESCE_MIN_BURSTS 0 // 0 = coalescer disabled (gri-parity dispatch)
 #define DEFAULT_STATION_ID "p4-iridium-1"
 #define DEFAULT_WIFI_SSID ""
 #define DEFAULT_WIFI_PSK ""
@@ -112,6 +113,7 @@ esp_err_t app_config_init(void)
     s_cfg.gain_db_x10         = DEFAULT_GAIN_DB_X10;
     s_cfg.bias_tee            = DEFAULT_BIAS_TEE;
     s_cfg.tagger_threshold_db = DEFAULT_TAGGER_THRESHOLD_DB;
+    s_cfg.coalesce_min_bursts = DEFAULT_COALESCE_MIN_BURSTS;
     strncpy(s_cfg.station_id, DEFAULT_STATION_ID, APP_CONFIG_STATION_ID_LEN - 1);
     s_cfg.station_id[APP_CONFIG_STATION_ID_LEN - 1] = '\0';
     s_cfg.wifi_ssid[0]                              = '\0';
@@ -152,6 +154,7 @@ esp_err_t app_config_init(void)
     nvs_get_i16_or(h, "gain_dbx10", &s_cfg.gain_db_x10, DEFAULT_GAIN_DB_X10);
     nvs_get_u8_or(h, "bias_tee", &bt, (uint8_t)DEFAULT_BIAS_TEE);
     nvs_get_f32_or(h, "tag_thr", &s_cfg.tagger_threshold_db, DEFAULT_TAGGER_THRESHOLD_DB);
+    nvs_get_u8_or(h, "coal_n", &s_cfg.coalesce_min_bursts, DEFAULT_COALESCE_MIN_BURSTS);
     nvs_get_str_or(h, "station", s_cfg.station_id, APP_CONFIG_STATION_ID_LEN,
                    DEFAULT_STATION_ID);
     nvs_get_str_or(h, "wifi_ssid", s_cfg.wifi_ssid, APP_CONFIG_WIFI_SSID_LEN, "");
@@ -268,6 +271,7 @@ SET_FIELD_NUM(app_config_set_lo_freq_hz, lo_freq_hz, uint32_t, "lo_hz", commit_o
 SET_FIELD_NUM(app_config_set_sample_rate_hz, sample_rate_hz, uint32_t, "rate_hz", commit_one_u32)
 SET_FIELD_NUM(app_config_set_gain_db_x10, gain_db_x10, int16_t, "gain_dbx10", commit_one_i16)
 SET_FIELD_NUM(app_config_set_tagger_threshold_db, tagger_threshold_db, float, "tag_thr", commit_one_f32)
+SET_FIELD_NUM(app_config_set_coalesce_min_bursts, coalesce_min_bursts, uint8_t, "coal_n", commit_one_u8)
 
 esp_err_t app_config_set_gain_mode(gain_mode_t mode)
 {
@@ -343,6 +347,9 @@ void app_config_log(void)
              MODES[mi], c.gain_db_x10 / 10.0f, c.bias_tee);
     ESP_LOGI(TAG, "tagger threshold=%.1f dB  station_id='%s'",
              (double)c.tagger_threshold_db, c.station_id);
+    ESP_LOGI(TAG, "gone-burst coalescer: %s (coal_n=%u)",
+             c.coalesce_min_bursts >= 2 ? "ENABLED (non-gri heuristic)" : "disabled",
+             (unsigned)c.coalesce_min_bursts);
     ESP_LOGI(TAG, "wifi_ssid='%s'  wifi_psk=%s",
              c.wifi_ssid, (c.wifi_psk[0] ? "(set)" : "(unset)"));
     if (c.out_host[0] && c.out_port) {
