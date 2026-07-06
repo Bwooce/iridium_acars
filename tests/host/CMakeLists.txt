@@ -589,11 +589,22 @@ target_compile_options(test_libacars_link PRIVATE
 # single vendored drop of 490 pure-C FANS ASN.1 module files with no
 # external deps (design §1), so there's no risk of silently picking up
 # something requiring zlib/jansson/libxml2.
+#
+# acars.c IS included here (unlike test_libacars_link's minimum set) so
+# the §6c ZK-NNC acceptance test can build a real ACARS frame and let
+# la_acars_parse() dispatch into the real la_arinc_parse() -> cpdlc.c
+# chain itself (acars.c:130-194's la_acars_apps_parse_and_reassemble,
+# label "H1" branch), instead of calling la_arinc_parse() directly like
+# the other fixtures do. That needs stubs for the three OTHER app
+# decoders acars.c hard-references (miam/ohma/media-adv) -- reuses the
+# same stub signatures as common/libacars_idf/port/libacars_app_stubs.c
+# but WITHOUT its la_arinc_parse stub, since we want the real one linked.
 file(GLOB LIBACARS_ASN1_SRCS ${LIBACARS_SRC}/asn1/*.c)
 set(LIBACARS_BEST_EFFORT_SRCS
     ${LIBACARS_SRC}/arinc.c
     ${LIBACARS_SRC}/cpdlc.c
     ${LIBACARS_SRC}/adsc.c
+    ${LIBACARS_SRC}/acars.c
     ${LIBACARS_SRC}/bitstream.c
     ${LIBACARS_SRC}/asn1-util.c
     ${LIBACARS_SRC}/asn1-format-common.c
@@ -611,6 +622,7 @@ set(LIBACARS_BEST_EFFORT_SRCS
     ${LIBACARS_SRC}/vstring.c
     ${LIBACARS_IDF_DIR}/version.c
     ${LIBACARS_ASN1_SRCS}
+    libacars_miam_ohma_media_stubs.c
 )
 
 add_executable(test_libacars_best_effort
