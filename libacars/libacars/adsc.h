@@ -53,12 +53,23 @@ typedef struct {
 	// just make that trust boundary explicit. partial/failed_tag/
 	// err_offset are only meaningful when err == true (adsc.c's tag loop
 	// sets them iff best_effort_decode was ON at parse time -- when OFF,
-	// they stay zeroed and rendering is bit-for-bit today's behaviour).
+	// they stay zeroed). Per-TAG rendering is identical in BOTH modes
+	// and matches upstream (a failed tag renders "-- Unparseable tag %u";
+	// its partially-populated data, if any, is freed at the failure site
+	// and never rendered -- calloc'd-zero tails would read as fabricated
+	// values). The flag only adds the message-level trust banner (text)
+	// and the partial/failed_tag/err_offset JSON fields.
+	// Slot accounting vs upstream's four reserved pointers: partial +
+	// failed_tag round up to one pointer-sized word, err_offset takes
+	// another -- two reserved slots consumed, two must remain to keep
+	// sizeof unchanged. Verified equal to upstream 2.2.1: 48 bytes on
+	// x86-64, 24 bytes on -m32.
 	bool partial;
 	uint8_t failed_tag;    // the tag byte the parser was on when it gave up
 	size_t err_offset;     // byte offset into the ADS-C payload of that tag
 	// reserved for future use
 	void (*reserved0)(void);
+	void (*reserved1)(void);
 } la_adsc_msg_t;
 
 // generic tag structure

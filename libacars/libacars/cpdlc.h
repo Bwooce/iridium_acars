@@ -39,12 +39,18 @@ typedef struct {
 	// consumed_bits is only meaningful when partial == true; see cpdlc.c
 	// for how it's derived from asn_dec_rval_t.consumed (byte-granular,
 	// not bit-exact -- see per_decoder.c / patches/README.md #0004).
+	// Slot accounting vs upstream's four reserved pointers: the two new
+	// bools pack into err's existing trailing padding (zero size cost);
+	// the two size_t fields consume two reserved slots; two must remain
+	// to keep sizeof unchanged. Verified equal to upstream 2.2.1:
+	// 56 bytes on x86-64, 28 bytes on -m32.
 	bool partial;
 	bool trailing_junk;
 	size_t consumed_bits;   // meaningful iff partial == true
 	size_t total_bits;      // input length in bits, for the banner's "of %zu"
 	// reserved for future use
 	void (*reserved0)(void);
+	void (*reserved1)(void);
 } la_cpdlc_msg;
 
 // cpdlc.c
