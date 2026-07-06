@@ -5,6 +5,13 @@ deferred, and how to continue. Companion docs: the design spec and plan under
 `docs/superpowers/specs/` and `docs/superpowers/plans/` (both dated 2026-07-06),
 and the SDD progress ledger at `.superpowers/sdd/progress.md` (git-ignored scratch).
 
+> **2026-07-06 (later) correction:** several claims below are superseded by
+> `ANALYSIS-2026-07-06-path-to-first-acars.md`: the bench DID decode 233 real
+> frames in 14 h (the monitor's grep patterns were wrong); the decode floor is
+> a tagger frozen-baseline latch, not the antenna; the overnight reboots are
+> PIE-coproc-save panics in production; and the scan DMA failure is control-
+> transfer churn, not bulk-size exhaustion.
+
 ## TL;DR
 
 - **T60 (narrowband spectral-width priority)** — DONE, production-verified on device,
