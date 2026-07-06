@@ -250,6 +250,9 @@ esp_err_t class_driver_retune(uint32_t hz)
         s_retune_done = xSemaphoreCreateBinary();
         if (!s_retune_done) return ESP_FAIL;
     }
+    // Clear any stale completion left by a previous timed-out retune so we
+    // wait for THIS request's completion, not the last one's.
+    (void)xSemaphoreTake(s_retune_done, 0);
     s_pending_retune_hz = hz;
     s_driver_obj.actions |= ACTION_RETUNE;
     // wait up to 3 s for the pump task to complete the quiesced retune
@@ -577,8 +580,11 @@ void class_driver_task(void *arg)
             s_driver_obj.actions &= ~ACTION_RETUNE;
             uint32_t hz = s_pending_retune_hz;
             esp_libusb_pause_stream(&s_driver_obj);
-            int r = rtlsdr_set_center_freq(rtldev, hz);
-            esp_libusb_resume_stream(&s_driver_obj, 0x81);
+            int r  = rtlsdr_set_center_freq(rtldev, hz);
+            int rr = esp_libusb_resume_stream(&s_driver_obj, 0x81);
+            if (rr != 0)
+                ESP_LOGE(TAG, "resume_stream returned %d after retune to %lu Hz — sample stream may be degraded/down",
+                         rr, (unsigned long)hz);
             ESP_LOGI(TAG, "retune to %lu Hz -> r=%d (stream resumed)", (unsigned long)hz, r);
             s_last_retune_ok = (r == 0);
             if (s_retune_done) xSemaphoreGive(s_retune_done);
