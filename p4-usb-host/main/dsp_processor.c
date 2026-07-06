@@ -221,6 +221,29 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
              "Creating wideband fft_burst_tagger (N=%d, fs=%u Hz, thr=%.1f dB)",
              FBT_FFT_SIZE, (unsigned)FS_DETECT_HZ, (double)thr);
 
+    // 4 MB baseline_history in PSRAM. Internal SRAM doesn't have room
+    // (int32 × FFT_SIZE × HISTORY_SIZE = 2048 × 512 × 4 = 4 MB).
+    size_t   bytes            = (size_t)FBT_FFT_SIZE * FBT_HISTORY_SIZE * sizeof(int32_t);
+    int32_t *baseline_history = (int32_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!baseline_history) {
+        ESP_LOGE(TAG, "baseline_history alloc %zu bytes (PSRAM) failed", bytes);
+        return NULL;
+    }
+
+    // Allocate the 66 KB tagger struct BEFORE the ~8 KB handle: the handle
+    // carved from the largest internal block leaves it just under the
+    // tagger's size when the budget is tight (seen in the smoke build:
+    // largest 73728 -> 65536 < 66672 -> create failed). Biggest-first
+    // avoids the fragmentation; the handle fits any smaller fragment.
+    fft_burst_tagger_t *tagger = fft_burst_tagger_init(FBT_BURST_PRE_LEN, FBT_BURST_POST_LEN,
+                                                       FBT_BURST_WIDTH, thr,
+                                                       baseline_history);
+    if (!tagger) {
+        ESP_LOGE(TAG, "fft_burst_tagger_init failed");
+        heap_caps_free(baseline_history);
+        return NULL;
+    }
+
     // Internal SRAM for the handle so the hot-path accum[] stays fast
     // (it was file-scope .bss / internal before). The struct holds no
     // PIE buffers, so its placement is perf-only, not correctness.
@@ -228,29 +251,13 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     if (!p) {
         ESP_LOGE(TAG, "dsp_processor handle alloc (%zu bytes internal) failed",
                  sizeof(*p));
+        fft_burst_tagger_destroy(tagger);
+        heap_caps_free(baseline_history);
         return NULL;
     }
-    p->user_cb = cb;
-
-    // 4 MB baseline_history in PSRAM. Internal SRAM doesn't have room
-    // (int32 × FFT_SIZE × HISTORY_SIZE = 2048 × 512 × 4 = 4 MB).
-    size_t bytes        = (size_t)FBT_FFT_SIZE * FBT_HISTORY_SIZE * sizeof(int32_t);
-    p->baseline_history = (int32_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
-    if (!p->baseline_history) {
-        ESP_LOGE(TAG, "baseline_history alloc %zu bytes (PSRAM) failed", bytes);
-        heap_caps_free(p);
-        return NULL;
-    }
-
-    p->tagger = fft_burst_tagger_init(FBT_BURST_PRE_LEN, FBT_BURST_POST_LEN,
-                                      FBT_BURST_WIDTH, thr,
-                                      p->baseline_history);
-    if (!p->tagger) {
-        ESP_LOGE(TAG, "fft_burst_tagger_init failed");
-        heap_caps_free(p->baseline_history);
-        heap_caps_free(p);
-        return NULL;
-    }
+    p->user_cb          = cb;
+    p->baseline_history = baseline_history;
+    p->tagger           = tagger;
 
     fft_burst_tagger_set_start(p->tagger, 0);
     s_default = p; // publish for cross-task diagnostic readers
