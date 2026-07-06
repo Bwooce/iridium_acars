@@ -17,6 +17,7 @@
 #include "frame_queue.h"
 #include "iridium_frame.h"
 #include "ida_decode.h"
+#include "ida_reassembler.h"
 #include "ibc_decode.h"
 #include "ira_decode.h"
 #include "ims_decode.h"
@@ -65,6 +66,10 @@ static _Atomic uint64_t s_class_lw_other = 0;
 // SBD reassembler instance — single global, not thread-safe (only the
 // decoder task touches it). 8 sessions × ~330 B ≈ 2.6 KB in BSS.
 static sbd_reassembler_t s_sbd;
+// Cross-burst IDA fragment reassembler (see ida_reassembler.h) — feeds
+// s_sbd a complete SBD envelope even when it spanned multiple physical
+// LW.DA bursts. 4 sessions × ~330 B ≈ 1.3 KB in BSS.
+static ida_reassembler_t s_ida_reasm;
 static _Atomic uint64_t  s_sbd_complete    = 0; // SBD messages reassembled
 static _Atomic uint64_t  s_acars_decoded   = 0; // ACARS messages successfully parsed
 static _Atomic uint64_t  s_acars_fragments = 0; // ACARS fragments awaiting reassembly
@@ -171,12 +176,36 @@ static la_acars_msg            *find_acars_msg(la_proto_node *node)
     return NULL;
 }
 
+// Strip Iridium SBD's own leading ACARS content-type marker (SOH
+// 0x01) and, when present, an additional 8-byte 0x03-tagged header
+// block of unknown meaning -- mirrors iridium-toolkit's
+// iridiumtk/reassembler/sbd.py:ReassembleIDASBDACARS.consume_l2() and
+// tests/host/acars_tail.c's strip_acars_prefix() (kept in sync; see
+// that file's comment for the discovery: real SBD-derived ACARS
+// payloads carry this marker, but nothing in this decode chain
+// stripped it before la_acars_parse_and_reassemble(), which expects
+// it pre-stripped -- see test_libacars_link.c's frame-layout comment).
+static void strip_acars_prefix(const uint8_t **p, int *n)
+{
+    if (*n < 1 || (*p)[0] != 0x01) return; // no SOH marker -- leave as-is
+    (*p)++;
+    (*n)--;
+    if (*n >= 8 && (*p)[0] == 0x03) {
+        (*p) += 8;
+        (*n) -= 8;
+    }
+}
+
 // Try to parse the reassembled SBD payload as ACARS. Logs the
 // decoded fields if a recognisable ACARS frame is found.
 static void try_acars(const sbd_message_t *msg,
                       int32_t peak_bin, float snr_db)
 {
     if (!msg || msg->payload_len < 8) return;
+    const uint8_t *acars_buf = msg->payload;
+    int            acars_len = msg->payload_len;
+    strip_acars_prefix(&acars_buf, &acars_len);
+    if (acars_len < 8) return;
     la_msg_dir dir = msg->uplink ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
     // D14: use la_acars_parse_and_reassemble with our persistent
     // la_reasm_ctx so multi-block ACARS messages (block_id 1-5 with
@@ -192,7 +221,7 @@ static void try_acars(const sbd_message_t *msg,
         .tv_usec = (suseconds_t)(msg->timestamp_us % 1000000ULL),
     };
     la_proto_node *node = la_acars_parse_and_reassemble(
-        msg->payload, msg->payload_len, dir, s_reasm_ctx, rx_time);
+        acars_buf, acars_len, dir, s_reasm_ctx, rx_time);
     if (!node) return;
     la_acars_msg *a = find_acars_msg(node);
     if (a) {
@@ -341,19 +370,34 @@ static void process_one(const frame_queue_item_t *it)
                      ida.header_ok, ida.da_ctr, (unsigned)ida.payload_len,
                      ida.crc_ok ? "OK" : "BAD");
             if (rc_ida == 0 && ida.ok && ida.header_ok && ida.crc_ok) {
-                sbd_message_t sbd;
-                int           rc_sbd = sbd_reassembler_feed(&s_sbd, &ida,
-                                                            it->direction == 1,
-                                                            it->timestamp_us,
-                                                            &sbd);
-                if (rc_sbd == 1) {
-                    atomic_fetch_add_explicit(&s_sbd_complete, 1,
-                                              memory_order_relaxed);
-                    ESP_LOGI(TAG, "SBD: type=%s %s len=%u (msg %u/%u)",
-                             sbd_type_wire_name(sbd.type),
-                             sbd.uplink ? "UL" : "DL",
-                             sbd.payload_len, sbd.msg_no, sbd.msg_count);
-                    try_acars(&sbd, it->peak_bin, it->snr_db);
+                // Stage 1: chain cross-burst IDA fragments (da_cont/
+                // da_ctr) into one complete SBD envelope -- a single
+                // physical LW.DA burst caps at 24 payload bytes, but
+                // real SBD/ACARS envelopes routinely need more than
+                // that (see ida_reassembler.h).
+                uint8_t merged[IDA_REASM_MAX_BYTES];
+                int     merged_len = 0;
+                int     rc_reasm   = ida_reassembler_feed(
+                    &s_ida_reasm, &ida, it->direction == 1,
+                    (uint32_t)it->freq_hz, it->timestamp_us, merged,
+                    (int)sizeof(merged), &merged_len);
+                if (rc_reasm == 1) {
+                    // Stage 2: SBD envelope-level (msgno/msgcnt) reassembly.
+                    sbd_message_t sbd;
+                    int           rc_sbd = sbd_reassembler_feed(&s_sbd, merged,
+                                                                merged_len,
+                                                                it->direction == 1,
+                                                                it->timestamp_us,
+                                                                &sbd);
+                    if (rc_sbd == 1) {
+                        atomic_fetch_add_explicit(&s_sbd_complete, 1,
+                                                  memory_order_relaxed);
+                        ESP_LOGI(TAG, "SBD: type=%s %s len=%u (msg %u/%u)",
+                                 sbd_type_wire_name(sbd.type),
+                                 sbd.uplink ? "UL" : "DL",
+                                 sbd.payload_len, sbd.msg_no, sbd.msg_count);
+                        try_acars(&sbd, it->peak_bin, it->snr_db);
+                    }
                 }
             }
         } else {
@@ -461,6 +505,7 @@ esp_err_t frame_decoder_init(void)
         return ESP_ERR_NO_MEM;
     }
     sbd_reassembler_init(&s_sbd);
+    ida_reassembler_init(&s_ida_reasm);
     // D17 message ring — recent ACARS decodes, served via HTTP /messages.
     msg_ring_init();
     // D14: libacars reassembly context for multi-block ACARS messages.
