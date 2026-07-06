@@ -1,6 +1,12 @@
 CONFIG_IDF_TARGET="esp32p4"
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
-CONFIG_ESP32P4_REV_MIN_100=y
+# P2 PIE-trap fix: rev-0 minimum re-enables the IDF HWLP silicon-bug
+# workarounds (SOC_CPU_HAS_HWLOOP_STATE_BUG + spurious EXT_ILL reason bit,
+# portasm.S) that REV_MIN=100 compiled out. With them absent, the lazy PIE
+# coprocessor save mis-routed ~1-in-600 traps in dsps_fird_s16_arp4 into
+# unhandled Illegal-instruction panics (31 identical crashes in 3.5 h,
+# 2026-07-06). Belt-and-braces with patches/0002 (HWLP removal).
+CONFIG_ESP32P4_REV_MIN_0=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
 
 # Build with -O2. Default IDF target picks "Debug" (-Og) which is awful for
