@@ -26,7 +26,14 @@ typedef struct {
     uint64_t total_bytes;             // USB bytes received since boot
     uint32_t feed_calls_window;       // dsp_processor_feed calls in this window
     uint64_t dsp_total_time_us;       // sum of feed wall time
-    uint32_t dsp_frame_count;         // FFT frames processed in this window
+    uint32_t dsp_frame_count;         // FFT steps (2048-sample blocks) fed
+                                      // through the tagger this window.
+                                      // Proportional to USB byte rate by
+                                      // construction — NOT a burst/frame
+                                      // rate. Printed as "steps=" in the
+                                      // STATUS line; see dsp.gone_bursts
+                                      // (printed as "bursts=") for the
+                                      // actual tagger burst-dispatch rate.
     uint64_t cycle_read_us;           // sum of esp_libusb_read_stream wall time
     uint64_t cycle_handle_events_us;  // sum of usb_host_client_handle_events wall time
     uint64_t cycle_take_converted_us; // sum of ingest_core1_take_converted wall time

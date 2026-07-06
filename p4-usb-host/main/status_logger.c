@@ -131,7 +131,7 @@ static void emit(const status_snapshot_t *s)
                                ? 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / window_us_div
                                : 0.0;
 
-    ESP_LOGI(TAG, "DSP: %u frames, total=%.0f us/frame, cap=%.1f%% "
+    ESP_LOGI(TAG, "DSP: %u steps, total=%.0f us/step, cap=%.1f%% "
                   "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
              s->dsp_frame_count, avg_dsp_us, dsp_pct,
              s->dsp.wind_us, s->dsp.fft_us, s->dsp.mag_us,
@@ -199,10 +199,19 @@ static void emit(const status_snapshot_t *s)
     // known type — task #111). bch_unknown = BCH false positives (random
     // noise corrected into valid codeword with no frame structure);
     // expect this to dominate over bch_decoded under marginal RF.
-    ESP_LOGI(TAG, "STATUS: rate=%.2f MB/s frames=%u processed=%u "
+    //
+    // steps= is dsp_frame_count: the number of 2048-sample FFT steps fed
+    // through the tagger this window. It's proportional to the USB byte
+    // rate by construction (fixed step size) and is NOT a burst or frame
+    // rate — do not read it as "N bursts/sec". bursts= (dsp.gone_bursts)
+    // is the actual tagger burst-dispatch rate: bursts the tagger
+    // finished and handed off this window. This distinction was the
+    // source of a 14-hour bench-monitoring misread (steps=~883/s at the
+    // nominal USB rate was mistaken for a burst rate).
+    ESP_LOGI(TAG, "STATUS: rate=%.2f MB/s steps=%u bursts=%u processed=%u "
                   "bch_decoded=%u bch_unknown=%u drops=%u "
                   "dsp_cap=%.0f%% worker_cap=%.0f%%",
-             rate_inst, s->dsp_frame_count,
+             rate_inst, s->dsp_frame_count, s->dsp.gone_bursts,
              s->ws.bursts_processed, s->ws.bursts_bch_decoded,
              s->ws.bursts_bch_unknown,
              s->us.rb_full_drops, dsp_pct, worker_pct);

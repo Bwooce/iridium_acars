@@ -123,7 +123,7 @@ By default the firmware emits a single short health line per second
 plus an extra warning line only when an anomaly counter is nonzero:
 
 ```
-STATUS: rate=4.88 MB/s frames=1252 processed=0 drops=0
+STATUS: rate=4.88 MB/s steps=1252 bursts=3 processed=0 drops=0
 STATUS-ERR: rb_full_drops=N status_err=N resubmit_err=N worker_dropped=N last_err=0xNN  # only when something's wrong
 ```
 
