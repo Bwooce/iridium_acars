@@ -53,6 +53,27 @@
 #define FBT_MAX_BURSTS 64    // gri default at fs=2.5MHz / burst_width=40k * 0.8 = 50, round up
 #define FBT_HISTORY_SIZE 512 // gri default (set in iridium_extractor_flowgraph.py)
 
+// Maximum tracked burst length, in input samples. gri passes
+// max_burst_len = int(input_sample_rate * 0.09) into the tagger
+// (iridium_extractor_flowgraph.py:509; rationale at :143-144: "After
+// 90 ms there needs to be a pause in the frame structure"). At our
+// fixed 2.5 MSPS input rate: int(2.5e6 * 0.09) = 225000. A burst whose
+// last_active - start exceeds this is force-closed AND triggers a
+// forced noise-floor refresh (gri fft_burst_tagger_impl.cc:265-285) —
+// the refresh is what stops a persistent carrier from freezing the
+// baseline EMA forever (n_bursts > 0 blocks the normal update path).
+#define FBT_MAX_BURST_LEN 225000
+
+// Burst-squelch threshold: squelch when the number of tracked bursts
+// EXCEEDS this (strictly greater, gri fft_burst_tagger_impl.cc:327).
+// gri computes it for max_bursts=0 (the iridium-extractor default,
+// apps/iridium-extractor:124) as
+//   d_max_bursts = (sample_rate / burst_width) * 0.8
+// (fft_burst_tagger_impl.cc:176-182) with INTEGER division of the Hz
+// values: (2500000 / 40000) * 0.8 = 62 * 0.8 = 49.6 → int → 49.
+// (FBT_MAX_BURSTS=64 above is only the tracking-array capacity.)
+#define FBT_SQUELCH_MAX_BURSTS 49
+
 // One detected burst (output record).
 typedef struct {
     // id shrunk to 32-bit (no downstream reader) so width_bins fits in the

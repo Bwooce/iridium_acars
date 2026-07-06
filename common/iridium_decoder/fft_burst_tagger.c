@@ -43,6 +43,7 @@
 #define FBT_NOW_US() ((uint64_t)esp_timer_get_time())
 #define FBT_HOT IRAM_ATTR
 #else
+#include <stdio.h>
 #include <time.h>
 static inline uint64_t fbt_now_us(void)
 {
@@ -129,6 +130,15 @@ struct fft_burst_tagger_s {
     int32_t *baseline_history; // [HISTORY_SIZE × N], caller-owned (PSRAM)
     int      history_index;
     bool     history_primed;
+    // gri's d_squelch_count (fft_burst_tagger_impl.cc:340-354): +3 per
+    // squelched step, -1 per clean step, noise-estimate reset at >= 10
+    // (so values stay in [0, 12] — uint8 is plenty). Deliberately a
+    // uint8 placed in the alignment padding after history_primed (the
+    // next member, bursts[], is 8-aligned) so sizeof(*this) stays
+    // BYTE-IDENTICAL on the P4 — verified riscv32 sizeof 66672 before
+    // and after; see the staged_new/staged_gone note below for why the
+    // struct must not grow.
+    uint8_t squelch_count;
 
     fbt_burst_t bursts[FBT_MAX_BURSTS];
     int         n_bursts;
@@ -280,6 +290,7 @@ fft_burst_tagger_t *fft_burst_tagger_init(int      burst_pre_len,
         t->burst_mask[i] = 1;
     t->history_index  = 0;
     t->history_primed = false;
+    t->squelch_count  = 0;
     t->n_bursts       = 0;
     t->d_index        = 0;
     t->burst_id       = 0;
@@ -387,6 +398,7 @@ void fft_burst_tagger_reset_baseline(fft_burst_tagger_t *t)
         t->burst_mask[i] = 1;
     t->history_index  = 0;
     t->history_primed = false;
+    t->squelch_count  = 0; // fresh floor → squelch pressure is stale too
     t->n_bursts       = 0;
 }
 
@@ -527,8 +539,16 @@ static int peak_cmp_desc(const void *a, const void *b)
     return 0;
 }
 
+// out_gone/max_gone/n_gone_inout: the burst-squelch path (gri
+// fft_burst_tagger_impl.cc:327-355) force-closes ALL tracked bursts
+// when their count exceeds FBT_SQUELCH_MAX_BURSTS; the closed bursts
+// are appended to out_gone at *n_gone_inout (gri pushes them onto
+// d_gone_bursts) and the just-created ones are retracted from out_new
+// (gri clears d_new_bursts).
 static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
-                                              fbt_burst_t *out_new, int max_new)
+                                              fbt_burst_t *out_new, int max_new,
+                                              fbt_burst_t *out_gone, int max_gone,
+                                              int *n_gone_inout)
 {
     int n_peaks = 0;
 
@@ -613,20 +633,89 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
             out_new[n_emitted++] = *b;
         }
     }
+
+    // Burst squelch — gri fft_burst_tagger_impl.cc:327-355. If more
+    // than FBT_SQUELCH_MAX_BURSTS bursts are tracked the band is
+    // saturated (broadband interferer / wrong noise estimate): retract
+    // this step's new bursts, force-close everything that predates this
+    // step (gone events), and clear the tracking table + mask. Repeated
+    // squelches (+3 each, -1 per clean step) mean the noise floor
+    // itself is off — at >= 10 gri resets the noise estimate entirely;
+    // fft_burst_tagger_reset_baseline() is that exact reset (history
+    // cleared, primed=false) plus already-done no-ops (n_bursts=0,
+    // mask=1).
+    if (t->n_bursts > FBT_SQUELCH_MAX_BURSTS) {
+#if defined(ESP_PLATFORM)
+        if (t->squelch_count == 0) {
+            ESP_LOGW("FBT", "Detector in burst squelch (n_bursts=%d) at sample %llu",
+                     t->n_bursts, (unsigned long long)t->d_index);
+        }
+#else
+        fprintf(stderr, "Detector in burst squelch at %llu\n",
+                (unsigned long long)t->d_index);
+#endif
+        n_emitted = 0; // gri: d_new_bursts.clear()
+        int ng    = n_gone_inout ? *n_gone_inout : 0;
+        for (int i = 0; i < t->n_bursts; i++) {
+            fbt_burst_t *bb = &t->bursts[i];
+            // gri :332 skips bursts created THIS step (they were only
+            // ever in d_new_bursts, which was just cleared).
+            if (bb->start != t->d_index - t->burst_pre_len) {
+                bb->stop = t->d_index;
+                if (out_gone && ng < max_gone) {
+                    out_gone[ng++] = *bb;
+                }
+            }
+        }
+        if (n_gone_inout) *n_gone_inout = ng;
+        t->n_bursts = 0;       // gri: d_bursts.clear()
+        rebuild_burst_mask(t); // gri: update_burst_mask()
+
+        t->squelch_count = (uint8_t)(t->squelch_count + 3);
+        if (t->squelch_count >= 10) {
+#if defined(ESP_PLATFORM)
+            ESP_LOGW("FBT", "Resetting noise estimate (squelch_count=%u)",
+                     (unsigned)t->squelch_count);
+#else
+            fprintf(stderr, "Resetting noise estimate\n");
+#endif
+            fft_burst_tagger_reset_baseline(t); // gri :345-348
+            t->squelch_count = 0;
+        }
+    } else if (t->squelch_count) {
+        t->squelch_count--;
+    }
     return n_emitted;
 }
 
-// Erase bursts whose last_active is older than burst_post_len. Emit
-// the timed-out bursts in out_gone.
+// Forward declaration: delete_gone_bursts_internal's force-close path
+// needs the (later-defined) EMA update for the forced refresh. No
+// FBT_HOT here — IRAM_ATTR mints a fresh .iram1.N section per use, and
+// a second attributed declaration conflicts with the definition's
+// (-Werror=attributes on the device build). The definition carries it.
+static void update_baseline_ema(fft_burst_tagger_t *t, bool force);
+
+// Erase bursts whose last_active is older than burst_post_len, OR that
+// have been active longer than FBT_MAX_BURST_LEN (gri's d_max_burst_len
+// force-close, fft_burst_tagger_impl.cc:263-270). Emit the closed
+// bursts in out_gone. A force-close additionally triggers a FORCED
+// noise-floor refresh (gri :283-285) — without it a persistent carrier
+// keeps n_bursts > 0 forever and the baseline EMA freezes at whatever
+// it held when the carrier appeared (the P1 frozen-baseline latch).
 static FBT_HOT int delete_gone_bursts_internal(fft_burst_tagger_t *t,
                                                fbt_burst_t *out_gone, int max_gone)
 {
-    int  n_emitted   = 0;
-    int  dst         = 0;
-    bool any_removed = false;
+    int  n_emitted          = 0;
+    int  dst                = 0;
+    bool any_removed        = false;
+    bool update_noise_floor = false;
     for (int src = 0; src < t->n_bursts; src++) {
         fbt_burst_t *b = &t->bursts[src];
-        if (b->last_active + t->burst_post_len <= t->d_index) {
+        // gri guards this on d_max_burst_len != 0; ours is a fixed
+        // non-zero compile-time constant (see fft_burst_tagger.h).
+        bool long_burst = (b->last_active - b->start) > FBT_MAX_BURST_LEN;
+        if (long_burst) update_noise_floor = true;
+        if (b->last_active + t->burst_post_len <= t->d_index || long_burst) {
             b->stop = t->d_index;
             if (out_gone && n_emitted < max_gone) {
                 out_gone[n_emitted++] = *b;
@@ -642,6 +731,13 @@ static FBT_HOT int delete_gone_bursts_internal(fft_burst_tagger_t *t,
     if (any_removed) {
         // Rebuild burst_mask to free bins we no longer protect.
         rebuild_burst_mask(t);
+    }
+    if (update_noise_floor) {
+        // gri fft_burst_tagger_impl.cc:283-285: update_filters_post(true).
+        // One forced EMA step per force-close event; over repeated
+        // force-close/re-detect cycles the carrier is absorbed into the
+        // baseline and stops re-triggering — this releases the latch.
+        update_baseline_ema(t, true);
     }
     return n_emitted;
 }
@@ -676,17 +772,19 @@ static inline void ema_step_inner(int32_t *__restrict__ bsum,
 }
 
 // EMA update: subtract oldest, add newest, advance index. gri only
-// updates when no bursts are active OR a long-burst forces a refresh;
-// we mirror that — if any burst is active, freeze the EMA.
+// updates when no bursts are active OR a long-burst forces a refresh
+// (update_filters_post(force) in fft_burst_tagger_impl.cc:225-242); we
+// mirror both — if any burst is active the EMA freezes UNLESS `force`
+// is set by the max-burst-len force-close path (delete_gone_bursts).
 //
 // Fused per-bin read+RMW+write loop. -O3 + restrict make this L2-
 // prefetch-friendly (sequential PSRAM access pattern), beating any
 // "bulk memcpy + in-SRAM operate + bulk memcpy back" rewrite by
 // ~25 µs/step (opp #3 in opt doc was tried 2026-05-22, regressed
 // base 73 → 99 µs and was reverted).
-static FBT_HOT void update_baseline_ema(fft_burst_tagger_t *t)
+static FBT_HOT void update_baseline_ema(fft_burst_tagger_t *t, bool force)
 {
-    if (t->n_bursts > 0) return; // burst active → freeze EMA
+    if (t->n_bursts > 0 && !force) return; // burst active → freeze EMA
 
     int32_t *old_slot = HIST(t, t->history_index);
     ema_step_inner(t->baseline_sum, old_slot, t->magnitude_shifted, N);
@@ -731,22 +829,31 @@ static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
 
     if (!t->history_primed) {
         uint64_t b0 = FBT_NOW_US();
-        update_baseline_ema(t);
+        update_baseline_ema(t, false);
         atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
         t->staged_n_new  = 0;
         t->staged_n_gone = 0;
     } else {
         uint64_t d0 = FBT_NOW_US();
         update_bursts_internal(t);
-        t->staged_n_new = create_new_bursts_internal(
-            t, t->staged_new, t->staged_max_new);
-        t->staged_n_gone = delete_gone_bursts_internal(
-            t, t->staged_gone, t->staged_max_gone);
-        uint64_t d1 = FBT_NOW_US();
+        // create-before-delete matches this port's existing order (gri
+        // runs delete first but filters peaks against the PRE-delete
+        // mask, so burst creation sees the same mask either way). The
+        // squelch path may append force-closed bursts to staged_gone;
+        // delete_gone appends its own after them.
+        int staged_gone_n = 0;
+        t->staged_n_new   = create_new_bursts_internal(
+            t, t->staged_new, t->staged_max_new,
+            t->staged_gone, t->staged_max_gone, &staged_gone_n);
+        staged_gone_n += delete_gone_bursts_internal(
+            t, t->staged_gone ? t->staged_gone + staged_gone_n : NULL,
+            t->staged_max_gone - staged_gone_n);
+        t->staged_n_gone = staged_gone_n;
+        uint64_t d1      = FBT_NOW_US();
         atomic_fetch_add_explicit(&s_acc_detect_us, (d1 - d0), memory_order_relaxed);
 
         uint64_t b0 = FBT_NOW_US();
-        update_baseline_ema(t);
+        update_baseline_ema(t, false);
         atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
     }
 
@@ -842,7 +949,7 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 
     if (!t->history_primed) {
         uint64_t b0 = FBT_NOW_US();
-        update_baseline_ema(t);
+        update_baseline_ema(t, false);
         atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
         t->d_index += N;
         return false;
@@ -850,16 +957,24 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
 
     uint64_t d0 = FBT_NOW_US();
     update_bursts_internal(t);
-    int      n_new_out  = create_new_bursts_internal(t, out_new_bursts, max_new);
-    int      n_gone_out = delete_gone_bursts_internal(t, out_gone_bursts, max_gone);
-    uint64_t d1         = FBT_NOW_US();
+    // See the pipelined path for the create/delete ordering note. The
+    // squelch path may append force-closed bursts to out_gone_bursts;
+    // delete_gone appends its own after them.
+    int n_gone_out = 0;
+    int n_new_out  = create_new_bursts_internal(t, out_new_bursts, max_new,
+                                                out_gone_bursts, max_gone,
+                                                &n_gone_out);
+    n_gone_out += delete_gone_bursts_internal(
+        t, out_gone_bursts ? out_gone_bursts + n_gone_out : NULL,
+        max_gone - n_gone_out);
+    uint64_t d1 = FBT_NOW_US();
     atomic_fetch_add_explicit(&s_acc_detect_us, (d1 - d0), memory_order_relaxed);
 
     if (n_new) *n_new = n_new_out;
     if (n_gone) *n_gone = n_gone_out;
 
     uint64_t b0 = FBT_NOW_US();
-    update_baseline_ema(t);
+    update_baseline_ema(t, false);
     atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
 
     t->d_index += N;
