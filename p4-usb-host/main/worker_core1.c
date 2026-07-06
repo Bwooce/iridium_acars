@@ -1122,6 +1122,35 @@ void worker_core1_push_burst(const detected_burst_t *burst)
     if (!s_pq_lock) return;
     s_bursts_queued++;
     hist_freq_record(burst->rel_freq_hz); // band occupancy of ALL detections
+
+    // P1 stale-reject at PUSH: don't queue bursts that are already
+    // unrecoverable — they would only be popped and dropped by the
+    // pop-side stale guard below, wasting a PQ slot (and, worse,
+    // EVICTING a decodable burst while they sit there). Both conditions
+    // are permanent (signal_buffer_head_total() is monotonic), so a
+    // burst rejected here could never have been decoded later:
+    //  (a) the extraction window itself is >= one ring span — it cannot
+    //      fit in the ring, so its start was overwritten before the
+    //      tagger's gone event even fired;
+    //  (b) the producer has already lapped the window's oldest sample
+    //      (same envelope the worker's pop-side check uses).
+    {
+        const uint64_t ring_span   = SIGNAL_BUF_SIZE / 4; // complex samples
+        const uint64_t check_start = burst->start_sample_idx - WB_PRE_PAD_SAMPLES;
+        const uint64_t check_len   = (uint64_t)burst->length_samples + WB_PRE_PAD_SAMPLES;
+        const uint64_t head        = signal_buffer_head_total();
+        if (check_len >= ring_span ||
+            (head > check_start && head - check_start > ring_span)) {
+            if ((s_stale_log_throttle++ & 0x7F) == 0) {
+                ESP_LOGW(TAG, "stale burst: start=%llu len=%lu (at push) — reject",
+                         (unsigned long long)burst->start_sample_idx,
+                         (unsigned long)burst->length_samples);
+            }
+            s_bursts_skipped++;
+            return;
+        }
+    }
+
     xSemaphoreTake(s_pq_lock, portMAX_DELAY);
     int r = pq_insert_locked(burst);
     if (s_pq_count > (int)s_queue_high_water) s_queue_high_water = s_pq_count;
