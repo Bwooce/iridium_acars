@@ -43,10 +43,41 @@ la_proto_node *la_cpdlc_parse(uint8_t const *buf, int len, la_msg_dir msg_dir) {
 	}
 
 	la_debug_print(D_INFO, "Decoding as %s, len: %d\n", msg->asn_type->name, len);
-	if(la_asn1_decode_as(msg->asn_type, &msg->data, buf, len) != 0) {
-		msg->err = true;
-	} else {
+	msg->total_bits = (size_t)len * 8;
+	asn_dec_rval_t rval;
+	int ret = la_asn1_decode_as(msg->asn_type, &msg->data, buf, len, &rval);
+	if(ret == 0) {
+		// Clean, fully-consumed success -- same as always.
 		msg->err = false;
+		return node;
+	}
+
+	bool best_effort_decode = false;
+	(void)la_config_get_bool("best_effort_decode", &best_effort_decode);
+	// design §4: OFF -> exactly current behaviour (err on any nonzero
+	// return, whether RC_FAIL or RC_OK-with-trailing-bytes). ON and we
+	// got at least one successfully-decoded bit -> keep the tree and
+	// tag it PARTIAL instead of discarding it. consumed == 0 means the
+	// decoder never got anywhere (eg. empty/garbage input) -- err as
+	// today regardless of the flag.
+	if(best_effort_decode && rval.consumed > 0) {
+		msg->err = false;
+		msg->partial = true;
+		// rval.code == RC_OK here means uper_decode_complete() built a
+		// complete, valid structure and simply didn't consume the whole
+		// buffer (trailing junk) -- NOT the same thing as a mid-message
+		// desync (RC_FAIL). Conflating the two is the policy trap design
+		// §4 calls out: trailing-junk trust is "whole message is good,
+		// ignore the tail"; desync trust is "only the prefix is good,
+		// everything after is uPER's silent post-corruption garbage".
+		msg->trailing_junk = (rval.code == RC_OK);
+		// asn_dec_rval_t.consumed is byte-granular (per_decoder.c rounds
+		// pd.moved's bit-exact value up to a byte count -- see
+		// patches/README.md #0004); express it in bits for the banner,
+		// documented as such rather than claimed bit-exact.
+		msg->consumed_bits = (size_t)rval.consumed * 8;
+	} else {
+		msg->err = true;
 	}
 	return node;
 }
@@ -60,6 +91,20 @@ void la_cpdlc_format_text(la_vstring *vstr, void const *data, int indent) {
 	if(msg->err == true) {
 		LA_ISPRINTF(vstr, indent, "-- Unparseable FANS-1/A message\n");
 		return;
+	}
+	if(msg->partial == true) {
+		// design §4: distinct wording for the two partial-success cases --
+		// do not conflate a benign trailing-bytes tail with a mid-message
+		// desync (see cpdlc.h for the full trust-level explanation).
+		if(msg->trailing_junk) {
+			LA_ISPRINTF(vstr, indent,
+					"-- NOTE: message decoded OK, %zu trailing bit(s) beyond bit %zu of %zu were ignored -- display only\n",
+					msg->total_bits - msg->consumed_bits, msg->consumed_bits, msg->total_bits);
+		} else {
+			LA_ISPRINTF(vstr, indent,
+					"-- WARNING: PARTIAL/UNTRUSTED decode (desync after bit %zu of %zu) -- display only\n",
+					msg->consumed_bits, msg->total_bits);
+		}
 	}
 	if(msg->asn_type != NULL) {
 		if(msg->data != NULL) {
@@ -92,6 +137,15 @@ void la_cpdlc_format_json(la_vstring *vstr, void const *data) {
 	la_json_append_bool(vstr, "err", msg->err);
 	if(msg->err == true) {
 		return;
+	}
+	// design §4: "partial"/"consumed_bits" sit next to "err". trailing_junk
+	// is exposed too -- a consumer must not treat a trailing-bytes partial
+	// the same as a desync partial (see cpdlc.h).
+	la_json_append_bool(vstr, "partial", msg->partial);
+	if(msg->partial == true) {
+		la_json_append_bool(vstr, "trailing_junk", msg->trailing_junk);
+		la_json_append_int64(vstr, "consumed_bits", (int64_t)msg->consumed_bits);
+		la_json_append_int64(vstr, "total_bits", (int64_t)msg->total_bits);
 	}
 	if(msg->asn_type != NULL) {
 		if(msg->data != NULL) {

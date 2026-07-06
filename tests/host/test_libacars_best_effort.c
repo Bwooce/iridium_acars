@@ -4,14 +4,10 @@
 //
 // This file grows across the phase's commits:
 //   - positive control (design §6a): the 7 intact fixtures cited in
-//     libacars/examples/{cpdlc,adsc}_get_position.c decode cleanly.
-//     Initially (this commit) only mode OFF is exercised, because the
-//     best_effort_decode config flag and la_cpdlc_msg/la_adsc_msg_t
-//     partial-state fields don't exist yet -- this commit only proves
-//     the host build wiring (design §6d) and pins today's baseline
-//     behaviour before any decode-path code is touched.
-//   - later commits add: mode ON == mode OFF byte-identical rendering
-//     for the same 7 fixtures, the bit-flip fuzz (§6b), and the ZK-NNC
+//     libacars/examples/{cpdlc,adsc}_get_position.c decode cleanly, and
+//     render byte-identically with best_effort_decode ON vs OFF (an
+//     intact fixture never takes the partial path either way).
+//   - later commits add: the bit-flip fuzz (§6b) and the ZK-NNC
 //     acceptance demo (§6c).
 //
 // Fixtures are the full ARINC-622 text messages ("/GSADDR.IMI.<air_reg><hex
@@ -21,6 +17,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <libacars/libacars.h>
 #include <libacars/arinc.h>
@@ -117,9 +114,67 @@ static void test_positive_control_mode_off(void)
     }
 }
 
+// Renders a fixture's full proto tree as text+json and returns both as
+// newly-allocated strings (caller frees). Destroys the tree before
+// returning.
+static void render_fixture(fixture_t const *fx, char **text_out, char **json_out)
+{
+    la_proto_node *node = la_arinc_parse(fx->arinc_text, LA_MSG_DIR_AIR2GND);
+    if (node == NULL) {
+        *text_out = NULL;
+        *json_out = NULL;
+        return;
+    }
+    la_vstring *tv = la_proto_tree_format_text(NULL, node);
+    la_vstring *jv = la_proto_tree_format_json(NULL, node);
+    *text_out      = tv != NULL ? strdup(tv->str) : NULL;
+    *json_out      = jv != NULL ? strdup(jv->str) : NULL;
+    if (tv != NULL) la_vstring_destroy(tv, true);
+    if (jv != NULL) la_vstring_destroy(jv, true);
+    la_proto_tree_destroy(node);
+}
+
+// design §6a: intact fixtures must render BYTE-IDENTICAL whether
+// best_effort_decode is OFF (today's default) or ON -- an intact
+// fixture never takes the partial path either way, so flipping the flag
+// must not change a single byte of output.
+static void test_positive_control_mode_on_matches_off(void)
+{
+    printf("Test: positive control, mode ON renders byte-identical to mode OFF\n");
+
+    for (int i = 0; i < NUM_FIXTURES; i++) {
+        fixture_t const *fx = &FIXTURES[i];
+
+        la_config_set_bool("best_effort_decode", false);
+        char *text_off = NULL, *json_off = NULL;
+        render_fixture(fx, &text_off, &json_off);
+
+        la_config_set_bool("best_effort_decode", true);
+        char *text_on = NULL, *json_on = NULL;
+        render_fixture(fx, &text_on, &json_on);
+
+        la_config_set_bool("best_effort_decode", false); // restore default
+
+        CHECK(text_off != NULL && text_on != NULL, "%s: NULL text rendering", fx->name);
+        CHECK(json_off != NULL && json_on != NULL, "%s: NULL json rendering", fx->name);
+        if (text_off != NULL && text_on != NULL) {
+            CHECK(strcmp(text_off, text_on) == 0, "%s: text rendering differs ON vs OFF", fx->name);
+        }
+        if (json_off != NULL && json_on != NULL) {
+            CHECK(strcmp(json_off, json_on) == 0, "%s: json rendering differs ON vs OFF", fx->name);
+        }
+
+        free(text_off);
+        free(json_off);
+        free(text_on);
+        free(json_on);
+    }
+}
+
 int main(void)
 {
     test_positive_control_mode_off();
+    test_positive_control_mode_on_matches_off();
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }

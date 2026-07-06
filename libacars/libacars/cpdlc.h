@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>                          // size_t
 #include <libacars/libacars.h>              // la_type_descriptor, la_proto_node
 #include <libacars/vstring.h>               // la_vstring
 #include <libacars/asn1/asn_application.h>  // asn_TYPE_descriptor_t
@@ -21,11 +22,29 @@ typedef struct {
 	asn_TYPE_descriptor_t *asn_type;
 	void *data;
 	bool err;
+	// best_effort_decode (design doc
+	// docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md §4):
+	// true whenever err == false but the decode was not a clean, fully-
+	// consumed success. trailing_junk distinguishes the two ways that can
+	// happen -- do NOT conflate them, they carry very different trust
+	// levels (design §4's flagged policy trap):
+	//   partial && !trailing_junk : uPER decode desynced mid-message
+	//     (RC_FAIL). The tree is a genuine partial parse -- fields before
+	//     the desync point are real, fields after are calloc'd zero /
+	//     plausible-looking garbage (asn1-util.c §3 contract).
+	//   partial &&  trailing_junk : uPER decode completed successfully
+	//     (RC_OK) but didn't consume the whole buffer. The whole tree is
+	//     a normal, fully-valid decode; only the ignored trailing bytes
+	//     are suspect.
+	// consumed_bits is only meaningful when partial == true; see cpdlc.c
+	// for how it's derived from asn_dec_rval_t.consumed (byte-granular,
+	// not bit-exact -- see per_decoder.c / patches/README.md #0004).
+	bool partial;
+	bool trailing_junk;
+	size_t consumed_bits;   // meaningful iff partial == true
+	size_t total_bits;      // input length in bits, for the banner's "of %zu"
 	// reserved for future use
 	void (*reserved0)(void);
-	void (*reserved1)(void);
-	void (*reserved2)(void);
-	void (*reserved3)(void);
 } la_cpdlc_msg;
 
 // cpdlc.c

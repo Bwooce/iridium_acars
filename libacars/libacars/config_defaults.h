@@ -31,5 +31,15 @@
 
 // Pretty-print JSON?
 
-	LA_CONFIG_SETTING_BOOLEAN("prettify_json", false)
+	LA_CONFIG_SETTING_BOOLEAN("prettify_json", false),
+
+// Render display-only, hard-tagged PARTIAL output for CPDLC (ASN.1 uPER)
+// and ADS-C messages that fail to decode completely, instead of
+// discarding everything? uPER fails silently -- post-desync fields
+// decode as plausible-looking garbage -- so this must never feed
+// automation; see docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md
+// for the safety contract. Default OFF preserves today's behaviour
+// exactly.
+
+	LA_CONFIG_SETTING_BOOLEAN("best_effort_decode", false)
 };

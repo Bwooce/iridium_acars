@@ -17,9 +17,13 @@ static int la_compare_fmtr(void const *k, void const *m) {
 	return(k == memb->type ? 0 : 1);
 }
 
-int la_asn1_decode_as(asn_TYPE_descriptor_t *td, void **struct_ptr, uint8_t const *buf, int size) {
+int la_asn1_decode_as(asn_TYPE_descriptor_t *td, void **struct_ptr, uint8_t const *buf, int size,
+		asn_dec_rval_t *rval_out) {
 	asn_dec_rval_t rval;
 	rval = uper_decode_complete(0, td, struct_ptr, buf, size);
+	if(rval_out != NULL) {
+		*rval_out = rval;
+	}
 	if(rval.code != RC_OK) {
 		la_debug_print(D_ERROR, "uper_decode_complete failed: %d\n", rval.code);
 		return -1;
