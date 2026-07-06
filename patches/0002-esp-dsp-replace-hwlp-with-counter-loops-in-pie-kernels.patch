@@ -1,0 +1,168 @@
+diff --git a/modules/fft/fixed/dsps_fft2r_sc16_arp4.S b/modules/fft/fixed/dsps_fft2r_sc16_arp4.S
+index 21f3520..595a1af 100644
+--- a/modules/fft/fixed/dsps_fft2r_sc16_arp4.S
++++ b/modules/fft/fixed/dsps_fft2r_sc16_arp4.S
+@@ -62,16 +62,22 @@ dsps_fft2r_sc16_arp4_:
+             srli     a7, t6, 2  // a7 = t6>> 2
+             beqz     a7, .fft2r_l3_skeep
+ 
+-            esp.lp.setup    0, a7, .fft2r_l3        // main butterfly loop
++            // iridium_acars patch: HWLP (esp.lp.setup) unsafe under lazy PIE save on
++            // P4 silicon (cf. dsps_fird_s16_arp4.S:123 panic); standard counter loop.
++            // a7 is recomputed every .fft2r_l2 iteration, safe to decrement.
++            .balign 4
++.fft2r_l3:                                          // main butterfly loop
+                 esp.vld.128.ip      q0, x25, 0      // Load data[m  .. m + 3]
+-                esp.vld.128.ip      q2, x24, 0      // Load data[ia .. ia + 3] 
++                esp.vld.128.ip      q2, x24, 0      // Load data[ia .. ia + 3]
+                 esp.cmul.s16        q1, q5, q0, 2
+                 esp.vmul.s16        q2, q2, q6      // q0 = in_data_ia*0x7fff
+                 esp.cmul.s16        q1, q5, q0, 3
+                 esp.vsub.s16        q3, q2, q1     // input[2 * m] = input[2 * ia] - re_temp;
+ 
+                 esp.vadd.s16.st.incp   q3, x25, q4, q2, q1
+-.fft2r_l3:      esp.vst.128.ip         q4, x24, 16
++                esp.vst.128.ip         q4, x24, 16
++                addi     a7, a7, -1
++            bnez     a7, .fft2r_l3
+ 
+ .fft2r_l3_skeep:    
+             add     t4, t4, t6          // ia += N2
+@@ -85,32 +91,42 @@ dsps_fft2r_sc16_arp4_:
+     srli    t0, t0, 1       // ie = ie>>1
+     mv      x26, a2         // x26 - pointer to w
+     mv      x24, a0
+-    esp.lp.setup    0, t0, .fft2r_l2_1
++    // iridium_acars patch: HWLP removed (P4 lazy PIE save panic, see above).
++    // t0 (ie) is still needed for the next loop, so count down in t1 (dead here).
++    mv      t1, t0
++    .balign 4
++.fft2r_l2_1:
+         esp.vldbc.32.ip     q2, x26, 4
+         esp.vldbc.32.ip     q7, x26, 4
+         esp.vunzip.32       q2, q7
+ 
+-        esp.vld.l.64.ip     q0, x24, 8 
+-        esp.vld.l.64.ip     q1, x24, 8 
+-        esp.vld.h.64.ip     q0, x24, 8 
++        esp.vld.l.64.ip     q0, x24, 8
++        esp.vld.l.64.ip     q1, x24, 8
++        esp.vld.h.64.ip     q0, x24, 8
+         esp.vld.h.64.ip     q1, x24, -24
+ 
+         esp.vmul.s16        q0, q0, q6
+-        esp.cmul.s16        q3, q2, q1, 2 
+-        esp.cmul.s16        q3, q2, q1, 3 
++        esp.cmul.s16        q3, q2, q1, 2
++        esp.cmul.s16        q3, q2, q1, 3
+         esp.vsub.s16        q4, q0, q3
+         esp.vadd.s16        q5, q0, q3
+ 
+         esp.vst.l.64.ip      q5, x24, 8
+         esp.vst.l.64.ip      q4, x24, 8
+         esp.vst.h.64.ip      q5, x24, 8
+-.fft2r_l2_1:        esp.vst.h.64.ip      q4, x24, 8
++        esp.vst.h.64.ip      q4, x24, 8
++        addi    t1, t1, -1
++    bnez    t1, .fft2r_l2_1
+ 
+     mv      x26, a2  // x26 - pointer to w
+     mv      x24, a0
+     add     t0, t0, -1
+ 
+-    esp.lp.setup    0, t0, .fft2r_l2_0
++    // iridium_acars patch: HWLP removed (P4 lazy PIE save panic, see above).
++    // Guard count==0 (N==8 case): the counter loop must run zero times.
++    beqz    t0, .fft2r_l2_0_skip
++    .balign 4
++.fft2r_l2_0:
+         esp.vld.128.ip      q0, x24, 16  // q0 = ia
+         esp.vld.128.ip      q1, x24,-16  // q1 = m
+         esp.vld.128.ip      q2, x26, 16
+@@ -125,9 +141,12 @@ dsps_fft2r_sc16_arp4_:
+         esp.vadd.s16        q0, q0, q3
+ 
+         esp.vzip.32         q0, q1
+-        
++
+         esp.vst.128.ip      q0, x24, 16
+-.fft2r_l2_0: esp.vst.128.ip      q1, x24, 16
++        esp.vst.128.ip      q1, x24, 16
++        addi    t0, t0, -1
++    bnez    t0, .fft2r_l2_0
++.fft2r_l2_0_skip:
+ 
+     lw  s8, 4(sp)
+     lw  s9, 8(sp)
+diff --git a/modules/fft/float/dsps_fft2r_fc32_arp4.S b/modules/fft/float/dsps_fft2r_fc32_arp4.S
+index 554b042..2f8f4b5 100644
+--- a/modules/fft/float/dsps_fft2r_fc32_arp4.S
++++ b/modules/fft/float/dsps_fft2r_fc32_arp4.S
+@@ -41,7 +41,12 @@ dsps_fft2r_fc32_arp4_:
+             flw     fa0, 0(t3)
+             flw     fa1, 4(t3)
+ 
+-            esp.lp.setup    0, t6, .fft2r_l3    // .fft2r_l3 - label to the last executed instruction   
++            // iridium_acars patch: HWLP (esp.lp.setup) unsafe under lazy PIE save on
++            // P4 silicon (cf. dsps_fird_s16_arp4.S:123 panic); standard counter loop.
++            // t6 (N2) is live after the loop, so count down in t2 (unused here).
++            mv       t2, t6       // loop counter = N2 (>= 1 guaranteed by outer BNEZ)
++            .balign 4
++.fft2r_l3:
+                 add      t5, t4, t6   // a12 = m = ia + N2
+ 
+                 slli     a4, t5, 3    // a14 - pointer for m*2
+@@ -69,8 +74,10 @@ dsps_fft2r_fc32_arp4_:
+                 fsw      ft10, 0(a3)
+                 fsw      ft11, 4(a3)
+ 
+-.fft2r_l3:      add     t4, t4, 1       // ia++
+-      
++                add     t4, t4, 1       // ia++
++                addi    t2, t2, -1
++            bnez    t2, .fft2r_l3
++
+             add     t4, t4, t6
+             add     t1, t1, 1           // j++
+ 
+diff --git a/modules/fir/fixed/dsps_fird_s16_arp4.S b/modules/fir/fixed/dsps_fird_s16_arp4.S
+index c9ab46d..9bc84b4 100644
+--- a/modules/fir/fixed/dsps_fird_s16_arp4.S
++++ b/modules/fir/fixed/dsps_fird_s16_arp4.S
+@@ -97,9 +97,16 @@ dsps_fird_s16_arp4:
+         esp.vld.128.ip          q1, s9, 16  // q1 - delay line data
+ 
+         beqz s6, .skip_main_loop1
+-        esp.lp.setup    0, s6, .main_loop1
++        // iridium_acars patch: esp.lp.setup (HWLP) is unsafe under the FreeRTOS lazy
++        // PIE-coprocessor save (rtos_save_pie_coproc) on P4 silicon -> Illegal
++        // instruction panic at dsps_fird_s16_arp4.S:123. Standard counter loop
++        // instead; s6 is recomputed every .loop_len iteration, safe to decrement.
++        .balign 4
++        .main_loop1:
+             esp.vmulas.s16.xacc.ld.ip     q0, s10, 16, q0, q1   // q0 - coeffs, q1 - data
+-        .main_loop1:     esp.vld.128.ip  q1, s9, 16              // Load delay line    
++            esp.vld.128.ip  q1, s9, 16              // Load delay line
++            addi s6, s6, -1
++        bnez s6, .main_loop1
+ .skip_main_loop1: nop
+ 
+ 
+@@ -113,10 +120,15 @@ dsps_fird_s16_arp4:
+         esp.vld.128.ip          q1, s9, 16
+         
+         beqz s7, .skip_main_loop3
+-        esp.lp.setup    1, s7, .main_loop3
++        // iridium_acars patch: HWLP removed (see .main_loop1 above); s7 is recomputed
++        // every .loop_len iteration, safe to decrement. Trailing nop was HWLP-end
++        // padding, no longer needed.
++        .balign 4
++        .main_loop3:
+             esp.vmulas.s16.xacc.ld.ip     q0, s10, 16, q0, q1 // q0 - coeffs, q1 - data
+             esp.vld.128.ip  q1, s9, 16
+-        .main_loop3: nop
++            addi s7, s7, -1
++        bnez s7, .main_loop3
+ .skip_main_loop3: nop
+ 
+         // Shift and Store result
