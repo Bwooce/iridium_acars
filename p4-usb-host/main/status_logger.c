@@ -127,9 +127,12 @@ static void emit(const status_snapshot_t *s)
     double dsp_pct       = (s->window_us > 0)
                                ? 100.0 * (double)s->dsp_total_time_us / window_us_div
                                : 0.0;
-    double worker_pct    = (s->window_us > 0)
-                               ? 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / window_us_div
-                               : 0.0;
+    // P1.5a: triage-REJECTED bursts don't appear in bursts_processed /
+    // avg_burst_us, but they still consume worker time (~one fast-pass
+    // each) — add them so worker_cap reflects the real load.
+    double worker_pct = (s->window_us > 0)
+                            ? 100.0 * ((double)s->ws.bursts_processed * (double)s->ws.avg_burst_us + (double)s->ws.bursts_triage_rejected * (double)s->ws.triage_rej_us) / window_us_div
+                            : 0.0;
 
     ESP_LOGI(TAG, "DSP: %u steps, total=%.0f us/step, cap=%.1f%% "
                   "[wind=%.0f fft=%.0f mag=%.0f detect=%.0f base=%.0f]",
@@ -161,18 +164,20 @@ static void emit(const status_snapshot_t *s)
     // + bch_skipped(short)=12.
     ESP_LOGI(TAG, "Worker: queued=%u dropped=%u processed=%u "
                   "bch_decoded=%u bch_unknown=%u bch_failed=%u "
-                  "bch_chase=%u skipped=%u "
-                  "qmax=%u avg_burst=%.0f us cap=%.1f%%",
+                  "bch_chase=%u skipped=%u triage_rej=%u "
+                  "qmax=%u avg_burst=%.0f us triage_rej_avg=%.0f us cap=%.1f%%",
              s->ws.bursts_queued, s->ws.bursts_dropped, s->ws.bursts_processed,
              s->ws.bursts_bch_decoded, s->ws.bursts_bch_unknown,
              s->ws.bursts_bch_failed, s->ws.bursts_bch_chase_recovered,
-             s->ws.bursts_skipped,
-             s->ws.queue_high_water, s->ws.avg_burst_us, worker_pct);
+             s->ws.bursts_skipped, s->ws.bursts_triage_rejected,
+             s->ws.queue_high_water, s->ws.avg_burst_us,
+             s->ws.triage_rej_us, worker_pct);
 
-    ESP_LOGI(TAG, "Worker-stages (us): extract=%.0f freq=%.0f fir=%.0f "
-                  "resamp=%.0f demod=%.0f bch=%.0f",
-             s->ws.extract_us, s->ws.freq_center_us, s->ws.fir_decim_us,
-             s->ws.resample_us, s->ws.demod_us, s->ws.bch_us);
+    ESP_LOGI(TAG, "Worker-stages (us): triage=%.0f extract=%.0f freq=%.0f "
+                  "fir=%.0f resamp=%.0f demod=%.0f bch=%.0f",
+             s->ws.triage_us, s->ws.extract_us, s->ws.freq_center_us,
+             s->ws.fir_decim_us, s->ws.resample_us, s->ws.demod_us,
+             s->ws.bch_us);
 #else
     // Quiet mode: one line of essential health, plus a separate WARN line
     // only when an anomaly counter is nonzero. Real burst/decode events
@@ -191,9 +196,11 @@ static void emit(const status_snapshot_t *s)
     double dsp_pct       = (s->window_us > 0)
                                ? 100.0 * (double)s->dsp_total_time_us / window_us_div
                                : 0.0;
-    double worker_pct    = (s->window_us > 0)
-                               ? 100.0 * (double)s->ws.bursts_processed * (double)s->ws.avg_burst_us / window_us_div
-                               : 0.0;
+    // P1.5a: include triage-rejected bursts' wall time (see verbose
+    // branch) so worker_cap reflects the fast-pass load too.
+    double worker_pct = (s->window_us > 0)
+                            ? 100.0 * ((double)s->ws.bursts_processed * (double)s->ws.avg_burst_us + (double)s->ws.bursts_triage_rejected * (double)s->ws.triage_rej_us) / window_us_div
+                            : 0.0;
 
     // bch_decoded = real Iridium frame decodes (BCH pass AND classify
     // known type — task #111). bch_unknown = BCH false positives (random
@@ -209,11 +216,11 @@ static void emit(const status_snapshot_t *s)
     // source of a 14-hour bench-monitoring misread (steps=~883/s at the
     // nominal USB rate was mistaken for a burst rate).
     ESP_LOGI(TAG, "STATUS: rate=%.2f MB/s steps=%u bursts=%u processed=%u "
-                  "bch_decoded=%u bch_unknown=%u drops=%u "
+                  "triage_rej=%u bch_decoded=%u bch_unknown=%u drops=%u "
                   "dsp_cap=%.0f%% worker_cap=%.0f%%",
              rate_inst, s->dsp_frame_count, s->dsp.gone_bursts,
-             s->ws.bursts_processed, s->ws.bursts_bch_decoded,
-             s->ws.bursts_bch_unknown,
+             s->ws.bursts_processed, s->ws.bursts_triage_rejected,
+             s->ws.bursts_bch_decoded, s->ws.bursts_bch_unknown,
              s->us.rb_full_drops, dsp_pct, worker_pct);
     iot_log(IOT_LOG_INFO,
             "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%%",

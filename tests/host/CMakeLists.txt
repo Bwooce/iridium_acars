@@ -423,6 +423,34 @@ target_link_libraries(test_pipeline_wideband_resampled PRIVATE m)
 # iridium-extractor to generate its cf32 input.)
 add_test(NAME pipeline_wideband_resampled COMMAND test_pipeline_wideband_resampled)
 
+# P1.5a fast-pass triage validation (Design A). Same self-contained
+# harness as test_pipeline_wideband_resampled, but runs
+# burst_pipeline_triage on a truncated copy of every burst window and
+# cross-checks the verdicts against the full pipeline: positive
+# control (every first-attempt decode must be accepted), triage-ON
+# decode floor, and synthetic noise/impulse rejection.
+add_executable(test_triage_fast_pass
+    test_triage_fast_pass.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_triage_fast_pass PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_triage_fast_pass PRIVATE m)
+add_test(NAME triage_fast_pass COMMAND test_triage_fast_pass)
+
 # Drift + AWGN parameter-sweep regression (#121). Same wideband pipeline
 # as test_pipeline_wideband_resampled, but each cell applies a synthetic
 # LO drift (±5/10/15 kHz) and added AWGN (sigma 0..400 int16 LSB), then

@@ -412,8 +412,35 @@ bool burst_pipeline_process_250khz(int16_t *iq250, int n_complex,
     return true;
 }
 
-int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
-                                 burst_pipeline_frame_cb cb, void *ctx)
+// P1.5a diagnostic: search_start at which the FIRST frame of the most
+// recent burst_pipeline_process_burst call decoded (0 = first
+// try_decode_frame attempt, >0 = recovered by the retry loop), or -1
+// if no first frame was found. See header.
+static int s_last_first_search_start = -1;
+
+int burst_pipeline_last_first_search_start(void)
+{
+    return s_last_first_search_start;
+}
+
+// Shared front half of the per-burst pipeline — steps 0-4 (per-burst
+// DC removal, D13 envelope start trim, pre-RRC coarse CFO, phase
+// correction, RRC matched filter), factored out of
+// burst_pipeline_process_burst so burst_pipeline_triage() runs the
+// EXACT same stage code on its truncated window (P1.5a; no duplicated
+// DSP). Behaviour notes:
+//   - use_force_start: only the full process_burst path consumes the
+//     one-shot s_force_burst_start override; the triage pass must not
+//     eat it (the host harnesses arm it for the full call that
+//     follows).
+//   - dump: only the full path writes the one-shot stage dumps (and
+//     only process_burst clears s_dump_pending afterwards).
+// Returns the D13 burst_start (>= 0) and fills adj/adj_n/omega, or -1
+// when the trimmed burst is too short for the matched filter.
+static int pipeline_head(int16_t *iq250, int n_complex,
+                         bool use_force_start, bool dump,
+                         int16_t **adj_out, int *adj_n_out,
+                         float *omega_out)
 {
     PROFILE_T0();
 
@@ -473,7 +500,7 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
     //    Cap at 7 ms so start_finder always finds the FIRST envelope
     //    rise (the actual burst we got tagged for).
     int burst_start;
-    if (s_force_burst_start >= 0) {
+    if (use_force_start && s_force_burst_start >= 0) {
         burst_start = s_force_burst_start;
         if (burst_start >= n_complex) burst_start = 0;
         s_force_burst_start = -1;
@@ -489,11 +516,11 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
     if (adj_n < UW_SPS * 28) {
         // Less than one full sync word worth — can't even run the
         // matched filter; bail out cleanly.
-        return 0;
+        return -1;
     }
     PROFILE_LOG(D13);
 
-    dump_iq_cf32("04_post_d13_250k", adj_burst, adj_n);
+    if (dump) dump_iq_cf32("04_post_d13_250k", adj_burst, adj_n);
 
     // 2. Pre-RRC squared-FFT CFO estimate on the trimmed burst.
     float omega_coarse = uw_correlator_estimate_cfo(adj_burst, adj_n);
@@ -518,13 +545,67 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
     }
     PROFILE_LOG(PREROT);
 
-    dump_iq_cf32("05_post_cfo_250k", adj_burst, adj_n);
+    if (dump) dump_iq_cf32("05_post_cfo_250k", adj_burst, adj_n);
 
     // 4. RRC matched filter.
     uw_correlator_apply_rrc(adj_burst, adj_burst, adj_n);
     PROFILE_LOG(RRC);
 
-    dump_iq_cf32("06_post_rrc_250k", adj_burst, adj_n);
+    if (dump) dump_iq_cf32("06_post_rrc_250k", adj_burst, adj_n);
+
+    *adj_out   = adj_burst;
+    *adj_n_out = adj_n;
+    *omega_out = omega_coarse;
+    return burst_start;
+}
+
+bool burst_pipeline_triage(int16_t *iq250, int n_complex)
+{
+    int16_t *adj_burst    = NULL;
+    int      adj_n        = 0;
+    float    omega_coarse = 0.0f;
+    int      burst_start  = pipeline_head(iq250, n_complex,
+                                          /*use_force_start=*/false,
+                                          /*dump=*/false,
+                                          &adj_burst, &adj_n, &omega_coarse);
+    if (burst_start < 0) return false;
+
+    // ONE try_decode_frame at search_start = 0 — gri's single UW attempt
+    // per frame slot. The accept criterion is exactly the full path's
+    // first-attempt criterion: uw_correlator_find picks a peak and
+    // qpsk_demod_process's UW check (diffs <= 2, qpsk_demod.c) passes.
+    // No retry loop, no multi-frame walk — those only run after ACCEPT,
+    // on the full re-extracted window in burst_pipeline_process_burst.
+    burst_pipeline_result_t res;
+    memset(&res, 0, sizeof(res));
+    if (!try_decode_frame(adj_burst, adj_n, 0, &res, /*dump=*/false)) {
+        return false;
+    }
+    // The escalated full pass re-decodes from scratch; the triage frame
+    // is only a verdict, not a deliverable.
+    free(res.frame.bits);
+    free(res.frame.soft_bits); // #112
+    return true;
+}
+
+int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
+                                 burst_pipeline_frame_cb cb, void *ctx)
+{
+    int16_t *adj_burst    = NULL;
+    int      adj_n        = 0;
+    float    omega_coarse = 0.0f;
+    int      burst_start  = pipeline_head(iq250, n_complex,
+                                          /*use_force_start=*/true,
+                                          /*dump=*/true,
+                                          &adj_burst, &adj_n, &omega_coarse);
+    if (burst_start < 0) {
+        s_last_first_search_start = -1;
+        return 0;
+    }
+    // Stage timer for the two loop buckets below; pipeline_head has its
+    // own PROFILE_T0, so BP_LOOP_FIRST starts from here (post-RRC), same
+    // window as before the P1.5a factoring.
+    PROFILE_T0();
 
     // 5-8. Per-frame matched filter + pre-rotate + decim + demod.
     //
@@ -572,6 +653,7 @@ int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
         }
     }
     PROFILE_LOG(LOOP_FIRST);
+    s_last_first_search_start = found ? first_used_search_start : -1;
 
     if (found) {
         res.burst_start  = burst_start;

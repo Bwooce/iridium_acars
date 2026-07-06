@@ -101,6 +101,62 @@ typedef void (*burst_pipeline_frame_cb)(burst_pipeline_result_t *res, void *ctx)
 int burst_pipeline_process_burst(int16_t *iq250, int n_complex,
                                  burst_pipeline_frame_cb cb, void *ctx);
 
+// ---------------------------------------------------------------------
+// P1.5a fast-pass triage (Design A).
+//
+// The worker's per-burst cost is dominated (~94%) by the first-frame
+// retry loop in burst_pipeline_process_burst — up to ~40
+// try_decode_frame calls compensating for our over-wide tagger windows
+// (task #70); gr-iridium makes ONE UW attempt per frame slot. Junk
+// bursts (impulsive broadband RFI) pay that full retry cost before
+// failing. The triage pass gives a cheap real verdict first: run the
+// identical steps 0-4 head (DC removal / D13 / coarse CFO / pre-rotate
+// / RRC) plus ONE try_decode_frame at search_start = 0 on a TRUNCATED
+// fixed window, and accept iff it decodes — i.e. iff qpsk_demod's UW
+// check (gri's diffs <= 2) passes. On ACCEPT the caller re-extracts the
+// FULL window and runs burst_pipeline_process_burst unchanged (retries,
+// multi-frame, BCH); on REJECT it drops the burst and counts it.
+//
+// Triage window length in complex samples at 250 ksps. Every term is an
+// existing pipeline constant (no tuned numbers):
+//     1750  D13 start-finder search depth (gri's 0.007 × 250 ksps,
+//           SEARCH_DEPTH_SAMPLES in burst_pipeline.c)
+//   + 1778  SYNC_SEARCH_LEN — the UW correlator's alias-free lag count
+//           (2048-pt FFT − 271-sample reference + 1); first-attempt UW
+//           offsets can't exceed this
+//   + 1910  one frame (191 sym × 10 sps = MAX_FRAME_LEN_NORMAL_10SPS)
+//           past the worst-case UW offset, what try_decode_frame's
+//           rotate/interp/decim consumes
+//   +  300  SYNC_SEARCH_LEN_GUARD margin (covers the +4 interp
+//           look-ahead and RRC tail edge effects)
+//   = 5738  (~23 ms at 250 ksps)
+// A window at least this long gives the triage attempt the SAME
+// effective UW search range and frame span as the full path's first
+// attempt; the only remaining difference is the per-burst DC mean /
+// RRC tail computed over the truncated instead of full window.
+#define BURST_PIPELINE_TRIAGE_LEN_250K (1750 + 1778 + 1910 + 300)
+
+// Run the triage verdict chain on `iq250` (typically the first
+// BURST_PIPELINE_TRIAGE_LEN_250K complex samples of a burst window;
+// shorter bursts pass their whole window). Modifies iq250 IN PLACE
+// (same stages as the full pipeline) — the caller must NOT reuse the
+// buffer for the escalated full pass; re-extract instead (on-device:
+// re-read from the signal ring, exactly like today's full path, so
+// decim phase/alignment is untouched).
+//
+// Returns true = ACCEPT (one-attempt decode succeeded; escalate),
+// false = REJECT (drop the burst). Does not consume the one-shot
+// force-start/dump diagnostics (those apply to the full call).
+bool burst_pipeline_triage(int16_t *iq250, int n_complex);
+
+// Diagnostic (P1.5a positive control): search_start at which the most
+// recent burst_pipeline_process_burst call decoded its FIRST frame.
+//   0  = first try_decode_frame attempt (the population triage must
+//        accept — same single-attempt criterion)
+//   >0 = recovered by the retry loop (triage's recall-risk population)
+//   -1 = no first frame decoded (or head guard bailed)
+int burst_pipeline_last_first_search_start(void);
+
 // Diagnostic: override D13's burst_start for the NEXT call only,
 // then auto-clear. Used by the path-C host harness to bypass our
 // envelope start-finder when we already have a known-good start

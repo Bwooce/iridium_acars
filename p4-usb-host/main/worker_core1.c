@@ -199,6 +199,16 @@ static _Atomic uint32_t s_bursts_bch_decoded         = 0; // BCH OK AND classify
 static _Atomic uint32_t s_bursts_bch_unknown         = 0; // BCH OK but iridium_frame_classify => IR_FRAME_UNKNOWN (BCH false-positive — task #111)
 static _Atomic uint32_t s_bursts_bch_failed          = 0; // BCH itself uncorrectable
 static _Atomic uint32_t s_bursts_bch_chase_recovered = 0; // Chase-2 soft decoder rescued a hard-decision BCH failure (#112)
+// P1.5a triage counters. rejected = the fast-pass verdict found no
+// frame at the single-attempt criterion, so the burst was dropped
+// WITHOUT paying the full retry-loop/multi-frame cost. Rejected
+// bursts never reach s_bursts_processed / s_burst_total_us, so their
+// wall time is tracked separately (s_t_triage_rej_us) for capacity
+// accounting; s_t_triage_us is the triage stage time of ACCEPTED
+// (escalated → processed) bursts, reported with the other stage means.
+static _Atomic uint32_t s_bursts_triage_rejected = 0;
+static _Atomic uint64_t s_t_triage_rej_us        = 0; // pop→drop wall time of rejects
+static _Atomic uint64_t s_t_triage_us            = 0; // triage stage time of accepted bursts
 
 // Diagnostic histograms (#116). Cumulative since boot — no decay /
 // rolling window; clients compute deltas if they want a rate.
@@ -552,9 +562,7 @@ void worker_core1_golden_print_summary(void)
 #else
 // Outside the smoke build, the public summary entry is a no-op so
 // smoke_test.c can call it unconditionally.
-void worker_core1_golden_print_summary(void)
-{
-}
+void worker_core1_golden_print_summary(void){}
 #endif // CONFIG_SMOKE_TEST_RAW_IRIDIUM
 
 // Buffer sizes for the wideband per-burst window. The tagger
@@ -604,6 +612,25 @@ void worker_core1_golden_print_summary(void)
 
 // 250 ksps output is at most WB_EXTRACT_MAX / 10 + 1.
 #define WB_DECIM_MAX ((WB_EXTRACT_MAX / DIDECIM_DECIM) + 8)
+
+// P1.5a triage extraction cap, in RAW samples at FS_DETECT_HZ.
+// Derivation (all existing constants, no tuned numbers):
+//   BURST_PIPELINE_TRIAGE_LEN_250K (= 5738, see burst_pipeline.h for
+//   the per-term derivation) × DIDECIM_DECIM = 57380 raw, rounded UP
+//   to a multiple of 80 (LCM(DIDECIM_DECIM, 16-complex cache line) —
+//   the same rounding safe_len gets below) = 57440, plus
+//   WB_PRE_PAD_SAMPLES — mirroring ext_len = safe_len +
+//   WB_PRE_PAD_SAMPLES so the triage extraction has the SAME start
+//   address and decim phase as the full path's window; it is purely a
+//   length truncation. = 57728 raw (~23.1 ms at 2.5 Msps, ~5.7 k
+//   complex post-decim).
+#define TRIAGE_EXT_RAW \
+    ((((BURST_PIPELINE_TRIAGE_LEN_250K * DIDECIM_DECIM) + 79) / 80) * 80 + WB_PRE_PAD_SAMPLES)
+_Static_assert(TRIAGE_EXT_RAW % 16 == 0,
+               "triage extraction length must be 16-complex aligned (64 B) "
+               "for signal_buffer_invalidate_range");
+_Static_assert(TRIAGE_EXT_RAW <= WB_EXTRACT_MAX,
+               "triage window must fit the shared decim output buffer");
 
 // (T45's WB_PRE_PAD % DIDECIM_DECIM static_assert removed with the 320
 // revert — 288 % 10 != 0 by design; the harmless tail-sample drop is
@@ -799,6 +826,67 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
     wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);
 }
 
+// Chunked ring-read → rotate-to-DC → 10× decim into s_decim_buf.
+// Factored out of worker_task for P1.5a so the triage pass (truncated
+// window) and the escalated full pass (today's exact path) share one
+// implementation. Caller must have called signal_buffer_invalidate_range
+// for [ext_start, ext_len) first.
+//
+// Each DECIM_CHUNK_IN-sample slice is pulled DIRECTLY from circular_buf
+// (PSRAM) into the internal-SRAM chunk buffer (task #64 — no PSRAM
+// intermediate), rotated there (phase continuity across chunks via the
+// burst-global sample_offset), then handed to process_split whose
+// scratch is also internal. The streaming FIR delay-line state in
+// s_decim is reset here once per extraction so leftover history from
+// previous bursts (or from the triage pass, on escalate) doesn't bleed
+// in.
+//
+// sd_tap: when true, emit the SD burst-capture record (header + raw
+// pre-rotate IQ chunks) exactly as before. Only the escalated full
+// pass taps SD — triage-rejected junk is not captured, and capturing
+// the truncated triage window would confuse host replay.
+static int wb_extract_decim(uint32_t ext_start, uint32_t ext_len,
+                            double                  phase_step,
+                            const detected_burst_t *burst, bool sd_tap)
+{
+    direct_if_decim_reset_state(&s_decim);
+    if (sd_tap) {
+        // If burst-mode SD capture is active, emit one record per
+        // burst. sd_capture_record_burst_* are no-ops when not in
+        // burst mode, so the hot-path cost is predicted-false branches.
+        sd_capture_record_burst_begin(ext_len,
+                                      burst->rel_freq_hz,
+                                      burst->peak_snr_db,
+                                      burst->magnitude_db,
+                                      burst->noise_db);
+    }
+    int n_250k = 0;
+    for (int off = 0; off < (int)ext_len; off += DECIM_CHUNK_IN) {
+        int chunk = (int)ext_len - off;
+        if (chunk > DECIM_CHUNK_IN) chunk = DECIM_CHUNK_IN;
+        signal_buffer_read_chunk(ext_start + (uint32_t)off,
+                                 (uint32_t)chunk, s_chunk_iq);
+        if (sd_tap) {
+            // SD burst-capture tap: raw pre-rotate IQ, so host replay
+            // sees exactly what the worker saw.
+            sd_capture_record_burst_chunk(s_chunk_iq, (size_t)chunk);
+        }
+        // Rotate the chunk in internal SRAM. sample_offset = off keeps
+        // the absolute-phase renorm aligned across the burst as if it
+        // were a single rotate call. _simd_at dispatches to the PIE asm
+        // on target and the chunked-scalar reference on host.
+        rotate_to_dc_q15_simd_at(s_chunk_iq, chunk, phase_step, off);
+        int n_chunk_out = direct_if_decim_process_split(&s_decim,
+                                                        s_chunk_iq, chunk,
+                                                        s_decim_buf + (size_t)n_250k * 2,
+                                                        s_decim_scr_in_i, s_decim_scr_in_q,
+                                                        s_decim_scr_out_i, s_decim_scr_out_q);
+        n_250k += n_chunk_out;
+    }
+    if (sd_tap) sd_capture_record_burst_end();
+    return n_250k;
+}
+
 void worker_task(void *arg)
 {
     ESP_LOGI(TAG, "Worker Task started on Core %d", xPortGetCoreID());
@@ -885,99 +973,78 @@ void worker_task(void *arg)
                 ext_len = WB_EXTRACT_MAX;
             }
 
-            // 1. Prepare wideband window: invalidate L2 cache for the
-            // whole range so the per-chunk reads in step 2+3 see
-            // fresh DMA-written data. Task #64: skip the PSRAM
-            // intermediate `s_extract_buf`; the decim chunk loop
-            // reads directly from circular_buf via
-            // signal_buffer_read_chunk, saving the extract-stage
-            // PSRAM write (~3 ms/burst on the smoke corpus).
-            uint32_t ext_start = (uint32_t)check_start; // ring offset (mod total_cap)
-            int64_t  t_ext0    = esp_timer_get_time();
+            uint32_t ext_start  = (uint32_t)check_start; // ring offset (mod total_cap)
+            int64_t  t_rot0     = esp_timer_get_time();
+            double   phase_step = -2.0 * M_PI * (double)burst.rel_freq_hz / (double)FS_DETECT_HZ;
+            int64_t  t_rot1     = esp_timer_get_time();
+            // Rotate-stage timer (kept for the per-stage breakdown) is
+            // effectively the phase_step setup now — the per-chunk
+            // rotate work counts under the decim timer.
+            s_t_rotate_us += (uint64_t)(t_rot1 - t_rot0);
+
+            // 1. P1.5a TRIAGE: extract + decim a TRUNCATED head window
+            // (fixed cap TRIAGE_EXT_RAW, independent of tagged length —
+            // same start address / pre-pad / decim phase as the full
+            // window, purely shorter) and run the fast-pass verdict
+            // chain: identical steps 0-4 head + ONE try_decode_frame at
+            // slot 0 (gri's one-UW-attempt-per-slot). Junk pays ~one
+            // retry-iteration's cost instead of the full ~40-call retry
+            // loop; real bursts escalate to the unchanged full path
+            // below (re-extracted from the ring, so alignment and decode
+            // behaviour are bit-identical to the pre-triage worker).
+            uint32_t tri_len = ext_len;
+            if (tri_len > (uint32_t)TRIAGE_EXT_RAW) tri_len = (uint32_t)TRIAGE_EXT_RAW;
+            int64_t t_tri0 = esp_timer_get_time();
+            signal_buffer_invalidate_range(ext_start, tri_len);
+            int n_tri = wb_extract_decim(ext_start, tri_len, phase_step,
+                                         &burst, /*sd_tap=*/false);
+            // Same T38-style torn-read guard as the full pass: the
+            // producer can lap the window while we were reading it.
+            if (!signal_buffer_burst_valid(check_start, check_len)) {
+                uint64_t lag = signal_buffer_head_total() - burst.start_sample_idx;
+                ESP_LOGW(TAG, "stale burst: start=%llu lag=%lu ms (during triage read) — drop",
+                         (unsigned long long)burst.start_sample_idx,
+                         (unsigned long)(lag * 1000ULL / FS_DETECT_HZ));
+                s_bursts_skipped++;
+                continue;
+            }
+            if (n_tri <= 64) {
+                ESP_LOGD(TAG, "triage decim produced %d samples — too short",
+                         n_tri);
+                s_bursts_skipped++;
+                continue;
+            }
+            bool    tri_accept = burst_pipeline_triage(s_decim_buf, n_tri);
+            int64_t t_tri1     = esp_timer_get_time();
+            if (!tri_accept) {
+                s_bursts_triage_rejected++;
+                // Rejected bursts never reach s_burst_total_us; account
+                // their pop→drop wall time here so capacity math
+                // (worker_cap) still sees the triage load.
+                s_t_triage_rej_us += (uint64_t)(t_tri1 - burst_t0);
+                continue;
+            }
+            s_t_triage_us += (uint64_t)(t_tri1 - t_tri0);
+
+            // 2. ESCALATE — full window, exactly the pre-triage path.
+            // Invalidate L2 for the whole range so the per-chunk reads
+            // see fresh DMA-written data (task #64: reads come straight
+            // from circular_buf, no PSRAM intermediate). The triage
+            // pass mutated s_decim_buf in place (DC removal / CFO
+            // rotation / RRC), so the full pass MUST re-extract from
+            // the ring — which also keeps decim phase and window
+            // alignment identical to today's full path (see the T45
+            // revert note at WB_PRE_PAD_SAMPLES).
+            int64_t t_ext0 = esp_timer_get_time();
             signal_buffer_invalidate_range(ext_start, ext_len);
             int64_t t_ext1 = esp_timer_get_time();
             s_t_extract_us += (uint64_t)(t_ext1 - t_ext0);
 
-            // 2 + 3. Fused rotate-to-DC + 10× decim, both running on
-            // internal-SRAM chunks. The previous design rotated the
-            // whole burst in PSRAM (~25 ms PSRAM round-trip) and then
-            // decimated from PSRAM scratch (PIE FIR partially blocked
-            // by the same vld.128 constraint as the FFT). This loop
-            // reads each DECIM_CHUNK_IN-sample slice from extract_buf
-            // (PSRAM, single linear read) into the internal-SRAM
-            // chunk buffer, rotates it there, then hands it to
-            // process_split (whose scratch is also internal). PSRAM
-            // is touched once per burst (read-only) instead of three
-            // times (extract-write + rotate-read+write + decim-read).
-            //
-            // Phase continuity across chunks via
-            // rotate_to_dc_q15_inc_at(..., sample_offset = off): each
-            // chunk's first absolute-phase renorm uses the burst-global
-            // sample index so the rotated output is identical to a
-            // single all-burst rotate call (within Q15 saturation).
-            //
-            // Streaming FIR delay-line state in `s_decim` carries
-            // history across chunks within a burst; reset once per
-            // burst so leftover history from previous bursts doesn't
-            // bleed in.
-            int64_t t_rot0     = esp_timer_get_time();
-            double  phase_step = -2.0 * M_PI * (double)burst.rel_freq_hz / (double)FS_DETECT_HZ;
-            int64_t t_rot1     = esp_timer_get_time();
-            // Rotate-stage timer (kept for the per-stage breakdown) is
-            // effectively the cosf/sinf phase_step setup now — the
-            // per-chunk rotate work counts under the decim timer.
-            s_t_rotate_us += (uint64_t)(t_rot1 - t_rot0);
-
+            // 3. Fused rotate-to-DC + 10× decim on internal-SRAM chunks
+            // (see wb_extract_decim; PSRAM is touched once, read-only).
             int64_t t_dec0 = esp_timer_get_time();
-            direct_if_decim_reset_state(&s_decim);
-            // If burst-mode SD capture is active, emit one record
-            // per burst: header + raw 2.5 MSPS IQ samples (pre-
-            // rotate, pre-decim — the exact bytes the worker just
-            // read from signal_buffer). Chunked via the same
-            // signal_buffer_read_chunk loop the decode path uses.
-            // sd_capture_record_burst_* are no-ops when not in
-            // burst mode, so the hot-path cost is two predicted-
-            // false branches.
-            sd_capture_record_burst_begin((uint32_t)ext_len,
-                                          burst.rel_freq_hz,
-                                          burst.peak_snr_db,
-                                          burst.magnitude_db,
-                                          burst.noise_db);
-            int n_250k = 0;
-            for (int off = 0; off < (int)ext_len; off += DECIM_CHUNK_IN) {
-                int chunk = (int)ext_len - off;
-                if (chunk > DECIM_CHUNK_IN) chunk = DECIM_CHUNK_IN;
-                // Pull chunk DIRECTLY from circular_buf (PSRAM) into the
-                // internal-SRAM chunk buffer. Task #64: skips the
-                // s_extract_buf intermediate -- L2 was already
-                // invalidated for the whole window above, so this
-                // single linear PSRAM read fills internal scratch
-                // without a PSRAM intermediate.
-                signal_buffer_read_chunk(ext_start + (uint32_t)off,
-                                         (uint32_t)chunk, s_chunk_iq);
-                // SD burst-capture tap. Writes the raw pre-rotate
-                // IQ chunk to the capture stream buffer; host
-                // pipeline replay sees exactly what the worker
-                // saw, so device-vs-host decode comparisons are
-                // apples-to-apples.
-                sd_capture_record_burst_chunk(s_chunk_iq, (size_t)chunk);
-                // Rotate the chunk in internal SRAM. sample_offset = off
-                // keeps the absolute-phase renorm aligned across the
-                // burst as if it were a single rotate call.
-                // _simd_at dispatches to the PIE asm on target (when
-                // ROT_SIMD_ARP4_AVAILABLE is set in the build) and to
-                // the chunked-scalar reference on host — same
-                // numerical contract either way.
-                rotate_to_dc_q15_simd_at(s_chunk_iq, chunk,
-                                         phase_step, off);
-                int n_chunk_out = direct_if_decim_process_split(&s_decim,
-                                                                s_chunk_iq, chunk,
-                                                                s_decim_buf + (size_t)n_250k * 2,
-                                                                s_decim_scr_in_i, s_decim_scr_in_q,
-                                                                s_decim_scr_out_i, s_decim_scr_out_q);
-                n_250k += n_chunk_out;
-            }
-            sd_capture_record_burst_end();
+            int     n_250k = wb_extract_decim(ext_start, ext_len, phase_step,
+                                              &burst, /*sd_tap=*/true);
             int64_t t_dec1 = esp_timer_get_time();
             s_t_decim_us += (uint64_t)(t_dec1 - t_dec0);
 
@@ -1290,6 +1357,15 @@ void worker_core1_get_stats(worker_stats_t *out)
     out->bursts_bch_chase_recovered =
         atomic_exchange_explicit(&s_bursts_bch_chase_recovered, 0,
                                  memory_order_relaxed);
+    uint32_t n_tri_rej =
+        atomic_exchange_explicit(&s_bursts_triage_rejected, 0, memory_order_relaxed);
+    out->bursts_triage_rejected = n_tri_rej;
+    uint64_t t_triage =
+        atomic_exchange_explicit(&s_t_triage_us, 0, memory_order_relaxed);
+    uint64_t t_triage_rej =
+        atomic_exchange_explicit(&s_t_triage_rej_us, 0, memory_order_relaxed);
+    out->triage_rej_us =
+        (n_tri_rej > 0) ? (float)t_triage_rej / (float)n_tri_rej : 0.0f;
     out->queue_high_water =
         atomic_exchange_explicit(&s_queue_high_water, 0, memory_order_relaxed);
     uint64_t total_us =
@@ -1313,9 +1389,10 @@ void worker_core1_get_stats(worker_stats_t *out)
         out->resample_us    = 0.0f;
         out->demod_us       = (float)t_pipeline / fn;
         out->bch_us         = (float)t_bch / fn;
+        out->triage_us      = (float)t_triage / fn;
     } else {
         out->avg_burst_us = out->extract_us = out->freq_center_us =
             out->fir_decim_us = out->resample_us = out->demod_us =
-                out->bch_us                      = 0.0f;
+                out->bch_us = out->triage_us = 0.0f;
     }
 }

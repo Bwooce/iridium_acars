@@ -28,8 +28,10 @@ typedef struct {
     uint32_t bursts_bch_unknown;         // subset that passed BCH but iridium_frame_classify returned UNKNOWN (BCH false positives)
     uint32_t bursts_bch_failed;          // subset that demod'd but BCH was uncorrectable (qpsk_demod false positives)
     uint32_t bursts_bch_chase_recovered; // subset where hard-BCH failed but Chase-2 soft decoder rescued it (#112; subset of bursts_bch_decoded + bursts_bch_unknown)
+    uint32_t bursts_triage_rejected;     // P1.5a fast-pass verdict said "no frame" — dropped without the full decode cost (not in bursts_processed)
     uint32_t queue_high_water;           // peak observed queue depth
     float    avg_burst_us;               // mean wall-clock per processed burst
+    float    triage_rej_us;              // mean pop→drop wall per triage-REJECTED burst (capacity accounting; rejects aren't in avg_burst_us)
 
     // Per-stage means (microseconds), averaged over processed bursts only.
     float extract_us;     // signal_buffer_extract
@@ -38,6 +40,7 @@ typedef struct {
     float resample_us;    // Stage 2 polyphase resample
     float demod_us;       // qpsk_demod_process + interleave
     float bch_us;         // BCH decode + de-interleave (when run)
+    float triage_us;      // P1.5a triage pass (extract+decim+verdict) of accepted bursts
 } worker_stats_t;
 
 void worker_core1_get_stats(worker_stats_t *out);
