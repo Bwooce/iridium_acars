@@ -38,13 +38,23 @@ CONFIG_SPIRAM_MEMTEST=y
 #    (2 × 16 KB raw + 2 × 32 KB conv = 96 KB).
 #  - 118784 (116 KB) added headroom for fft_sc16_2048's twiddle +
 #    dsp_processor's s_accum + uw_correlator scratch.
-#  - 180224 (176 KB) needed once esp_libusb's 4 × 8 KB = 32 KB async
-#    bulk-IN transfer pool is also DMA-capable internal allocated
-#    (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n per the errata
-#    hardening means usb_host_transfer_alloc cannot land buffers in
-#    PSRAM). Without this bump, transfer_alloc returns
-#    ESP_ERR_NO_MEM at start-stream because internal DMA heap is
-#    exhausted by the wideband front-end's static allocations.
+#  - 180224 (176 KB) was floated as the number needed once esp_libusb's
+#    async bulk-IN transfer pool is also DMA-capable internal
+#    allocated (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n per the
+#    errata hardening means usb_host_transfer_alloc cannot land
+#    buffers in PSRAM) — without enough reserve, transfer_alloc
+#    returns ESP_ERR_NO_MEM at start-stream because internal DMA heap
+#    is exhausted by the wideband front-end's static allocations.
+#    The value actually configured below (147456 / 144 KB) is
+#    narrower than that estimate, which is the structural ~30 KB
+#    shortfall documented in docs/superpowers/
+#    ANALYSIS-2026-07-06-path-to-first-acars.md (P3): boot logs show
+#    "transfer_alloc #4 failed" and a 0-2 KB largest-free-block at
+#    runtime. esp_libusb.h's ASYNC_TRANSFER_COUNT was right-sized
+#    8 → 6 (P3-2, 64 KB → 48 KB pool) to fit inside this reserve with
+#    margin rather than raising the reserve itself (out of scope here
+#    — see the analysis doc's ranked reclaim list for the other
+#    consumers competing for this budget).
 #
 # ingest_core1's resample output (s_resamp) stays in PSRAM — AXI-
 # GDMA reads PSRAM sources fine and the resample's CPU touch is one
