@@ -2,7 +2,9 @@
 
 **Date:** 2026-07-06
 **Branch:** `freq-scanner` (off `t60-narrowband-priority` — depends on T60 `width_bins`)
-**Status:** design approved, spec under review
+**Status:** IMPLEMENTED (Tasks 1-8, branch `freq-scanner`) — manual `hop` retune
+works on device; automated `scan` deferred pending a DMA-internal budget fix. See
+`docs/superpowers/HANDOFF-2026-07-06-freq-scanner.md` for full state and follow-ups.
 
 ## Problem
 
