@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include "usb/usb_host.h"
 #include "esp_log.h"
 #include "esp_libusb.h"
@@ -48,6 +49,15 @@ static volatile uint64_t s_total_short_xfers   = 0;
 static volatile size_t   s_producer_rb_max_used     = 0;
 static volatile size_t   s_producer_rb_used_at_drop = 0;
 static volatile uint32_t s_producer_samples         = 0;
+
+// Task 7 (stream-pause retune): count of bulk-IN URBs currently
+// in-flight (submitted, not yet completed). Incremented after each
+// successful submit_stream_transfers() submission; decremented by
+// stream_transfer_cb when it frees (rather than resubmits) a completing
+// URB because streaming has been set false. esp_libusb_pause_stream()
+// polls this down to 0 (bounded) to know the bulk pipe is quiesced
+// before a retune's control transfers run.
+static _Atomic(int) s_live_xfers = 0;
 
 // Mutex-take timeout for the control/bulk transfer critical section (#T8).
 // Generous relative to a single USB control transfer (CTRL_TIMEOUT=300 ms in
@@ -162,6 +172,7 @@ void stream_transfer_cb(usb_transfer_t *transfer)
 {
     class_adsb_dev *dev = adsbdev;
     if (!dev->streaming) {
+        atomic_fetch_sub_explicit(&s_live_xfers, 1, memory_order_relaxed);
         usb_host_transfer_free(transfer);
         return;
     }
@@ -285,6 +296,55 @@ void esp_libusb_set_dev_hdl(usb_device_handle_t hdl)
     }
 }
 
+// Task 7 (stream-pause retune): the transfer alloc+submit loop, factored
+// out of esp_libusb_start_stream() so esp_libusb_resume_stream() can
+// re-run it after a pause without re-doing usbring_init() or the
+// streaming/s_stream_start_us bookkeeping (those stay the caller's
+// responsibility — see start_stream and resume_stream below). Returns 0
+// on success, -1 on the first alloc/submit failure (same contract as
+// the original inline loop).
+static int submit_stream_transfers(class_driver_t *driver_obj, usb_device_handle_t dev_hdl, unsigned char endpoint)
+{
+    class_adsb_dev *dev = adsbdev;
+    for (int i = 0; i < ASYNC_TRANSFER_COUNT; i++) {
+        esp_err_t r = usb_host_transfer_alloc(ASYNC_TRANSFER_SIZE, 0, &dev->transfers[i]);
+        if (r != ESP_OK || dev->transfers[i] == NULL) {
+            size_t free_now    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            size_t largest_now = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            ESP_LOGE("LIBUSB", "transfer_alloc #%d failed: r=0x%x (%s), "
+                               "DMA-internal heap free=%u KB largest=%u KB "
+                               "(needed %d KB). Bump CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL "
+                               "or shrink ASYNC_TRANSFER_COUNT/_SIZE.",
+                     i, r, esp_err_to_name(r),
+                     (unsigned)(free_now / 1024),
+                     (unsigned)(largest_now / 1024),
+                     ASYNC_TRANSFER_SIZE / 1024);
+            return -1;
+        }
+        dev->transfers[i]->device_handle    = dev_hdl;
+        dev->transfers[i]->bEndpointAddress = endpoint;
+        dev->transfers[i]->callback         = stream_transfer_cb;
+        dev->transfers[i]->context          = (void *)driver_obj;
+        dev->transfers[i]->num_bytes        = ASYNC_TRANSFER_SIZE;
+
+        r = usb_host_transfer_submit(dev->transfers[i]);
+        if (r != ESP_OK) {
+            // KNOWN LEAK on this fatal path: the ringbuffer and the
+            // already-submitted URBs are NOT reclaimed — earlier
+            // transfers are in flight, and freeing them (or the ring
+            // their callback writes into) without an endpoint
+            // halt+flush would be a use-after-free. Start-stream
+            // failure leaves the device unusable anyway; the recovery
+            // path is a reboot. Proper unwind = halt+flush+free, only
+            // worth doing if this ever needs to be retryable.
+            ESP_LOGE("LIBUSB", "Failed to submit async transfer %d: %d", i, r);
+            return -1;
+        }
+        atomic_fetch_add_explicit(&s_live_xfers, 1, memory_order_relaxed);
+    }
+    return 0;
+}
+
 int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
 {
     class_adsb_dev *dev = adsbdev;
@@ -336,43 +396,57 @@ int esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
              (unsigned)(internal_largest_at_start / 1024),
              ASYNC_TRANSFER_COUNT, ASYNC_TRANSFER_SIZE / 1024,
              ASYNC_TRANSFER_COUNT * ASYNC_TRANSFER_SIZE / 1024);
-    for (int i = 0; i < ASYNC_TRANSFER_COUNT; i++) {
-        esp_err_t r = usb_host_transfer_alloc(ASYNC_TRANSFER_SIZE, 0, &dev->transfers[i]);
-        if (r != ESP_OK || dev->transfers[i] == NULL) {
-            size_t free_now    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-            size_t largest_now = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-            ESP_LOGE("LIBUSB", "transfer_alloc #%d failed: r=0x%x (%s), "
-                               "DMA-internal heap free=%u KB largest=%u KB "
-                               "(needed %d KB). Bump CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL "
-                               "or shrink ASYNC_TRANSFER_COUNT/_SIZE.",
-                     i, r, esp_err_to_name(r),
-                     (unsigned)(free_now / 1024),
-                     (unsigned)(largest_now / 1024),
-                     ASYNC_TRANSFER_SIZE / 1024);
-            return -1;
-        }
-        dev->transfers[i]->device_handle    = dev_hdl;
-        dev->transfers[i]->bEndpointAddress = endpoint;
-        dev->transfers[i]->callback         = stream_transfer_cb;
-        dev->transfers[i]->context          = (void *)driver_obj;
-        dev->transfers[i]->num_bytes        = ASYNC_TRANSFER_SIZE;
-
-        r = usb_host_transfer_submit(dev->transfers[i]);
-        if (r != ESP_OK) {
-            // KNOWN LEAK on this fatal path: the ringbuffer and the
-            // already-submitted URBs are NOT reclaimed — earlier
-            // transfers are in flight, and freeing them (or the ring
-            // their callback writes into) without an endpoint
-            // halt+flush would be a use-after-free. Start-stream
-            // failure leaves the device unusable anyway; the recovery
-            // path is a reboot. Proper unwind = halt+flush+free, only
-            // worth doing if this ever needs to be retryable.
-            ESP_LOGE("LIBUSB", "Failed to submit async transfer %d: %d", i, r);
-            return -1;
-        }
+    if (submit_stream_transfers(driver_obj, dev_hdl, endpoint) != 0) {
+        return -1;
     }
     ESP_LOGI("LIBUSB", "Started async stream on handle %p", dev_hdl);
     return 0;
+}
+
+// Task 7 (stream-pause retune): quiesce the bulk stream so a retune's
+// control transfers don't contend with in-flight bulk URBs. See
+// esp_libusb.h's doc comment for the contract.
+int esp_libusb_pause_stream(class_driver_t *driver_obj)
+{
+    class_adsb_dev *dev = adsbdev;
+    if (!dev) return -1;
+
+    dev->streaming = false;
+
+    // Bounded drain: stream_transfer_cb now frees (rather than
+    // resubmits) each completing URB and decrements s_live_xfers.
+    // Never spin forever — a device that stops completing URBs
+    // entirely (e.g. unplugged mid-retune) must not wedge this task.
+    int64_t deadline_us = esp_timer_get_time() + 300 * 1000;
+    while (atomic_load_explicit(&s_live_xfers, memory_order_relaxed) != 0 &&
+           esp_timer_get_time() < deadline_us) {
+        usb_host_client_handle_events(driver_obj->client_hdl, pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGI("LIBUSB", "stream paused (live_xfers=%d)",
+             atomic_load_explicit(&s_live_xfers, memory_order_relaxed));
+    return 0;
+}
+
+// Task 7 (stream-pause retune): resume after esp_libusb_pause_stream().
+// Deliberately does NOT call esp_libusb_start_stream() — reuses the
+// existing usbring allocation (usbring_reset(), not usbring_init())
+// and only re-submits a fresh batch of transfers.
+int esp_libusb_resume_stream(class_driver_t *driver_obj, unsigned char endpoint)
+{
+    class_adsb_dev *dev = adsbdev;
+    if (!dev) return -1;
+
+    usb_device_handle_t dev_hdl = driver_obj->dev_hdl ? driver_obj->dev_hdl : dev->dev_hdl;
+    if (!dev_hdl) {
+        ESP_LOGE("LIBUSB", "Cannot resume stream: NULL device handle");
+        return -1;
+    }
+
+    usbring_reset();
+    dev->streaming    = true;
+    s_stream_start_us = esp_timer_get_time();
+    return submit_stream_transfers(driver_obj, dev_hdl, endpoint);
 }
 
 int esp_libusb_read_stream(const uint8_t **out_ptr, size_t max_length, size_t *received)

@@ -49,10 +49,23 @@ static dsp_processor_t *s_dsp = NULL;
 #define ACTION_CLOSE_DEV 0x20
 #define ACTION_EXIT 0x40
 #define ACTION_START_STREAM 0x80
+#define ACTION_RETUNE 0x100
 
 static const char   *TAG               = "CLASS";
 static rtlsdr_dev_t *rtldev            = NULL;
 static volatile int  s_last_gain_dbx10 = -1;
+
+// Task 7 (stream-pause retune): the actual rtlsdr_set_center_freq() call
+// must run on usb_pump (this task), not the caller — it shares the
+// control-transfer wait loop's usb_host_client_handle_events() call with
+// the pump loop, and the retune's control transfers must not contend
+// with in-flight bulk URBs (that contention is what wedges Approach A).
+// class_driver_retune() posts the request via ACTION_RETUNE and blocks
+// on s_retune_done; the pump loop below does the pause/retune/resume and
+// gives the semaphore.
+static volatile uint32_t s_pending_retune_hz = 0;
+static SemaphoreHandle_t s_retune_done       = NULL;
+static volatile bool     s_last_retune_ok    = false;
 
 // T48 (docs/perf-decoupling-design-2026-07-04.md §T48): the combined
 // class_driver loop is split into two Core-0 tasks:
@@ -228,13 +241,22 @@ int class_driver_get_tuner_gain_dbx10(void)
     return s_last_gain_dbx10;
 }
 
+static class_driver_t s_driver_obj = {0};
+
 esp_err_t class_driver_retune(uint32_t hz)
 {
     if (!rtldev) return ESP_ERR_INVALID_STATE;
-    int r = rtlsdr_set_center_freq(rtldev, hz);
-    return (r == 0) ? ESP_OK : ESP_FAIL;
+    if (!s_retune_done) {
+        s_retune_done = xSemaphoreCreateBinary();
+        if (!s_retune_done) return ESP_FAIL;
+    }
+    s_pending_retune_hz = hz;
+    s_driver_obj.actions |= ACTION_RETUNE;
+    // wait up to 3 s for the pump task to complete the quiesced retune
+    if (xSemaphoreTake(s_retune_done, pdMS_TO_TICKS(3000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    return s_last_retune_ok ? ESP_OK : ESP_FAIL;
 }
-static class_driver_t s_driver_obj = {0};
 
 static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg)
 {
@@ -547,6 +569,20 @@ void class_driver_task(void *arg)
 
         if (s_driver_obj.actions & ACTION_OPEN_DEV) action_open_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_START_STREAM) action_start_stream(&s_driver_obj);
+        if (s_driver_obj.actions & ACTION_RETUNE) {
+            // Task 7: runs here (usb_pump) so the retune's control
+            // transfers share this task with the bulk stream's
+            // usb_host_client_handle_events() instead of racing it from
+            // the caller — see esp_libusb_pause_stream()'s doc comment.
+            s_driver_obj.actions &= ~ACTION_RETUNE;
+            uint32_t hz = s_pending_retune_hz;
+            esp_libusb_pause_stream(&s_driver_obj);
+            int r = rtlsdr_set_center_freq(rtldev, hz);
+            esp_libusb_resume_stream(&s_driver_obj, 0x81);
+            ESP_LOGI(TAG, "retune to %lu Hz -> r=%d (stream resumed)", (unsigned long)hz, r);
+            s_last_retune_ok = (r == 0);
+            if (s_retune_done) xSemaphoreGive(s_retune_done);
+        }
         if (s_driver_obj.actions & ACTION_CLOSE_DEV) action_close_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_EXIT) break;
 

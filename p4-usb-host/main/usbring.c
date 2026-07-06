@@ -61,6 +61,12 @@ void usbring_deinit(void)
     s_consumer_task = NULL;
 }
 
+void usbring_reset(void)
+{
+    atomic_store_explicit(&s_head, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_tail, 0, memory_order_relaxed);
+}
+
 bool usbring_write(const uint8_t *data, uint32_t n)
 {
     if (!s_buf) return false;

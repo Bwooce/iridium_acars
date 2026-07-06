@@ -51,6 +51,16 @@ esp_err_t usbring_init(uint32_t capacity);
 // consumer are both idle (no in-flight stream_transfer_cb / drain loop).
 void usbring_deinit(void);
 
+// Reset head/tail to 0 WITHOUT touching the PSRAM allocation (s_buf /
+// s_capacity untouched). Drops any stale buffered samples. For the
+// stream-pause-retune path (class_driver.c ACTION_RETUNE): the ring is
+// paused/drained, not torn down, so resume must reuse the existing
+// allocation rather than calling usbring_init() again (that would leak
+// the previous 4 MB PSRAM block — usbring_init() is not idempotent).
+// Only safe once producer and consumer are both idle, same precondition
+// as usbring_deinit().
+void usbring_reset(void);
+
 // Producer: copy `n` bytes from `data` into the ring, splitting the
 // memcpy at the physical wrap boundary via usbring_ring.h's
 // usbring_write_contig(). Returns false (nothing written) if `n`

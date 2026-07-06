@@ -85,6 +85,24 @@ void stream_transfer_cb(usb_transfer_t *transfer);
 void transfer_read_cb(usb_transfer_t *transfer);
 int  esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout);
 int  esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint);
+// Stream-pause-retune (task 7): quiesce the bulk stream in place so a
+// tuner retune's control transfers don't contend with in-flight bulk
+// URBs (that contention is what wedges rtlsdr_set_center_freq when
+// called while the stream is live). Sets streaming=false (so
+// stream_transfer_cb frees, rather than resubmits, each completing
+// URB) and drains until s_live_xfers reaches 0 or a bounded (~300 ms)
+// deadline elapses. MUST be called from the same task that runs
+// usb_host_client_handle_events (usb_pump / class_driver_task) — the
+// drain loop itself calls that function.
+int esp_libusb_pause_stream(class_driver_t *driver_obj);
+// Resume after esp_libusb_pause_stream(): resets the (still-allocated)
+// usbring ring and resubmits a fresh batch of transfers. Deliberately
+// does NOT call esp_libusb_start_stream() / usbring_init() — the ring
+// allocation is reused, not recreated (usbring_init() is not
+// idempotent; calling it here would leak the previous 4 MB PSRAM
+// block). MUST be called from the usb_pump task, same as the pause
+// call it pairs with.
+int esp_libusb_resume_stream(class_driver_t *driver_obj, unsigned char endpoint);
 // Zero-copy stream read (T49a): peeks the usbring instead of memcpy'ing
 // into a caller buffer. On success (return 0), *out_ptr points directly
 // into the ring's PSRAM backing store and *received is the contiguous
