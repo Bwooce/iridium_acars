@@ -33,6 +33,7 @@
 #include "signal_buffer.h"
 #include "dsp_processor.h"
 #include "burst_pipeline.h"
+#include "worker_core1.h" // worker_core1_prealloc_fir (was only transitively included)
 #include "smoke_test.h"
 
 #if CONFIG_SMOKE_TEST_CORPUS
