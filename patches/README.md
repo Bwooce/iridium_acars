@@ -4,6 +4,11 @@ Patches against gitignored vendored code: the vendored ESP-IDF
 (`esp-idf/`) and component-manager downloads
 (`p4-usb-host/managed_components/`).
 
+`libacars/` is a different case: it's a plain **tracked** copy of upstream
+libacars 2.2.1 (no submodule, not gitignored), so there's no apply/patch
+step -- edits just live in the tree. The no-editing-vendored-.c policy
+still applies by default; deliberate exceptions are recorded below.
+
 IDF patches — apply after cloning / updating the IDF:
 
 ```sh
@@ -132,3 +137,36 @@ unchanged.
 Verification: apply on the bench checkout, rebuild + flash, then
 `scripts/smoke_run.sh raw` must complete (no HP-WDT hang) with GOLDEN
 matched>=40.
+
+## 0004 — libacars: fix `uper_decode()` hard-zeroing `consumed` on RC_FAIL
+
+**File:** `libacars/libacars/asn1/per_decoder.c` (tracked copy, not a
+`.patch` file -- see the note above).
+**Upstream version:** libacars 2.2.1.
+
+`asn_codecs.h`'s own documented contract for `asn_dec_rval_t.consumed`
+says the consumed-byte count must stay meaningful even when
+`code == RC_FAIL`, "to indicate the number of successfully decoded
+bytes... providing a possibility to fail with more diagnostics". The uPER
+decoder's `uper_decode()` violated this: on failure it hard-zeroed
+`rval.consumed = 0` instead of reporting `pd.moved`, the bit offset the
+decoder had already tracked internally at the point of failure (asserted
+equal to `rval.consumed` on the success path two lines above, at
+`per_decoder.c:86`).
+
+Fix: `rval.consumed = pd.moved;` on the failure branch. This is what
+makes best-effort/partial decode (design
+`docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md` §3)
+possible at all -- without it, callers of `la_asn1_decode_as()` have no
+way to find out how far a uPER decode got before desyncing.
+`uper_decode_complete()` (same file, unchanged) already rounds any
+nonzero `rval.consumed` up to a byte count before returning it, so this
+also matches the byte-granularity the BER/XER codecs already provide on
+failure -- `la_asn1_decode_as()`'s `consumed` output is therefore
+byte-granular (rounded up from the bit-exact `pd.moved`), not bit-exact;
+see cpdlc.c's `consumed_bits` field for how that gets turned back into a
+bit count for display.
+
+Independently upstreamable (no interaction with the best-effort feature
+itself -- it's a standalone contract-violation bugfix). AI-assisted; see
+git history for authorship.

@@ -85,8 +85,16 @@ uper_decode(asn_codec_ctx_t *opt_codec_ctx, asn_TYPE_descriptor_t *td, void **sp
 			(long)rval.consumed, (long)pd.moved);
 		assert(rval.consumed == pd.moved);
 	} else {
-		/* PER codec is not a restartable */
-		rval.consumed = 0;
+		/*
+		 * PER codec is not restartable, but asn_codecs.h's own contract
+		 * (asn_dec_rval_t.consumed) says the consumed count must stay
+		 * meaningful even on failure, "to indicate the number of
+		 * successfully decoded bytes". pd.moved already tracks the exact
+		 * bit offset the decoder reached before failing -- report it
+		 * instead of hard-zeroing. iridium_acars local fix, see
+		 * patches/README.md.
+		 */
+		rval.consumed = pd.moved;
 	}
 	return rval;
 }
