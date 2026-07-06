@@ -615,8 +615,15 @@ target_link_libraries(test_uw_correlator_albq_ul PRIVATE m)
 # firmware runs, and emits CSV + summary. Used by the long-running
 # capture monitor to compute decode-quality over many bursts offline,
 # decoupled from the firmware's own decode metric.
+#
+# Also runs the IDA -> SBD -> ACARS tail glue (acars_tail.c, shared
+# with test_acars_tail_synthetic) on any LW.DA frame it decodes, so it
+# doubles as the IQ-file -> ACARS-text proof path. Pulls in the same
+# minimum libacars source set as test_libacars_link (kept in sync with
+# common/libacars_idf/CMakeLists.txt).
 add_executable(decode_burst_capture
     decode_burst_capture.c
+    acars_tail.c
     ${COMMON_DIR}/direct_if_decim.c
     ${COMMON_DIR}/rotate_to_dc.c
     ${COMMON_DIR}/burst_pipeline.c
@@ -626,10 +633,35 @@ add_executable(decode_burst_capture
     ${COMMON_DIR}/sym_timing.c
     ${COMMON_DIR}/iridium_frame.c
     ${COMMON_DIR}/iridium_bch.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/sbd_reassembler.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
 )
 target_include_directories(decode_burst_capture PRIVATE
     ${COMMON_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}    # esp_log.h stub
+    ${LIBACARS_UPSTREAM}           # for <libacars/...> includes
+    ${LIBACARS_IDF_DIR}            # for "config.h"
+)
+target_compile_options(decode_burst_capture PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
 )
 target_link_libraries(decode_burst_capture PRIVATE m)
 

@@ -13,9 +13,14 @@
 //   2. decimates 10× to 250 ksps (direct_if_decim)
 //   3. runs burst_pipeline_process_burst (multi-frame)
 //   4. classifies each decoded frame
+//   5. for LW.DA frames: runs ida_decode -> sbd_reassembler_feed ->
+//      libacars ACARS parse (the same tail glue frame_decoder.c runs
+//      on-device, shared via acars_tail.c) and prints any assembled
+//      SBD payload / parsed ACARS text
 //
-// Output: one CSV row per burst plus a summary at the end. CSV makes
-// it easy to roll up across many capture files in the monitor.
+// Output: one CSV row per burst plus a summary at the end, on top of
+// "SBD: " / "ACARS: " lines for anything the tail glue produces. CSV
+// makes it easy to roll up across many capture files in the monitor.
 //
 // Build via tests/host/CMakeLists.txt target decode_burst_capture.
 
@@ -32,6 +37,10 @@
 #include "qpsk_demod.h"
 #include "uw_correlator.h"
 #include "iridium_frame.h"
+#include "ida_decode.h"
+#include "sbd_reassembler.h"
+#include "acars_tail.h"
+#include <libacars/reassembly.h>
 
 #define SD_CAPTURE_BURST_MAGIC 0x54535242u /* "BRST" little-endian */
 
@@ -54,11 +63,36 @@ typedef struct {
     int frames_decoded;
     int frames_ms, frames_tl, frames_bc, frames_lw, frames_ra, frames_unk;
     int frames_dl, frames_ul;
+    int sbd_messages;
+    int acars_decoded;
 } burst_summary_t;
 
-static void on_frame(burst_pipeline_result_t *res, void *ctx)
+// Context handed to on_frame() via burst_pipeline_process_burst's ctx
+// pointer: the per-burst summary counters plus the IDA->SBD->ACARS
+// tail state, which (like frame_decoder.c's s_sbd / s_reasm_ctx) must
+// persist across frames/bursts so multi-frame SBD sessions and
+// multi-block ACARS reassembly work.
+typedef struct {
+    burst_summary_t    bs;
+    sbd_reassembler_t *sbd;
+    la_reasm_ctx      *reasm;
+    uint64_t           burst_t_us; // capture-header timestamp for
+                                   // this burst; used as a stand-in
+                                   // for the worker's per-frame
+                                   // timestamp (not tracked at this
+                                   // offline granularity).
+} decode_ctx_t;
+
+static void print_hex(const uint8_t *buf, size_t n)
 {
-    burst_summary_t *bs = (burst_summary_t *)ctx;
+    for (size_t i = 0; i < n; i++)
+        printf("%02x", buf[i]);
+}
+
+static void on_frame(burst_pipeline_result_t *res, void *ctx_)
+{
+    decode_ctx_t    *ctx = (decode_ctx_t *)ctx_;
+    burst_summary_t *bs  = &ctx->bs;
     bs->frames_decoded++;
 
     iridium_frame_t      f;
@@ -78,6 +112,41 @@ static void on_frame(burst_pipeline_result_t *res, void *ctx)
             break;
         case IR_FRAME_LW:
             bs->frames_lw++;
+            // Mirrors frame_decoder.c's process_one() IR_FRAME_LW /
+            // IR_LW_DA dispatch: run ida_decode, and on a clean
+            // header+CRC feed the shared IDA->SBD->ACARS tail glue.
+            if (f.lw_subtype == IR_LW_DA) {
+                ida_decoded_t ida    = {0};
+                int           rc_ida = ida_decode(&f, &ida);
+                if (rc_ida == 0 && ida.ok && ida.header_ok && ida.crc_ok) {
+                    acars_tail_result_t tail;
+                    int                 rc_tail = acars_tail_feed(ctx->sbd, ctx->reasm, &ida,
+                                                                  dir == IR_FRM_DIR_UPLINK,
+                                                                  ctx->burst_t_us, &tail);
+                    if (rc_tail == 1 && tail.sbd_ready) {
+                        bs->sbd_messages++;
+                        printf("SBD: type=%s %s len=%u (msg %u/%u) payload=",
+                               sbd_type_wire_name(tail.sbd.type),
+                               tail.sbd.uplink ? "UL" : "DL",
+                               tail.sbd.payload_len, tail.sbd.msg_no,
+                               tail.sbd.msg_count);
+                        print_hex(tail.sbd.payload, tail.sbd.payload_len);
+                        printf("\n");
+
+                        if (tail.acars_ready) {
+                            bs->acars_decoded++;
+                            printf("ACARS: %s mode=%c label='%.2s' block=%c "
+                                   "msgnum='%.4s' flight='%.6s' crc=%s "
+                                   "txt=\"%s\"\n",
+                                   tail.sbd.uplink ? "UL" : "DL",
+                                   tail.mode ? tail.mode : '?',
+                                   tail.label, tail.block_id ? tail.block_id : '?',
+                                   tail.msg_num, tail.flight_id,
+                                   tail.crc_ok ? "OK" : "BAD", tail.txt);
+                        }
+                    }
+                }
+            }
             break;
         case IR_FRAME_RA:
             bs->frames_ra++;
@@ -137,6 +206,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // IDA -> SBD -> ACARS tail state, persistent across bursts/frames
+    // (mirrors frame_decoder.c's s_sbd / s_reasm_ctx globals).
+    sbd_reassembler_t sbd;
+    sbd_reassembler_init(&sbd);
+    la_reasm_ctx *reasm = la_reasm_ctx_new();
+    if (!reasm) {
+        fprintf(stderr, "la_reasm_ctx_new() failed\n");
+        return 1;
+    }
+
     int             bursts_seen = 0, bursts_too_short = 0, bursts_decode_ok = 0;
     int             frames_total = 0;
     burst_summary_t total        = {0};
@@ -188,30 +267,37 @@ int main(int argc, char **argv)
             continue;
         }
 
-        burst_summary_t bs     = {0};
-        int             frames = burst_pipeline_process_burst(iq250, n250, on_frame, &bs);
+        decode_ctx_t dctx       = {0};
+        dctx.sbd                = &sbd;
+        dctx.reasm              = reasm;
+        dctx.burst_t_us         = h.t_us;
+        int              frames = burst_pipeline_process_burst(iq250, n250, on_frame, &dctx);
+        burst_summary_t *bs     = &dctx.bs;
         if (frames > 0) bursts_decode_ok++;
         frames_total += frames;
-        total.frames_decoded += bs.frames_decoded;
-        total.frames_ms += bs.frames_ms;
-        total.frames_tl += bs.frames_tl;
-        total.frames_bc += bs.frames_bc;
-        total.frames_lw += bs.frames_lw;
-        total.frames_ra += bs.frames_ra;
-        total.frames_unk += bs.frames_unk;
-        total.frames_dl += bs.frames_dl;
-        total.frames_ul += bs.frames_ul;
+        total.frames_decoded += bs->frames_decoded;
+        total.frames_ms += bs->frames_ms;
+        total.frames_tl += bs->frames_tl;
+        total.frames_bc += bs->frames_bc;
+        total.frames_lw += bs->frames_lw;
+        total.frames_ra += bs->frames_ra;
+        total.frames_unk += bs->frames_unk;
+        total.frames_dl += bs->frames_dl;
+        total.frames_ul += bs->frames_ul;
+        total.sbd_messages += bs->sbd_messages;
+        total.acars_decoded += bs->acars_decoded;
 
         if (emit_csv) {
             printf("%u,%u,%.0f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                    h.seq, h.length_samples, h.rel_freq_hz, h.peak_snr_db,
-                   bs.frames_decoded, bs.frames_ms, bs.frames_tl, bs.frames_bc,
-                   bs.frames_lw, bs.frames_ra, bs.frames_unk,
-                   bs.frames_dl, bs.frames_ul);
+                   bs->frames_decoded, bs->frames_ms, bs->frames_tl, bs->frames_bc,
+                   bs->frames_lw, bs->frames_ra, bs->frames_unk,
+                   bs->frames_dl, bs->frames_ul);
         }
     }
 
     fclose(fp);
+    la_reasm_ctx_destroy(reasm);
 
     fprintf(stderr,
             "\n== %s summary ==\n"
@@ -220,7 +306,9 @@ int main(int argc, char **argv)
             "  decode ok         : %d (%.1f%%)\n"
             "  frames            : %d\n"
             "    MS/TL/BC/LW/RA : %d/%d/%d/%d/%d  unknown: %d\n"
-            "    DL/UL           : %d/%d\n",
+            "    DL/UL           : %d/%d\n"
+            "  SBD messages      : %d\n"
+            "  ACARS decoded     : %d\n",
             argv[1],
             bursts_seen, bursts_too_short,
             bursts_decode_ok,
@@ -228,7 +316,8 @@ int main(int argc, char **argv)
             frames_total,
             total.frames_ms, total.frames_tl, total.frames_bc, total.frames_lw,
             total.frames_ra, total.frames_unk,
-            total.frames_dl, total.frames_ul);
+            total.frames_dl, total.frames_ul,
+            total.sbd_messages, total.acars_decoded);
 
     return 0;
 }
