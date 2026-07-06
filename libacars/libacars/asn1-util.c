@@ -20,7 +20,31 @@ static int la_compare_fmtr(void const *k, void const *m) {
 int la_asn1_decode_as(asn_TYPE_descriptor_t *td, void **struct_ptr, uint8_t const *buf, int size,
 		asn_dec_rval_t *rval_out) {
 	asn_dec_rval_t rval;
-	rval = uper_decode_complete(0, td, struct_ptr, buf, size);
+	// Passing NULL here (as the pre-best-effort code did) makes
+	// uper_decode() fall back to ASN__DEFAULT_STACK_MAX (30000 bytes,
+	// asn_internal.h) as the recursion-depth guard
+	// (ASN__STACK_OVERFLOW_CHECK). Under ASan (HOST_TESTS_ASAN, needed
+	// for the best-effort bit-flip fuzz -- design
+	// docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md
+	// §6b), every stack frame in the recursive constr_SEQUENCE/
+	// constr_CHOICE decoders is inflated by redzone instrumentation, and
+	// that budget is exhausted by ordinary, VALID, intact CPDLC messages
+	// (observed: SOUCAYA/MSTEC7X/MELCAYA all silently RC_FAIL under
+	// ASan, RC_OK without it -- no sanitizer report, just the guard
+	// firing early). Disable the check here (max_stack_size = 0, "0
+	// disables stack bounds checking" per asn_codecs.h) rather than
+	// raise it to an arbitrary larger number: this ASN.1 module's
+	// grammar (single FANS CPDLC/ADS-C schema) has small, SCHEMA-bounded
+	// nesting and repetition limits (eg. the uplink/downlink msg element
+	// SEQUENCE OF caps at 4 elements) -- there is no attacker-controlled
+	// unbounded-recursion vector here for the guard to defend against,
+	// unlike a generic ASN.1 decoder accepting arbitrary schemas. This
+	// path is host-only today (common/libacars_idf stubs it out on
+	// device -- device enablement is a later phase); revisit this
+	// decision against the embedded target's real stack budget when
+	// that phase wires it up.
+	asn_codec_ctx_t codec_ctx = { .max_stack_size = 0 };
+	rval = uper_decode_complete(&codec_ctx, td, struct_ptr, buf, size);
 	if(rval_out != NULL) {
 		*rval_out = rval;
 	}

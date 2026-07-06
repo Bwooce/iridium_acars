@@ -239,11 +239,171 @@ static void test_adsc_truncated_payload(void)
     la_config_set_bool("best_effort_decode", false); // restore default
 }
 
+// Returns the exact bytes production code feeds to la_cpdlc_parse() /
+// la_adsc_parse(): hex-decodes the payload after the fixed
+// "/GSADDR.IMI.<air_reg>" prefix (1+7+1+3+1+7 = 20 chars, true for all 7
+// fixtures -- 7-char ground address, 3-char IMI, 7-char air_reg) and
+// strips the trailing 2-byte CRC, mirroring la_arinc_parse()
+// (arinc.c: air_reg(7), la_slurp_hexstring(), then
+// `buflen -= LA_ARINC_CRC_LEN`). Caller frees *buf via free() (matches
+// LA_XCALLOC/free pairing used throughout libacars).
+static size_t get_fixture_payload(fixture_t const *fx, uint8_t **buf)
+{
+    char const *hexpart_lit = fx->arinc_text + 20;
+    char       *hexpart     = strdup(hexpart_lit);
+    size_t      n           = la_slurp_hexstring(hexpart, buf);
+    free(hexpart);
+    if (n < 2) {
+        return 0;
+    }
+    return n - 2; // strip CRC
+}
+
+// design §6b: flip every bit of every one of the 7 fixtures' actual
+// decode buffers (~2,048 iterations total -- close to the design's
+// ~2,250 estimate) with best_effort_decode ON, under ASan+UBSan
+// (HOST_TESTS_ASAN). Assertions:
+//   - no sanitizer hits (enforced externally by the ASan build itself --
+//     a crash here means the whole ctest run fails)
+//   - every RC_FAIL (err == true) yields either PARTIAL output or a
+//     clean "Unparseable"/"Malformed" rendering -- never a NULL/garbage
+//     render
+//   - every RC_OK-full flip (err == false) renders IDENTICALLY whether
+//     best_effort_decode is ON or OFF -- the flag must never change
+//     behaviour on a message that fully decoded
+//   - ADS-C only: value-byte flips in fixed-length groups must not
+//     desync framing. Operationalized via a ground-truth table built by
+//     truncating the ORIGINAL (unflipped) buffer at every length and
+//     recording where that truncation's decode gives up (msg->err_offset)
+//     -- that marks the start of "the tag containing this byte
+//     position". A real flip's failure (if any) must not land on an
+//     EARLIER tag than that ground truth, ie. corruption must not
+//     cascade backward through already-parsed tags.
+static void test_bitflip_fuzz(void)
+{
+    printf("Test: bit-flip fuzz, every bit of all 7 fixtures (best_effort_decode ON)\n");
+    la_config_set_bool("best_effort_decode", true);
+
+    long total_iters = 0, rc_ok_full = 0, rc_fail = 0, partials = 0;
+
+    for (int i = 0; i < NUM_FIXTURES; i++) {
+        fixture_t const *fx   = &FIXTURES[i];
+        uint8_t         *orig = NULL;
+        size_t           len  = get_fixture_payload(fx, &orig);
+        CHECK(orig != NULL && len > 0, "%s: failed to extract raw payload", fx->name);
+        if (orig == NULL || len == 0) {
+            free(orig);
+            continue;
+        }
+
+        // ADS-C ground truth: tag_start_at[b] = byte offset of the tag
+        // that a decode truncated to (b+1) bytes fails inside of (or, in
+        // the rare case that truncation lands exactly on a trailing
+        // boundary, the truncation length itself).
+        size_t *tag_start_at = NULL;
+        if (fx->kind == FIXTURE_ADSC) {
+            tag_start_at = calloc(len, sizeof(size_t));
+            for (size_t trunc = 1; trunc <= len; trunc++) {
+                la_proto_node *n = la_adsc_parse(orig, (int)trunc, LA_MSG_DIR_AIR2GND, ARINC_MSG_ADS);
+                if (n != NULL) {
+                    la_adsc_msg_t const *m  = n->data;
+                    tag_start_at[trunc - 1] = (m->err && m->partial) ? m->err_offset : trunc;
+                    la_proto_tree_destroy(n);
+                }
+            }
+        }
+
+        for (size_t bit = 0; bit < len * 8; bit++) {
+            total_iters++;
+            uint8_t *mut = malloc(len);
+            memcpy(mut, orig, len);
+            mut[bit / 8] ^= (uint8_t)(1u << (7 - (bit % 8)));
+
+            la_proto_node *node = (fx->kind == FIXTURE_CPDLC)
+                                      ? la_cpdlc_parse(mut, (int)len, LA_MSG_DIR_AIR2GND)
+                                      : la_adsc_parse(mut, (int)len, LA_MSG_DIR_AIR2GND, ARINC_MSG_ADS);
+
+            bool err = true, partial = false;
+            if (node != NULL) {
+                if (fx->kind == FIXTURE_CPDLC) {
+                    la_cpdlc_msg const *m = node->data;
+                    err                   = m->err;
+                    partial               = m->partial;
+                } else {
+                    la_adsc_msg_t const *m = node->data;
+                    err                    = m->err;
+                    partial                = m->partial;
+                }
+            }
+
+            // A CPDLC partial success has err == false too (design §4:
+            // "ON + consumed>0 -> ... err=false"), so err alone can't
+            // tell "genuinely fully decoded" apart from "best-effort
+            // salvage" -- must also check partial. (ADS-C keeps err ==
+            // true on any tag failure regardless of the flag, design §8,
+            // so this reduces to the plain !err check there.)
+            bool full_success = !err && !partial;
+
+            if (full_success) {
+                rc_ok_full++;
+                la_vstring *v_on    = la_proto_tree_format_text(NULL, node);
+                char       *text_on = v_on != NULL ? strdup(v_on->str) : NULL;
+                if (v_on != NULL) la_vstring_destroy(v_on, true);
+                la_proto_tree_destroy(node);
+
+                la_config_set_bool("best_effort_decode", false);
+                la_proto_node *node_off = (fx->kind == FIXTURE_CPDLC)
+                                              ? la_cpdlc_parse(mut, (int)len, LA_MSG_DIR_AIR2GND)
+                                              : la_adsc_parse(mut, (int)len, LA_MSG_DIR_AIR2GND, ARINC_MSG_ADS);
+                la_config_set_bool("best_effort_decode", true);
+                la_vstring *v_off    = node_off != NULL ? la_proto_tree_format_text(NULL, node_off) : NULL;
+                char       *text_off = v_off != NULL ? strdup(v_off->str) : NULL;
+                if (v_off != NULL) la_vstring_destroy(v_off, true);
+                if (node_off != NULL) la_proto_tree_destroy(node_off);
+
+                CHECK(text_on != NULL && text_off != NULL && strcmp(text_on, text_off) == 0,
+                      "%s bit %zu: RC_OK-full rendering differs ON vs OFF", fx->name, bit);
+                free(text_on);
+                free(text_off);
+            } else {
+                rc_fail++;
+                if (partial) partials++;
+
+                la_vstring *v = node != NULL ? la_proto_tree_format_text(NULL, node) : NULL;
+                CHECK(v != NULL, "%s bit %zu: NULL/empty rendering on non-full-success", fx->name, bit);
+                if (v != NULL) la_vstring_destroy(v, true);
+
+                if (fx->kind == FIXTURE_ADSC && node != NULL && partial) {
+                    la_adsc_msg_t const *m            = node->data;
+                    size_t               ground_truth = tag_start_at[bit / 8];
+                    CHECK(m->err_offset >= ground_truth,
+                          "%s bit %zu: ADS-C framing desync (err_offset=%zu < tag start %zu)",
+                          fx->name, bit, m->err_offset, ground_truth);
+                }
+
+                if (node != NULL) la_proto_tree_destroy(node);
+            }
+
+            free(mut);
+        }
+
+        free(tag_start_at);
+        free(orig);
+    }
+
+    la_config_set_bool("best_effort_decode", false); // restore default
+
+    printf("  %ld iterations: %ld RC_OK(full), %ld RC_FAIL (%ld yielded PARTIAL output)\n",
+           total_iters, rc_ok_full, rc_fail, partials);
+    CHECK(total_iters > 2000, "fewer bit-flip iterations than expected: %ld", total_iters);
+}
+
 int main(void)
 {
     test_positive_control_mode_off();
     test_positive_control_mode_on_matches_off();
     test_adsc_truncated_payload();
+    test_bitflip_fuzz();
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }

@@ -814,9 +814,22 @@ asn_INTEGER2long(const INTEGER_t *iptr, long *lptr) {
 	/* Actually l = -(*b >> 7); gains nothing, yet unreadable! */
 	if((*b >> 7)) l = -1; else l = 0;
 
-	/* Conversion engine */
-	for(; b < end; b++)
-		l = (l << 8) | *b;
+	/*
+	 * Conversion engine. Do the shift-and-accumulate on the unsigned
+	 * representation and cast back at the end: left-shifting a negative
+	 * signed value (the sign-extended -1 seeded above) is undefined
+	 * behaviour in C even though two's-complement hardware has always
+	 * done the obviously-intended thing here -- UBSan (host builds
+	 * only, see patches/README.md) flags it on any negative INTEGER.
+	 * unsigned long is at least as wide as long (C99), so this is a
+	 * lossless bit-for-bit reinterpretation.
+	 */
+	{
+		unsigned long ul = (unsigned long)l;
+		for(; b < end; b++)
+			ul = (ul << 8) | *b;
+		l = (long)ul;
+	}
 
 	*lptr = l;
 	return 0;

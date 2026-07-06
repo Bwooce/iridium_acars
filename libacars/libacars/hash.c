@@ -28,11 +28,22 @@ typedef struct {
 } la_hash_element;
 
 uint32_t la_hash_string(char const *str, uint32_t h) {
-	int h_work = (int)h;
+	// This is a djb2-style hash: intentional unsigned wraparound on
+	// overflow (well-defined mod 2^32 arithmetic), not a bug to avoid.
+	// Upstream computed it through a signed `int` accumulator instead,
+	// which is undefined behaviour on overflow in C -- UBSan aborts on
+	// it (discovered via the best-effort-decode bit-flip fuzz calling
+	// la_config_set_bool()/get_bool() thousands of times, which hash
+	// this same short string every call: design
+	// docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md
+	// §6b; see patches/README.md). Fix: do the arithmetic directly in
+	// uint32_t the whole way, matching the function's own declared
+	// return type and matching the two's-complement wraparound behaviour
+	// the signed version relied on in practice.
 	for(char const *p = str; *p != '\0'; p++) {
-		h_work = h_work * LA_HASH_MULTIPLIER + (int)(*p);
+		h = h * LA_HASH_MULTIPLIER + (uint32_t)(*p);
 	}
-	return (uint32_t)h_work;
+	return h;
 }
 
 uint32_t la_hash_key_str(void const *k) {

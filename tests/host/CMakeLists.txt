@@ -32,15 +32,21 @@ endif()
 # against corrupted input (constr_CHOICE/constr_SEQUENCE partial-tree
 # traversal on RC_FAIL). Off by default for the same reason as
 # HOST_TESTS_UBSAN. Enable with `cmake -DHOST_TESTS_ASAN=ON`.
-option(HOST_TESTS_ASAN "Build host tests with -fsanitize=address,undefined" OFF)
+#
+# Deliberately scoped to test_libacars_best_effort only (via
+# HOST_TESTS_ASAN_FLAGS applied with target_compile/link_options below),
+# NOT applied globally like HOST_TESTS_UBSAN above. Turning it on
+# globally lights up pre-existing, out-of-scope issues elsewhere in the
+# suite (a qpsk_demod.c leak, "left shift of negative value" UB in the
+# DSP hot paths exercised by fft_burst_tagger/pipeline_drift_snr, a
+# pre-existing leak in the ACARS-only test_libacars_link) that this task
+# is explicitly barred from touching (common/iridium_decoder/,
+# p4-usb-host/ are out of scope for the libacars best-effort decode
+# design). Scoping keeps the ASan gate meaningful for what this task
+# actually changed instead of failing on unrelated debt.
+option(HOST_TESTS_ASAN "Build host tests with -fsanitize=address,undefined (test_libacars_best_effort only)" OFF)
 if(HOST_TESTS_ASAN)
-    add_compile_options(
-        -fsanitize=address,undefined
-        -fno-sanitize-recover=all
-    )
-    add_link_options(
-        -fsanitize=address,undefined
-    )
+    set(HOST_TESTS_ASAN_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=all)
 endif()
 
 # Pull production sources directly from common/iridium_decoder/ so the
@@ -623,7 +629,9 @@ target_compile_options(test_libacars_best_effort PRIVATE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
     -Wno-unused-variable
+    ${HOST_TESTS_ASAN_FLAGS}
 )
+target_link_options(test_libacars_best_effort PRIVATE ${HOST_TESTS_ASAN_FLAGS})
 target_link_libraries(test_libacars_best_effort PRIVATE m)
 add_test(NAME libacars_best_effort COMMAND test_libacars_best_effort)
 
