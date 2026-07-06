@@ -1492,7 +1492,14 @@ LA_ADSC_FORMATTER_FUN(la_adsc_contract_request_format_text) {
 	}
 	for(la_list *ptr = r->req_tag_list; ptr != NULL; ptr = la_list_next(ptr)) {
 		la_adsc_tag_t *t = ptr->data;
-		if(!t->type) {
+		// Same defensive data-NULL guard as la_adsc_tag_output_text():
+		// a sub-tag whose type has a parser but no data must render as
+		// unparseable, never be handed to its formatter (which would
+		// deref NULL). Unreachable in the current flow (see
+		// la_adsc_tag_parse()'s failure-site cleanup), kept as a
+		// guarantee since these formatters iterate a nested tag list the
+		// top-level walkers never see.
+		if(!t->type || (t->type->parse != NULL && t->data == NULL)) {
 			LA_ISPRINTF(ctx->vstr, ctx->indent, "-- Unparseable tag %u\n", t->tag);
 			break;
 		}
@@ -1514,7 +1521,9 @@ LA_ADSC_FORMATTER_FUN(la_adsc_contract_request_format_json) {
 	la_json_array_start(ctx->vstr, "groups");
 	for(la_list *ptr = r->req_tag_list; ptr != NULL; ptr = la_list_next(ptr)) {
 		la_adsc_tag_t *t = ptr->data;
-		if(t->type == NULL || t->type->format_json == NULL || t->type->json_key == NULL) {
+		// Defensive data-NULL guard -- see la_adsc_contract_request_format_text().
+		if(t->type == NULL || t->type->format_json == NULL || t->type->json_key == NULL
+				|| (t->type->parse != NULL && t->data == NULL)) {
 			break;
 		}
 		la_json_object_start(ctx->vstr, NULL);
@@ -1659,31 +1668,38 @@ static int la_adsc_tag_parse(la_adsc_tag_t *t, la_dict const
 		return -1;
 	}
 	la_debug_print(D_INFO, "Found tag %u (%s)\n", t->tag, type->label);
-	// Set t->type as soon as the tag is identified, BEFORE calling its
-	// parser -- not after, as upstream did. Some group parsers (eg.
-	// la_adsc_noncomp_notify_parse, la_adsc_contract_request_parse) set
-	// t->data to a partially-populated allocation before a downstream
-	// failure can return -1; with t->type left NULL on that path,
-	// la_adsc_tag_destroy()'s "t->data == NULL || t->type == NULL" guard
-	// skipped freeing t->data entirely, leaking it (and any of its own
-	// nested allocations, eg. la_adsc_noncomp_notify_t.groups). Setting
-	// t->type here fixes the leak unconditionally (design
-	// docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md
-	// §8's "pre-existing LEAK to fix") -- it does not change the value
-	// t->type ends up holding on the success path, only how early it's
-	// visible. la_adsc_tag_output_text/json are updated alongside this to
-	// treat "type set but data still NULL" the same as "type unset",
-	// since a parser can fail before ever allocating t->data.
-	t->type = type;
 	int consumed_bytes = 0;
 	if(type->parse == NULL) {       // tag is empty, no parsing required - return with success
 		goto end;
 	}
 	if((consumed_bytes = (*(type->parse))(t, buf, len)) < 0) {
+		// Pre-existing LEAK fix (design docs/superpowers/plans/
+		// 2026-07-07-libacars-best-effort-decode.md §8): some group
+		// parsers (la_adsc_noncomp_notify_parse,
+		// la_adsc_contract_request_parse) assign t->data a real,
+		// partially-populated allocation BEFORE a downstream failure
+		// makes them return -1. Upstream left t->type NULL on this path,
+		// so la_adsc_tag_destroy()'s "t->data == NULL || t->type == NULL"
+		// guard skipped freeing that data (and its nested allocations,
+		// eg. la_adsc_noncomp_notify_t.groups). Free it here, at the
+		// failure site, keyed off the local `type` -- and leave t->type
+		// NULL exactly as upstream did, so a failed tag still renders as
+		// "-- Unparseable tag %u" in every mode (a partially-populated
+		// group must never be rendered: its calloc'd-zero tail would
+		// read as plausible-but-fabricated values).
+		if(t->data != NULL) {
+			if(type->destroy != NULL) {
+				type->destroy(t->data);
+			} else {
+				LA_XFREE(t->data);
+			}
+			t->data = NULL;
+		}
 		return -1;
 	}
 end:
 	tag_len += consumed_bytes;
+	t->type = type;
 	return tag_len;
 }
 
@@ -1769,19 +1785,15 @@ static void la_adsc_tag_output_text(void const *p, void *ctx) {
 
 	la_adsc_tag_t const *t = p;
 	la_adsc_formatter_ctx_t *c = ctx;
-	if(!t->type) {
+	// Defensive: "t->type set with a parser but t->data NULL" cannot
+	// happen in the current flow (la_adsc_tag_parse only sets t->type on
+	// full success, and cleans t->data up at the failure site), but if it
+	// ever did, formatting would deref NULL -- treat it exactly like an
+	// unparseable tag, with upstream's wording. Tags whose type has no
+	// parser (empty flags) legitimately have t->data == NULL on success
+	// and must keep rendering via their empty-tag formatters.
+	if(!t->type || (t->type->parse != NULL && t->data == NULL)) {
 		LA_ISPRINTF(c->vstr, c->indent, "-- Unparseable tag %u\n", t->tag);
-		return;
-	}
-	if(t->type->parse != NULL && t->data == NULL) {
-		// Known tag WITH a group parser (tags with no parser, eg. empty
-		// flags, legitimately have t->data == NULL on success -- don't
-		// confuse the two), but the parser failed before ever allocating
-		// t->data (eg. a length check tripped first). t->type is set
-		// unconditionally now (leak fix above) purely so
-		// la_adsc_tag_destroy() has something to key off; there is
-		// nothing here to format.
-		LA_ISPRINTF(c->vstr, c->indent, "-- Truncated tag %u (%s)\n", t->tag, t->type->label);
 		return;
 	}
 	if(t->type->format_text != NULL) {
@@ -1795,12 +1807,8 @@ static void la_adsc_tag_output_json(void const *p, void *ctx) {
 
 	la_adsc_tag_t const *t = p;
 	la_adsc_formatter_ctx_t *c = ctx;
-	if(!t->type) {
-		return;
-	}
-	if(t->type->parse != NULL && t->data == NULL) {
-		// See la_adsc_tag_output_text() for why t->data can be NULL even
-		// with t->type set and this NOT be the legitimate empty-tag case.
+	// Defensive guard, same rationale as la_adsc_tag_output_text().
+	if(!t->type || (t->type->parse != NULL && t->data == NULL)) {
 		return;
 	}
 	if(t->type->format_json != NULL && t->type->json_key != NULL) {
@@ -1832,12 +1840,11 @@ void la_adsc_format_text(la_vstring *vstr, void const *data, int indent) {
 	la_list_foreach(msg->tag_list, la_adsc_tag_output_text, &ctx);
 	if(msg->err == true) {
 		if(msg->partial == true) {
-			// design §8 group-quantized-trust banner. la_list_length()
-			// doesn't exist in this la_list implementation, so count the
-			// good prefix directly: tag_list holds every appended tag
-			// including the failing one, so length-1 is the number of
-			// tags parsed before it.
-			int good_tags = la_list_length(msg->tag_list) - 1;
+			// design §8 group-quantized-trust banner. tag_list holds every
+			// appended tag including the failing one (la_adsc_parse appends
+			// before parsing), so length-1 is the number of fully-parsed
+			// tags before the failure.
+			int good_tags = (int)la_list_length(msg->tag_list) - 1;
 			LA_ISPRINTF(ctx.vstr, ctx.indent,
 					"-- WARNING: PARTIAL/UNTRUSTED decode -- first %d group(s) trustworthy, "
 					"failed at tag 0x%02x, byte offset %zu -- display only\n",
@@ -1867,6 +1874,12 @@ void la_adsc_format_json(la_vstring *vstr, void const *data) {
 	// design §8: "partial"/"failed_tag"/"err_offset" next to "err". Only
 	// meaningful (and only ever set) when err == true and
 	// best_effort_decode was ON at parse time.
+	// NOTE for the upstream PR: the "partial" key is emitted
+	// unconditionally (always false when the flag is OFF), so
+	// flag-OFF JSON output gains one constant key vs upstream 2.2.1.
+	// Emitting it only when true would keep flag-OFF output identical --
+	// upstream's call whether schema stability or output stability
+	// matters more.
 	la_json_append_bool(vstr, "partial", msg->partial);
 	if(msg->partial == true) {
 		la_json_append_int64(vstr, "failed_tag", (int64_t)msg->failed_tag);

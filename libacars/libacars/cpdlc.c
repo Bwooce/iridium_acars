@@ -141,6 +141,11 @@ void la_cpdlc_format_json(la_vstring *vstr, void const *data) {
 	// design §4: "partial"/"consumed_bits" sit next to "err". trailing_junk
 	// is exposed too -- a consumer must not treat a trailing-bytes partial
 	// the same as a desync partial (see cpdlc.h).
+	// NOTE for the upstream PR: the "partial" key is emitted
+	// unconditionally (always false when the flag is OFF), so flag-OFF
+	// JSON output gains one constant key vs upstream 2.2.1. Emitting it
+	// only when true would keep flag-OFF output identical -- upstream's
+	// call whether schema stability or output stability matters more.
 	la_json_append_bool(vstr, "partial", msg->partial);
 	if(msg->partial == true) {
 		la_json_append_bool(vstr, "trailing_junk", msg->trailing_junk);
