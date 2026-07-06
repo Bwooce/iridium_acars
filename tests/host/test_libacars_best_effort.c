@@ -171,10 +171,79 @@ static void test_positive_control_mode_on_matches_off(void)
     }
 }
 
+// design §8: a truncated ADS-C payload (real-world analog: broken SBD
+// reassembly cutting a message's tail) must -- with best_effort_decode
+// ON -- keep the tags parsed before the break, tag msg->partial, and
+// record failed_tag/err_offset; with the flag OFF, behaviour must match
+// today exactly (err set, no partial labelling). Also exercises the
+// la_adsc_tag_parse leak fix (t->type set before parsing): under a
+// plain (non-ASan) build this only proves the fields come out right:
+// the actual leak-freed-or-not is what the ASan fuzz build (later
+// commit) verifies.
+static void test_adsc_truncated_payload(void)
+{
+    printf("Test: truncated ADS-C payload -> partial labelling when flag ON\n");
+
+    // BOMASAI fixture (examples/adsc_get_position.c:26) with the last 20
+    // hex characters (10 bytes) chopped off -- long enough to still
+    // contain at least one complete tag before the cut, short enough to
+    // guarantee a truncated final tag.
+    fixture_t const bomasai = FIXTURES[3];
+    char const      full[]  = "/BOMASAI.ADS.VT-ANB072501A070A988CA73248F0E5DC10200000F5EE1ABC000102B885E0A19F5";
+    CHECK(strcmp(full, bomasai.arinc_text) == 0, "BOMASAI fixture text drifted -- update the copy above");
+    size_t full_len = strlen(full);
+    char   truncated[128];
+    CHECK(full_len - 20 < sizeof(truncated), "truncated buffer too small");
+    memcpy(truncated, full, full_len - 20);
+    truncated[full_len - 20] = '\0';
+
+    for (int mode = 0; mode < 2; mode++) {
+        bool const best_effort = (mode == 1);
+        la_config_set_bool("best_effort_decode", best_effort);
+
+        la_proto_node *node = la_arinc_parse(truncated, LA_MSG_DIR_AIR2GND);
+        CHECK(node != NULL, "truncated BOMASAI: la_arinc_parse returned NULL");
+        if (node == NULL) {
+            continue;
+        }
+        la_proto_node *adsc_node = la_proto_tree_find_adsc(node);
+        CHECK(adsc_node != NULL, "truncated BOMASAI: no ADS-C node in tree");
+        if (adsc_node != NULL) {
+            la_adsc_msg_t const *msg = adsc_node->data;
+            CHECK(msg->err == true, "truncated BOMASAI: err not set (mode=%d)", best_effort);
+            CHECK(msg->partial == best_effort,
+                  "truncated BOMASAI: partial=%d, expected %d (mode=%d)", msg->partial, best_effort, best_effort);
+            if (best_effort) {
+                CHECK(msg->err_offset > 0, "truncated BOMASAI: err_offset == 0 with flag ON");
+            } else {
+                CHECK(msg->err_offset == 0, "truncated BOMASAI: err_offset set with flag OFF");
+                CHECK(msg->failed_tag == 0, "truncated BOMASAI: failed_tag set with flag OFF");
+            }
+
+            la_vstring *tv = la_proto_tree_format_text(NULL, node);
+            if (best_effort) {
+                CHECK(tv != NULL && strstr(tv->str, "PARTIAL/UNTRUSTED") != NULL,
+                      "truncated BOMASAI: no PARTIAL banner in text with flag ON");
+            } else {
+                CHECK(tv != NULL && strstr(tv->str, "Malformed ADS-C message") != NULL,
+                      "truncated BOMASAI: missing today's-behaviour banner with flag OFF");
+            }
+            if (tv != NULL) la_vstring_destroy(tv, true);
+
+            la_vstring *jv = la_proto_tree_format_json(NULL, node);
+            CHECK(jv != NULL && strstr(jv->str, "\"partial\":") != NULL, "truncated BOMASAI: no \"partial\" key in json");
+            if (jv != NULL) la_vstring_destroy(jv, true);
+        }
+        la_proto_tree_destroy(node);
+    }
+    la_config_set_bool("best_effort_decode", false); // restore default
+}
+
 int main(void)
 {
     test_positive_control_mode_off();
     test_positive_control_mode_on_matches_off();
+    test_adsc_truncated_payload();
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }

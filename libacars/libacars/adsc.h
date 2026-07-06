@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>                 // size_t
 #include <libacars/libacars.h>      // la_proto_node, la_type_descriptor
 #include <libacars/arinc.h>         // la_arinc_imi
 #include <libacars/list.h>          // la_list
@@ -45,11 +46,19 @@ typedef struct {
 typedef struct {
 	bool err;
 	la_list *tag_list;
+	// best_effort_decode (design doc
+	// docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md §8):
+	// "mostly labelling" -- unlike CPDLC, la_adsc_parse() already keeps
+	// and renders every tag decoded before the failing one; these fields
+	// just make that trust boundary explicit. partial/failed_tag/
+	// err_offset are only meaningful when err == true (adsc.c's tag loop
+	// sets them iff best_effort_decode was ON at parse time -- when OFF,
+	// they stay zeroed and rendering is bit-for-bit today's behaviour).
+	bool partial;
+	uint8_t failed_tag;    // the tag byte the parser was on when it gave up
+	size_t err_offset;     // byte offset into the ADS-C payload of that tag
 	// reserved for future use
 	void (*reserved0)(void);
-	void (*reserved1)(void);
-	void (*reserved2)(void);
-	void (*reserved3)(void);
 } la_adsc_msg_t;
 
 // generic tag structure

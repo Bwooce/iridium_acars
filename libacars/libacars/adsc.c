@@ -1659,6 +1659,22 @@ static int la_adsc_tag_parse(la_adsc_tag_t *t, la_dict const
 		return -1;
 	}
 	la_debug_print(D_INFO, "Found tag %u (%s)\n", t->tag, type->label);
+	// Set t->type as soon as the tag is identified, BEFORE calling its
+	// parser -- not after, as upstream did. Some group parsers (eg.
+	// la_adsc_noncomp_notify_parse, la_adsc_contract_request_parse) set
+	// t->data to a partially-populated allocation before a downstream
+	// failure can return -1; with t->type left NULL on that path,
+	// la_adsc_tag_destroy()'s "t->data == NULL || t->type == NULL" guard
+	// skipped freeing t->data entirely, leaking it (and any of its own
+	// nested allocations, eg. la_adsc_noncomp_notify_t.groups). Setting
+	// t->type here fixes the leak unconditionally (design
+	// docs/superpowers/plans/2026-07-07-libacars-best-effort-decode.md
+	// §8's "pre-existing LEAK to fix") -- it does not change the value
+	// t->type ends up holding on the success path, only how early it's
+	// visible. la_adsc_tag_output_text/json are updated alongside this to
+	// treat "type set but data still NULL" the same as "type unset",
+	// since a parser can fail before ever allocating t->data.
+	t->type = type;
 	int consumed_bytes = 0;
 	if(type->parse == NULL) {       // tag is empty, no parsing required - return with success
 		goto end;
@@ -1668,7 +1684,6 @@ static int la_adsc_tag_parse(la_adsc_tag_t *t, la_dict const
 	}
 end:
 	tag_len += consumed_bytes;
-	t->type = type;
 	return tag_len;
 }
 
@@ -1694,18 +1709,35 @@ la_proto_node *la_adsc_parse(uint8_t const *buf, int len, la_msg_dir msg_dir, la
 
 	msg->err = false;
 	switch(imi) {
-		case ARINC_MSG_ADS:
+		case ARINC_MSG_ADS: {
+			// design §8: "group-quantized-trust" banner. best_effort_decode
+			// doesn't change WHAT gets kept on failure -- prior tags were
+			// already kept and rendered before this feature existed (see
+			// la_adsc_format_text()'s pre-existing "-- Malformed ADS-C
+			// message" path) -- it only adds the explicit trust-boundary
+			// labelling (partial/failed_tag/err_offset) so a consumer
+			// doesn't have to infer "how many tags are actually good" from
+			// list position.
+			bool best_effort_decode = false;
+			(void)la_config_get_bool("best_effort_decode", &best_effort_decode);
+			int const total_len = len;
 			while(len > 0) {
 				la_debug_print(D_INFO, "Remaining length: %u\n", len);
 				tag = LA_XCALLOC(1, sizeof(la_adsc_tag_t));
 				msg->tag_list = la_list_append(msg->tag_list, tag);
 				if((consumed_bytes = la_adsc_tag_parse(tag, tag_table, buf, len)) < 0) {
 					msg->err = true;
+					if(best_effort_decode) {
+						msg->partial = true;
+						msg->failed_tag = tag->tag;
+						msg->err_offset = (size_t)(total_len - len);
+					}
 					break;
 				}
 				buf += consumed_bytes; len -= consumed_bytes;
 			}
 			break;
+		}
 		case ARINC_MSG_DIS:
 			// DIS payload consists of an error code only, without any tag.
 			// Let's insert a fake tag value of 255.
@@ -1741,6 +1773,17 @@ static void la_adsc_tag_output_text(void const *p, void *ctx) {
 		LA_ISPRINTF(c->vstr, c->indent, "-- Unparseable tag %u\n", t->tag);
 		return;
 	}
+	if(t->type->parse != NULL && t->data == NULL) {
+		// Known tag WITH a group parser (tags with no parser, eg. empty
+		// flags, legitimately have t->data == NULL on success -- don't
+		// confuse the two), but the parser failed before ever allocating
+		// t->data (eg. a length check tripped first). t->type is set
+		// unconditionally now (leak fix above) purely so
+		// la_adsc_tag_destroy() has something to key off; there is
+		// nothing here to format.
+		LA_ISPRINTF(c->vstr, c->indent, "-- Truncated tag %u (%s)\n", t->tag, t->type->label);
+		return;
+	}
 	if(t->type->format_text != NULL) {
 		t->type->format_text(c, t->type->label, t->data);
 	}
@@ -1753,6 +1796,11 @@ static void la_adsc_tag_output_json(void const *p, void *ctx) {
 	la_adsc_tag_t const *t = p;
 	la_adsc_formatter_ctx_t *c = ctx;
 	if(!t->type) {
+		return;
+	}
+	if(t->type->parse != NULL && t->data == NULL) {
+		// See la_adsc_tag_output_text() for why t->data can be NULL even
+		// with t->type set and this NOT be the legitimate empty-tag case.
 		return;
 	}
 	if(t->type->format_json != NULL && t->type->json_key != NULL) {
@@ -1783,7 +1831,20 @@ void la_adsc_format_text(la_vstring *vstr, void const *data, int indent) {
 	}
 	la_list_foreach(msg->tag_list, la_adsc_tag_output_text, &ctx);
 	if(msg->err == true) {
-		LA_ISPRINTF(ctx.vstr, ctx.indent, "-- Malformed ADS-C message\n");
+		if(msg->partial == true) {
+			// design §8 group-quantized-trust banner. la_list_length()
+			// doesn't exist in this la_list implementation, so count the
+			// good prefix directly: tag_list holds every appended tag
+			// including the failing one, so length-1 is the number of
+			// tags parsed before it.
+			int good_tags = la_list_length(msg->tag_list) - 1;
+			LA_ISPRINTF(ctx.vstr, ctx.indent,
+					"-- WARNING: PARTIAL/UNTRUSTED decode -- first %d group(s) trustworthy, "
+					"failed at tag 0x%02x, byte offset %zu -- display only\n",
+					good_tags, msg->failed_tag, msg->err_offset);
+		} else {
+			LA_ISPRINTF(ctx.vstr, ctx.indent, "-- Malformed ADS-C message\n");
+		}
 	}
 }
 
@@ -1803,6 +1864,14 @@ void la_adsc_format_json(la_vstring *vstr, void const *data) {
 	la_list_foreach(msg->tag_list, la_adsc_tag_output_json, &ctx);
 	la_json_array_end(vstr);
 	la_json_append_bool(vstr, "err", msg->err);
+	// design §8: "partial"/"failed_tag"/"err_offset" next to "err". Only
+	// meaningful (and only ever set) when err == true and
+	// best_effort_decode was ON at parse time.
+	la_json_append_bool(vstr, "partial", msg->partial);
+	if(msg->partial == true) {
+		la_json_append_int64(vstr, "failed_tag", (int64_t)msg->failed_tag);
+		la_json_append_int64(vstr, "err_offset", (int64_t)msg->err_offset);
+	}
 }
 
 void la_adsc_destroy(void *data) {
