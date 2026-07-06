@@ -13,6 +13,15 @@
 #define CTRL_OUT (USB_BM_REQUEST_TYPE_TYPE_VENDOR | USB_BM_REQUEST_TYPE_DIR_OUT)
 #define CTRL_IN (USB_BM_REQUEST_TYPE_TYPE_VENDOR | USB_BM_REQUEST_TYPE_DIR_IN)
 
+// P3-1 (DMA-INT reclaim): capacity of the single pre-allocated control
+// URB/response_buf reused by every esp_libusb_control_transfer() call.
+// 8 B setup packet + CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=256 B —
+// every real caller (tuner/demod register I/O in librtlsdr.c) sends/reads
+// at most a few bytes, so this is a generous one-time allocation, not a
+// per-call one.
+#define CTRL_XFER_MAX_DATA_LEN 256
+#define CTRL_XFER_BUF_SIZE (sizeof(usb_setup_packet_t) + CTRL_XFER_MAX_DATA_LEN)
+
 #define USB_SETUP_PACKET_INIT_CONTROL(setup_pkt_ptr, bm_reqtype, b_request, w_value, w_index, w_length) ({ \
     (setup_pkt_ptr)->bmRequestType = bm_reqtype;                                                           \
     (setup_pkt_ptr)->bRequest      = b_request;                                                            \
@@ -81,6 +90,9 @@ typedef struct
 } class_adsb_dev;
 
 void init_adsb_dev();
+// P3-1: free the control URB + response_buf pre-allocated by init_adsb_dev().
+// Call at device close, mirroring init_adsb_dev()'s alloc.
+void deinit_adsb_dev(void);
 void stream_transfer_cb(usb_transfer_t *transfer);
 void transfer_read_cb(usb_transfer_t *transfer);
 int  esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout);
