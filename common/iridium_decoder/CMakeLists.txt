@@ -28,6 +28,13 @@ idf_component_register(
         "frame_queue.c"
         # Phase D part 4: IDA frame post-LCW decoder (de-interleave + BCH).
         "ida_decode.c"
+        # Phase A device-corpus: inverse of ida_decode.c's LW.DA path --
+        # re-encodes a known-good da_cont/da_ctr/payload triple into a
+        # content-accurate over-the-air bitstream. Lets the FRAME_DECODER
+        # smoke corpus drive real captured ACARS payloads (which have no
+        # surviving raw pre-BCH bits) through the actual production
+        # classify+BCH+reassembly chain.
+        "ida_encode.c"
         # Phase D part 5: SBD multi-frame reassembler.
         "sbd_reassembler.c"
         # Phase A (ACARS smoke): cross-burst IDA (LW.DA) fragment
