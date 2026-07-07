@@ -16,6 +16,7 @@ cd esp-idf
 git apply ../patches/0001-esp_dma_utils-defer-stash-alloc-until-overflow-confirmed.patch
 git apply ../patches/0003-freertos-riscv-coproc-save-area-in-internal-ram-for-psram-stacks.patch
 git apply ../patches/0004-freertos-riscv-pie-coproc-trap-storm-watchdog.patch   # apply AFTER 0003
+git apply ../patches/0005-freertos-riscv-pie-coproc-save-restore-spacing-fence-align.patch   # apply AFTER 0004
 ```
 
 Managed-component patches — apply from the repo root after the
@@ -189,6 +190,64 @@ clean GOLDEN pass (`matched>=40`, no HP-WDT — root fault cured) **or** an
 attributable `Coprocessor lazy-save trap storm` panic with the MEPC/MTVAL
 of the faulting save/restore instruction (root fault not yet cured, but no
 silent wedge).
+
+## 0005 — freertos/riscv: PIE save/restore spacing/fence/alignment screen (EXPERIMENT)
+
+**File:** `components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S`
+**IDF version:** v6.1 (vendored `release/v6.1` checkout). Re-verify on IDF
+updates. **Apply AFTER 0004** (context lines are diffed against the
+0004-applied tree; 0005 touches only the `pie_save_regs`/`pie_restore_regs`
+macros, which 0004 does not).
+
+This is a **cheap, falsifiable experiment**, not a proven fix. The device-smoke
+RAW/REAL wedge hard-hangs Core 1 (HP-WDT, no coredump) inside
+`rtos_save_pie_coproc` on the back-to-back 128-bit PIE Q-register run
+(`esp.vst.128.ip`/`esp.vld.128.ip`, `.insn 0x82012{2,6,a,e}3b`). Prior work
+ruled out memory region (0003), re-entry storm (0004 watchdog saw none), and our
+own kernels (single-PIE-owner-per-core avoids it). The surviving lead is
+esp-dsp issue **#102 "Problematic HW Loops on ESP32-P4"** (DSP-158): on P4 rev-1.0
+silicon a custom-coproc op (`esp.lp.setup`) that is **not 4-byte aligned** makes
+the core "go haywire"; the fix is `.balignw 4,0x0001`. Hypothesis: the PIE
+Q-register hang is a related pipeline / memory-ordering / alignment hazard on
+back-to-back custom-coproc ops.
+
+The patch ADDS only register-safe padding — every functional PIE op is kept
+intact and in its original order — testing three hypotheses at once (a "does ANY
+spacing help" screen; if it passes, a follow-up bisects which element mattered):
+
+- **H1 alignment:** `.balignw 4,0x0001` (mirror of esp-dsp #102) before each
+  run of coproc ops (the Q-register block, the QACC/UA block, and the XACC op),
+  in both macros.
+- **H2 memory-ordering:** `fence` before the first vector access and between the
+  Q-register block and the exotic-register (QACC/UA/XACC/SAR) block.
+- **H3 pipeline hazard:** two `nop`s between each pair of consecutive
+  `esp.vst.128.ip`/`esp.vld.128.ip` and QACC/UA ops.
+
+`fence`/`nop`/`.balignw` are all register-safe (no clobber of the `a1`/`a2`
+scratch the macros already use), which matters because these macros run in the
+illegal-instruction trap handler with a tight register budget.
+
+**Build-verified** (SMOKE_TEST_RAW, 0002+0003+0004+0005 applied): compiles
+clean; disassembly of `rtos_save_pie_coproc` confirms all 16 Q-register ops
+survive with correct encodings, separated by the nops/fences.
+
+**Known caveat (important for interpreting a bench result):** in the linked
+image the coproc ops land at **2-mod-4** addresses, i.e. the `.balignw` did NOT
+achieve absolute 4-byte alignment — `rtos_save_pie_coproc` is placed at a
+2-mod-4 base and IRAM does not honor `R_RISCV_ALIGN` to 4 here, so the padding
+tracked the assembler's local frame parity only. The H2 (fence) and H3 (2-nop)
+perturbations ARE genuinely applied; H1 as-emitted is "padding present, ops
+still 2-mod-4". So a still-hangs bench result cleanly falsifies H2+H3 but only
+partially H1 — a targeted 4-byte-alignment retry (force routine/section
+alignment) would be the H1 follow-up before discarding alignment entirely.
+
+**Bench procedure (main session):** apply 0005 after 0004, set
+`CONFIG_SMOKE_TEST_MODE=y` + `CONFIG_SMOKE_TEST_RAW_IRIDIUM=y`, build, flash,
+`scripts/smoke_run.sh raw`. GOLDEN pass (`matched>=40`, no HP-WDT) ⇒ spacing/
+fence/alignment FIXED the wedge (bisect which element next). Still HP-WDT hang
+(or a 0004 attributable trap-storm panic) ⇒ falsified; proceed to PIE-ownership
+re-tiering (research plan path (b)). Restore the production sdkconfig afterward
+(smoke_run leaves `CONFIG_SMOKE_TEST_MODE=y` in the gitignored sdkconfig).
 
 ## libacars — fix `uper_decode()` hard-zeroing `consumed` on RC_FAIL
 
