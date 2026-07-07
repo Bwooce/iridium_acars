@@ -110,9 +110,33 @@ build_flash_capture() {  # $1 = label (variant name or "production")
     log "[$label] capturing ${CAP_SECS}s serial -> $slog"
     "$REPO/scripts/monitor.sh" "$CAP_SECS" "$PORT" reset >"$slog" 2>&1 || true
 
+    local verdict=""
     if grep -q "SMOKE_PASS" "$slog"; then
-        log "[$label] RESULT: SMOKE_PASS"
+        verdict="SMOKE_PASS"
     elif grep -q "SMOKE_FAIL\|PLACEMENT_FAIL" "$slog"; then
+        verdict="SMOKE_FAIL"
+    fi
+
+    # Phase A device-corpus: the FRAME variant's on-device pass/fail
+    # boolean already covers this (frame_decoder_acars_decoded_total()
+    # delta, see p4-usb-host/main/smoke_test.c), but require the actual
+    # textual evidence here too -- a real captured ACARS message (REG
+    # A62001, tests/fixtures/fixture_acars_frames.h) went all the way
+    # through classify -> BCH -> ida_reassembler -> sbd_reassembler ->
+    # libacars and printed a clean FRMDEC "ACARS:" line, not just that
+    # the aggregate device-side boolean happened to be true.
+    if [ "$label" = frame ] && [ "$verdict" = SMOKE_PASS ]; then
+        if grep -qE 'ACARS:.*reg=A62001.*crc=OK' "$slog"; then
+            log "[$label] ACARS check OK: found FRMDEC \"ACARS: ... reg=A62001 ... crc=OK\" line"
+        else
+            log "[$label] ACARS check FAILED: no FRMDEC \"ACARS: ... reg=A62001 ... crc=OK\" line in $slog"
+            verdict="SMOKE_FAIL"
+        fi
+    fi
+
+    if [ "$verdict" = SMOKE_PASS ]; then
+        log "[$label] RESULT: SMOKE_PASS"
+    elif [ "$verdict" = SMOKE_FAIL ]; then
         log "[$label] RESULT: SMOKE_FAIL"
     elif [ "$label" = production ]; then
         grep -qE "class_driver|LIBUSB|rate>" "$slog" && log "[production] streaming path alive" || log "[production] (no stream markers in ${CAP_SECS}s — check $slog)"
