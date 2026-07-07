@@ -332,4 +332,33 @@ config ENABLE_SD_LOG
         without that pressure, builds without an SD card requirement
         should leave this off.
 
+config DIAG_SINGLE_PIE_OWNER
+    bool "P2 diagnostic: force ingest resample workers onto the scalar (non-PIE) MAC path"
+    default n
+    help
+        Discriminator for the HP-WDT hang in the PIE lazy save/restore
+        machinery (rtos_save_pie_coproc; all three shipped mitigations
+        -- HWLP removal, REV_MIN=0, coproc save areas in internal RAM
+        -- still leave the hang reproducible). Each core currently has
+        more than one task touching PIE: Core 0 runs class/dsp_feed
+        (tagger FFT) AND rs_worker_a (resample); Core 1 runs
+        worker_core1 (FFT/FIR/rotate via burst_pipeline) AND
+        rs_worker_b (resample). Because pxPortUpdateCoprocOwner only
+        swaps -- and only then runs the lazy save/restore body -- when
+        the current PIE owner differs from the incoming task, two PIE
+        users sharing a core is what exercises that machinery at all.
+
+        When enabled, this forces resample_256_to_250.c's per-emit MAC
+        onto its ANSI/scalar fallback (RS25_DISABLE_PIE_ASM) for BOTH
+        resample workers, making the tagger and worker_core1 the ONLY
+        PIE user on their respective cores. If the hang disappears with
+        this on, the fault is conclusively in the save/restore
+        machinery (owner never changes, so its save/restore body never
+        runs); if it persists, the fault is in PIE execution itself.
+
+        Diagnostic only -- default OFF. With this off, the compiled
+        resample_256_to_250.o is unchanged (same COMPILE_FLAGS string
+        as before this option existed). Do not ship with this on: the
+        scalar MAC is measured at ~8x the PIE kernel's per-tap cost.
+
 endmenu

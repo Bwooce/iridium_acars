@@ -1,0 +1,130 @@
+diff --git a/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c b/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
+index 40f6edb7a8..9a275fba4c 100644
+--- a/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
++++ b/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
+@@ -69,6 +69,8 @@
+ #if ( SOC_CPU_COPROC_NUM > 0 )
+ 
+ #include "esp_private/panic_internal.h"
++#include "esp_rom_sys.h"    /* esp_rom_printf() — panic-safe, no heap/locks -- iridium_acars patch */
++#include "esp_cpu.h"        /* esp_cpu_get_cycle_count() / esp_cpu_get_core_id() -- iridium_acars patch */
+ 
+ /* Since `portFORCE_INLINE` is not defined in `portmacro.h`, we must define it here since it is
+  * used by `atomic.h`. */
+@@ -940,6 +942,96 @@ void vPortCoprocUsedInISR(void* frame)
+     xt_unhandled_exception(frame);
+ }
+ 
++/* iridium_acars patch (P2 PIE-wedge diagnostic net):
++ *
++ * The lazy coprocessor save/restore runs from the illegal-instruction trap
++ * (rtos_save_<name>_coproc, portasm.S) with interrupts masked. Because that
++ * routine contains no loop, a program counter parked there is never a spin --
++ * it means the trap is being *re-entered*: the faulting instruction is retried
++ * by `mret` and immediately faults again, forever, with the tick starved, until
++ * the hardware watchdog resets the chip (`rst:0x7 HP_SYS_HP_WDT_RESET`, Core1
++ * Saved PC = rtos_save_pie_coproc). This is the deterministic device-smoke RAW
++ * wedge. It was proven this session (H-A) to live in the PIE *owner-swap*
++ * save/restore machinery: forcing a single PIE owner per core (so the swap body
++ * never runs) makes the wedge disappear, where every prior run wedged at the
++ * 2nd burst callback.
++ *
++ * A silent re-entry storm is the worst possible failure: no backtrace, no
++ * attribution, just a watchdog reset. This watchdog converts it into an
++ * attributable panic. On every coprocessor lazy-save trap it records the
++ * faulting PC (frame->mepc). When the SAME PC re-faults `COPROC_TRAP_STORM_LIMIT`
++ * times back-to-back (guarded by a short cycle-count window so that a hot call
++ * site legitimately re-trapping across unrelated context switches -- seconds or
++ * milliseconds apart, with forward progress in between -- can never trip it),
++ * the retried instruction is provably making no forward progress, so we panic
++ * with the faulting MEPC/MTVAL, the coprocessor index and the current owner
++ * instead of spinning to the HP-WDT.
++ *
++ * This ships regardless of whether the primary fix is complete: it makes
++ * production strictly safer (a storm becomes a clean, recoverable reboot with
++ * forensics rather than a mute wedge) and it is the diagnostic that identifies
++ * the exact re-faulting instruction on the bench. Generic across all
++ * coprocessors (FPU/HWLP/PIE/DSP); a non-buggy coprocessor never re-faults the
++ * same PC without retiring it, so the guard cannot false-positive.
++ */
++#ifndef COPROC_TRAP_STORM_LIMIT
++/* Consecutive same-PC re-faults before we declare a storm. A real storm produces
++ * thousands of re-entries per millisecond, so this trips within ~tens of µs --
++ * far ahead of the HP-WDT -- while being unreachable by legitimate scheduling. */
++#define COPROC_TRAP_STORM_LIMIT     16
++#endif
++#ifndef COPROC_TRAP_STORM_WINDOW_CYCLES
++/* Max plausible gap between two iterations of a genuine storm (one full trip
++ * through the trap vector + save/restore body). ~125 µs at 400 MHz: comfortably
++ * larger than any storm iteration yet far smaller than the ms-scale spacing of
++ * legitimate owner-swap traps, which also make forward progress in between. */
++#define COPROC_TRAP_STORM_WINDOW_CYCLES     50000u
++#endif
++
++/**
++ * @brief Bounded re-entry watchdog for the coprocessor lazy-save trap path.
++ *
++ * Called at the top of every rtos_save_<name>_coproc routine (portasm.S), with
++ * the coprocessor already enabled and `sp` still pointing at the RvExcFrame.
++ * Panics (never returns) if it detects a same-PC re-fault storm.
++ *
++ * @param frame  The RvExcFrame of the illegal-instruction trap (== sp).
++ * @param coproc Coprocessor index being saved (FPU/HWLP/PIE/DSP).
++ */
++void xPortCoprocTrapStormCheck(RvExcFrame *frame, int coproc)
++{
++    static uint32_t s_last_mepc[portNUM_PROCESSORS][SOC_CPU_COPROC_NUM];
++    static uint32_t s_last_cycle[portNUM_PROCESSORS][SOC_CPU_COPROC_NUM];
++    static uint32_t s_count[portNUM_PROCESSORS][SOC_CPU_COPROC_NUM];
++
++    const int core = esp_cpu_get_core_id();
++    const uint32_t mepc = (uint32_t) frame->mepc;
++    const uint32_t now  = esp_cpu_get_cycle_count();
++
++    if (mepc == s_last_mepc[core][coproc] &&
++        (now - s_last_cycle[core][coproc]) < COPROC_TRAP_STORM_WINDOW_CYCLES) {
++        s_count[core][coproc]++;
++    } else {
++        s_count[core][coproc] = 1;
++    }
++    s_last_mepc[core][coproc]  = mepc;
++    s_last_cycle[core][coproc] = now;
++
++    if (s_count[core][coproc] >= COPROC_TRAP_STORM_LIMIT) {
++        /* Interrupts are masked here, so we cannot abort() (it would fault
++         * again). Print the forensics with the panic-safe ROM printf first, then
++         * simulate an abort exactly like vPortCoprocUsedInISR does. */
++        esp_rom_printf("\r\nERROR: coprocessor lazy-save trap storm on core %d: "
++                       "coproc=%d re-faulted %u times at MEPC=0x%08x MTVAL=0x%08x owner=%p\r\n",
++                       core, coproc, (unsigned) s_count[core][coproc],
++                       (unsigned) mepc, (unsigned) frame->mtval,
++                       (void *) port_uxCoprocOwner[core][coproc]);
++        g_panic_abort = true;
++        g_panic_abort_details = (char *) "ERROR: Coprocessor lazy-save trap storm (retried instruction never retires)!\n";
++        xt_unhandled_exception(frame);
++    }
++}
++
+ #if CONFIG_IDF_TARGET_ESP32S31
+ /* On the ESP32-S31, the PIE is only available on core 1, so we need to perform a few checks when core 0 uses a PIE instruction.
+  * the functions here will help us with that. */
+diff --git a/components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S b/components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S
+index be5b80e8a3..5b21b070ac 100644
+--- a/components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S
++++ b/components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S
+@@ -72,6 +72,15 @@ rtos_save_\name\()_coproc:
+     /* Enable the coprocessor needed by the current task */
+     \enable_coproc a1
+     mv    s0, ra
++    /* iridium_acars patch (P2 PIE-wedge diagnostic net): bounded re-entry
++     * watchdog. `sp` still holds the RvExcFrame address here (see above) and
++     * `ra` is preserved in s0, so it is safe to call C. Panics with the faulting
++     * MEPC/MTVAL/owner if this trap is re-entered on the same PC without the
++     * retried instruction ever retiring, converting the silent HP-WDT wedge into
++     * an attributable panic. */
++    mv    a0, sp
++    li    a1, \coproc_idx
++    call  xPortCoprocTrapStormCheck
+     call  rtos_current_tcb
+     /* If the current TCB is NULL, the coprocessor is used during initialization, even before
+      * the scheduler started. Consider this a valid usage, it will be disabled as soon as the

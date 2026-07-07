@@ -15,6 +15,7 @@ IDF patches — apply after cloning / updating the IDF:
 cd esp-idf
 git apply ../patches/0001-esp_dma_utils-defer-stash-alloc-until-overflow-confirmed.patch
 git apply ../patches/0003-freertos-riscv-coproc-save-area-in-internal-ram-for-psram-stacks.patch
+git apply ../patches/0004-freertos-riscv-pie-coproc-trap-storm-watchdog.patch   # apply AFTER 0003
 ```
 
 Managed-component patches — apply from the repo root after the
@@ -138,7 +139,58 @@ Verification: apply on the bench checkout, rebuild + flash, then
 `scripts/smoke_run.sh raw` must complete (no HP-WDT hang) with GOLDEN
 matched>=40.
 
-## 0004 — libacars: fix `uper_decode()` hard-zeroing `consumed` on RC_FAIL
+## 0004 — freertos/riscv: PIE/coprocessor lazy-save trap-storm watchdog
+
+**Files:** `components/freertos/FreeRTOS-Kernel/portable/riscv/port.c`,
+`components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S`
+**IDF version:** v6.1 (vendored `release/v6.1` checkout). Re-verify on IDF
+updates. **Apply AFTER 0003** (both patches touch `port.c`; 0004 is diffed
+against the 0003-applied tree).
+
+The FreeRTOS-P4 coprocessor context switch is lazy: the first coprocessor
+instruction a task runs after losing ownership traps as an illegal
+instruction and `rtos_save_<name>_coproc` (portasm.S) runs from the trap
+handler, with interrupts masked, to swap the owner and save/restore the
+128-bit PIE (or FPU/DSP) context. That routine contains **no loop**, so a
+program counter parked there is never a spin — it is a *re-entry storm*:
+the retried instruction `mret`s and immediately re-faults, forever, tick
+starved, until the hardware watchdog resets the chip (`rst:0x7
+HP_SYS_HP_WDT_RESET`, `Core1 Saved PC = rtos_save_pie_coproc`). This is the
+deterministic device-smoke RAW/REAL wedge. It was localised this cycle
+(H-A) to the PIE **owner-swap** save/restore body: forcing a single PIE
+owner per core (see `CONFIG_DIAG_SINGLE_PIE_OWNER`) makes the wedge vanish,
+where every prior run wedged at the 2nd burst callback. Patches 0002
+(HWLP removal), REV_MIN=0 and 0003 (save areas in internal RAM) each
+addressed a plausible mechanism but the smoke hang survived all of them.
+
+Fix: a bounded re-entry watchdog. `xPortCoprocTrapStormCheck(frame,
+coproc)` is called at the top of every `rtos_save_<name>_coproc` (one
+insertion in the shared `generate_coprocessor_routine` macro; `sp` still
+holds the `RvExcFrame` and `ra` is preserved in `s0`, so calling C is
+safe). It records the faulting `mepc` per core/coproc; when the SAME PC
+re-faults `COPROC_TRAP_STORM_LIMIT` (16) times inside a short cycle-count
+window (so a hot call site legitimately re-trapping across unrelated
+context switches — ms apart, with forward progress in between — cannot
+trip it), it prints MEPC/MTVAL/coproc/owner with the panic-safe
+`esp_rom_printf` and simulates an abort exactly like `vPortCoprocUsedInISR`
+(interrupts are masked, so `abort()` cannot be used).
+
+This is a diagnostic net that **ships regardless** of whether the root
+save/restore fault is fully cured: it converts a silent HP-WDT wedge into
+an attributable panic + clean recoverable reboot (production strictly
+safer) and, on the bench, prints the exact re-faulting instruction that
+identifies the culprit. A non-buggy coprocessor never re-faults the same
+PC without retiring it, so the guard cannot false-positive; overhead is a
+handful of instructions on the already-heavy lazy-save path.
+
+Verification: apply on the bench checkout (after 0003), rebuild with
+`SMOKE_TEST_RAW`, flash, `scripts/smoke_run.sh raw`. Expected: either a
+clean GOLDEN pass (`matched>=40`, no HP-WDT — root fault cured) **or** an
+attributable `Coprocessor lazy-save trap storm` panic with the MEPC/MTVAL
+of the faulting save/restore instruction (root fault not yet cured, but no
+silent wedge).
+
+## libacars — fix `uper_decode()` hard-zeroing `consumed` on RC_FAIL
 
 **File:** `libacars/libacars/asn1/per_decoder.c` (tracked copy, not a
 `.patch` file -- see the note above).
