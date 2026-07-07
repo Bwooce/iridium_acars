@@ -406,6 +406,9 @@ void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)
     out->step_us     = (uint32_t)acc_step_us_snap;
     out->tag_steps   = tag_steps;
     out->coalesced   = atomic_exchange_explicit(&p->acc_coalesced, 0, memory_order_relaxed);
+    fft_burst_tagger_get_squelch_stats(&out->squelch_events,
+                                       &out->squelch_dropped,
+                                       &out->noise_resets);
 }
 
 void dsp_processor_read_reset_density(dsp_processor_t *p, dsp_density_t *out)

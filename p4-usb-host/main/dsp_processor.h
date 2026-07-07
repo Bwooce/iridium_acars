@@ -105,6 +105,11 @@ typedef struct {
     uint32_t step_us;     // total fft_burst_tagger_step wall time
     uint32_t tag_steps;   // tagger steps in this window
     uint32_t coalesced;   // gone bursts suppressed by the P1.5 coalescer (0 unless coal_n >= 2)
+    // Squelch visibility (2026-07-07 decode-regression batch) — window
+    // counts from fft_burst_tagger_get_squelch_stats():
+    uint32_t squelch_events;  // tagger steps where the burst squelch fired
+    uint32_t squelch_dropped; // bursts force-closed by the squelch (counted, never dispatched)
+    uint32_t noise_resets;    // squelch-driven noise-estimate resets (0.42 s re-prime each)
 } dsp_stage_stats_t;
 
 void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out);

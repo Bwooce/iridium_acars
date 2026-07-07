@@ -146,11 +146,15 @@ static void emit(const status_snapshot_t *s)
     {
         uint32_t ts = s->dsp.tag_steps ? s->dsp.tag_steps : 1;
         ESP_LOGI(TAG,
-                 "fbt: new=%u gone=%u coal=%u frames=%u step_us=%u "
+                 "fbt: new=%u gone=%u coal=%u sq=%u sqdrop=%u sqreset=%u "
+                 "frames=%u step_us=%u "
                  "wind=%.0f fft=%.0f mag=%.0f det=%.0f base=%.0f "
                  "(us/step, steps=%u)",
                  (unsigned)s->dsp.new_bursts, (unsigned)s->dsp.gone_bursts,
                  (unsigned)s->dsp.coalesced,
+                 (unsigned)s->dsp.squelch_events,
+                 (unsigned)s->dsp.squelch_dropped,
+                 (unsigned)s->dsp.noise_resets,
                  (unsigned)s->dsp.frames, (unsigned)s->dsp.step_us,
                  s->dsp.wind_us, s->dsp.fft_us, s->dsp.mag_us,
                  s->dsp.detect_us, s->dsp.baseline_us, (unsigned)ts);
@@ -278,10 +282,12 @@ static void emit(const status_snapshot_t *s)
 
     bool over_capacity = (dsp_pct > 80.0) || (worker_pct > 80.0);
     if (over_capacity || s->us.rb_full_drops || s->us.status_errors ||
-        s->us.resubmit_errors || s->ws.bursts_dropped || any_recovery) {
+        s->us.resubmit_errors || s->ws.bursts_dropped ||
+        s->dsp.squelch_events || any_recovery) {
         ESP_LOGW(TAG,
                  "STATUS-ERR: cap[dsp=%.0f%% worker=%.0f%%] "
                  "usb[rb_full=%u status_err=%u resubmit_err=%u pool_lost=%u last=0x%02x] "
+                 "fbt[sq=%u sqdrop=%u sqreset=%u] "
                  "worker[dropped=%u] "
                  "sb[stash_fails=%u recoveries=%u audio_dropped=%u dma_timeouts=%u] "
                  "ing[dispatch_drops=%u slow_waits=%u raw_slow_waits=%u] "
@@ -289,6 +295,8 @@ static void emit(const status_snapshot_t *s)
                  dsp_pct, worker_pct,
                  s->us.rb_full_drops, s->us.status_errors,
                  s->us.resubmit_errors, lu_pool_lost, s->us.last_error_status,
+                 s->dsp.squelch_events, s->dsp.squelch_dropped,
+                 s->dsp.noise_resets,
                  s->ws.bursts_dropped,
                  sb_fails, sb_recoveries, sb_audio_drop, sb_dma_to,
                  ic_disp_drops, ic_slow_waits, ic_raw_slow_wait,

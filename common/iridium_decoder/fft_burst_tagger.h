@@ -186,6 +186,27 @@ void fft_burst_tagger_reset_baseline(fft_burst_tagger_t *t);
 // instrumentation enabled — returns zeros.
 void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps);
 
+// Diagnostic — read-and-reset the squelch visibility counters
+// accumulated since the last call (same process-wide idiom as
+// fft_burst_tagger_get_stage_us):
+//   squelch_events   steps where the burst squelch fired
+//                    (n_bursts > FBT_SQUELCH_MAX_BURSTS)
+//   squelch_dropped  bursts force-closed by the squelch while still
+//                    ACTIVE (above threshold at the squelch step).
+//                    These are counted but NOT emitted as gone events —
+//                    a deliberate divergence from gr-iridium, which
+//                    dispatches them into an effectively unbounded
+//                    parallel downstream; our bounded single-worker PQ
+//                    was monopolised by them under live interference.
+//                    Already-quiet (post-pad) closures still dispatch.
+//                    See the squelch block in create_new_bursts_internal.
+//   noise_resets     squelch-driven noise-estimate resets
+//                    (squelch_count >= 10 → reset_baseline)
+// Any pointer may be NULL.
+void fft_burst_tagger_get_squelch_stats(uint32_t *squelch_events,
+                                        uint32_t *squelch_dropped,
+                                        uint32_t *noise_resets);
+
 // Scalar Q15 window-multiply kernel — the tagger's window stage AND
 // the bit-exact REFERENCE for any SIMD replacement (T50 golden
 // harness, tests/host/test_window_multiply_golden.c). For each

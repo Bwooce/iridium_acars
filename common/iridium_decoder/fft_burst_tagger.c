@@ -76,6 +76,16 @@ static _Atomic(uint64_t) s_acc_detect_us;
 static _Atomic(uint64_t) s_acc_base_us;
 static _Atomic(uint32_t) s_acc_steps;
 
+// Squelch visibility counters (2026-07-07 decode-regression batch):
+// squelch steps, bursts force-closed by the squelch (counted, NOT
+// dispatched — see the squelch path in create_new_bursts_internal),
+// and squelch-driven noise-estimate resets. Read-and-reset via
+// fft_burst_tagger_get_squelch_stats(). Same single-tagger-process
+// relaxed-atomic idiom as the stage timers above.
+static _Atomic(uint32_t) s_acc_squelch_events;
+static _Atomic(uint32_t) s_acc_squelch_dropped;
+static _Atomic(uint32_t) s_acc_noise_resets;
+
 #if defined(ESP_PLATFORM)
 // Pipelined helper task (Core 1): does mag+detect+EMA on the
 // fft_buf that tagger JUST FFT'd, in parallel with tagger doing
@@ -541,10 +551,12 @@ static int peak_cmp_desc(const void *a, const void *b)
 
 // out_gone/max_gone/n_gone_inout: the burst-squelch path (gri
 // fft_burst_tagger_impl.cc:327-355) force-closes ALL tracked bursts
-// when their count exceeds FBT_SQUELCH_MAX_BURSTS; the closed bursts
-// are appended to out_gone at *n_gone_inout (gri pushes them onto
-// d_gone_bursts) and the just-created ones are retracted from out_new
-// (gri clears d_new_bursts).
+// when their count exceeds FBT_SQUELCH_MAX_BURSTS and retracts the
+// just-created ones from out_new (gri clears d_new_bursts). Unlike
+// gri, only the force-closed bursts that were already QUIET (in their
+// post-pad, content complete) are appended to out_gone; the ones still
+// active at the squelch step are counted (s_acc_squelch_dropped) and
+// dropped — see the DELIBERATE DIVERGENCE note at the squelch block.
 static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
                                               fbt_burst_t *out_new, int max_new,
                                               fbt_burst_t *out_gone, int max_gone,
@@ -655,19 +667,52 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
                 (unsigned long long)t->d_index);
 #endif
         n_emitted = 0; // gri: d_new_bursts.clear()
-        int ng    = n_gone_inout ? *n_gone_inout : 0;
+        // DELIBERATE DIVERGENCE from gr-iridium: gri pushes every
+        // squelch-force-closed burst onto d_gone_bursts and dispatches
+        // it downstream (fft_burst_tagger_impl.cc:329-338). gri survives
+        // that only because its downstream (tagged_burst_to_pdu → an
+        // effectively unbounded parallel decoder pipeline) absorbs the
+        // flood. Our downstream is a 64-slot priority queue drained by
+        // ONE worker at ~1-10 bursts/s: under live interference the
+        // squelch fires ~15/s and each event used to dispatch up to
+        // ~50-64 junk windows, monopolising the PQ and starving real
+        // bursts (2026-07-06/07 live soak: worker shed >=99.9% of
+        // bursts, zero decodes over 16 h). Split the closures:
+        //   (a) bursts already QUIET at the squelch step (last_active <
+        //       d_index — signal ended, sitting out their post-pad):
+        //       their window content is complete and their natural
+        //       timeout dispatch was imminent regardless of the squelch;
+        //       dispatch them (same outcome gri's timeout path would
+        //       produce, so this adds nothing over the natural rate).
+        //   (b) bursts still ACTIVE this step (last_active == d_index —
+        //       persistent interference carriers, or the truncated
+        //       front of a still-transmitting burst): counted in
+        //       s_acc_squelch_dropped and NOT dispatched. These are the
+        //       storm multiplier — a continuous interferer re-enters
+        //       this set on every squelch event forever.
+        // Max-burst-len force-closes (delete_gone_bursts_internal) still
+        // dispatch unconditionally: those windows are length-ranked
+        // already and can carry real multi-frame content.
+        int sq_dropped = 0;
+        int ng         = n_gone_inout ? *n_gone_inout : 0;
         for (int i = 0; i < t->n_bursts; i++) {
             fbt_burst_t *bb = &t->bursts[i];
             // gri :332 skips bursts created THIS step (they were only
             // ever in d_new_bursts, which was just cleared).
-            if (bb->start != t->d_index - t->burst_pre_len) {
-                bb->stop = t->d_index;
-                if (out_gone && ng < max_gone) {
-                    out_gone[ng++] = *bb;
-                }
+            if (bb->start == t->d_index - t->burst_pre_len) continue;
+            if (bb->last_active == t->d_index) {
+                sq_dropped++; // (b) active at squelch: count, don't dispatch
+                continue;
+            }
+            bb->stop = t->d_index; // (a) quiet: dispatch as gone
+            if (out_gone && ng < max_gone) {
+                out_gone[ng++] = *bb;
             }
         }
         if (n_gone_inout) *n_gone_inout = ng;
+        atomic_fetch_add_explicit(&s_acc_squelch_dropped, (uint32_t)sq_dropped,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_acc_squelch_events, 1u, memory_order_relaxed);
         t->n_bursts = 0;       // gri: d_bursts.clear()
         rebuild_burst_mask(t); // gri: update_burst_mask()
 
@@ -679,6 +724,7 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
 #else
             fprintf(stderr, "Resetting noise estimate\n");
 #endif
+            atomic_fetch_add_explicit(&s_acc_noise_resets, 1u, memory_order_relaxed);
             fft_burst_tagger_reset_baseline(t); // gri :345-348
             t->squelch_count = 0;
         }
@@ -839,8 +885,9 @@ static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
         // create-before-delete matches this port's existing order (gri
         // runs delete first but filters peaks against the PRE-delete
         // mask, so burst creation sees the same mask either way). The
-        // squelch path may append force-closed bursts to staged_gone;
-        // delete_gone appends its own after them.
+        // squelch path may append already-quiet force-closed bursts to
+        // staged_gone (still-active ones are counted, not emitted — see
+        // create_new_bursts_internal); delete_gone appends after them.
         int staged_gone_n = 0;
         t->staged_n_new   = create_new_bursts_internal(
             t, t->staged_new, t->staged_max_new,
@@ -958,8 +1005,9 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
     uint64_t d0 = FBT_NOW_US();
     update_bursts_internal(t);
     // See the pipelined path for the create/delete ordering note. The
-    // squelch path may append force-closed bursts to out_gone_bursts;
-    // delete_gone appends its own after them.
+    // squelch path may append already-quiet force-closed bursts to
+    // out_gone_bursts (still-active ones are counted, not emitted — see
+    // create_new_bursts_internal); delete_gone appends its own after them.
     int n_gone_out = 0;
     int n_new_out  = create_new_bursts_internal(t, out_new_bursts, max_new,
                                                 out_gone_bursts, max_gone,
@@ -1001,4 +1049,19 @@ void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps)
         out[4] = base_us;
     }
     if (steps) *steps = steps_v;
+}
+
+void fft_burst_tagger_get_squelch_stats(uint32_t *squelch_events,
+                                        uint32_t *squelch_dropped,
+                                        uint32_t *noise_resets)
+{
+    uint32_t ev = atomic_exchange_explicit(&s_acc_squelch_events, 0,
+                                           memory_order_relaxed);
+    uint32_t dr = atomic_exchange_explicit(&s_acc_squelch_dropped, 0,
+                                           memory_order_relaxed);
+    uint32_t rs = atomic_exchange_explicit(&s_acc_noise_resets, 0,
+                                           memory_order_relaxed);
+    if (squelch_events) *squelch_events = ev;
+    if (squelch_dropped) *squelch_dropped = dr;
+    if (noise_resets) *noise_resets = rs;
 }
