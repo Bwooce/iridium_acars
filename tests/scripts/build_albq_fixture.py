@@ -260,7 +260,14 @@ def main() -> int:
     # iterates through all 8 stripes, asserting that *some* in-band burst
     # is detected on each (most stripes catch ≥1 burst from the active
     # 1149-1159 ms window).
-    target_rate = 2_560_000
+    target_rate = 2_500_000  # Path A: RTL-SDR now samples natively at 2.5 MSPS
+                             # (== pipeline rate, no resample). Fixtures are the
+                             # smoke's stand-in for the SDR, so emit them at 2.5
+                             # directly (12M -> 2.5) — the smoke then feeds them
+                             # through the production-identical no-resample
+                             # ingest. Golden compares decoded frame bits with
+                             # +-125k timing tolerance, so direct-2.5 vs the
+                             # golden's chained-2.5 still matches on content.
     TARGET_BYTES = 3 * 16384       # 49152 = 3 × 16 KB transfers = 9.6 ms
     # Use the same time anchor as the host fixture (centred on the gr-
     # iridium-selected high-SNR burst). Many other concurrent bursts at
