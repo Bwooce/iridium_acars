@@ -53,15 +53,16 @@ typedef struct {
 
     // Header fields parsed from bits[0..19] (per
     // iridium-toolkit/bitsparser.py:IridiumDAMessage):
-    //   bits[ 0.. 3]  flags1
-    //   bits[ 4]      cont (bit 4)
+    //   bits[ 0.. 2]  flags1
+    //   bits[ 3]      cont (continuation flag — bitsparser.py:1388)
+    //   bits[ 4]      spacer (unlabeled/unused — bitsparser.py:1389)
     //   bits[ 5.. 7]  da_ctr (3-bit message counter)
     //   bits[ 8..10]  flags2
     //   bits[11..15]  da_len (5-bit payload byte count, 0..24)
     //   bits[16]      flags3
     //   bits[17..19]  zero1 (sanity-check, must be 0)
-    uint8_t da_flags1; // 4 bits
-    uint8_t da_cont;   // 1 bit
+    uint8_t da_flags1; // 3 bits (bits 0..2; bit 4 is an unused spacer)
+    uint8_t da_cont;   // 1 bit (bit 3)
     uint8_t da_ctr;    // 3 bits
     uint8_t da_flags2; // 3 bits
     uint8_t da_len;    // 5 bits — number of valid payload bytes
