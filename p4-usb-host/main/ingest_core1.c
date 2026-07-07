@@ -372,18 +372,18 @@ static void ingest_task(void *arg)
                     gave_raw_done = true;
                 }
 
-                int16_t batch_scratch[RS25_BATCH_COMPLEX * 2]
-                    __attribute__((aligned(16)));
-                int64_t tr0        = esp_timer_get_time();
-                int     n_out_tile = resample_256_to_250_process_explicit(
-                    s_persist_delay_i, s_persist_delay_q,
-                    &s_persist_wpos, &s_persist_start_pos,
-                    s_tile, tile_complex,
-                    out + 2 * n_out_complex, tile_complex,
-                    batch_scratch);
+                // Path A: native 2.5 MSPS in == 2.5 MSPS pipeline rate, so
+                // there is NO resample — copy the converted tile straight to
+                // the output. This drops the PIE resample MAC entirely (no 2nd
+                // PIE owner on Core 1 → no coprocessor-save wedge), and its
+                // ~75%-of-a-core cost. resample_256_to_250 remains in the
+                // library for the host gri-parity tests (2.56 MSPS fixtures).
+                int64_t tr0 = esp_timer_get_time();
+                memcpy(out + 2 * n_out_complex, s_tile,
+                       (size_t)tile_complex * 2 * sizeof(int16_t));
                 int64_t tr1 = esp_timer_get_time();
                 resample_us += (tr1 - tr0);
-                n_out_complex += n_out_tile;
+                n_out_complex += tile_complex;
             }
             if (!gave_raw_done) {
                 // n_in_complex_total == 0 (degenerate 0/1-byte

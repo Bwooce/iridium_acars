@@ -17,7 +17,12 @@
 // before signal_buffer_push, so everything DOWNSTREAM of ingest sees
 // FS_DETECT_HZ. Keeping FS_IN_HZ for code that still reasons about
 // the SDR's nominal rate (status logger, etc.).
-#define FS_IN_HZ 2560000u
+#define FS_IN_HZ 2500000u     // Path A: RTL-SDR sampled DIRECTLY at 2.5 MSPS
+                              // (== FS_DETECT_HZ) so NO 2.56->2.5 resample is
+                              // needed in production. Removes the 2nd PIE owner
+                              // (wedge), the resample CPU cost, and the R3 merge.
+                              // resample_256_to_250 stays in the lib for the host
+                              // gri-parity tests (2.56 MSPS fixtures).
 #define FS_DETECT_HZ 2500000u // wideband path rate
 // SDR tuned LO. NOTE: 1626 MHz is NOT mid-band — it's the boundary between
 // the duplex band (1616.0-1626.0 MHz, 240 user channels @ 41.667 kHz, where

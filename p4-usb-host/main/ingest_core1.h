@@ -11,7 +11,12 @@
 // class_driver currently uses, expressed in int16 units (8192 elements
 // = 32 KB per slot).
 #define INGEST_NUM_SLOTS 2
-#define INGEST_SLOT_ELEMS (16 * 1024) /* int16 elements per slot (32 KB each) */
+#define INGEST_SLOT_ELEMS (20 * 1024) /* int16 elements per slot (40 KB each).    \
+                                       * Path A (native 2.5 MSPS, no resample):   \
+                                       * output = input count = 8192 complex =    \
+                                       * 16384 int16 for a 16 KB dispatch — the \
+                                       * old 16*1024 was an exact fit; 20*1024    \
+                                       * adds safety margin. */
 
 // T49b: size of the internal-SRAM staging tile the convert+resample loop
 // processes at a time, in complex samples (4 KB = 1024 complex * 2 int16).
