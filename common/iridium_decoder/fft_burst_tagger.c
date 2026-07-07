@@ -57,6 +57,25 @@ static inline uint64_t fbt_now_us(void)
 
 #define N FBT_FFT_SIZE
 
+// ESP32-P4 PIE (arp4) 8-lane kernels for the two per-bin hot loops.
+// Defined in fft_burst_tagger_arp4.S, which self-gates on the same
+// condition so it compiles to nothing on host / non-PIE targets. When
+// FBT_USE_PIE_KERNELS is 0 the scalar C below is the sole path AND the
+// bit-exact reference the host golden test pins against.
+#if defined(__riscv) && defined(SOC_CPU_HAS_PIE)
+#define FBT_USE_PIE_KERNELS 1
+// mag²: dst[k] = re[k]² + im[k]² over `n` bins (n a multiple of 8).
+extern void fbt_mag_sq_pass_arp4(const int16_t *src_iq, int32_t *dst, int n);
+// EMA RMW: bsum[k] += min(mag[k],clamp) - slot[k]; slot[k]=min(mag[k],clamp).
+extern void fbt_ema_step_arp4(int32_t *bsum, int32_t *slot,
+                              const int32_t *mag, int n, int32_t clamp);
+// Priming EMA: bsum[k] += min(mag[k],clamp); slot[k]=min(...); no old read.
+extern void fbt_ema_step_prime_arp4(int32_t *bsum, int32_t *slot,
+                                    const int32_t *mag, int n, int32_t clamp);
+#else
+#define FBT_USE_PIE_KERNELS 0
+#endif
+
 // Per-stage timer accumulators (single-tagger process — fine for our
 // usage). Order matches fft_burst_tagger_get_stage_us() docs.
 //
@@ -575,7 +594,17 @@ static FBT_HOT void window_multiply(fft_burst_tagger_t *t,
 static inline void mag_sq_pass(const int16_t *__restrict__ src_iq,
                                int32_t *__restrict__ dst, int n)
 {
-    for (int k = 0; k < n; k++) {
+    int k = 0;
+#if FBT_USE_PIE_KERNELS
+    // PIE 8-lane kernel handles the 8-bin-aligned bulk; the scalar tail
+    // below is bit-identical and covers any remainder (none for N=2048).
+    int nv = n & ~7;
+    if (nv) {
+        fbt_mag_sq_pass_arp4(src_iq, dst, nv);
+        k = nv;
+    }
+#endif
+    for (; k < n; k++) {
         int32_t re = src_iq[2 * k + 0];
         int32_t im = src_iq[2 * k + 1];
         dst[k]     = re * re + im * im;
@@ -934,7 +963,19 @@ static inline void ema_step_inner(int32_t *__restrict__ bsum,
                                   const int32_t *__restrict__ mag,
                                   int n)
 {
-    for (int k = 0; k < n; k++) {
+    int k = 0;
+#if FBT_USE_PIE_KERNELS
+    // PIE 4-lane int32 kernel: vmin.s32 clamp + vsub/vadd RMW. The scalar
+    // tail below is the bit-exact reference and covers any remainder
+    // (none for N=2048). NB: `slot` is the PSRAM baseline_history slot —
+    // the kernel does the same sequential vld/vst the scalar loop does.
+    int nv = n & ~3;
+    if (nv) {
+        fbt_ema_step_arp4(bsum, slot, mag, nv, FBT_EMA_SLOT_CLAMP);
+        k = nv;
+    }
+#endif
+    for (; k < n; k++) {
         int32_t old = slot[k]; // one PSRAM read (L2 cached)
         int32_t cur = mag[k];  // in-SRAM read
         // Clamp mag² to prevent baseline_sum int32 overflow under strong
@@ -959,7 +1000,15 @@ static inline void ema_step_inner_prime(int32_t *__restrict__ bsum,
                                         const int32_t *__restrict__ mag,
                                         int n)
 {
-    for (int k = 0; k < n; k++) {
+    int k = 0;
+#if FBT_USE_PIE_KERNELS
+    int nv = n & ~3;
+    if (nv) {
+        fbt_ema_step_prime_arp4(bsum, slot, mag, nv, FBT_EMA_SLOT_CLAMP);
+        k = nv;
+    }
+#endif
+    for (; k < n; k++) {
         int32_t cur = mag[k];
         if (cur > FBT_EMA_SLOT_CLAMP) {
             cur = FBT_EMA_SLOT_CLAMP;

@@ -272,6 +272,19 @@ add_executable(test_window_multiply_golden
 target_include_directories(test_window_multiply_golden PRIVATE ${COMMON_DIR})
 target_link_libraries(test_window_multiply_golden PRIVATE m)
 
+# Bit-exact golden harness for the ESP32-P4 PIE tagger kernels
+# (fft_burst_tagger_arp4.S: mag² + baseline EMA). Host has no PIE, so this
+# re-implements the scalar reference AND a faithful C model of the arp4
+# lane/accumulator math and pins them to a frozen golden + hand-checkable
+# spot values, with negative controls. Self-contained (only needs the
+# public header for FBT_FFT_SIZE/FBT_HISTORY_SIZE); device bit-exactness
+# still requires a hardware RAW-GOLDEN check.
+add_executable(test_tagger_mag_ema_golden
+    test_tagger_mag_ema_golden.c
+)
+target_include_directories(test_tagger_mag_ema_golden PRIVATE ${COMMON_DIR})
+target_link_libraries(test_tagger_mag_ema_golden PRIVATE m)
+
 # Phase 3.6.M: C direct-IF decimator vs Python scipy reference. For
 # one burst, runs the same rotate+decim in C and compares NMSE
 # against /tmp/host_direct_if/burst_NNN.cf32 (the Python output).
@@ -1104,6 +1117,7 @@ add_test(NAME tagger_latch_release  COMMAND test_tagger_latch_release)
 add_test(NAME tagger_carrier_absorption COMMAND test_tagger_carrier_absorption)
 add_test(NAME tagger_live_conditions COMMAND test_tagger_live_conditions)
 add_test(NAME window_multiply_golden COMMAND test_window_multiply_golden)
+add_test(NAME tagger_mag_ema_golden COMMAND test_tagger_mag_ema_golden)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
 add_test(NAME rotate_to_dc          COMMAND test_rotate_to_dc)

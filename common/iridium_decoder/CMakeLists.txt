@@ -84,6 +84,11 @@ idf_component_register(
         # later if more headroom is needed.
         "fft_sc16_2048.c"
         "fft_burst_tagger.c"
+        # PIE asm 8-lane kernels for the tagger's per-bin mag² and
+        # baseline-EMA hot loops. Self-gates on __riscv && SOC_CPU_HAS_PIE
+        # so it compiles to a no-op on host (and non-P4 targets); the
+        # scalar C in fft_burst_tagger.c stays the reference + fallback.
+        "fft_burst_tagger_arp4.S"
         "direct_if_decim.c"
         "resample_256_to_250.c"
         # PIE asm 9-tap MAC for the resampler hot path. Self-gates
