@@ -167,11 +167,12 @@ static void emit(const status_snapshot_t *s)
     // successes that fail BCH outright. On the ALBQ raw fixture:
     // processed=58 typically resolves to bch_decoded=19 + bch_failed=27
     // + bch_skipped(short)=12.
-    ESP_LOGI(TAG, "Worker: queued=%u dropped=%u processed=%u "
+    ESP_LOGI(TAG, "Worker: queued=%u dropped=%u evicted=%u processed=%u "
                   "bch_decoded=%u bch_unknown=%u bch_failed=%u "
                   "bch_chase=%u skipped=%u triage_rej=%u "
                   "qmax=%u avg_burst=%.0f us triage_rej_avg=%.0f us cap=%.1f%%",
-             s->ws.bursts_queued, s->ws.bursts_dropped, s->ws.bursts_processed,
+             s->ws.bursts_queued, s->ws.bursts_dropped,
+             s->ws.bursts_evicted, s->ws.bursts_processed,
              s->ws.bursts_bch_decoded, s->ws.bursts_bch_unknown,
              s->ws.bursts_bch_failed, s->ws.bursts_bch_chase_recovered,
              s->ws.bursts_skipped, s->ws.bursts_triage_rejected,
@@ -283,12 +284,12 @@ static void emit(const status_snapshot_t *s)
     bool over_capacity = (dsp_pct > 80.0) || (worker_pct > 80.0);
     if (over_capacity || s->us.rb_full_drops || s->us.status_errors ||
         s->us.resubmit_errors || s->ws.bursts_dropped ||
-        s->dsp.squelch_events || any_recovery) {
+        s->ws.bursts_evicted || s->dsp.squelch_events || any_recovery) {
         ESP_LOGW(TAG,
                  "STATUS-ERR: cap[dsp=%.0f%% worker=%.0f%%] "
                  "usb[rb_full=%u status_err=%u resubmit_err=%u pool_lost=%u last=0x%02x] "
                  "fbt[sq=%u sqdrop=%u sqreset=%u] "
-                 "worker[dropped=%u] "
+                 "worker[dropped=%u evicted=%u] "
                  "sb[stash_fails=%u recoveries=%u audio_dropped=%u dma_timeouts=%u] "
                  "ing[dispatch_drops=%u slow_waits=%u raw_slow_waits=%u] "
                  "heap[dma_free=%uKB dma_largest=%uKB]",
@@ -297,7 +298,7 @@ static void emit(const status_snapshot_t *s)
                  s->us.resubmit_errors, lu_pool_lost, s->us.last_error_status,
                  s->dsp.squelch_events, s->dsp.squelch_dropped,
                  s->dsp.noise_resets,
-                 s->ws.bursts_dropped,
+                 s->ws.bursts_dropped, s->ws.bursts_evicted,
                  sb_fails, sb_recoveries, sb_audio_drop, sb_dma_to,
                  ic_disp_drops, ic_slow_waits, ic_raw_slow_wait,
                  dma_free / 1024, dma_largest / 1024);

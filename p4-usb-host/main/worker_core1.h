@@ -21,7 +21,10 @@ void worker_core1_prealloc_fir(void);
 // accumulated since the previous call and resets the internal counters.
 typedef struct {
     uint32_t bursts_queued;              // pushed to the queue (incl. dropped)
-    uint32_t bursts_dropped;             // dropped because queue was full
+    uint32_t bursts_dropped;             // dropped because queue was full (newcomer weakest)
+    uint32_t bursts_evicted;             // displaced from a full PQ by a stronger newcomer
+                                         // before the worker popped them (churn indicator:
+                                         // under junk storms this ticks while dropped stays 0)
     uint32_t bursts_processed;           // ran end-to-end through the worker
     uint32_t bursts_skipped;             // dropped by edge/length/zero-output guards
     uint32_t bursts_bch_decoded;         // subset whose frame passed BCH AND classified as a known type (real decodes)

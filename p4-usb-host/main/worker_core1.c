@@ -160,8 +160,14 @@ static void pq_extract_max_locked(detected_burst_t *out)
 // class_driver — a volatile RMW on RV32 loses increments across that
 // race, and volatile 64-bit reads can tear. Relaxed ordering is plenty
 // for diagnostics; get_stats uses atomic_exchange for exact windows.
-static _Atomic uint32_t s_bursts_queued    = 0;
-static _Atomic uint32_t s_bursts_dropped   = 0;
+static _Atomic uint32_t s_bursts_queued  = 0;
+static _Atomic uint32_t s_bursts_dropped = 0;
+// PQ evictions (2026-07-07 decode-regression batch): a full PQ replaced
+// its weakest slot with a stronger newcomer (pq_insert_locked r==0).
+// Previously counted NOWHERE — under junk storms the queue can churn
+// entirely through evictions while bursts_dropped stays 0, hiding the
+// fact that queued bursts never survive to a pop.
+static _Atomic uint32_t s_bursts_evicted   = 0;
 static _Atomic uint32_t s_bursts_processed = 0;
 static _Atomic uint32_t s_bursts_skipped   = 0;
 static _Atomic uint32_t s_queue_high_water = 0;
@@ -1273,7 +1279,9 @@ void worker_core1_push_burst(const detected_burst_t *burst)
     // (buffer full and it was weaker than everything already queued).
     if (r > 0) {
         xSemaphoreGive(s_pq_items);
-    } else if (r < 0) {
+    } else if (r == 0) {
+        s_bursts_evicted++; // a queued burst was displaced before the worker saw it
+    } else {
         s_bursts_dropped++;
     }
 }
@@ -1324,6 +1332,8 @@ void worker_core1_get_stats(worker_stats_t *out)
         atomic_exchange_explicit(&s_bursts_queued, 0, memory_order_relaxed);
     out->bursts_dropped =
         atomic_exchange_explicit(&s_bursts_dropped, 0, memory_order_relaxed);
+    out->bursts_evicted =
+        atomic_exchange_explicit(&s_bursts_evicted, 0, memory_order_relaxed);
     out->bursts_processed = n;
     out->bursts_skipped =
         atomic_exchange_explicit(&s_bursts_skipped, 0, memory_order_relaxed);
