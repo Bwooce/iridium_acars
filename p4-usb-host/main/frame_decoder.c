@@ -228,10 +228,21 @@ static void try_acars(const sbd_message_t *msg,
         if (a->reasm_status == LA_REASM_COMPLETE ||
             a->reasm_status == LA_REASM_SKIPPED) {
             atomic_fetch_add_explicit(&s_acars_decoded, 1, memory_order_relaxed);
-            ESP_LOGI(TAG, "ACARS: %s mode=%c label='%.2s' block=%c msgnum='%.4s' "
-                          "flight='%.6s' crc=%s txt=\"%s\"",
+            // a->reg is libacars's raw fixed-width 7-char field, NUL-
+            // terminated but left-padded with '.' for short registrations
+            // (e.g. "A62001" -> ".A62001") -- strip the padding the same
+            // way iridium-toolkit's own pretty-printer and
+            // tests/host/test_acars_tail_real.c do, so the logged REG
+            // reads as the human-readable tail number a device operator
+            // (or the smoke-test verdict parser) can match against.
+            const char *reg_nodot = a->reg;
+            while (*reg_nodot == '.')
+                reg_nodot++;
+            ESP_LOGI(TAG, "ACARS: %s mode=%c reg=%s label='%.2s' block=%c "
+                          "msgnum='%.4s' flight='%.6s' crc=%s txt=\"%s\"",
                      msg->uplink ? "UL" : "DL",
                      a->mode ? a->mode : '?',
+                     reg_nodot,
                      a->label, a->block_id ? a->block_id : '?',
                      a->msg_num, a->flight_id,
                      a->crc_ok ? "OK" : "BAD",

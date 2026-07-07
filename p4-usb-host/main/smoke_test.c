@@ -60,6 +60,18 @@
 #include "fixture_albq_frames_corpus.h"
 #include "frame_decoder.h"
 #include "qpsk_demod.h"
+// Phase A device-corpus: real captured ACARS payloads (no synthetic
+// hex duplicated here -- fixture_acars_frames.h is the single source
+// of truth, shared with tests/host/test_ida_encode_roundtrip.c and
+// test_acars_tail_real.c). ida_encode_da_frame() re-encodes each
+// fragment's da_cont/da_ctr/payload into a content-accurate wire
+// bitstream at boot so it drives the SAME production
+// classify->BCH->ida_reassembler->sbd_reassembler->libacars chain as
+// every other FRAME_DECODER corpus entry -- see ida_encode.h for why
+// this re-encoding is necessary (no surviving raw pre-BCH bits for
+// these specific captured bursts).
+#include "fixture_acars_frames.h"
+#include "ida_encode.h"
 #endif
 
 #include "frame_pdu.h"
@@ -263,8 +275,20 @@ static void smoke_test_run_frame_decoder(void)
     // already classified zero frames; subtract baseline).
     frame_decoder_class_counts_t before, after;
     frame_decoder_get_class_counts(&before);
-    ESP_LOGI(TAG, "Pushing %u corpus frames -> frame_decoder...",
-             ALBQ_FRAME_CORPUS_LEN);
+    uint64_t acars_decoded_before = frame_decoder_acars_decoded_total();
+
+    // Phase A device-corpus: total real-ACARS fixture fragments (both
+    // messages need 2 chained LW.DA fragments each -- see
+    // ida_reassembler.h). Computed from the fixture itself rather than
+    // hardcoded so the EXP_LW_TOTAL tolerance below tracks the fixture
+    // if it grows.
+    int acars_frag_total = 0;
+    for (int m = 0; m < ACARS_FIXTURE_NUM_MESSAGES; m++) {
+        acars_frag_total += ACARS_FIXTURE_MESSAGES[m].n_fragments;
+    }
+
+    ESP_LOGI(TAG, "Pushing %u corpus frames + %d real-ACARS fixture frames -> frame_decoder...",
+             ALBQ_FRAME_CORPUS_LEN, acars_frag_total);
     int pushed_ok = 0, push_drops = 0;
     for (unsigned int i = 0; i < ALBQ_FRAME_CORPUS_LEN; i++) {
         const albq_frame_corpus_entry_t *e = &ALBQ_FRAME_CORPUS[i];
@@ -290,6 +314,60 @@ static void smoke_test_run_frame_decoder(void)
         else
             push_drops++;
     }
+
+    // Phase A device-corpus: push the real captured ACARS messages
+    // (tests/fixtures/fixture_acars_frames.h). Each fragment's demod
+    // bits are re-encoded from the fixture's known-good
+    // da_cont/da_ctr/payload at push time via ida_encode_da_frame() --
+    // that fixture stores post-BCH payload bytes, not raw pre-BCH
+    // bits (none survive for this capture window; see the fixture's
+    // header comment), and frame_decoder_push() is the only injection
+    // point, consuming raw bits that go through the full production
+    // classify -> BCH chain. This re-encoding was validated against
+    // that same chain on host by test_ida_encode_roundtrip.c before
+    // being trusted here.
+    //
+    // Timestamps are passed EXPLICITLY from the fixture (fr->timestamp_us),
+    // NOT 0/"stamp now": the ida_reassembler chains a message's two
+    // fragments only if they arrive within IDA_REASM_FRAG_GAP_US
+    // (280 ms) of each other (ida_reassembler.h). The fixture's own
+    // real capture timestamps are ~90 ms apart, safely inside that
+    // window -- but wall-clock "now" at push time is NOT, because the
+    // retry-on-full-queue backoff above (one vTaskDelay(1) tick per
+    // attempt) could stretch the gap between two pushes well past
+    // 280 ms on a loaded queue and silently orphan the second
+    // fragment. Explicit fixture timestamps make the chain immune to
+    // that push-loop jitter.
+    for (int m = 0; m < ACARS_FIXTURE_NUM_MESSAGES; m++) {
+        const acars_fixture_message_t *msg = &ACARS_FIXTURE_MESSAGES[m];
+        for (int fi = 0; fi < msg->n_fragments; fi++) {
+            const acars_fixture_fragment_t *fr = &msg->fragments[fi];
+            uint8_t                         bits[IDA_ENCODE_FRAME_BITS];
+            if (ida_encode_da_frame(fr->da_cont, fr->da_ctr, fr->payload,
+                                    fr->payload_len, bits) != 0) {
+                ESP_LOGE(TAG, "ACARS fixture msg %d frag %d: ida_encode_da_frame failed",
+                         m, fi);
+                push_drops++;
+                continue;
+            }
+            bool ok = false;
+            for (int attempt = 0; attempt < 100; attempt++) {
+                // Real captures of this message ran ~12-13 dB SNR
+                // (see project_30min_live_stability memory note); the
+                // fixture doesn't carry its own SNR field, so log a
+                // representative fixed value here.
+                ok = frame_decoder_push(bits, IDA_ENCODE_FRAME_BITS, DIR_DOWNLINK,
+                                        fr->freq_hz, 0, 12.5f, fr->timestamp_us);
+                if (ok) break;
+                vTaskDelay(1);
+            }
+            if (ok)
+                pushed_ok++;
+            else
+                push_drops++;
+        }
+    }
+
     // Wait for the decoder task to drain. 100 ms × 30 = up to 3 s.
     for (int i = 0; i < 30 && frame_decoder_queue_count() > 0; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -302,15 +380,19 @@ static void smoke_test_run_frame_decoder(void)
     uint64_t got_lw_da    = after.lw_da - before.lw_da;
     uint64_t got_lw_other = after.lw_other - before.lw_other;
     uint64_t got_total    = got_unknown + got_ms + got_tl + got_bc + got_lw_da + got_lw_other;
+    uint64_t got_acars    = frame_decoder_acars_decoded_total() - acars_decoded_before;
 
-    ESP_LOGI(TAG, "Pushed: %d ok / %d dropped (corpus size %u)",
-             pushed_ok, push_drops, ALBQ_FRAME_CORPUS_LEN);
+    ESP_LOGI(TAG, "Pushed: %d ok / %d dropped (corpus size %u + %d ACARS fixture)",
+             pushed_ok, push_drops, ALBQ_FRAME_CORPUS_LEN, acars_frag_total);
     ESP_LOGI(TAG, "Decoder counts: UNKNOWN=%llu MS=%llu TL=%llu BC=%llu "
                   "LW.DA=%llu LW.other=%llu (total processed=%llu)",
              (unsigned long long)got_unknown, (unsigned long long)got_ms,
              (unsigned long long)got_tl, (unsigned long long)got_bc,
              (unsigned long long)got_lw_da, (unsigned long long)got_lw_other,
              (unsigned long long)got_total);
+    ESP_LOGI(TAG, "ACARS fixture: %llu/%d real messages decoded (see FRMDEC "
+                  "\"ACARS:\" lines above for reg=/crc= detail)",
+             (unsigned long long)got_acars, ACARS_FIXTURE_NUM_MESSAGES);
 
     bool pass = true;
     if (push_drops > 0) {
@@ -327,9 +409,11 @@ static void smoke_test_run_frame_decoder(void)
     // 82-entry Albuquerque corpus: 1 TL + 11 BC + 6 LW.DA + 55 LW.other
     // (the LW count breaks down by ft); 9 UNKNOWN. Allow ±2 slack for
     // any classifier-tuning drift between host (gcc) and target (riscv32).
+    // EXP_LW_TOTAL is bumped by acars_frag_total: every real-ACARS
+    // fixture fragment we push above classifies as LW.DA too.
     const int EXP_TL       = 1;
     const int EXP_BC       = 11;
-    const int EXP_LW_TOTAL = 61; // matches host: 14 BC + 61 LW + 1 TL etc.
+    const int EXP_LW_TOTAL = 61 + acars_frag_total; // ALBQ-only baseline + ACARS fixture
     if ((int)got_tl < EXP_TL - 2 || (int)got_tl > EXP_TL + 2) {
         ESP_LOGE(TAG, "  TL count %llu out of range [%d..%d]",
                  (unsigned long long)got_tl, EXP_TL - 2, EXP_TL + 2);
@@ -344,6 +428,16 @@ static void smoke_test_run_frame_decoder(void)
     if (lw_total < EXP_LW_TOTAL - 2 || lw_total > EXP_LW_TOTAL + 2) {
         ESP_LOGE(TAG, "  LW total %d out of range [%d..%d]",
                  lw_total, EXP_LW_TOTAL - 2, EXP_LW_TOTAL + 2);
+        pass = false;
+    }
+    // Phase A device-corpus pass criterion: the real-ACARS fixture
+    // messages must both fully decode (device-side counter check,
+    // independent of the log-line text check scripts/smoke_run.sh
+    // does for reg=/crc=OK -- this catches a silent regression even
+    // if serial log capture drops a line).
+    if (got_acars < (uint64_t)ACARS_FIXTURE_NUM_MESSAGES) {
+        ESP_LOGE(TAG, "  ACARS decoded=%llu, expected >= %d (real-capture fixture messages)",
+                 (unsigned long long)got_acars, ACARS_FIXTURE_NUM_MESSAGES);
         pass = false;
     }
     if (pass)
