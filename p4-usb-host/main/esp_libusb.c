@@ -76,40 +76,6 @@ void init_adsb_dev()
         // fails the transfer rather than dereferencing it.
         ESP_LOGE("LIBUSB", "Failed to create xfer_mutex — control transfers will fail");
     }
-
-    // P3-1 (DMA-INT reclaim): one control-transfer URB + response buffer,
-    // sized for the largest control transfer we'll ever issue (8 B setup
-    // + CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=256 B data), allocated
-    // once here and reused by every esp_libusb_control_transfer() call
-    // instead of alloc/free per call. This removes ~22 DMA-internal
-    // alloc/free cycles per scanner retune hop (the mid-scan EP0-stall/
-    // NO_MEM cause). Freed in esp_libusb_deinit_adsb_dev() at device close.
-    if (usb_host_transfer_alloc(CTRL_XFER_BUF_SIZE, 0, &adsbdev->transfer) != ESP_OK ||
-        adsbdev->transfer == NULL) {
-        ESP_LOGE("LIBUSB", "init_adsb_dev: failed to pre-allocate control URB (%u B) — "
-                           "control transfers will fail",
-                 (unsigned)CTRL_XFER_BUF_SIZE);
-        adsbdev->transfer = NULL;
-    }
-    adsbdev->response_buf = calloc(CTRL_XFER_BUF_SIZE, sizeof(uint8_t));
-    if (!adsbdev->response_buf) {
-        ESP_LOGE("LIBUSB", "init_adsb_dev: failed to allocate response_buf (%u B) — "
-                           "control transfers will fail",
-                 (unsigned)CTRL_XFER_BUF_SIZE);
-    }
-}
-
-void deinit_adsb_dev(void)
-{
-    if (!adsbdev) return;
-    if (adsbdev->transfer) {
-        usb_host_transfer_free(adsbdev->transfer);
-        adsbdev->transfer = NULL;
-    }
-    if (adsbdev->response_buf) {
-        free(adsbdev->response_buf);
-        adsbdev->response_buf = NULL;
-    }
 }
 
 void transfer_read_cb(usb_transfer_t *transfer)
@@ -129,11 +95,9 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     // any concurrent caller of this function (e.g. the AGC task's
     // multi-register gain sequence in
     // agc.c/librtlsdr.c racing the class_driver task's own control
-    // transfers). Without this lock, one caller can stomp a transfer or
+    // transfers). Without this lock, one caller can free() a transfer or
     // response_buf that another caller's in-flight completion callback is
-    // still about to write into (#T8). P3-1: the same lock is what makes
-    // reusing one pre-allocated transfer/response_buf across calls safe —
-    // only one caller ever touches them at a time.
+    // still about to write into (#T8).
     if (adsbdev->xfer_mutex == NULL) {
         ESP_LOGE("LIBUSB", "control_transfer: xfer_mutex not initialised");
         return -1;
@@ -147,17 +111,18 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     size_t    sizePacket;
     esp_err_t r;
 
-    // P3-1: transfer/response_buf are pre-allocated once at device-open
-    // (init_adsb_dev) and reused here — no alloc/free per call. Only
-    // re-initialise the fields that vary per request.
-    if (!adsbdev->transfer || !adsbdev->response_buf) {
-        ESP_LOGE("LIBUSB", "control_transfer: pre-allocated URB/response_buf missing");
-        goto done;
+    if (adsbdev->transfer) {
+        usb_host_transfer_free(adsbdev->transfer);
+        adsbdev->transfer = NULL;
     }
+    if (adsbdev->response_buf) {
+        free(adsbdev->response_buf);
+        adsbdev->response_buf = NULL;
+    }
+
     sizePacket = sizeof(usb_setup_packet_t) + wLength;
-    if (sizePacket > CTRL_XFER_BUF_SIZE) {
-        ESP_LOGE("LIBUSB", "control_transfer: wLength=%u exceeds pre-allocated capacity (%u)",
-                 wLength, (unsigned)CTRL_XFER_BUF_SIZE);
+    if (usb_host_transfer_alloc(sizePacket, 0, &adsbdev->transfer) != ESP_OK ||
+        adsbdev->transfer == NULL) {
         goto done;
     }
     USB_SETUP_PACKET_INIT_CONTROL((usb_setup_packet_t *)adsbdev->transfer->data_buffer, bm_req_type, b_request, wValue, wIndex, wLength);
@@ -167,6 +132,13 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     adsbdev->transfer->context       = (void *)driver_obj; // was &param: dangling
     adsbdev->transfer->callback      = transfer_read_cb;
     adsbdev->is_done                 = false;
+    adsbdev->response_buf            = calloc(sizePacket, sizeof(uint8_t));
+    if (!adsbdev->response_buf) {
+        ESP_LOGE("LIBUSB", "control_transfer: response_buf calloc(%u) failed", (unsigned)sizePacket);
+        usb_host_transfer_free(adsbdev->transfer);
+        adsbdev->transfer = NULL;
+        goto done;
+    }
 
     if (bm_req_type == CTRL_OUT) {
         for (uint8_t i = 0; i < wLength; i++) {

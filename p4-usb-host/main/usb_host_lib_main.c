@@ -29,6 +29,7 @@
 #include "bch_decoder.h"
 #include "aggregator_ingest.h"
 #include "frame_link.h"
+#include "esp_iot_log.h"
 #include "esp_heap_caps.h"
 
 // One-line snapshot of internal-DMA-capable heap (the pool the USB
@@ -245,18 +246,15 @@ void app_main(void)
     // during the synthetic-fixture regression.
 #if !CONFIG_SMOKE_TEST_MODE
     wifi_link_start();
-    // P3-3 (DMA-INT reclaim): esp-iot-log is mDNS-discovery-only by design
-    // (do not modify it — see project memory
-    // project_esp_hosted_multicast_tx_broken.md's AGENTS.md note) and mdns
-    // pins 8-15 KB of internal SRAM the moment mdns_init() runs. On this
-    // board that spend buys nothing: outbound IPv4 multicast from the C6/
-    // SDIO Wi-Fi path is silently dropped by the esp_hosted slave blob
-    // (proven; unicast/broadcast are fine), so mDNS queries — and the
-    // discovery iot_log_init() exists to do — never leave the device.
-    // Skip the call rather than patch the component: iot_log_metric()/
-    // iot_log_poll() (status_logger.c) are both no-ops while
-    // uninitialised, so nothing downstream needs to change. Use HTTP
-    // /status for remote monitoring instead.
+    {
+        app_config_t snap;
+        app_config_snapshot(&snap);
+        iot_log_config_t iot_cfg = IOT_LOG_CONFIG_DEFAULT();
+        if (snap.station_id[0]) {
+            iot_cfg.device_name = snap.station_id;
+        }
+        iot_log_init(&iot_cfg);
+    }
     http_server_start();
     // Only in AP-fallback mode: hijack DNS so phones auto-open the
     // config form via captive-portal detection. STA mode leaves DNS
