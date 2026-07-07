@@ -291,8 +291,9 @@ int ida_encode_da_frame(uint8_t da_cont, uint8_t da_ctr,
     uint8_t msg[N_BLOCKS * BCH_MSG_BITS];
     memset(msg, 0, sizeof(msg));
     int p = 0;
-    p += 4; // da_flags1 = 0
-    msg[p++] = da_cont & 1;
+    p += 3;                 // da_flags1 = 0 (bits[0:3])
+    msg[p++] = da_cont & 1; // bit 3 = cont (iridium-toolkit bitstream_bch[3:4])
+    p += 1;                 // bit 4 = spacer (bitstream_bch[4:5], always 0)
     for (int k = 0; k < 3; k++)
         msg[p++] = (uint8_t)((da_ctr >> (2 - k)) & 1);
     p += 3; // da_flags2 = 0

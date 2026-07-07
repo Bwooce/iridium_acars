@@ -183,8 +183,15 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
     }                                         \
     _v;                                       \
 })
-    out->da_flags1 = (uint8_t)PACKBITS_N(0, 4);
-    out->da_cont   = (uint8_t)PACKBITS_N(4, 1);
+    // Header bit layout matches iridium-toolkit bitsparser.py:1385-1391:
+    //   bits[0:3] flags, bit[3]=cont, bit[4]=spacer, bits[5:8]=ctr,
+    //   bits[8:11] flags, bits[11:16]=len. da_cont was previously read
+    //   from bit 4 (the spacer, always ~0), which silently collapsed
+    //   every multi-fragment opener (cont=1) into a standalone frame
+    //   and orphaned its continuation — breaking all cross-burst SBD
+    //   reassembly. See tests/host/test_phaseb_cut.c.
+    out->da_flags1 = (uint8_t)PACKBITS_N(0, 3);
+    out->da_cont   = (uint8_t)PACKBITS_N(3, 1);
     out->da_ctr    = (uint8_t)PACKBITS_N(5, 3);
     out->da_flags2 = (uint8_t)PACKBITS_N(8, 3);
     out->da_len    = (uint8_t)PACKBITS_N(11, 5);
