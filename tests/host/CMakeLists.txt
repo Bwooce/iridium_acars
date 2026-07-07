@@ -840,6 +840,62 @@ target_compile_options(decode_burst_capture PRIVATE
 )
 target_link_libraries(decode_burst_capture PRIVATE m)
 
+# test_phaseb_cut: validate the full device decode DSP chain against a
+# known-good real IQ slice (phaseb_cuts). Splices the tagger+ingest
+# harness of test_pipeline_wideband_resampled onto decode_burst_capture's
+# IDA->SBD->ACARS tail so one run answers "does OUR chain recover the
+# manifest-proven ACARS message?". Not wired into ctest (needs a runtime
+# IQ file produced by tests/scripts/phaseb_cut_to_256.py); build-only.
+add_executable(test_phaseb_cut
+    test_phaseb_cut.c
+    acars_tail.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/ida_reassembler.c
+    ${COMMON_DIR}/sbd_reassembler.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_phaseb_cut PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+    ${LIBACARS_UPSTREAM}
+    ${LIBACARS_IDF_DIR}
+)
+target_compile_options(test_phaseb_cut PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+target_link_libraries(test_phaseb_cut PRIVATE m)
+
 # Positive control for the IDA -> SBD -> ACARS tail glue (acars_tail.c),
 # the shared helper decode_burst_capture uses on LW.DA frames. Feeds a
 # synthetic-but-valid multi-fragment SBD message wrapping a
