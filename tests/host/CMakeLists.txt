@@ -517,6 +517,20 @@ add_executable(test_tagger_latch_release
 target_include_directories(test_tagger_latch_release PRIVATE ${COMMON_DIR})
 target_link_libraries(test_tagger_latch_release PRIVATE m)
 
+# Clamp-saturated strong-carrier absorption (2026-07-07 fix 2): a
+# carrier whose per-bin mag² exceeds the int32-retirement bound
+# (threshold_lin × INT32_MAX / HISTORY) used to force-close-cycle
+# forever; the clamp-run cutoff must absorb it within the gri-derived
+# bound. Complements test_tagger_latch_release, whose carrier stays
+# deliberately BELOW the EMA slot clamp.
+add_executable(test_tagger_carrier_absorption
+    test_tagger_carrier_absorption.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_tagger_carrier_absorption PRIVATE ${COMMON_DIR})
+target_link_libraries(test_tagger_carrier_absorption PRIVATE m)
+
 # Live-RF-conditions regression gate (2026-07-07): the ALBQ end-to-end
 # chain of test_pipeline_wideband_resampled with a deterministic CW +
 # tone-flood overlay that forces the P1 force-close / squelch / noise-
@@ -1031,6 +1045,7 @@ add_test(NAME resample_pie_model    COMMAND test_resample_pie_model)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
 add_test(NAME test_scanner_tagger_reset COMMAND test_scanner_tagger_reset)
 add_test(NAME tagger_latch_release  COMMAND test_tagger_latch_release)
+add_test(NAME tagger_carrier_absorption COMMAND test_tagger_carrier_absorption)
 add_test(NAME tagger_live_conditions COMMAND test_tagger_live_conditions)
 add_test(NAME window_multiply_golden COMMAND test_window_multiply_golden)
 # direct_if_decim intentionally NOT auto-registered: needs

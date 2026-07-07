@@ -197,6 +197,86 @@ struct fft_burst_tagger_s {
     int          staged_max_gone;
 };
 
+// EMA history-slot clamp: the largest per-slot magnitude² such that
+// HISTORY_SIZE slots still sum inside int32 (baseline_sum's type).
+#define FBT_EMA_SLOT_CLAMP (INT32_MAX / FBT_HISTORY_SIZE)
+
+// Carrier-absorption fix (2026-07-07 decode-regression batch).
+//
+// PROBLEM: gri's float baseline absorbs a persistent strong carrier —
+// each max-burst-len force-close pushes one forced EMA refresh
+// (update_filters_post(true), fft_burst_tagger_impl.cc:283-285), so
+// after at most FBT_HISTORY_SIZE forced refreshes the whole history
+// holds the carrier and it stops re-triggering. Full turnover takes
+// FBT_HISTORY_SIZE × FBT_MAX_BURST_LEN / fs = 512 × 225000 / 2.5e6
+// = 46.08 s; the re-trigger actually stops much earlier, once
+// baseline_sum × threshold_lin >= mag² × HISTORY_SIZE.
+//
+// Our int32 port clamps each history slot at FBT_EMA_SLOT_CLAMP so
+// baseline_sum can't overflow. Carriers with
+//   mag² <= threshold_lin × INT32_MAX / HISTORY_SIZE
+// (~1.05e8 at the 14 dB default) still absorb through the normal
+// threshold math, just against the clamped slots. Anything stronger
+// can NEVER be retired — even a fully-saturated baseline_sum
+// (= INT32_MAX) stays below mag²/threshold — so the carrier re-triggers
+// and force-close-cycles forever, feeding the squelch storm.
+//
+// FIX: track, per bin, the run of CONSECUTIVE clamped EMA writes
+// (consecutive in EMA-write numbering, so freezes don't break a run).
+// One EMA write fills exactly one history slot per bin, so
+// FBT_HISTORY_SIZE consecutive clamped writes <=> every slot of that
+// bin currently holds the clamp value <=> the true baseline is at least
+// HISTORY × clamp, i.e. beyond int32 representation. At that point the
+// carrier IS the baseline (gri's fully-absorbed state, where relative
+// magnitude ~ 1 << threshold), so the bin is treated as below
+// threshold until an unclamped write breaks the run. No new tunable:
+// the cutoff is the existing FBT_HISTORY_SIZE, and its time-equivalent
+// under pure force-close cycling is the same 46.08 s bound as gri's
+// full turnover (faster in practice: the post-squelch/post-close steps
+// where n_bursts drops to 0 add extra writes).
+//
+// The table is a file-scope side allocation (PSRAM on device) rather
+// than a struct member: the tagger struct is byte-frozen (see the
+// squelch_count/staged_new notes — growing it shifts internal-SRAM
+// allocations and trips the P4 PIE position-sensitivity bug). Single
+// tagger instance per process, same idiom as the s_acc_* accumulators.
+typedef struct {
+    uint32_t last_write; // s_ema_write_no of the most recent clamped write
+    uint16_t run_len;    // consecutive clamped writes, saturates at HISTORY_SIZE
+} fbt_clamp_run_t;
+static fbt_clamp_run_t *s_clamp_run = NULL; // [N], NULL => tracking disabled
+static uint32_t         s_ema_write_no;     // one per executed EMA step
+
+// True iff every history slot of `bin` currently holds the clamp value:
+// the run reached a full history AND the most recent EMA write was part
+// of it (an unclamped write since then would have re-based run_len).
+static inline bool bin_carrier_saturated(int bin)
+{
+    if (!s_clamp_run) return false;
+    const fbt_clamp_run_t *cr = &s_clamp_run[bin];
+    return cr->run_len >= FBT_HISTORY_SIZE && cr->last_write == s_ema_write_no;
+}
+
+// Maintain the per-bin clamp runs for one EMA write. Kept OUT of
+// ema_step_inner so that loop's vectorisation is untouched; this pass
+// re-reads the in-SRAM magnitudes with a predictable rarely-taken
+// branch and only touches the (PSRAM) table for bins at/over the clamp.
+static void ema_clamp_track(const int32_t *__restrict__ mag, int n)
+{
+    if (!s_clamp_run) return;
+    for (int k = 0; k < n; k++) {
+        if (mag[k] >= FBT_EMA_SLOT_CLAMP) {
+            fbt_clamp_run_t *cr = &s_clamp_run[k];
+            if (cr->last_write + 1 == s_ema_write_no) {
+                if (cr->run_len < FBT_HISTORY_SIZE) cr->run_len++;
+            } else {
+                cr->run_len = 1; // unclamped write(s) in between broke the run
+            }
+            cr->last_write = s_ema_write_no;
+        }
+    }
+}
+
 // Build a Q15 Blackman window of length N.
 static void build_blackman_q15(int16_t *w_out)
 {
@@ -295,6 +375,27 @@ fft_burst_tagger_t *fft_burst_tagger_init(int      burst_pre_len,
     t->baseline_history = baseline_history_ext;
     memset(t->baseline_history, 0,
            sizeof(int32_t) * N * FBT_HISTORY_SIZE);
+
+    // Carrier-absorption clamp-run table (see fbt_clamp_run_t above).
+    // 16 KB; PSRAM on device (it is only touched for bins at the EMA
+    // slot clamp, never on the per-step fast path). Alloc failure just
+    // disables the absorption cutoff (bin_carrier_saturated => false).
+    // Single-instance side table: re-init re-zeroes it; s_ema_write_no
+    // stays monotonic so stale last_write values can't fake a run.
+    if (!s_clamp_run) {
+#if defined(ESP_PLATFORM)
+        s_clamp_run = (fbt_clamp_run_t *)heap_caps_calloc(
+            N, sizeof(fbt_clamp_run_t), MALLOC_CAP_SPIRAM);
+        if (!s_clamp_run) {
+            ESP_LOGE("FBT_INIT", "clamp-run table PSRAM alloc failed "
+                                 "(carrier-absorption cutoff disabled)");
+        }
+#else
+        s_clamp_run = (fbt_clamp_run_t *)calloc(N, sizeof(fbt_clamp_run_t));
+#endif
+    } else {
+        memset(s_clamp_run, 0, sizeof(fbt_clamp_run_t) * N);
+    }
     memset(t->baseline_sum, 0, sizeof(t->baseline_sum));
     for (int i = 0; i < N; i++)
         t->burst_mask[i] = 1;
@@ -404,6 +505,10 @@ void fft_burst_tagger_reset_baseline(fft_burst_tagger_t *t)
     if (!t) return;
     memset(t->baseline_history, 0, sizeof(int32_t) * N * FBT_HISTORY_SIZE);
     memset(t->baseline_sum, 0, sizeof(t->baseline_sum));
+    // History slots are zeroed => no bin is clamp-saturated any more;
+    // clear the runs so a still-present carrier re-earns its full
+    // HISTORY_SIZE run against the fresh floor.
+    if (s_clamp_run) memset(s_clamp_run, 0, sizeof(fbt_clamp_run_t) * N);
     for (int i = 0; i < N; i++)
         t->burst_mask[i] = 1;
     t->history_index  = 0;
@@ -498,6 +603,11 @@ static FBT_HOT void update_bursts_internal(fft_burst_tagger_t *t)
             if (above_threshold(t->magnitude_shifted[bin],
                                 t->baseline_sum[bin],
                                 t->threshold_q15)) {
+                // Carrier-absorption fix: a clamp-saturated bin no
+                // longer refreshes last_active, so the carrier's burst
+                // times out (or hits max-burst-len) and — with peak
+                // creation suppressed too — is not re-created.
+                if (bin_carrier_saturated(bin)) continue;
                 t->bursts[b].last_active = t->d_index;
                 break;
             }
@@ -570,6 +680,13 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
         int32_t mag2 = t->magnitude_shifted[bin];
         int32_t base = t->baseline_sum[bin];
         if (above_threshold(mag2, base, t->threshold_q15)) {
+            // Carrier-absorption fix: a bin whose entire baseline
+            // history is pinned at the EMA slot clamp is owned by a
+            // carrier too strong for int32 to retire — treat it as
+            // absorbed (gri's converged-float-baseline behavior)
+            // instead of re-triggering forever. Checked only after the
+            // raw compare so unclamped bins pay nothing.
+            if (bin_carrier_saturated(bin)) continue;
             t->peaks[n_peaks].bin = bin;
             // Sort key = relative_magnitude × (HISTORY_SIZE × 32768)
             // to keep an int64 representation that's stable for
@@ -808,9 +925,11 @@ static inline void ema_step_inner(int32_t *__restrict__ bsum,
     for (int k = 0; k < n; k++) {
         int32_t old = slot[k]; // one PSRAM read (L2 cached)
         int32_t cur = mag[k];  // in-SRAM read
-        // Clamp mag² to prevent baseline_sum int32 overflow under strong carrier
-        if (cur > INT32_MAX / FBT_HISTORY_SIZE) {
-            cur = INT32_MAX / FBT_HISTORY_SIZE;
+        // Clamp mag² to prevent baseline_sum int32 overflow under strong
+        // carrier. Bins pinned at the clamp are tracked by
+        // ema_clamp_track (carrier-absorption fix) — see above.
+        if (cur > FBT_EMA_SLOT_CLAMP) {
+            cur = FBT_EMA_SLOT_CLAMP;
         }
         bsum[k] = bsum[k] - old + cur; // in-SRAM RMW
         slot[k] = cur;                 // one PSRAM write (L2 writeback)
@@ -832,8 +951,10 @@ static FBT_HOT void update_baseline_ema(fft_burst_tagger_t *t, bool force)
 {
     if (t->n_bursts > 0 && !force) return; // burst active → freeze EMA
 
+    s_ema_write_no++; // EMA-write numbering for the clamp-run tracking
     int32_t *old_slot = HIST(t, t->history_index);
     ema_step_inner(t->baseline_sum, old_slot, t->magnitude_shifted, N);
+    ema_clamp_track(t->magnitude_shifted, N);
 
     t->history_index++;
     if (t->history_index >= FBT_HISTORY_SIZE) {
