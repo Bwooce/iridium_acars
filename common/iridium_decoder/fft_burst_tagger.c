@@ -503,11 +503,23 @@ void fft_burst_tagger_flush(fft_burst_tagger_t *t,
 void fft_burst_tagger_reset_baseline(fft_burst_tagger_t *t)
 {
     if (!t) return;
-    memset(t->baseline_history, 0, sizeof(int32_t) * N * FBT_HISTORY_SIZE);
+    // NOTE: baseline_history (4 MB PSRAM) is deliberately NOT memset
+    // here. This reset runs on the DSP feed path — the squelch's noise
+    // reset fires it from inside fft_burst_tagger_step() (under live
+    // interference every 1-3 s), and the scanner fires it on every LO
+    // hop — and a synchronous 4 MB PSRAM memset stalls the usbring
+    // consumer for ~10 ms each time (a P1-era contributor to the 6.9/s
+    // rb_full overflow trickle). The stale slots are never read:
+    // while !history_primed, update_baseline_ema uses
+    // ema_step_inner_prime, which only accumulates into baseline_sum
+    // and OVERWRITES the slot; by the time priming wraps
+    // (history_primed = true, subtract-old path resumes) every slot has
+    // been rewritten. Bit-exact with the old memset behavior — the
+    // primed-path subtract of a zeroed slot equals not subtracting.
     memset(t->baseline_sum, 0, sizeof(t->baseline_sum));
-    // History slots are zeroed => no bin is clamp-saturated any more;
-    // clear the runs so a still-present carrier re-earns its full
-    // HISTORY_SIZE run against the fresh floor.
+    // The fresh floor will be re-learned slot by slot; the old history's
+    // clamp runs are meaningless against it, so clear them (a
+    // still-present carrier re-earns its full HISTORY_SIZE run).
     if (s_clamp_run) memset(s_clamp_run, 0, sizeof(fbt_clamp_run_t) * N);
     for (int i = 0; i < N; i++)
         t->burst_mask[i] = 1;
@@ -936,6 +948,27 @@ static inline void ema_step_inner(int32_t *__restrict__ bsum,
     }
 }
 
+// Priming variant: accumulate-and-overwrite WITHOUT reading the old
+// slot. Used while !history_primed so that fft_burst_tagger_reset_baseline
+// can skip its 4 MB history memset (the stale slot contents are never
+// read — each priming step overwrites its slot before the primed path
+// could ever subtract it). Also what a zero-initialised history would
+// compute, so init-time priming is bit-identical too.
+static inline void ema_step_inner_prime(int32_t *__restrict__ bsum,
+                                        int32_t *__restrict__ slot,
+                                        const int32_t *__restrict__ mag,
+                                        int n)
+{
+    for (int k = 0; k < n; k++) {
+        int32_t cur = mag[k];
+        if (cur > FBT_EMA_SLOT_CLAMP) {
+            cur = FBT_EMA_SLOT_CLAMP;
+        }
+        bsum[k] += cur; // in-SRAM RMW
+        slot[k] = cur;  // one PSRAM write (no old-slot read)
+    }
+}
+
 // EMA update: subtract oldest, add newest, advance index. gri only
 // updates when no bursts are active OR a long-burst forces a refresh
 // (update_filters_post(force) in fft_burst_tagger_impl.cc:225-242); we
@@ -953,7 +986,12 @@ static FBT_HOT void update_baseline_ema(fft_burst_tagger_t *t, bool force)
 
     s_ema_write_no++; // EMA-write numbering for the clamp-run tracking
     int32_t *old_slot = HIST(t, t->history_index);
-    ema_step_inner(t->baseline_sum, old_slot, t->magnitude_shifted, N);
+    if (t->history_primed) {
+        ema_step_inner(t->baseline_sum, old_slot, t->magnitude_shifted, N);
+    } else {
+        // Priming: don't read the (possibly stale post-reset) old slot.
+        ema_step_inner_prime(t->baseline_sum, old_slot, t->magnitude_shifted, N);
+    }
     ema_clamp_track(t->magnitude_shifted, N);
 
     t->history_index++;

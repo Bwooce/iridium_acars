@@ -58,8 +58,11 @@ static void emit(const status_snapshot_t *s)
                                        ? (float)s->ingest.slot_wait_total_us / (float)s->ingest.consumer_waits
                                        : 0.0f;
 
-    float producer_peak_pct = 100.0f * (float)s->us.producer_rb_max_used / (512.0f * 1024.0f);
-    float drop_fill_pct     = 100.0f * (float)s->us.producer_rb_used_at_drop / (512.0f * 1024.0f);
+    // Fill %: against the ACTUAL ring capacity (STREAM_RINGBUF_BYTES).
+    // These divided by a stale 512 KB constant from the pre-4 MB era,
+    // so the verbose line read up to ~800% at peak.
+    float producer_peak_pct = 100.0f * (float)s->us.producer_rb_max_used / (float)STREAM_RINGBUF_BYTES;
+    float drop_fill_pct     = 100.0f * (float)s->us.producer_rb_used_at_drop / (float)STREAM_RINGBUF_BYTES;
 
     ESP_LOGI(TAG, "USB: rate_inst=%.2f MB/s rate_avg=%.2f MB/s feed_calls=%u "
                   "(avg_per_call=%.0f us) PSRAM_free=%d",
@@ -285,16 +288,20 @@ static void emit(const status_snapshot_t *s)
     if (over_capacity || s->us.rb_full_drops || s->us.status_errors ||
         s->us.resubmit_errors || s->ws.bursts_dropped ||
         s->ws.bursts_evicted || s->dsp.squelch_events || any_recovery) {
+        // rb_peak: the window's peak usbring fill as % of capacity — the
+        // leading indicator for rb_full overflow (drops start at 100%).
+        unsigned rb_peak_pct = (unsigned)(100.0f * (float)s->us.producer_rb_max_used /
+                                          (float)STREAM_RINGBUF_BYTES);
         ESP_LOGW(TAG,
                  "STATUS-ERR: cap[dsp=%.0f%% worker=%.0f%%] "
-                 "usb[rb_full=%u status_err=%u resubmit_err=%u pool_lost=%u last=0x%02x] "
+                 "usb[rb_full=%u rb_peak=%u%% status_err=%u resubmit_err=%u pool_lost=%u last=0x%02x] "
                  "fbt[sq=%u sqdrop=%u sqreset=%u] "
                  "worker[dropped=%u evicted=%u] "
                  "sb[stash_fails=%u recoveries=%u audio_dropped=%u dma_timeouts=%u] "
                  "ing[dispatch_drops=%u slow_waits=%u raw_slow_waits=%u] "
                  "heap[dma_free=%uKB dma_largest=%uKB]",
                  dsp_pct, worker_pct,
-                 s->us.rb_full_drops, s->us.status_errors,
+                 s->us.rb_full_drops, rb_peak_pct, s->us.status_errors,
                  s->us.resubmit_errors, lu_pool_lost, s->us.last_error_status,
                  s->dsp.squelch_events, s->dsp.squelch_dropped,
                  s->dsp.noise_resets,
