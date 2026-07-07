@@ -908,6 +908,52 @@ target_compile_options(test_acars_tail_real PRIVATE
     -Wno-sign-compare
 )
 
+# Phase A device-corpus: round-trip proof for ida_encode_da_frame() (the
+# inverse of iridium_frame_classify()+ida_decode()'s LW.DA path) against
+# the real-capture fixture_acars_frames.h payloads -- encode -> classify
+# -> BCH decode -> ida_reassembler -> sbd_reassembler -> libacars, and
+# check the reassembled message matches the fixture's golden REG/mode/
+# block_id. Load-bearing precondition for trusting the encoder in the
+# device FRAME_DECODER smoke corpus (p4-usb-host/main/smoke_test.c),
+# which has no other way to inject these real payloads (no surviving
+# raw pre-BCH bits -- see fixture_acars_frames.h's header comment).
+add_executable(test_ida_encode_roundtrip
+    test_ida_encode_roundtrip.c
+    ${COMMON_DIR}/ida_encode.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/ida_reassembler.c
+    ${COMMON_DIR}/sbd_reassembler.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_ida_encode_roundtrip PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+    ${LIBACARS_UPSTREAM}
+    ${LIBACARS_IDF_DIR}
+)
+target_compile_options(test_ida_encode_roundtrip PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+
 add_executable(test_pipeline_direct_if_albq
     test_pipeline_direct_if_albq.c
     ${COMMON_DIR}/burst_pipeline.c
@@ -977,6 +1023,7 @@ add_test(NAME ibc_decode           COMMAND test_ibc_decode)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME acars_tail_synthetic COMMAND test_acars_tail_synthetic)
 add_test(NAME acars_tail_real      COMMAND test_acars_tail_real)
+add_test(NAME ida_encode_roundtrip COMMAND test_ida_encode_roundtrip)
 add_test(NAME fft_sc16_2048         COMMAND test_fft_sc16_2048)
 add_test(NAME resample_split        COMMAND test_resample_split)
 add_test(NAME resample_tile         COMMAND test_resample_tile)
