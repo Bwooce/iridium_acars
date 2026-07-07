@@ -125,9 +125,25 @@ idf_component_register(
 # vectorise scalar accumulators, hoist invariant loads). Functional
 # regression coverage by the host ctest suite gates the more
 # aggressive scheduling.
+set(_resample_flags "-O3 -funroll-loops")
+# P2 diagnostic (CONFIG_DIAG_SINGLE_PIE_OWNER, default OFF): force
+# resample_256_to_250.c's per-emit MAC onto the ANSI/scalar fallback
+# (see the RS25_USE_PIE_ASM gate in that file) instead of the PIE
+# resample_arp4.S kernel. Both rs_worker_a (Core 0) and rs_worker_b
+# (Core 1) call the SAME process_explicit function, so this one define
+# takes PIE out of both resample workers at once, leaving the tagger
+# FFT (Core 0) and worker_core1 (Core 1) as the sole PIE user on their
+# respective cores -- see the Kconfig help text for the full
+# save/restore-machinery-vs-PIE-execution discriminator rationale.
+# When CONFIG_DIAG_SINGLE_PIE_OWNER is unset (production default),
+# this branch is not taken and _resample_flags is byte-identical to
+# the string used before this option existed.
+if(CONFIG_DIAG_SINGLE_PIE_OWNER)
+    set(_resample_flags "${_resample_flags} -DRS25_DISABLE_PIE_ASM")
+endif()
 set_source_files_properties(resample_256_to_250.c
     PROPERTIES COMPILE_FLAGS
-    "-O3 -funroll-loops"
+    "${_resample_flags}"
 )
 
 # fft_burst_tagger's compute_magnitude_shifted (per-bin re²+im²) and
