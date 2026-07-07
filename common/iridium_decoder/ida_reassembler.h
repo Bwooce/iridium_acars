@@ -52,7 +52,7 @@ extern "C" {
 // tight ±260 Hz deadband against gr-iridium's own fine-tuned frequency
 // estimate; our estimator is coarser, so we widen it while staying
 // well inside the 40 kHz channel grid (channels can't be confused).
-#define IDA_REASM_FREQ_DEADBAND_HZ 2000u
+#define IDA_REASM_FREQ_DEADBAND_HZ 5000u
 #define IDA_REASM_FRAG_GAP_US (280ULL * 1000ULL)         // max gap between consecutive fragments
 #define IDA_REASM_SESSION_TIMEOUT_US (1000ULL * 1000ULL) // max age since last fragment
 
