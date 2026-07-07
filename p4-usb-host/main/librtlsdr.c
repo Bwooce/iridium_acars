@@ -1476,6 +1476,14 @@ found:
 
 int rtlsdr_close(rtlsdr_dev_t *dev)
 {
+    (void)dev;
+    // P3-1: free the control URB + response_buf that init_adsb_dev()
+    // pre-allocated at open (see esp_libusb_control_transfer()). Everything
+    // else below is a pre-existing stub (T19: replug already requires a
+    // reboot independent of this), but this reclaim is cheap and correct
+    // to do here regardless.
+    deinit_adsb_dev();
+
     //     if (!dev)
     //         return -1;
 

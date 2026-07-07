@@ -7,6 +7,7 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h" // xTaskCreatePinnedToCoreWithCaps
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include <errno.h>
@@ -357,6 +358,17 @@ void serial_cmd_init(void)
         return;
     }
 
-    xTaskCreate(serial_cmd_task, "serial_cmd", TASK_STACK, NULL, 3, NULL);
+    // PSRAM stack (P3-4, DMA-INT reclaim) -- this task only does UART
+    // line I/O and NVS/scanner command dispatch, no DMA-internal-SRAM-only
+    // work (contrast ota_runner.c's task, which MUST stay internal-SRAM
+    // because esp_https_ota's flash writes disable PSRAM cache access).
+    // Same pattern as wifi_link.c's health_wdt_task / sd_log.c / frame_decoder.c.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(serial_cmd_task, "serial_cmd",
+                                                    TASK_STACK, NULL, 3, NULL,
+                                                    tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "serial_cmd task create failed");
+        return;
+    }
     ESP_LOGI(TAG, "serial command task started");
 }
