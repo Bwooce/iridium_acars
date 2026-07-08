@@ -9,7 +9,8 @@
 static const char      *TAG   = "SCANNER";
 static dsp_processor_t *s_dsp = NULL;
 static scanner_pos_t    s_map[SCANNER_MAX_POSITIONS];
-static int              s_map_n = 0;
+static int              s_map_n       = 0;
+static uint32_t         s_last_hot_hz = 0;
 
 void scanner_init(dsp_processor_t *dsp)
 {
@@ -73,7 +74,13 @@ void scanner_scan(uint32_t start_hz, uint32_t stop_hz, uint32_t step_hz, uint32_
                  (unsigned long)s_map[hot].center_hz,
                  scanner_pos_narrowband_rate(&s_map[hot]));
         scanner_hop(s_map[hot].center_hz, false);
+        s_last_hot_hz = s_map[hot].center_hz;
     }
+}
+
+uint32_t scanner_last_hot_hz(void)
+{
+    return s_last_hot_hz;
 }
 
 void scanner_print_last_map(void)

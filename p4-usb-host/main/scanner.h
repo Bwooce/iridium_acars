@@ -31,3 +31,12 @@ void scanner_print_last_map(void);
 // the LO. Reuses the same reset the LO hop performs. No-op if the detector
 // isn't wired yet.
 void scanner_reset_baseline(void);
+
+// The center_hz of the most recent hot bin any scanner_scan() call found
+// (0 if no scan has ever found one yet). Sticky: a scan that finds nothing
+// hot leaves this at its previous value rather than clearing it.
+// scanner_scan() only live-retunes (persist=false); callers that want the
+// discovered center to survive a reboot (e.g. autotune's periodic LO
+// re-scan) read this and persist it themselves via
+// app_config_set_lo_freq_hz().
+uint32_t scanner_last_hot_hz(void);
