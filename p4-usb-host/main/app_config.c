@@ -28,6 +28,11 @@ static const char *NVS_NS = "iridium";
 #define DEFAULT_COALESCE_MIN_BURSTS 0 // 0 = coalescer disabled (gri-parity dispatch)
 #define DEFAULT_DCMASK_LO 1           // lo>hi => disabled by default
 #define DEFAULT_DCMASK_HI (-1)
+#define DEFAULT_AUTOTUNE_GAIN_DWELL_S 180  // 55 s too noisy (design §Dwell adequacy)
+#define DEFAULT_AUTOTUNE_IRA_LO_HZ 1626200000u // IRA simplex allocation, fixed
+#define DEFAULT_AUTOTUNE_GAIN_MIN_DBX10 80  // skip the deaf 0..7.7 dB low end
+#define DEFAULT_AUTOTUNE_GAIN_MAX_DBX10 460 // skip the 48/49.6 dB saturating top
+#define DEFAULT_AUTOTUNE_GAIN_STRIDE 3      // coarse: every 3rd R828D step
 #define DEFAULT_STATION_ID "p4-iridium-1"
 #define DEFAULT_WIFI_SSID ""
 #define DEFAULT_WIFI_PSK ""
@@ -118,6 +123,11 @@ esp_err_t app_config_init(void)
     s_cfg.coalesce_min_bursts = DEFAULT_COALESCE_MIN_BURSTS;
     s_cfg.dcmask_lo           = DEFAULT_DCMASK_LO;
     s_cfg.dcmask_hi           = DEFAULT_DCMASK_HI;
+    s_cfg.autotune_gain_dwell_s   = DEFAULT_AUTOTUNE_GAIN_DWELL_S;
+    s_cfg.autotune_ira_lo_hz      = DEFAULT_AUTOTUNE_IRA_LO_HZ;
+    s_cfg.autotune_gain_min_dbx10 = DEFAULT_AUTOTUNE_GAIN_MIN_DBX10;
+    s_cfg.autotune_gain_max_dbx10 = DEFAULT_AUTOTUNE_GAIN_MAX_DBX10;
+    s_cfg.autotune_gain_stride    = DEFAULT_AUTOTUNE_GAIN_STRIDE;
     strncpy(s_cfg.station_id, DEFAULT_STATION_ID, APP_CONFIG_STATION_ID_LEN - 1);
     s_cfg.station_id[APP_CONFIG_STATION_ID_LEN - 1] = '\0';
     s_cfg.wifi_ssid[0]                              = '\0';
@@ -161,6 +171,11 @@ esp_err_t app_config_init(void)
     nvs_get_u8_or(h, "coal_n", &s_cfg.coalesce_min_bursts, DEFAULT_COALESCE_MIN_BURSTS);
     nvs_get_i16_or(h, "dcmask_lo", &s_cfg.dcmask_lo, DEFAULT_DCMASK_LO);
     nvs_get_i16_or(h, "dcmask_hi", &s_cfg.dcmask_hi, DEFAULT_DCMASK_HI);
+    nvs_get_u32_or(h, "at_dwell_s", &s_cfg.autotune_gain_dwell_s, DEFAULT_AUTOTUNE_GAIN_DWELL_S);
+    nvs_get_u32_or(h, "at_ira_hz", &s_cfg.autotune_ira_lo_hz, DEFAULT_AUTOTUNE_IRA_LO_HZ);
+    nvs_get_i16_or(h, "at_g_min", &s_cfg.autotune_gain_min_dbx10, DEFAULT_AUTOTUNE_GAIN_MIN_DBX10);
+    nvs_get_i16_or(h, "at_g_max", &s_cfg.autotune_gain_max_dbx10, DEFAULT_AUTOTUNE_GAIN_MAX_DBX10);
+    nvs_get_u8_or(h, "at_g_strd", &s_cfg.autotune_gain_stride, DEFAULT_AUTOTUNE_GAIN_STRIDE);
     nvs_get_str_or(h, "station", s_cfg.station_id, APP_CONFIG_STATION_ID_LEN,
                    DEFAULT_STATION_ID);
     nvs_get_str_or(h, "wifi_ssid", s_cfg.wifi_ssid, APP_CONFIG_WIFI_SSID_LEN, "");
@@ -280,6 +295,11 @@ SET_FIELD_NUM(app_config_set_tagger_threshold_db, tagger_threshold_db, float, "t
 SET_FIELD_NUM(app_config_set_coalesce_min_bursts, coalesce_min_bursts, uint8_t, "coal_n", commit_one_u8)
 SET_FIELD_NUM(app_config_set_dcmask_lo, dcmask_lo, int16_t, "dcmask_lo", commit_one_i16)
 SET_FIELD_NUM(app_config_set_dcmask_hi, dcmask_hi, int16_t, "dcmask_hi", commit_one_i16)
+SET_FIELD_NUM(app_config_set_autotune_gain_dwell_s, autotune_gain_dwell_s, uint32_t, "at_dwell_s", commit_one_u32)
+SET_FIELD_NUM(app_config_set_autotune_ira_lo_hz, autotune_ira_lo_hz, uint32_t, "at_ira_hz", commit_one_u32)
+SET_FIELD_NUM(app_config_set_autotune_gain_min_dbx10, autotune_gain_min_dbx10, int16_t, "at_g_min", commit_one_i16)
+SET_FIELD_NUM(app_config_set_autotune_gain_max_dbx10, autotune_gain_max_dbx10, int16_t, "at_g_max", commit_one_i16)
+SET_FIELD_NUM(app_config_set_autotune_gain_stride, autotune_gain_stride, uint8_t, "at_g_strd", commit_one_u8)
 
 esp_err_t app_config_set_gain_mode(gain_mode_t mode)
 {

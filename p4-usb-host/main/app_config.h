@@ -64,6 +64,16 @@ typedef struct {
     int16_t dcmask_lo;
     int16_t dcmask_hi;
 
+    // Autotune RF-recalibration knobs (2026-07-08 autotune design). NVS
+    // keys "at_dwell_s"/"at_ira_hz"/"at_g_min"/"at_g_max"/"at_g_strd".
+    // Consumed by the manual `autotune` serial command; not hot-path.
+    uint32_t autotune_gain_dwell_s;   // per-gain dwell during calibration (>=55 s
+                                      // is too noisy per the design; default 180)
+    uint32_t autotune_ira_lo_hz;      // IRA reference LO for gain calibration
+    int16_t  autotune_gain_min_dbx10; // lower bound of the swept gain range (tenths dB)
+    int16_t  autotune_gain_max_dbx10; // upper bound of the swept gain range (tenths dB)
+    uint8_t  autotune_gain_stride;    // coarse sweep: sample every Nth R828D step
+
     char     station_id[APP_CONFIG_STATION_ID_LEN]; // for upstream/log identification
     char     wifi_ssid[APP_CONFIG_WIFI_SSID_LEN];   // for D17 C6 wireless
     char     wifi_psk[APP_CONFIG_WIFI_PSK_LEN];     // for D17 C6 wireless
@@ -100,6 +110,11 @@ esp_err_t app_config_set_tagger_threshold_db(float db);
 esp_err_t app_config_set_coalesce_min_bursts(uint8_t n);
 esp_err_t app_config_set_dcmask_lo(int16_t v);
 esp_err_t app_config_set_dcmask_hi(int16_t v);
+esp_err_t app_config_set_autotune_gain_dwell_s(uint32_t v);
+esp_err_t app_config_set_autotune_ira_lo_hz(uint32_t v);
+esp_err_t app_config_set_autotune_gain_min_dbx10(int16_t v);
+esp_err_t app_config_set_autotune_gain_max_dbx10(int16_t v);
+esp_err_t app_config_set_autotune_gain_stride(uint8_t v);
 esp_err_t app_config_set_station_id(const char *id);
 esp_err_t app_config_set_wifi_ssid(const char *ssid);
 esp_err_t app_config_set_wifi_psk(const char *psk);

@@ -57,6 +57,14 @@ static void cmd_config(void)
     uart_puts(buf);
     snprintf(buf, sizeof(buf), "dcmask_lo=%d dcmask_hi=%d\r\n", (int)c.dcmask_lo, (int)c.dcmask_hi);
     uart_puts(buf);
+    snprintf(buf, sizeof(buf), "autotune_gain_dwell_s=%lu\r\n", (unsigned long)c.autotune_gain_dwell_s);
+    uart_puts(buf);
+    snprintf(buf, sizeof(buf), "autotune_ira_lo_hz=%lu\r\n", (unsigned long)c.autotune_ira_lo_hz);
+    uart_puts(buf);
+    snprintf(buf, sizeof(buf), "autotune_gain_min=%d autotune_gain_max=%d autotune_gain_stride=%u\r\n",
+             (int)c.autotune_gain_min_dbx10, (int)c.autotune_gain_max_dbx10,
+             (unsigned)c.autotune_gain_stride);
+    uart_puts(buf);
     snprintf(buf, sizeof(buf), "ota_url=%s\r\n", c.ota_url);
     uart_puts(buf);
 }
@@ -94,6 +102,16 @@ static void cmd_get(const char *key)
         snprintf(buf, sizeof(buf), "%d\r\n", (int)c.dcmask_lo);
     else if (strcmp(key, "dcmask_hi") == 0)
         snprintf(buf, sizeof(buf), "%d\r\n", (int)c.dcmask_hi);
+    else if (strcmp(key, "autotune_gain_dwell_s") == 0)
+        snprintf(buf, sizeof(buf), "%lu\r\n", (unsigned long)c.autotune_gain_dwell_s);
+    else if (strcmp(key, "autotune_ira_lo_hz") == 0)
+        snprintf(buf, sizeof(buf), "%lu\r\n", (unsigned long)c.autotune_ira_lo_hz);
+    else if (strcmp(key, "autotune_gain_min") == 0)
+        snprintf(buf, sizeof(buf), "%d\r\n", (int)c.autotune_gain_min_dbx10);
+    else if (strcmp(key, "autotune_gain_max") == 0)
+        snprintf(buf, sizeof(buf), "%d\r\n", (int)c.autotune_gain_max_dbx10);
+    else if (strcmp(key, "autotune_gain_stride") == 0)
+        snprintf(buf, sizeof(buf), "%u\r\n", (unsigned)c.autotune_gain_stride);
     else if (strcmp(key, "ota_url") == 0)
         snprintf(buf, sizeof(buf), "%s\r\n", c.ota_url);
     else {
@@ -134,6 +152,16 @@ static void cmd_set(const char *key, const char *val)
         rc = app_config_set_dcmask_lo((int16_t)atoi(val));
     else if (strcmp(key, "dcmask_hi") == 0)
         rc = app_config_set_dcmask_hi((int16_t)atoi(val));
+    else if (strcmp(key, "autotune_gain_dwell_s") == 0)
+        rc = app_config_set_autotune_gain_dwell_s((uint32_t)atol(val));
+    else if (strcmp(key, "autotune_ira_lo_hz") == 0)
+        rc = app_config_set_autotune_ira_lo_hz((uint32_t)atol(val));
+    else if (strcmp(key, "autotune_gain_min") == 0)
+        rc = app_config_set_autotune_gain_min_dbx10((int16_t)atoi(val));
+    else if (strcmp(key, "autotune_gain_max") == 0)
+        rc = app_config_set_autotune_gain_max_dbx10((int16_t)atoi(val));
+    else if (strcmp(key, "autotune_gain_stride") == 0)
+        rc = app_config_set_autotune_gain_stride((uint8_t)atoi(val));
     else if (strcmp(key, "ota_url") == 0)
         rc = app_config_set_ota_url(val);
     else {
