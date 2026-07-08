@@ -18,4 +18,23 @@
 // tuner runs its own hardware AGC so manual gain writes won't hold. The
 // routine refuses (with a serial message) rather than silently flipping the
 // mode (which would persist to NVS).
+//
+// Concurrency: refuses (logs + returns) if another autotune pass -- this
+// one, autotune_run_lo_rescan(), or a periodic re-run from autotune_sched.c
+// -- is already in progress. Safe to call from any task.
 void autotune_run_manual(void);
+
+// Periodic/boot LO density re-scan (2026-07-08 boot/periodic extension,
+// design doc step 3): sweeps the ACARS band with the existing scanner
+// (SCAN_START_HZ..SCAN_STOP_HZ, see scanner.h) and parks + persists on the
+// hottest center. This is "SLOW center-tracking" per the design's empirical
+// finding (best-LO is mean-reverting, not momentum) -- callers should use a
+// long interval (autotune_lo_interval_s, default hourly), not a fast one.
+//
+// Same MANUAL-gain-mode precondition and in-progress guard as
+// autotune_run_manual(). CAUTION: relies on scanner_scan()'s automated
+// multi-hop retune, whose DMA-internal-heap-churn safety under sustained
+// unattended use is not yet confirmed (backlog #7); autotune_lo_interval_s=0
+// disables this path if it proves unsafe. Requires device-smoke validation
+// before merge.
+void autotune_run_lo_rescan(void);

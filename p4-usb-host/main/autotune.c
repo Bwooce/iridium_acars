@@ -7,6 +7,7 @@
 #include "scanner.h"
 #include "worker_core1.h"
 
+#include <stdatomic.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,7 +21,29 @@ static const char *TAG = "AUTOTUNE";
 // Mirrors scanner_scan's settle discard.
 #define AUTOTUNE_PRIME_MS 3000
 
-void autotune_run_manual(void)
+// In-progress guard shared by every autotune entry point (the manual serial
+// `autotune` command, the boot-time pass, and the periodic gain/LO
+// scheduler in autotune_sched.c). Without this, a hand-typed `autotune` in
+// the middle of a scheduled pass -- or the two scheduled clocks landing on
+// the same wakeup -- would run two sweeps concurrently, each retuning the
+// LO/gain out from under the other. All entry points must go through
+// autotune_try_begin()/autotune_end() around their body.
+static atomic_bool s_autotune_busy = false;
+
+static bool autotune_try_begin(void)
+{
+    bool expected = false;
+    return atomic_compare_exchange_strong(&s_autotune_busy, &expected, true);
+}
+
+static void autotune_end(void)
+{
+    atomic_store(&s_autotune_busy, false);
+}
+
+// Body of the manual/boot/periodic gain-calibration pass. Caller must hold
+// the busy guard (autotune_try_begin() already returned true).
+static void autotune_run_manual_locked(void)
 {
     app_config_t cfg;
     app_config_snapshot(&cfg);
@@ -124,4 +147,64 @@ void autotune_run_manual(void)
     }
 
     (void)unknown; // logged per-gain above; secondary signal only
+}
+
+void autotune_run_manual(void)
+{
+    if (!autotune_try_begin()) {
+        ESP_LOGW(TAG, "REFUSED: another autotune pass is already in progress");
+        return;
+    }
+    autotune_run_manual_locked();
+    autotune_end();
+}
+
+void autotune_run_lo_rescan(void)
+{
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+
+    // Same MANUAL-only precondition as the gain-cal pass (see autotune.h):
+    // a live LO sweep fights SOFTWARE_AGC/TUNER_AGC just as much as a gain
+    // sweep would, and the density-scan result is only meaningful if the
+    // gain that's about to receive it is held steady.
+    if (cfg.gain_mode != GAIN_MODE_MANUAL) {
+        ESP_LOGW(TAG, "LO rescan REFUSED: gain_mode=%d; needs MANUAL (1)",
+                 (int)cfg.gain_mode);
+        return;
+    }
+    if (!autotune_try_begin()) {
+        ESP_LOGW(TAG, "LO rescan REFUSED: another autotune pass is already in progress");
+        return;
+    }
+
+    // NOTE (backlog #7, docs/superpowers/HANDOFF-2026-07-08-post-path-a.md):
+    // automated multi-hop `scanner_scan()` is NOT yet confirmed safe --
+    // DMA-internal-heap churn across repeated retunes is an open issue and
+    // the control-URB-reuse fix for it was reverted (9638816). scanner_scan
+    // is nonetheless the only implemented LO-density routine (design doc
+    // step 3), and autotune_lo_interval_s=0 remains the operator's escape
+    // hatch if this wedges the RTL in the field. MUST be validated by
+    // device-smoke before this path merges to main (mandatory per project
+    // policy for any DSP/RF-control-path change) -- see the design doc's
+    // "Empirical findings" section for why the interval defaults long
+    // (hourly) rather than the original 600 s satellite-handoff estimate.
+    ESP_LOGI(TAG, "=== autotune LO rescan: sweeping %lu-%lu Hz step %lu Hz ===",
+             (unsigned long)SCAN_START_HZ, (unsigned long)SCAN_STOP_HZ,
+             (unsigned long)SCAN_STEP_HZ);
+    scanner_scan(SCAN_START_HZ, SCAN_STOP_HZ, SCAN_STEP_HZ, SCAN_DWELL_MS);
+
+    // scanner_scan() parks live (persist=false) on the hottest center but
+    // doesn't write NVS. For "track the slow-drifting center" to survive a
+    // reboot, persist whatever it landed on.
+    uint32_t hot_hz = scanner_last_hot_hz();
+    if (hot_hz) {
+        (void)app_config_set_lo_freq_hz(hot_hz);
+        ESP_LOGI(TAG, "=== autotune LO rescan done: persisted center %lu Hz ===",
+                 (unsigned long)hot_hz);
+    } else {
+        ESP_LOGW(TAG, "=== autotune LO rescan done: no hot center found; LO unchanged ===");
+    }
+
+    autotune_end();
 }
