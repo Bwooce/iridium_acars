@@ -923,10 +923,11 @@ void worker_task(void *arg)
                 // fixed-latency (shrinkable) vs unbounded-deficit apart.
                 if ((s_stale_log_throttle++ & 0x7F) == 0) {
                     uint64_t lag = signal_buffer_head_total() - burst.start_sample_idx;
-                    ESP_LOGW(TAG, "stale burst: start=%llu lag=%lu ms (%.2f ring-spans) — drop",
+                    ESP_LOGW(TAG, "stale burst: start=%llu lag=%lu ms (%.2f ring-spans) snr=%.1f — drop",
                              (unsigned long long)burst.start_sample_idx,
                              (unsigned long)(lag * 1000ULL / FS_DETECT_HZ),
-                             (double)lag / (double)(SIGNAL_BUF_SIZE / 4));
+                             (double)lag / (double)(SIGNAL_BUF_SIZE / 4),
+                             (double)burst.peak_snr_db);
                 }
                 s_bursts_skipped++;
                 continue;
@@ -1260,9 +1261,10 @@ void worker_core1_push_burst(const detected_burst_t *burst)
         if (check_len >= ring_span ||
             (head > check_start && head - check_start > ring_span)) {
             if ((s_stale_log_throttle++ & 0x7F) == 0) {
-                ESP_LOGW(TAG, "stale burst: start=%llu len=%lu (at push) — reject",
+                ESP_LOGW(TAG, "stale burst: start=%llu len=%lu snr=%.1f (at push) — reject",
                          (unsigned long long)burst->start_sample_idx,
-                         (unsigned long)burst->length_samples);
+                         (unsigned long)burst->length_samples,
+                         (double)burst->peak_snr_db);
             }
             s_bursts_skipped++;
             return;
