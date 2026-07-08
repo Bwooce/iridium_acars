@@ -102,6 +102,15 @@ typedef struct {
     float    detect_us;   // unused
     float    baseline_us; // unused
     float    total_us;    // total per-frame
+    // Per-stage MIN (uncontended compute floor, µs/step). Preemption can
+    // only add wall time, so the min over the window is jitter-immune —
+    // this is what the smoke perf check asserts on (the *_us means above
+    // are contention-inflated and informational only).
+    float wind_min_us;
+    float fft_min_us;
+    float mag_min_us;
+    float detect_min_us;
+    float baseline_min_us;
     // Raw window accumulators for the `fbt:` diagnostic line. Formatted
     // and emitted by status_logger on Core 1 — the getter itself must
     // stay log-free (it runs on Core 0's hot loop).

@@ -186,6 +186,16 @@ void fft_burst_tagger_reset_baseline(fft_burst_tagger_t *t);
 // instrumentation enabled — returns zeros.
 void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps);
 
+// Diagnostic — read-and-reset the per-stage MINIMUM wall time (µs)
+// observed since the last call. Same stage ordering as
+// fft_burst_tagger_get_stage_us(). The min is the uncontended compute
+// floor: preemption can only ADD to a step's wall time, so the minimum
+// over many steps is a tight lower bound on real compute — a stable
+// perf-regression signal immune to scheduler jitter (unlike the mean,
+// which a single preemption outlier inflates). Stages with no clean
+// step in the window read back as 0.
+void fft_burst_tagger_get_stage_min_us(uint64_t out[5]);
+
 // Diagnostic — read-and-reset the squelch visibility counters
 // accumulated since the last call (same process-wide idiom as
 // fft_burst_tagger_get_stage_us):

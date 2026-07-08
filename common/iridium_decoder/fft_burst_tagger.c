@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
@@ -94,6 +95,32 @@ static _Atomic(uint64_t) s_acc_mag_us;
 static _Atomic(uint64_t) s_acc_detect_us;
 static _Atomic(uint64_t) s_acc_base_us;
 static _Atomic(uint32_t) s_acc_steps;
+
+// Per-stage MINIMUM (uncontended compute floor). The mean above is
+// wall-clock (esp_timer) sum/count: preemption between t0/t1 is billed
+// to whichever stage was running, and the smoke feed task yields
+// (vTaskDelay) between transfers, so a rare ms-scale scheduler outlier
+// drags the mean up — a false perf regression. The min over thousands
+// of steps can only be LOWERED by faster compute; preemption can only
+// ADD time, so the min is a tight lower bound on real per-step compute.
+// A genuine regression (-Og rebuild, cache pessimisation, dropped PIE
+// kernel) raises the floor; scheduling jitter cannot. Read-and-reset
+// (to the UINT64_MAX sentinel) via fft_burst_tagger_get_stage_min_us().
+static _Atomic(uint64_t) s_min_wind_us;
+static _Atomic(uint64_t) s_min_fft_us;
+static _Atomic(uint64_t) s_min_mag_us;
+static _Atomic(uint64_t) s_min_detect_us;
+static _Atomic(uint64_t) s_min_base_us;
+
+// Relaxed-CAS min: lower the accumulator to v if v is smaller. Same
+// single-tagger-process relaxed-atomic idiom as the sum adds above.
+static inline void fbt_acc_min(_Atomic(uint64_t) *m, uint64_t v)
+{
+    uint64_t cur = atomic_load_explicit(m, memory_order_relaxed);
+    while (v < cur && !atomic_compare_exchange_weak_explicit(
+                          m, &cur, v, memory_order_relaxed, memory_order_relaxed)) {
+    }
+}
 
 // Squelch visibility counters (2026-07-07 decode-regression batch):
 // squelch steps, bursts force-closed by the squelch (counted, NOT
@@ -424,6 +451,15 @@ fft_burst_tagger_t *fft_burst_tagger_init(int      burst_pre_len,
     t->n_bursts       = 0;
     t->d_index        = 0;
     t->burst_id       = 0;
+
+    // Per-stage min floors start at the sentinel (statics default-zero,
+    // which would be a permanently-broken min). See the accumulators'
+    // declaration comment for why the min is the assertion signal.
+    atomic_store_explicit(&s_min_wind_us, UINT64_MAX, memory_order_relaxed);
+    atomic_store_explicit(&s_min_fft_us, UINT64_MAX, memory_order_relaxed);
+    atomic_store_explicit(&s_min_mag_us, UINT64_MAX, memory_order_relaxed);
+    atomic_store_explicit(&s_min_detect_us, UINT64_MAX, memory_order_relaxed);
+    atomic_store_explicit(&s_min_base_us, UINT64_MAX, memory_order_relaxed);
 
 #if defined(ESP_PLATFORM)
     // Pipelined helper: alt fft_buf in PSRAM.
@@ -1078,13 +1114,17 @@ static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
 
     uint64_t t2 = FBT_NOW_US();
     compute_magnitude_shifted(t, fb);
-    uint64_t t3 = FBT_NOW_US();
-    atomic_fetch_add_explicit(&s_acc_mag_us, (t3 - t2), memory_order_relaxed);
+    uint64_t t3  = FBT_NOW_US();
+    uint64_t mag = t3 - t2;
+    atomic_fetch_add_explicit(&s_acc_mag_us, mag, memory_order_relaxed);
+    fbt_acc_min(&s_min_mag_us, mag);
 
     if (!t->history_primed) {
         uint64_t b0 = FBT_NOW_US();
         update_baseline_ema(t, false);
-        atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
+        uint64_t base = FBT_NOW_US() - b0;
+        atomic_fetch_add_explicit(&s_acc_base_us, base, memory_order_relaxed);
+        fbt_acc_min(&s_min_base_us, base);
         t->staged_n_new  = 0;
         t->staged_n_gone = 0;
     } else {
@@ -1105,11 +1145,15 @@ static FBT_HOT void tagger_pipe_post_fft(fft_burst_tagger_t *t)
             t->staged_max_gone - staged_gone_n);
         t->staged_n_gone = staged_gone_n;
         uint64_t d1      = FBT_NOW_US();
-        atomic_fetch_add_explicit(&s_acc_detect_us, (d1 - d0), memory_order_relaxed);
+        uint64_t detect  = d1 - d0;
+        atomic_fetch_add_explicit(&s_acc_detect_us, detect, memory_order_relaxed);
+        fbt_acc_min(&s_min_detect_us, detect);
 
         uint64_t b0 = FBT_NOW_US();
         update_baseline_ema(t, false);
-        atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
+        uint64_t base = FBT_NOW_US() - b0;
+        atomic_fetch_add_explicit(&s_acc_base_us, base, memory_order_relaxed);
+        fbt_acc_min(&s_min_base_us, base);
     }
 
     t->d_index = saved_d;
@@ -1159,10 +1203,14 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
         window_multiply(t, input, fb);
         uint64_t t1 = FBT_NOW_US();
         fft_sc16_2048(fb);
-        uint64_t t2 = FBT_NOW_US();
-        atomic_fetch_add_explicit(&s_acc_wind_us, (t1 - t0), memory_order_relaxed);
-        atomic_fetch_add_explicit(&s_acc_fft_us, (t2 - t1), memory_order_relaxed);
+        uint64_t t2   = FBT_NOW_US();
+        uint64_t wind = t1 - t0;
+        uint64_t fft  = t2 - t1;
+        atomic_fetch_add_explicit(&s_acc_wind_us, wind, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_acc_fft_us, fft, memory_order_relaxed);
         atomic_fetch_add_explicit(&s_acc_steps, 1, memory_order_relaxed);
+        fbt_acc_min(&s_min_wind_us, wind);
+        fbt_acc_min(&s_min_fft_us, fft);
 
         // 3. Snapshot pending state, ADVANCE d_index, then notify.
         //    Race-fix: t->d_index must be at its post-advance value
@@ -1197,15 +1245,23 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
     compute_magnitude_shifted(t, t->fft_buf);
     uint64_t t3 = FBT_NOW_US();
 
-    atomic_fetch_add_explicit(&s_acc_wind_us, (t1 - t0), memory_order_relaxed);
-    atomic_fetch_add_explicit(&s_acc_fft_us, (t2 - t1), memory_order_relaxed);
-    atomic_fetch_add_explicit(&s_acc_mag_us, (t3 - t2), memory_order_relaxed);
+    uint64_t wind = t1 - t0;
+    uint64_t fft  = t2 - t1;
+    uint64_t mag  = t3 - t2;
+    atomic_fetch_add_explicit(&s_acc_wind_us, wind, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_acc_fft_us, fft, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_acc_mag_us, mag, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_acc_steps, 1, memory_order_relaxed);
+    fbt_acc_min(&s_min_wind_us, wind);
+    fbt_acc_min(&s_min_fft_us, fft);
+    fbt_acc_min(&s_min_mag_us, mag);
 
     if (!t->history_primed) {
         uint64_t b0 = FBT_NOW_US();
         update_baseline_ema(t, false);
-        atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
+        uint64_t base = FBT_NOW_US() - b0;
+        atomic_fetch_add_explicit(&s_acc_base_us, base, memory_order_relaxed);
+        fbt_acc_min(&s_min_base_us, base);
         t->d_index += N;
         return false;
     }
@@ -1223,15 +1279,19 @@ FBT_HOT bool fft_burst_tagger_step(fft_burst_tagger_t *t,
     n_gone_out += delete_gone_bursts_internal(
         t, out_gone_bursts ? out_gone_bursts + n_gone_out : NULL,
         max_gone - n_gone_out);
-    uint64_t d1 = FBT_NOW_US();
-    atomic_fetch_add_explicit(&s_acc_detect_us, (d1 - d0), memory_order_relaxed);
+    uint64_t d1     = FBT_NOW_US();
+    uint64_t detect = d1 - d0;
+    atomic_fetch_add_explicit(&s_acc_detect_us, detect, memory_order_relaxed);
+    fbt_acc_min(&s_min_detect_us, detect);
 
     if (n_new) *n_new = n_new_out;
     if (n_gone) *n_gone = n_gone_out;
 
     uint64_t b0 = FBT_NOW_US();
     update_baseline_ema(t, false);
-    atomic_fetch_add_explicit(&s_acc_base_us, (FBT_NOW_US() - b0), memory_order_relaxed);
+    uint64_t base = FBT_NOW_US() - b0;
+    atomic_fetch_add_explicit(&s_acc_base_us, base, memory_order_relaxed);
+    fbt_acc_min(&s_min_base_us, base);
 
     t->d_index += N;
     return true;
@@ -1257,6 +1317,27 @@ void fft_burst_tagger_get_stage_us(uint64_t out[5], uint32_t *steps)
         out[4] = base_us;
     }
     if (steps) *steps = steps_v;
+}
+
+void fft_burst_tagger_get_stage_min_us(uint64_t out[5])
+{
+    // Read-and-reset: exchange each min back to the UINT64_MAX sentinel
+    // so the next window starts fresh. A sentinel that survived (no clean
+    // step observed in the window) maps to 0. Ordering matches
+    // fft_burst_tagger_get_stage_us(): {wind, fft, mag, detect, base}.
+    uint64_t wind_us   = atomic_exchange_explicit(&s_min_wind_us, UINT64_MAX, memory_order_relaxed);
+    uint64_t fft_us    = atomic_exchange_explicit(&s_min_fft_us, UINT64_MAX, memory_order_relaxed);
+    uint64_t mag_us    = atomic_exchange_explicit(&s_min_mag_us, UINT64_MAX, memory_order_relaxed);
+    uint64_t detect_us = atomic_exchange_explicit(&s_min_detect_us, UINT64_MAX, memory_order_relaxed);
+    uint64_t base_us   = atomic_exchange_explicit(&s_min_base_us, UINT64_MAX, memory_order_relaxed);
+
+    if (out) {
+        out[0] = (wind_us == UINT64_MAX) ? 0 : wind_us;
+        out[1] = (fft_us == UINT64_MAX) ? 0 : fft_us;
+        out[2] = (mag_us == UINT64_MAX) ? 0 : mag_us;
+        out[3] = (detect_us == UINT64_MAX) ? 0 : detect_us;
+        out[4] = (base_us == UINT64_MAX) ? 0 : base_us;
+    }
 }
 
 void fft_burst_tagger_get_squelch_stats(uint32_t *squelch_events,

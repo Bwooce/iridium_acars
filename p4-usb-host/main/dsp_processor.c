@@ -384,19 +384,29 @@ void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)
     uint64_t tag_stage_us[5] = {0};
     uint32_t tag_steps       = 0;
     fft_burst_tagger_get_stage_us(tag_stage_us, &tag_steps);
+    // Per-stage uncontended min (µs/step). Read-and-reset unconditionally
+    // so the accumulator drains even in the frames==0 window; these are
+    // already per-step floors — do NOT divide by frame/step count.
+    uint64_t tag_min_us[5] = {0};
+    fft_burst_tagger_get_stage_min_us(tag_min_us);
 
     if (frames == 0) {
         memset(out, 0, sizeof(*out));
     } else {
-        float fn         = (float)frames;
-        float ts         = (tag_steps > 0) ? (float)tag_steps : 1.0f;
-        out->frames      = frames;
-        out->wind_us     = (float)tag_stage_us[0] / ts;
-        out->fft_us      = (float)tag_stage_us[1] / ts;
-        out->mag_us      = (float)tag_stage_us[2] / ts;
-        out->detect_us   = (float)tag_stage_us[3] / ts;
-        out->baseline_us = (float)tag_stage_us[4] / ts;
-        out->total_us    = (float)acc_step_us_snap / fn;
+        float fn             = (float)frames;
+        float ts             = (tag_steps > 0) ? (float)tag_steps : 1.0f;
+        out->frames          = frames;
+        out->wind_us         = (float)tag_stage_us[0] / ts;
+        out->fft_us          = (float)tag_stage_us[1] / ts;
+        out->mag_us          = (float)tag_stage_us[2] / ts;
+        out->detect_us       = (float)tag_stage_us[3] / ts;
+        out->baseline_us     = (float)tag_stage_us[4] / ts;
+        out->total_us        = (float)acc_step_us_snap / fn;
+        out->wind_min_us     = (float)tag_min_us[0];
+        out->fft_min_us      = (float)tag_min_us[1];
+        out->mag_min_us      = (float)tag_min_us[2];
+        out->detect_min_us   = (float)tag_min_us[3];
+        out->baseline_min_us = (float)tag_min_us[4];
     }
     // Raw accumulators for the `fbt:` line. No ESP_LOGI here: this
     // getter runs on usb_pump's 1 Hz snapshot and log formatting belongs
