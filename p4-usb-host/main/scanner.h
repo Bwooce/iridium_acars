@@ -25,3 +25,9 @@ void scanner_scan(uint32_t start_hz, uint32_t stop_hz, uint32_t step_hz, uint32_
 
 // Reprint the last density map (or "no scan yet").
 void scanner_print_last_map(void);
+
+// Reset the tagger noise-floor baseline so it re-learns after a live change
+// that shifts the floor (e.g. a gain step during autotune) without changing
+// the LO. Reuses the same reset the LO hop performs. No-op if the detector
+// isn't wired yet.
+void scanner_reset_baseline(void);

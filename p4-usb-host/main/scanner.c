@@ -31,6 +31,11 @@ esp_err_t scanner_hop(uint32_t hz, bool persist)
     return ESP_OK;
 }
 
+void scanner_reset_baseline(void)
+{
+    if (s_dsp) dsp_processor_reset_tagger_baseline(s_dsp);
+}
+
 void scanner_scan(uint32_t start_hz, uint32_t stop_hz, uint32_t step_hz, uint32_t dwell_ms)
 {
     if (!s_dsp) {

@@ -2,6 +2,9 @@
 #include "app_config.h"
 #include "dsp_processor.h"
 #include "scanner.h"
+#include "autotune.h"
+#include "autotune_gainset.h"
+#include "class_driver.h"
 #include "wifi_link.h"
 #include "class_driver.h" // class_driver_prepare_for_reboot()
 #include "driver/uart.h"
@@ -285,6 +288,26 @@ static void cmd_hop(char *args)
         uart_puts("ERR retune failed\r\n");
 }
 
+// Live tuner-gain apply (no reboot), snapped to the nearest real R828D step.
+// Complements `set gain_dbx10` (which persists but only takes effect at the
+// next detector-create); this takes effect immediately on the running stream.
+static void cmd_setgain(char *args)
+{
+    char *g_s = args ? strtok(args, " \t") : NULL;
+    if (!g_s) {
+        uart_puts("ERR usage: setgain <dbx10>  (e.g. 254 = 25.4 dB)\r\n");
+        return;
+    }
+    int snapped = autotune_snap_gain(atoi(g_s));
+    if (class_driver_set_tuner_gain_dbx10(snapped)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "OK gain=%d.%d dB (live)\r\n", snapped / 10, snapped % 10);
+        uart_puts(buf);
+    } else {
+        uart_puts("ERR SDR not streaming yet\r\n");
+    }
+}
+
 static void cmd_scan(char *args)
 {
     uint32_t start = SCAN_START_HZ, stop = SCAN_STOP_HZ, step = SCAN_STEP_HZ, dwell = SCAN_DWELL_MS;
@@ -332,6 +355,16 @@ static void dispatch(char *line)
         cmd_scan(strtok(NULL, ""));
         return;
     }
+    if (strcmp(cmd, "setgain") == 0) {
+        cmd_setgain(strtok(NULL, ""));
+        return;
+    }
+    if (strcmp(cmd, "autotune") == 0) {
+        uart_puts("OK autotune running (minutes; see log for curve + pick)\r\n");
+        autotune_run_manual();
+        uart_puts("autotune done\r\n");
+        return;
+    }
     if (strcmp(cmd, "map") == 0) {
         scanner_print_last_map();
         return;
@@ -356,7 +389,8 @@ static void dispatch(char *line)
         return;
     }
 
-    uart_puts("ERR unknown command (set/get/config/reboot/hop/scan/map/nettest)\r\n");
+    uart_puts("ERR unknown command "
+              "(set/get/config/reboot/hop/scan/map/setgain/autotune/nettest)\r\n");
 }
 
 static void serial_cmd_task(void *arg)
