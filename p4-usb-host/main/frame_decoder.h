@@ -21,8 +21,9 @@ extern "C" {
 #endif
 
 // Initialise the decoder: allocate PSRAM-backed queue, spawn the
-// consumer task, register with the task watchdog. Idempotent —
-// subsequent calls return ESP_OK without reinitialising.
+// consumer task. Idempotent — subsequent calls return ESP_OK without
+// reinitialising. (The task is deliberately NOT watchdog-subscribed;
+// see the rationale in decoder_task().)
 esp_err_t frame_decoder_init(void);
 
 // Producer-side push. Called by worker_core1 after qpsk_demod reports

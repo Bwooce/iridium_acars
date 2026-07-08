@@ -12,7 +12,6 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_task_wdt.h"
 #include "frame_decoder.h"
 #include "frame_queue.h"
 #include "iridium_frame.h"
@@ -35,12 +34,20 @@ static const char *TAG = "FRMDEC";
 
 #define FRAME_QUEUE_SLOTS 64 // 64 × ~2064 B ≈ 132 KB in PSRAM
 #define DECODER_STACK 6144
-#define DECODER_PRIO 4 // Core 0: < class_driver (6), < httpd (5),
-                       // > sd_log (2), > logger (1)
-                       // Decoder is bursty (only wakes when a
-                       // frame arrives, ms-scale compute) so
-                       // its CPU cost doesn't displace the
-                       // USB consumer or httpd in practice.
+#define DECODER_PRIO 6 // Core 0: == dsp_feed (6), < usb_pump (7),
+                       // > httpd (5), > sd_log (2), > logger (1).
+                       // Was 4, but under Path A's clean fast streaming
+                       // usb_pump(7) <-> dsp_feed(6) ping-pong keeps Core 0
+                       // continuously busy at prio >=6, so a prio-4 decoder
+                       // is NEVER the highest-ready task and starves for the
+                       // full 60 s TASK_WDT window -> frame_decoder abort/
+                       // reboot + zero decodes (2026-07-08). Equal to
+                       // dsp_feed so it gets scheduled when dsp_feed blocks
+                       // for the next USB block; it self-throttles (ONE
+                       // frame per wake then taskYIELD, below) so it takes
+                       // only a single decode's slice and yields straight
+                       // back to the tagger — it cannot runaway-starve
+                       // dsp_feed at equal priority.
 #define DECODER_CORE 0 // Moved from Core 1 → Core 0 (#123,
                        // 2026-05-31). Core 1's worker (prio
                        // 5) was being preempted by anything
@@ -455,13 +462,18 @@ static void decoder_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "Decoder task started on Core %d", xPortGetCoreID());
 
-    // Register with the task watchdog so the decoder participates in
-    // panic-on-stuck behaviour like the other long-running tasks.
-    esp_err_t wdt_rc = esp_task_wdt_add(NULL);
-    if (wdt_rc != ESP_OK && wdt_rc != ESP_ERR_INVALID_ARG) {
-        ESP_LOGW(TAG, "esp_task_wdt_add returned %d (%s)",
-                 wdt_rc, esp_err_to_name(wdt_rc));
-    }
+    // NOT subscribed to the task watchdog. The decoder is a best-effort
+    // downstream consumer: if Core 0 is momentarily saturated by the
+    // usb_pump/dsp_feed (tagger) real-time path and this task is starved,
+    // the correct behaviour is to let frames queue/drop while ingest and
+    // detection keep running — NOT to panic-reboot the whole device (which
+    // tears down the USB stream, the tagger, and any in-flight pass). This
+    // task previously WDT-rebooted every ~60 s under Path A's fast streaming
+    // when it ran at prio 4; it now runs at prio 6 (see DECODER_PRIO) so it
+    // is scheduled, but a WDT subscription here is the wrong safety net for
+    // a throughput deficit. Same rationale as class_driver's unsubscribe
+    // (memory: task-wdt-subscription-pitfalls). Stream-stall / health
+    // watchdogs elsewhere still cover a genuinely wedged pipeline.
 
     // Decoder task is a single serial consumer (one xTaskCreatePinnedToCoreWithCaps
     // instance, non-reentrant). Move the ~2.1 KB frame_queue_item_t from stack to
@@ -480,20 +492,17 @@ static void decoder_task(void *arg)
         }
         if (got) {
             process_one(&item);
-            // Drain a small batch per wake. One-item-per-tick capped the
-            // decoder at 100 frames/s — under bench-noise load (tagger at
-            // 140 bursts/s, multi-frame bursts emitting several frames
-            // each) the 63-deep queue filled within seconds and dropped.
-            // The batch stays small so the 1-tick yield below still runs
-            // often enough for IDLE1 / status_logger.
-            for (int b = 1; b < 8 && frame_queue_pop(s_queue, &item); b++) {
-                process_one(&item);
-            }
-            // Yield once after each batch so IDLE1 / lower-prio tasks
-            // (status_logger) get a slice even if bursts arrive
-            // back-to-back. taskYIELD here would also work but a
-            // 1-tick delay is more predictable.
-            vTaskDelay(1);
+            // ONE frame per wake, then taskYIELD — do NOT drain a batch.
+            // Now that this task runs at prio 6 (== dsp_feed, raised from 4
+            // to escape the usb_pump<->dsp_feed ping-pong that TASK_WDT-
+            // rebooted it), it must not hold Core 0 across several frames or
+            // it would delay the tagger (dsp_feed) it shares the priority
+            // with. Draining one frame then yielding bounds its hold to a
+            // single decode. taskYIELD (not vTaskDelay) keeps draining a
+            // deep queue at full rate — the loop re-pops as soon as the
+            // tagger has taken its slice — so it does NOT reintroduce the
+            // ~100 frame/s cap a per-item vTaskDelay(1) would impose.
+            taskYIELD();
         } else {
             // Empty — sleep one tick (10 ms at 100 Hz tick rate). Note:
             // pdMS_TO_TICKS(2) rounds to 0 ticks at the default 100 Hz
@@ -501,7 +510,8 @@ static void decoder_task(void *arg)
             // starvation. Using `1` directly forces at least one tick.
             vTaskDelay(1);
         }
-        esp_task_wdt_reset();
+        // No esp_task_wdt_reset() — this task is not WDT-subscribed
+        // (see the rationale where the subscription used to be).
     }
 }
 
