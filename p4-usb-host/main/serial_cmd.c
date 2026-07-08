@@ -68,6 +68,11 @@ static void cmd_config(void)
              (int)c.autotune_gain_min_dbx10, (int)c.autotune_gain_max_dbx10,
              (unsigned)c.autotune_gain_stride);
     uart_puts(buf);
+    snprintf(buf, sizeof(buf), "autotune_on_boot=%d\r\n", (int)c.autotune_on_boot);
+    uart_puts(buf);
+    snprintf(buf, sizeof(buf), "autotune_gain_interval_s=%lu autotune_lo_interval_s=%lu\r\n",
+             (unsigned long)c.autotune_gain_interval_s, (unsigned long)c.autotune_lo_interval_s);
+    uart_puts(buf);
     snprintf(buf, sizeof(buf), "ota_url=%s\r\n", c.ota_url);
     uart_puts(buf);
 }
@@ -115,6 +120,12 @@ static void cmd_get(const char *key)
         snprintf(buf, sizeof(buf), "%d\r\n", (int)c.autotune_gain_max_dbx10);
     else if (strcmp(key, "autotune_gain_stride") == 0)
         snprintf(buf, sizeof(buf), "%u\r\n", (unsigned)c.autotune_gain_stride);
+    else if (strcmp(key, "autotune_on_boot") == 0)
+        snprintf(buf, sizeof(buf), "%d\r\n", (int)c.autotune_on_boot);
+    else if (strcmp(key, "autotune_gain_interval_s") == 0)
+        snprintf(buf, sizeof(buf), "%lu\r\n", (unsigned long)c.autotune_gain_interval_s);
+    else if (strcmp(key, "autotune_lo_interval_s") == 0)
+        snprintf(buf, sizeof(buf), "%lu\r\n", (unsigned long)c.autotune_lo_interval_s);
     else if (strcmp(key, "ota_url") == 0)
         snprintf(buf, sizeof(buf), "%s\r\n", c.ota_url);
     else {
@@ -165,6 +176,12 @@ static void cmd_set(const char *key, const char *val)
         rc = app_config_set_autotune_gain_max_dbx10((int16_t)atoi(val));
     else if (strcmp(key, "autotune_gain_stride") == 0)
         rc = app_config_set_autotune_gain_stride((uint8_t)atoi(val));
+    else if (strcmp(key, "autotune_on_boot") == 0)
+        rc = app_config_set_autotune_on_boot(atoi(val) != 0);
+    else if (strcmp(key, "autotune_gain_interval_s") == 0)
+        rc = app_config_set_autotune_gain_interval_s((uint32_t)atol(val));
+    else if (strcmp(key, "autotune_lo_interval_s") == 0)
+        rc = app_config_set_autotune_lo_interval_s((uint32_t)atol(val));
     else if (strcmp(key, "ota_url") == 0)
         rc = app_config_set_ota_url(val);
     else {

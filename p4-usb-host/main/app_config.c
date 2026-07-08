@@ -28,11 +28,14 @@ static const char *NVS_NS = "iridium";
 #define DEFAULT_COALESCE_MIN_BURSTS 0 // 0 = coalescer disabled (gri-parity dispatch)
 #define DEFAULT_DCMASK_LO 1           // lo>hi => disabled by default
 #define DEFAULT_DCMASK_HI (-1)
-#define DEFAULT_AUTOTUNE_GAIN_DWELL_S 180  // 55 s too noisy (design §Dwell adequacy)
+#define DEFAULT_AUTOTUNE_GAIN_DWELL_S 180      // 55 s too noisy (design §Dwell adequacy)
 #define DEFAULT_AUTOTUNE_IRA_LO_HZ 1626200000u // IRA simplex allocation, fixed
-#define DEFAULT_AUTOTUNE_GAIN_MIN_DBX10 80  // skip the deaf 0..7.7 dB low end
-#define DEFAULT_AUTOTUNE_GAIN_MAX_DBX10 460 // skip the 48/49.6 dB saturating top
-#define DEFAULT_AUTOTUNE_GAIN_STRIDE 3      // coarse: every 3rd R828D step
+#define DEFAULT_AUTOTUNE_GAIN_MIN_DBX10 80     // skip the deaf 0..7.7 dB low end
+#define DEFAULT_AUTOTUNE_GAIN_MAX_DBX10 460    // skip the 48/49.6 dB saturating top
+#define DEFAULT_AUTOTUNE_GAIN_STRIDE 3         // coarse: every 3rd R828D step
+#define DEFAULT_AUTOTUNE_ON_BOOT false         // don't eat a boot on every reboot
+#define DEFAULT_AUTOTUNE_GAIN_INTERVAL_S 3600u // hourly (RFI/thermal-driven, slow)
+#define DEFAULT_AUTOTUNE_LO_INTERVAL_S 3600u   // hourly (mean-reverting; do NOT shorten)
 #define DEFAULT_STATION_ID "p4-iridium-1"
 #define DEFAULT_WIFI_SSID ""
 #define DEFAULT_WIFI_PSK ""
@@ -114,20 +117,23 @@ esp_err_t app_config_init(void)
 
     // Apply defaults FIRST so the struct is well-defined even if
     // NVS init fails completely.
-    s_cfg.lo_freq_hz          = DEFAULT_LO_FREQ_HZ;
-    s_cfg.sample_rate_hz      = DEFAULT_SAMPLE_RATE_HZ;
-    s_cfg.gain_mode           = DEFAULT_GAIN_MODE;
-    s_cfg.gain_db_x10         = DEFAULT_GAIN_DB_X10;
-    s_cfg.bias_tee            = DEFAULT_BIAS_TEE;
-    s_cfg.tagger_threshold_db = DEFAULT_TAGGER_THRESHOLD_DB;
-    s_cfg.coalesce_min_bursts = DEFAULT_COALESCE_MIN_BURSTS;
-    s_cfg.dcmask_lo           = DEFAULT_DCMASK_LO;
-    s_cfg.dcmask_hi           = DEFAULT_DCMASK_HI;
-    s_cfg.autotune_gain_dwell_s   = DEFAULT_AUTOTUNE_GAIN_DWELL_S;
-    s_cfg.autotune_ira_lo_hz      = DEFAULT_AUTOTUNE_IRA_LO_HZ;
-    s_cfg.autotune_gain_min_dbx10 = DEFAULT_AUTOTUNE_GAIN_MIN_DBX10;
-    s_cfg.autotune_gain_max_dbx10 = DEFAULT_AUTOTUNE_GAIN_MAX_DBX10;
-    s_cfg.autotune_gain_stride    = DEFAULT_AUTOTUNE_GAIN_STRIDE;
+    s_cfg.lo_freq_hz               = DEFAULT_LO_FREQ_HZ;
+    s_cfg.sample_rate_hz           = DEFAULT_SAMPLE_RATE_HZ;
+    s_cfg.gain_mode                = DEFAULT_GAIN_MODE;
+    s_cfg.gain_db_x10              = DEFAULT_GAIN_DB_X10;
+    s_cfg.bias_tee                 = DEFAULT_BIAS_TEE;
+    s_cfg.tagger_threshold_db      = DEFAULT_TAGGER_THRESHOLD_DB;
+    s_cfg.coalesce_min_bursts      = DEFAULT_COALESCE_MIN_BURSTS;
+    s_cfg.dcmask_lo                = DEFAULT_DCMASK_LO;
+    s_cfg.dcmask_hi                = DEFAULT_DCMASK_HI;
+    s_cfg.autotune_gain_dwell_s    = DEFAULT_AUTOTUNE_GAIN_DWELL_S;
+    s_cfg.autotune_ira_lo_hz       = DEFAULT_AUTOTUNE_IRA_LO_HZ;
+    s_cfg.autotune_gain_min_dbx10  = DEFAULT_AUTOTUNE_GAIN_MIN_DBX10;
+    s_cfg.autotune_gain_max_dbx10  = DEFAULT_AUTOTUNE_GAIN_MAX_DBX10;
+    s_cfg.autotune_gain_stride     = DEFAULT_AUTOTUNE_GAIN_STRIDE;
+    s_cfg.autotune_on_boot         = DEFAULT_AUTOTUNE_ON_BOOT;
+    s_cfg.autotune_gain_interval_s = DEFAULT_AUTOTUNE_GAIN_INTERVAL_S;
+    s_cfg.autotune_lo_interval_s   = DEFAULT_AUTOTUNE_LO_INTERVAL_S;
     strncpy(s_cfg.station_id, DEFAULT_STATION_ID, APP_CONFIG_STATION_ID_LEN - 1);
     s_cfg.station_id[APP_CONFIG_STATION_ID_LEN - 1] = '\0';
     s_cfg.wifi_ssid[0]                              = '\0';
@@ -176,6 +182,11 @@ esp_err_t app_config_init(void)
     nvs_get_i16_or(h, "at_g_min", &s_cfg.autotune_gain_min_dbx10, DEFAULT_AUTOTUNE_GAIN_MIN_DBX10);
     nvs_get_i16_or(h, "at_g_max", &s_cfg.autotune_gain_max_dbx10, DEFAULT_AUTOTUNE_GAIN_MAX_DBX10);
     nvs_get_u8_or(h, "at_g_strd", &s_cfg.autotune_gain_stride, DEFAULT_AUTOTUNE_GAIN_STRIDE);
+    uint8_t at_on_boot = (uint8_t)DEFAULT_AUTOTUNE_ON_BOOT;
+    nvs_get_u8_or(h, "at_on_boot", &at_on_boot, (uint8_t)DEFAULT_AUTOTUNE_ON_BOOT);
+    s_cfg.autotune_on_boot = (bool)at_on_boot;
+    nvs_get_u32_or(h, "at_g_ivl_s", &s_cfg.autotune_gain_interval_s, DEFAULT_AUTOTUNE_GAIN_INTERVAL_S);
+    nvs_get_u32_or(h, "at_lo_ivl_s", &s_cfg.autotune_lo_interval_s, DEFAULT_AUTOTUNE_LO_INTERVAL_S);
     nvs_get_str_or(h, "station", s_cfg.station_id, APP_CONFIG_STATION_ID_LEN,
                    DEFAULT_STATION_ID);
     nvs_get_str_or(h, "wifi_ssid", s_cfg.wifi_ssid, APP_CONFIG_WIFI_SSID_LEN, "");
@@ -300,6 +311,17 @@ SET_FIELD_NUM(app_config_set_autotune_ira_lo_hz, autotune_ira_lo_hz, uint32_t, "
 SET_FIELD_NUM(app_config_set_autotune_gain_min_dbx10, autotune_gain_min_dbx10, int16_t, "at_g_min", commit_one_i16)
 SET_FIELD_NUM(app_config_set_autotune_gain_max_dbx10, autotune_gain_max_dbx10, int16_t, "at_g_max", commit_one_i16)
 SET_FIELD_NUM(app_config_set_autotune_gain_stride, autotune_gain_stride, uint8_t, "at_g_strd", commit_one_u8)
+SET_FIELD_NUM(app_config_set_autotune_gain_interval_s, autotune_gain_interval_s, uint32_t, "at_g_ivl_s", commit_one_u32)
+SET_FIELD_NUM(app_config_set_autotune_lo_interval_s, autotune_lo_interval_s, uint32_t, "at_lo_ivl_s", commit_one_u32)
+
+esp_err_t app_config_set_autotune_on_boot(bool v)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.autotune_on_boot = v;
+    xSemaphoreGive(s_cfg_mu);
+    return commit_one_u8("at_on_boot", (uint8_t)v);
+}
 
 esp_err_t app_config_set_gain_mode(gain_mode_t mode)
 {
@@ -378,6 +400,9 @@ void app_config_log(void)
     ESP_LOGI(TAG, "gone-burst coalescer: %s (coal_n=%u)",
              c.coalesce_min_bursts >= 2 ? "ENABLED (non-gri heuristic)" : "disabled",
              (unsigned)c.coalesce_min_bursts);
+    ESP_LOGI(TAG, "autotune: on_boot=%d gain_interval_s=%lu lo_interval_s=%lu",
+             (int)c.autotune_on_boot, (unsigned long)c.autotune_gain_interval_s,
+             (unsigned long)c.autotune_lo_interval_s);
     ESP_LOGI(TAG, "wifi_ssid='%s'  wifi_psk=%s",
              c.wifi_ssid, (c.wifi_psk[0] ? "(set)" : "(unset)"));
     if (c.out_host[0] && c.out_port) {

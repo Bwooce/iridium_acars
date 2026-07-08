@@ -74,6 +74,21 @@ typedef struct {
     int16_t  autotune_gain_max_dbx10; // upper bound of the swept gain range (tenths dB)
     uint8_t  autotune_gain_stride;    // coarse sweep: sample every Nth R828D step
 
+    // Boot-time + periodic auto-run (2026-07-08 boot/periodic extension).
+    // NVS keys "at_on_boot"/"at_g_ivl_s"/"at_lo_ivl_s". Consumed by
+    // autotune_sched.c; 0 for either interval = that clock disabled.
+    bool autotune_on_boot;             // run one calibration pass after the
+                                       // stream comes up stable at boot. Default
+                                       // FALSE — dev/smoke/normal reboots
+                                       // shouldn't eat a multi-minute cal.
+    uint32_t autotune_gain_interval_s; // periodic IRA gain re-cal period (s);
+                                       // RFI/thermal-driven, slow. Default 3600.
+    uint32_t autotune_lo_interval_s;   // periodic LO density re-scan period (s);
+                                       // SLOW center-tracking only — best-LO is
+                                       // mean-reverting (empirical finding), NOT
+                                       // momentum, so this must NOT be short
+                                       // (do not default 600). Default 3600.
+
     char     station_id[APP_CONFIG_STATION_ID_LEN]; // for upstream/log identification
     char     wifi_ssid[APP_CONFIG_WIFI_SSID_LEN];   // for D17 C6 wireless
     char     wifi_psk[APP_CONFIG_WIFI_PSK_LEN];     // for D17 C6 wireless
@@ -115,6 +130,9 @@ esp_err_t app_config_set_autotune_ira_lo_hz(uint32_t v);
 esp_err_t app_config_set_autotune_gain_min_dbx10(int16_t v);
 esp_err_t app_config_set_autotune_gain_max_dbx10(int16_t v);
 esp_err_t app_config_set_autotune_gain_stride(uint8_t v);
+esp_err_t app_config_set_autotune_on_boot(bool v);
+esp_err_t app_config_set_autotune_gain_interval_s(uint32_t v);
+esp_err_t app_config_set_autotune_lo_interval_s(uint32_t v);
 esp_err_t app_config_set_station_id(const char *id);
 esp_err_t app_config_set_wifi_ssid(const char *ssid);
 esp_err_t app_config_set_wifi_psk(const char *psk);
