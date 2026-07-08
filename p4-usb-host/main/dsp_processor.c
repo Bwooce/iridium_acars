@@ -325,6 +325,7 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     p->coalesce_min     = cfg.coalesce_min_bursts; // 0/1 = off (default)
 
     fft_burst_tagger_set_start(p->tagger, 0);
+    fft_burst_tagger_set_dc_mask(p->tagger, cfg.dcmask_lo, cfg.dcmask_hi);
     s_default = p; // publish for cross-task diagnostic readers
     return p;
 }

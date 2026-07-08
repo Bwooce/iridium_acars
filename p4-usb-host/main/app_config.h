@@ -58,6 +58,12 @@ typedef struct {
     // change. NVS key "coal_n".
     uint8_t coalesce_min_bursts;
 
+    // Near-DC tagger exclusion window (near-DC tagger-mask work). Signed
+    // FFT-bin offsets from DC; lo>hi = disabled. Applied at detector create
+    // and live-settable. NVS keys "dcmask_lo"/"dcmask_hi".
+    int16_t dcmask_lo;
+    int16_t dcmask_hi;
+
     char     station_id[APP_CONFIG_STATION_ID_LEN]; // for upstream/log identification
     char     wifi_ssid[APP_CONFIG_WIFI_SSID_LEN];   // for D17 C6 wireless
     char     wifi_psk[APP_CONFIG_WIFI_PSK_LEN];     // for D17 C6 wireless
@@ -92,6 +98,8 @@ esp_err_t app_config_set_gain_db_x10(int16_t v);
 esp_err_t app_config_set_bias_tee(bool on);
 esp_err_t app_config_set_tagger_threshold_db(float db);
 esp_err_t app_config_set_coalesce_min_bursts(uint8_t n);
+esp_err_t app_config_set_dcmask_lo(int16_t v);
+esp_err_t app_config_set_dcmask_hi(int16_t v);
 esp_err_t app_config_set_station_id(const char *id);
 esp_err_t app_config_set_wifi_ssid(const char *ssid);
 esp_err_t app_config_set_wifi_psk(const char *psk);
