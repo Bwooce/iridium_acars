@@ -42,9 +42,13 @@ to restart. Companion memory: `project_path_a_native_2500`,
 - **Frequency-prior is a NO-GO** for flood reduction. `/diag/histograms` (491k
   detections) shows RFI **densest INSIDE the ACARS band** (63% in 1620.75–1622)
   with a sharp near-LO peak (~1621.9, bins 17–19) that does NOT match real IDA
-  (reference peaks 1620.5–1621) → a local interferer / DC-LO-region artifact,
-  in-band, untouchable by a band prior. Real flood levers = **notch the near-LO
-  peak** + **raise `tag_thr`**.
+  (reference peaks 1620.5–1621) → a local RTL DC/LO artifact, in-band, untouchable
+  by a band prior. **CONFIRMED local (2026-07-08): the HydraSDR (same sky, 12-bit)
+  shows 1621.9 as ordinary (2127, == neighbors) — no spike.** It's our RTL
+  DC-offset spike (LO=1622; peak just below LO = near baseband DC) past #113 DC
+  removal — a chunk of our "flood" is self-inflicted. Real flood levers = **exclude
+  near-DC bins from the tagger burst mask** (kills the peak at source) + **raise
+  `tag_thr`** (residual broadband).
 - **Path A dissolved the PIE wedge** (one owner/core by construction). Old R1/R3/
   pie-retier branches are dead.
 - **IMS = dead/off-mission**: 0 IMS frames received in 14 h; planes use SBD-data
@@ -75,8 +79,9 @@ to restart. Companion memory: `project_path_a_native_2500`,
    bias-tee/antenna. 8-bit-ADC-under-RFI is the ceiling.
 
 **Flood / noise (tagger-side — the real levers, per the histogram):**
-3. **Notch/exclude the near-LO peak** (~1621.9, bins 17–19) — likely RTL DC/LO
-   spike past DC-removal (#113); ~66k detections in 3 bins. Most targeted win.
+3. **Exclude the near-DC bins from the tagger burst mask** (~1621.9, bins 17–19)
+   — CONFIRMED RTL DC/LO spike (HydraSDR clean at 1621.9, so it's local, not RF);
+   ~66k detections/window in 3 bins. Most targeted win, self-inflicted flood.
 4. **Raise `tag_thr`** — flood is high across ALL bins; a threshold bump cuts
    everywhere (cheap, one value). Judge by FRMDEC bch_ok/h, not burst counts.
 5. Verify P1.5 prefilter's per-burst FFT didn't worsen worker throughput (A/B).
