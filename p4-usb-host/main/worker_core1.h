@@ -79,6 +79,10 @@ typedef struct {
 } worker_histograms_t;
 void worker_core1_get_histograms(worker_histograms_t *out);
 
+// Copy the fine near-DC histogram (cumulative since boot). Copies
+// min(max, WORKER_DCFINE_BINS) entries; *total_out gets the sum (may be NULL).
+void worker_core1_get_dcfine(uint32_t *out, int max, uint32_t *total_out);
+
 // Smoke-only: dumps per-burst golden-bits comparison summary at the
 // end of the smoke run. Compiled to a no-op outside the
 // CONFIG_SMOKE_TEST_RAW_IRIDIUM build.

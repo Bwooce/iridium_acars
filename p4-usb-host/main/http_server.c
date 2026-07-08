@@ -23,6 +23,7 @@
 #include "esp_libusb.h"
 #include "fault_inject.h"
 #include "worker_core1.h"
+#include "worker_dcfine.h"
 #include "aggregator_ingest.h"
 #include "frame_link.h"
 #include "dsp_processor.h"
@@ -460,6 +461,34 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
     }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, n);
+}
+
+// /diag/dcfine — fine near-DC occupancy histogram (WORKER_DCFINE_BINS
+// buckets, ~1221 Hz each, DC ±234 kHz). Separate endpoint because the
+// 384-value array does not fit /diag/histograms' shared 3072-byte body.
+static esp_err_t diag_dcfine_get(httpd_req_t *req)
+{
+    static uint32_t dc[WORKER_DCFINE_BINS];
+    uint32_t        total = 0;
+    worker_core1_get_dcfine(dc, WORKER_DCFINE_BINS, &total);
+
+    char body[4096];
+    int  n = 0, m;
+    // bin0_Hz = -HALF * width; width = round(FS/N) = 1221. Consumer:
+    // offset_Hz(i) = bin0_Hz + i*width; i=HALF is DC.
+    m = snprintf(body, sizeof(body),
+                 "{\"dcfine_bin0_Hz\":%d,\"dcfine_bin_Hz_width\":1221,"
+                 "\"dcfine_total\":%u,\"dcfine\":[",
+                 -(WORKER_DCFINE_HALF * 1221), (unsigned)total);
+    if (m > 0) n = m;
+    for (int i = 0; i < WORKER_DCFINE_BINS; i++) {
+        if (n >= (int)sizeof(body) - 2) break;
+        m = snprintf(body + n, sizeof(body) - n, "%s%u", i ? "," : "", (unsigned)dc[i]);
+        if (m > 0) n += m;
+    }
+    if (n < (int)sizeof(body) - 2) n += snprintf(body + n, sizeof(body) - n, "]}");
+    httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, n);
 }
 
@@ -1666,6 +1695,7 @@ esp_err_t http_server_start(void)
         {.uri = "/", .method = HTTP_GET, .handler = index_get, .user_ctx = NULL},
         {.uri = "/status", .method = HTTP_GET, .handler = status_get, .user_ctx = NULL},
         {.uri = "/diag/histograms", .method = HTTP_GET, .handler = diag_histograms_get, .user_ctx = NULL},
+        {.uri = "/diag/dcfine", .method = HTTP_GET, .handler = diag_dcfine_get, .user_ctx = NULL},
         {.uri = "/diag/dsp_health", .method = HTTP_GET, .handler = diag_dsp_health_get, .user_ctx = NULL},
         {.uri = "/diag/recovery_counters", .method = HTTP_GET, .handler = diag_recovery_counters_get, .user_ctx = NULL},
         {.uri = "/messages", .method = HTTP_GET, .handler = messages_get, .user_ctx = NULL},

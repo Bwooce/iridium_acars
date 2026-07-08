@@ -285,6 +285,13 @@ add_executable(test_tagger_mag_ema_golden
 target_include_directories(test_tagger_mag_ema_golden PRIVATE ${COMMON_DIR})
 target_link_libraries(test_tagger_mag_ema_golden PRIVATE m)
 
+# Fine near-DC diagnostic bucket-index math (worker_dcfine.h), used to pin
+# the tuner-internal DC/LO artifact ahead of the near-DC tagger mask.
+add_executable(test_dcfine_index test_dcfine_index.c)
+target_include_directories(test_dcfine_index PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
+target_link_libraries(test_dcfine_index PRIVATE m)
+add_test(NAME test_dcfine_index COMMAND test_dcfine_index)
+
 # Phase 3.6.M: C direct-IF decimator vs Python scipy reference. For
 # one burst, runs the same rotate+decim in C and compares NMSE
 # against /tmp/host_direct_if/burst_NNN.cf32 (the Python output).

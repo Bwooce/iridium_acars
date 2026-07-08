@@ -40,6 +40,7 @@
 #include "bch_decoder.h"
 #include "frame_decoder.h"
 #include "iridium_frame.h"
+#include "worker_dcfine.h"
 #include "sdkconfig.h"
 
 #if CONFIG_SMOKE_TEST_RAW_IRIDIUM
@@ -285,6 +286,14 @@ static inline void hist_freq_record(float rel_freq_hz)
     if (bin < 0) bin = 0;
     if (bin >= HIST_FREQ_BINS) bin = HIST_FREQ_BINS - 1;
     s_hist_freq[bin]++;
+}
+
+static _Atomic uint32_t s_hist_dcfine[WORKER_DCFINE_BINS];
+
+static inline void hist_dcfine_record(float rel_freq_hz)
+{
+    int idx = worker_dcfine_index(rel_freq_hz);
+    if (idx >= 0) s_hist_dcfine[idx]++;
 }
 
 // Per-stage timing accumulators, summed over processed bursts only.
@@ -1249,6 +1258,7 @@ void worker_core1_push_burst(const detected_burst_t *burst)
     if (!s_pq_lock) return;
     s_bursts_queued++;
     hist_freq_record(burst->rel_freq_hz);                        // band occupancy of ALL detections
+    hist_dcfine_record((float)burst->rel_freq_hz);               // fine near-DC diagnostic
     hist_snr_record_into(s_hist_snr_pushed, burst->peak_snr_db); // P1.5c: SNR of ALL detections
     hist_duration_record_pushed(burst->length_samples);          // P1.5c: duration class of ALL detections
 
@@ -1332,6 +1342,18 @@ void worker_core1_get_histograms(worker_histograms_t *out)
     out->freq_total            = total_freq;
     out->snr_pushed_total      = total_snr_pushed;
     out->duration_pushed_total = total_duration_pushed;
+}
+
+void worker_core1_get_dcfine(uint32_t *out, int max, uint32_t *total_out)
+{
+    if (!out) return;
+    uint32_t total = 0;
+    int      n     = max < WORKER_DCFINE_BINS ? max : WORKER_DCFINE_BINS;
+    for (int i = 0; i < n; i++) {
+        out[i] = s_hist_dcfine[i];
+        total += s_hist_dcfine[i];
+    }
+    if (total_out) *total_out = total;
 }
 
 void worker_core1_get_stats(worker_stats_t *out)
