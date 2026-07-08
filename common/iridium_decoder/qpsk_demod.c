@@ -263,7 +263,7 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         // hard decisions for the first 12 symbols. Helps tell apart
         // "PLL never locked" (random hard_decisions) from "wrong
         // burst alignment" (decisions structured but offset).
-        ESP_LOGI(TAG,
+        ESP_LOGD(TAG,
                  "UW no match: dl_diffs=%d ul_diffs=%d omega=%.4f hd[0..11]=[%d %d %d %d %d %d %d %d %d %d %d %d]",
                  dl_diffs, ul_diffs, (double)omega_hat,
                  hard_decisions[0], hard_decisions[1], hard_decisions[2],
