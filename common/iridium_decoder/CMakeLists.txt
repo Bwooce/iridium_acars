@@ -77,6 +77,11 @@ idf_component_register(
         # and the host pipeline test. Single source of truth for the
         # gr-iridium-aligned D13 → CFO → RRC → UW → demod chain.
         "burst_pipeline.c"
+        # P1.5b cheap feature pre-discriminator (width + duration +
+        # in-band channel SNR) run at burst pop before the full retry
+        # pipeline; replaces the P1.5a UW/CFO fast-pass. Depends on
+        # fft_sc16_2048 (one 2048-pt FFT for the channel-SNR gate).
+        "burst_prefilter.c"
         # Phase 3.6.M wideband-tagger path. All portable C — same
         # source compiles for host unit tests and P4 firmware.
         # fft_sc16_2048 internals are scalar Q15; esp-dsp's

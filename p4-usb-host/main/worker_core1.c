@@ -34,6 +34,7 @@
 #include "uw_correlator.h"
 #include "sd_capture.h"
 #include "burst_pipeline.h"
+#include "burst_prefilter.h"
 #include "direct_if_decim.h"
 #include "rotate_to_dc.h"
 #include "bch_decoder.h"
@@ -119,8 +120,27 @@ static int pq_insert_locked(const detected_burst_t *b)
         s_pq[s_pq_count++] = *b;
         return 1;
     }
-    // Full: find the lowest-priority slot; replace only if the newcomer
-    // outranks it (narrowband-first, then SNR).
+    // Full. EVICT-STALE-FIRST: a burst admitted while fresh can go stale
+    // while it waits in the queue (backlog) — the producer laps its start
+    // sample, so the worker's pop-side guard is guaranteed to drop it. Such
+    // a slot is a doomed descriptor holding capacity hostage. Reclaim it
+    // for the (fresh) newcomer before touching any decodable burst. O(cap),
+    // one head read + a lag compare per slot. head_total is monotonic and
+    // >= every queued start, so head - start is the ring-lap distance
+    // (same >ring-span test the pop-side guard uses).
+    const uint64_t head = signal_buffer_head_total();
+    for (int i = 0; i < BURST_PQ_CAP; i++) {
+        // head is monotonic and normally >= start; the head > start guard
+        // just keeps the unsigned subtraction from wrapping in a pathological
+        // ordering (never wrongly evicts a fresh burst).
+        if (head > s_pq[i].start_sample_idx &&
+            head - s_pq[i].start_sample_idx > (uint64_t)SIGNAL_BUF_CAPACITY_COMPLEX) {
+            s_pq[i] = *b; // reclaim a doomed slot (occupied-slot give stands)
+            return 0;
+        }
+    }
+    // No stale slot: find the lowest-priority slot; replace only if the
+    // newcomer outranks it (narrowband-first, then SNR).
     int   min_i = 0;
     float min_s = burst_priority(&s_pq[0]);
     for (int i = 1; i < BURST_PQ_CAP; i++) {
@@ -194,6 +214,10 @@ static _Atomic uint32_t s_bursts_bch_chase_recovered = 0; // Chase-2 soft decode
 static _Atomic uint32_t s_bursts_triage_rejected = 0;
 static _Atomic uint64_t s_t_triage_rej_us        = 0; // pop→drop wall time of rejects
 static _Atomic uint64_t s_t_triage_us            = 0; // triage stage time of accepted bursts
+// P1.5b: burst_prefilter rejects (width/duration/channel-SNR). Mirrors the
+// triage-rejected count (the prefilter IS the fast-pass now) but is kept as
+// a distinct name so /status can attribute drops to the pre-filter.
+static _Atomic uint32_t s_bursts_prefilter_rejected = 0;
 
 // Diagnostic histograms (#116). Cumulative since boot — no decay /
 // rolling window; clients compute deltas if they want a rate.
@@ -968,65 +992,24 @@ void worker_task(void *arg)
             // rotate work counts under the decim timer.
             s_t_rotate_us += (uint64_t)(t_rot1 - t_rot0);
 
-            // 1. P1.5a TRIAGE: extract + decim a TRUNCATED head window
-            // (fixed cap TRIAGE_EXT_RAW, independent of tagged length —
-            // same start address / pre-pad / decim phase as the full
-            // window, purely shorter) and run the fast-pass verdict
-            // chain: identical steps 0-4 head + ONE try_decode_frame at
-            // slot 0 (gri's one-UW-attempt-per-slot). Junk pays ~one
-            // retry-iteration's cost instead of the full ~40-call retry
-            // loop; real bursts escalate to the unchanged full path
-            // below (re-extracted from the ring, so alignment and decode
-            // behaviour are bit-identical to the pre-triage worker).
-            uint32_t tri_len = ext_len;
-            if (tri_len > (uint32_t)TRIAGE_EXT_RAW) tri_len = (uint32_t)TRIAGE_EXT_RAW;
-            int64_t t_tri0 = esp_timer_get_time();
-            signal_buffer_invalidate_range(ext_start, tri_len);
-            int n_tri = wb_extract_decim(ext_start, tri_len, phase_step,
-                                         &burst, /*sd_tap=*/false);
-            // Same T38-style torn-read guard as the full pass: the
-            // producer can lap the window while we were reading it.
-            if (!signal_buffer_burst_valid(check_start, check_len)) {
-                uint64_t lag = signal_buffer_head_total() - burst.start_sample_idx;
-                ESP_LOGW(TAG, "stale burst: start=%llu lag=%lu ms (during triage read) — drop",
-                         (unsigned long long)burst.start_sample_idx,
-                         (unsigned long)(lag * 1000ULL / FS_DETECT_HZ));
-                s_bursts_skipped++;
-                continue;
-            }
-            if (n_tri <= 64) {
-                ESP_LOGD(TAG, "triage decim produced %d samples — too short",
-                         n_tri);
-                s_bursts_skipped++;
-                continue;
-            }
-            bool    tri_accept = burst_pipeline_triage(s_decim_buf, n_tri);
-            int64_t t_tri1     = esp_timer_get_time();
-            if (!tri_accept) {
-                s_bursts_triage_rejected++;
-                // Rejected bursts never reach s_burst_total_us; account
-                // their pop→drop wall time here so capacity math
-                // (worker_cap) still sees the triage load.
-                s_t_triage_rej_us += (uint64_t)(t_tri1 - burst_t0);
-                continue;
-            }
-            s_t_triage_us += (uint64_t)(t_tri1 - t_tri0);
-
-            // 2. ESCALATE — full window, exactly the pre-triage path.
+            // 1. EXTRACT — full window. (P1.5b: the P1.5a truncated-head
+            // TRIAGE + burst_pipeline_triage fast-pass that used to sit
+            // here was removed. That "fast pass" ran the expensive UW/CFO
+            // chain — the very FFT-bound work it was meant to avoid — and
+            // was single-attempt, so it rejected retry-recoverable real
+            // bursts. It is replaced by burst_prefilter() below, a cheap
+            // feature discriminator run AFTER extraction and BEFORE the
+            // ~94%-cost retry pipeline. See docs .../2026-07-07-triage-redesign.md.)
+            //
             // Invalidate L2 for the whole range so the per-chunk reads
             // see fresh DMA-written data (task #64: reads come straight
-            // from circular_buf, no PSRAM intermediate). The triage
-            // pass mutated s_decim_buf in place (DC removal / CFO
-            // rotation / RRC), so the full pass MUST re-extract from
-            // the ring — which also keeps decim phase and window
-            // alignment identical to today's full path (see the T45
-            // revert note at WB_PRE_PAD_SAMPLES).
+            // from circular_buf, no PSRAM intermediate).
             int64_t t_ext0 = esp_timer_get_time();
             signal_buffer_invalidate_range(ext_start, ext_len);
             int64_t t_ext1 = esp_timer_get_time();
             s_t_extract_us += (uint64_t)(t_ext1 - t_ext0);
 
-            // 3. Fused rotate-to-DC + 10× decim on internal-SRAM chunks
+            // 2. Fused rotate-to-DC + 10× decim on internal-SRAM chunks
             // (see wb_extract_decim; PSRAM is touched once, read-only).
             int64_t t_dec0 = esp_timer_get_time();
             int     n_250k = wb_extract_decim(ext_start, ext_len, phase_step,
@@ -1061,6 +1044,33 @@ void worker_task(void *arg)
                 s_bursts_skipped++;
                 continue;
             }
+
+            // 3. P1.5b PRE-FILTER (replaces the P1.5a UW/CFO fast-pass):
+            //    cheap feature discriminator on the full decimated 250 ksps
+            //    window — spectral width (tagger metadata), active-envelope
+            //    duration (O(N) time domain), and integrated in-band channel
+            //    SNR (one 2048-pt FFT). Rejects the documented bench junk
+            //    (broadband RFI, short impulses, flat noise) BEFORE the
+            //    multi-frame + retry pipeline where ~94% of per-burst cost
+            //    lives. Host-validated 0 false-rejects on real bursts
+            //    (tests/host/test_burst_prefilter.c). Does NOT mutate
+            //    s_decim_buf (DC removal is internal to its FFT segment), so
+            //    the pipeline below still sees the raw decimated window.
+            //    Rejection wall time flows through the existing triage
+            //    capacity counters (s_bursts_triage_rejected / s_t_triage_*).
+            int64_t                  t_pf0 = esp_timer_get_time();
+            burst_prefilter_result_t pf;
+            bool                     pf_accept =
+                burst_prefilter(s_decim_buf, n_250k,
+                                (int)BURST_WIDTH_BINS(&burst), &pf);
+            int64_t t_pf1 = esp_timer_get_time();
+            if (!pf_accept) {
+                s_bursts_prefilter_rejected++;
+                s_bursts_triage_rejected++; // surfaced via /status + worker_stats
+                s_t_triage_rej_us += (uint64_t)(t_pf1 - burst_t0);
+                continue;
+            }
+            s_t_triage_us += (uint64_t)(t_pf1 - t_pf0);
 
             // 3.5 Per-burst DC removal moved INSIDE burst_pipeline_process_burst
             //     as step 0 (2026-05-31, #128). Was at this site originally
@@ -1351,6 +1361,8 @@ void worker_core1_get_stats(worker_stats_t *out)
     uint32_t n_tri_rej =
         atomic_exchange_explicit(&s_bursts_triage_rejected, 0, memory_order_relaxed);
     out->bursts_triage_rejected = n_tri_rej;
+    out->bursts_prefilter_rejected =
+        atomic_exchange_explicit(&s_bursts_prefilter_rejected, 0, memory_order_relaxed);
     uint64_t t_triage =
         atomic_exchange_explicit(&s_t_triage_us, 0, memory_order_relaxed);
     uint64_t t_triage_rej =

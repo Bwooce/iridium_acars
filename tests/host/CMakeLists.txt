@@ -464,6 +464,36 @@ target_include_directories(test_triage_fast_pass PRIVATE
 target_link_libraries(test_triage_fast_pass PRIVATE m)
 add_test(NAME triage_fast_pass COMMAND test_triage_fast_pass)
 
+# P1.5b burst pre-filter validation (the redesign replacing P1.5a). Same
+# self-contained ALBQ harness as test_pipeline_wideband_resampled, but
+# runs burst_prefilter (cheap width + duration + in-band-channel-SNR
+# discriminator) on the full decimated window and cross-checks against the
+# full pipeline: positive control (every decode, incl. retry-loop
+# recoveries, must be accepted — 0 false-rejects), decode floor, and
+# synthetic width/duration/SNR junk rejection.
+add_executable(test_burst_prefilter
+    test_burst_prefilter.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/burst_prefilter.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_burst_prefilter PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_burst_prefilter PRIVATE m)
+add_test(NAME burst_prefilter COMMAND test_burst_prefilter)
+
 # Drift + AWGN parameter-sweep regression (#121). Same wideband pipeline
 # as test_pipeline_wideband_resampled, but each cell applies a synthetic
 # LO drift (±5/10/15 kHz) and added AWGN (sigma 0..400 int16 LSB), then
