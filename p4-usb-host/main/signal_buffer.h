@@ -16,6 +16,15 @@
 // Multiple of 64 (wrap-path DMA alignment) and /2 is a multiple of 32.
 #define SIGNAL_BUF_SIZE (16 * 1024 * 1024)
 
+// Ring capacity in COMPLEX samples — the SINGLE source of truth. The ring
+// stores int8 IQ = 2 bytes/complex, so capacity = SIGNAL_BUF_SIZE/2. EVERY
+// stale/ring-span/lap check (signal_buffer.c's total_cap AND worker_core1.c's
+// pre-reject + lag log) MUST derive from this, never a hardcoded /N: when the
+// element width last changed (int16->int8) the worker's private SIGNAL_BUF_SIZE/4
+// copies silently kept the old half-size capacity and rejected still-valid
+// bursts, defeating the larger window. Centralised so that can't recur.
+#define SIGNAL_BUF_CAPACITY_COMPLEX (SIGNAL_BUF_SIZE / 2)
+
 esp_err_t signal_buffer_init();
 void      signal_buffer_push(const int16_t *samples, size_t n_samples);
 

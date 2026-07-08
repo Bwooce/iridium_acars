@@ -926,7 +926,7 @@ void worker_task(void *arg)
                     ESP_LOGW(TAG, "stale burst: start=%llu lag=%lu ms (%.2f ring-spans) snr=%.1f — drop",
                              (unsigned long long)burst.start_sample_idx,
                              (unsigned long)(lag * 1000ULL / FS_DETECT_HZ),
-                             (double)lag / (double)(SIGNAL_BUF_SIZE / 4),
+                             (double)lag / (double)(SIGNAL_BUF_CAPACITY_COMPLEX),
                              (double)burst.peak_snr_db);
                 }
                 s_bursts_skipped++;
@@ -1254,7 +1254,7 @@ void worker_core1_push_burst(const detected_burst_t *burst)
     //  (b) the producer has already lapped the window's oldest sample
     //      (same envelope the worker's pop-side check uses).
     {
-        const uint64_t ring_span   = SIGNAL_BUF_SIZE / 4; // complex samples
+        const uint64_t ring_span   = SIGNAL_BUF_CAPACITY_COMPLEX; // complex samples
         const uint64_t check_start = burst->start_sample_idx - WB_PRE_PAD_SAMPLES;
         const uint64_t check_len   = (uint64_t)burst->length_samples + WB_PRE_PAD_SAMPLES;
         const uint64_t head        = signal_buffer_head_total();

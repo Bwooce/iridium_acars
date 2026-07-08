@@ -300,7 +300,7 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
 {
     if (!circular_buf || !s_dma) return;
 
-    const uint32_t total_cap = SIGNAL_BUF_SIZE / 2; // complex samples
+    const uint32_t total_cap = SIGNAL_BUF_CAPACITY_COMPLEX; // complex samples
 
     // Cache-line alignment via carry-forward (#125). Available = previous
     // carry + this push. If less than ALIGN_COMPLEX (32), accumulate in
@@ -556,7 +556,7 @@ uint64_t signal_buffer_stream_epoch_us(void)
 
 bool signal_buffer_burst_valid(uint64_t start_idx, uint32_t length)
 {
-    const uint32_t total_cap = SIGNAL_BUF_SIZE / 2;
+    const uint32_t total_cap = SIGNAL_BUF_CAPACITY_COMPLEX;
     if (length == 0 || length >= total_cap) return false;
 
     // T44: absolute-index staleness. `start_idx` is the tagger's 64-bit
@@ -602,7 +602,7 @@ static void invalidate_ring_segment(uint8_t *base, size_t off, size_t len)
 void signal_buffer_invalidate_range(uint32_t start_idx, uint32_t length)
 {
     if (!circular_buf) return;
-    const uint32_t total_cap     = SIGNAL_BUF_SIZE / 2;
+    const uint32_t total_cap     = SIGNAL_BUF_CAPACITY_COMPLEX;
     uint32_t       actual_start  = start_idx % total_cap;
     size_t         bytes_to_read = length * 2;
     uint8_t       *base          = (uint8_t *)circular_buf;
@@ -620,7 +620,7 @@ void signal_buffer_invalidate_range(uint32_t start_idx, uint32_t length)
 void signal_buffer_read_chunk(uint32_t start_idx, uint32_t length, int16_t *dest)
 {
     if (!circular_buf) return;
-    const uint32_t total_cap    = SIGNAL_BUF_SIZE / 2;
+    const uint32_t total_cap    = SIGNAL_BUF_CAPACITY_COMPLEX;
     uint32_t       actual_start = start_idx % total_cap;
     // Expand int8 ring back to the int16 public API: int16 = int8 << 8
     // (bit-exact inverse of the push-side >>8 narrow). int8 -> int32 is
