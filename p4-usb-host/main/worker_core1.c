@@ -205,6 +205,15 @@ static _Atomic uint32_t s_bursts_bch_decoded         = 0; // BCH OK AND classify
 static _Atomic uint32_t s_bursts_bch_unknown         = 0; // BCH OK but iridium_frame_classify => IR_FRAME_UNKNOWN (BCH false-positive — task #111)
 static _Atomic uint32_t s_bursts_bch_failed          = 0; // BCH itself uncorrectable
 static _Atomic uint32_t s_bursts_bch_chase_recovered = 0; // Chase-2 soft decoder rescued a hard-decision BCH failure (#112)
+// Cumulative-since-boot BCH decode counters for autotune. The window
+// counters above are drained (exchange-with-zero) by worker_core1_get_stats
+// every second from status_logger; a second reader (the autotune gain sweep)
+// would steal counts from status_logger and vice versa. These parallel
+// counters are NEVER reset, so autotune reads a start/end snapshot and takes
+// the delta over its dwell window without racing the periodic drain — same
+// cumulative pattern as worker_core1_get_histograms().
+static _Atomic uint32_t s_bch_decoded_cum = 0;
+static _Atomic uint32_t s_bch_unknown_cum = 0;
 // P1.5a triage counters. rejected = the fast-pass verdict found no
 // frame at the single-attempt criterion, so the burst was dropped
 // WITHOUT paying the full retry-loop/multi-frame cost. Rejected
@@ -791,6 +800,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
                          e1_bch, e2_bch,
                          iridium_frame_type_name(classified.type));
                 s_bursts_bch_decoded++;
+                s_bch_decoded_cum++;
                 real_known = true;
             } else {
                 ESP_LOGD(TAG, "BCH PASS but UNKNOWN: errors=%d/%d "
@@ -798,6 +808,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
                               "a valid codeword with no frame structure)",
                          e1_bch, e2_bch);
                 s_bursts_bch_unknown++;
+                s_bch_unknown_cum++;
             }
         } else {
             ESP_LOGD(TAG, "BCH FAIL: e1=%d e2=%d (false-positive "
@@ -1354,6 +1365,15 @@ void worker_core1_get_dcfine(uint32_t *out, int max, uint32_t *total_out)
         total += s_hist_dcfine[i];
     }
     if (total_out) *total_out = total;
+}
+
+void worker_core1_get_decode_counts(uint32_t *decoded, uint32_t *unknown)
+{
+    // Non-resetting reads of the cumulative-since-boot counters. Autotune
+    // takes a delta across its dwell window; unaffected by the periodic
+    // worker_core1_get_stats() drain that status_logger runs.
+    if (decoded) *decoded = atomic_load_explicit(&s_bch_decoded_cum, memory_order_relaxed);
+    if (unknown) *unknown = atomic_load_explicit(&s_bch_unknown_cum, memory_order_relaxed);
 }
 
 void worker_core1_get_stats(worker_stats_t *out)

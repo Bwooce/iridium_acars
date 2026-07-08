@@ -49,6 +49,13 @@ typedef struct {
 
 void worker_core1_get_stats(worker_stats_t *out);
 
+// Cumulative-since-boot BCH decode counters (bch_decoded / bch_unknown).
+// Unlike worker_core1_get_stats(), this does NOT reset — it is a plain read
+// so multiple readers (status_logger's periodic drain and the autotune gain
+// sweep) don't steal counts from each other. Autotune snapshots at the start
+// and end of each dwell window and uses the delta. Either pointer may be NULL.
+void worker_core1_get_decode_counts(uint32_t *decoded, uint32_t *unknown);
+
 // Diagnostic histograms (#116). Cumulative since boot; clients compute
 // deltas if they want a rate. Closes the design-review gap that /status
 // alone can't distinguish "antenna empty" from "demod broken in a new way."
