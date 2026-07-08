@@ -1,5 +1,6 @@
 #include "serial_cmd.h"
 #include "app_config.h"
+#include "dsp_processor.h"
 #include "scanner.h"
 #include "wifi_link.h"
 #include "driver/uart.h"
@@ -137,6 +138,17 @@ static void cmd_set(const char *key, const char *val)
     else {
         uart_puts("ERR unknown key\r\n");
         return;
+    }
+
+    // dcmask_lo/hi must take effect on the running tagger immediately (bench
+    // tuning loop), not just at the next detector-create/reboot. Re-apply
+    // from the just-committed NVS-backed config so both bounds reflect
+    // current state even though only one of the pair changed this call.
+    if (rc == ESP_OK &&
+        (strcmp(key, "dcmask_lo") == 0 || strcmp(key, "dcmask_hi") == 0)) {
+        app_config_t c;
+        app_config_snapshot(&c);
+        dsp_processor_apply_dc_mask(c.dcmask_lo, c.dcmask_hi);
     }
 
     if (rc == ESP_OK) {

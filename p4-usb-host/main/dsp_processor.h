@@ -149,4 +149,12 @@ typedef struct {
 void dsp_processor_read_reset_density(dsp_processor_t *p, dsp_density_t *out);
 void dsp_processor_reset_tagger_baseline(dsp_processor_t *p);
 
+// Re-apply the near-DC exclusion window to the live (already-created)
+// tagger, so `set dcmask_lo`/`set dcmask_hi` over serial take effect
+// immediately instead of only on the next detector-create/reboot. Safe
+// to call before the first dsp_processor_create() (falls through to a
+// NULL tagger pointer, which fft_burst_tagger_set_dc_mask ignores since
+// the window is process-global).
+void dsp_processor_apply_dc_mask(int16_t lo, int16_t hi);
+
 #endif

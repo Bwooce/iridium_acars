@@ -335,6 +335,16 @@ dsp_processor_t *dsp_processor_default(void)
     return s_default;
 }
 
+// Cross-task write of two int globals inside fft_burst_tagger (s_dc_mask_lo/
+// s_dc_mask_hi), read once per FFT step by the Core-0 scan loop. Not mutex
+// guarded: worst case one FFT step observes a half-updated window (one bound
+// old, one new) before the next step sees both new values — harmless, since
+// the window only gates new-burst declaration, not the noise-floor EMA.
+void dsp_processor_apply_dc_mask(int16_t lo, int16_t hi)
+{
+    fft_burst_tagger_set_dc_mask(s_default ? s_default->tagger : NULL, lo, hi);
+}
+
 void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_samples)
 {
     // n_samples is complex IQ pairs. At FS_DETECT_HZ the typical USB
