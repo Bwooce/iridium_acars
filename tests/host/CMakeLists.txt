@@ -312,6 +312,13 @@ add_executable(test_autotune_gainset test_autotune_gainset.c)
 target_include_directories(test_autotune_gainset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
 add_test(NAME test_autotune_gainset COMMAND test_autotune_gainset)
 
+# Autotune boot-time + periodic auto-run: pure "is this interval due"
+# arithmetic (autotune_sched.h), factored out of the device autotune_sched.c
+# task so the scheduling logic is host-testable without FreeRTOS/esp_timer.
+add_executable(test_autotune_sched test_autotune_sched.c)
+target_include_directories(test_autotune_sched PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
+add_test(NAME test_autotune_sched COMMAND test_autotune_sched)
+
 # Phase 3.6.M: C direct-IF decimator vs Python scipy reference. For
 # one burst, runs the same rotate+decim in C and compares NMSE
 # against /tmp/host_direct_if/burst_NNN.cf32 (the Python output).

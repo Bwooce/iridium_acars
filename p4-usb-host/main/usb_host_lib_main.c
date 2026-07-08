@@ -32,6 +32,7 @@
 #include "frame_link.h"
 #include "esp_iot_log.h"
 #include "esp_heap_caps.h"
+#include "autotune_sched.h"
 
 // One-line snapshot of internal-DMA-capable heap (the pool the USB
 // transfer ring competes for). Temporary diagnostic for the SD-link
@@ -376,6 +377,15 @@ void app_main(void)
                             CLASS_TASK_PRIORITY,
                             &class_driver_task_hdl,
                             0);
+
+    // Autotune boot-time + periodic auto-run (2026-07-08 boot/periodic
+    // extension): low-priority task that waits for the USB stream to come
+    // up live, optionally runs one calibration pass (autotune_on_boot), then
+    // re-fires the gain/LO clocks independently forever. No-op (stays
+    // parked) unless gain_mode is MANUAL. Safe to start now -- it blocks on
+    // stream liveness before touching the scanner/detector that
+    // class_driver_task is about to create.
+    autotune_sched_init();
 
     vTaskDelay(10); // Add a short delay to let the tasks run
 
