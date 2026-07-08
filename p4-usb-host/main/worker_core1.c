@@ -1258,7 +1258,7 @@ void worker_core1_push_burst(const detected_burst_t *burst)
     if (!s_pq_lock) return;
     s_bursts_queued++;
     hist_freq_record(burst->rel_freq_hz);                        // band occupancy of ALL detections
-    hist_dcfine_record((float)burst->rel_freq_hz);               // fine near-DC diagnostic
+    hist_dcfine_record(burst->rel_freq_hz);                      // fine near-DC diagnostic
     hist_snr_record_into(s_hist_snr_pushed, burst->peak_snr_db); // P1.5c: SNR of ALL detections
     hist_duration_record_pushed(burst->length_samples);          // P1.5c: duration class of ALL detections
 

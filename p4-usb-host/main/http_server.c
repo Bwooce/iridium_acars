@@ -473,14 +473,14 @@ static esp_err_t diag_dcfine_get(httpd_req_t *req)
     uint32_t        total = 0;
     worker_core1_get_dcfine(dc, WORKER_DCFINE_BINS, &total);
 
-    char body[4096];
-    int  n = 0, m;
-    // bin0_Hz = -HALF * width; width = round(FS/N) = 1221. Consumer:
-    // offset_Hz(i) = bin0_Hz + i*width; i=HALF is DC.
+    static char body[4096];
+    int         n = 0, m;
+    // bin0_Hz = -HALF * width; width = WORKER_DCFINE_BIN_HZ_REPORT = round(FS/N) = 1221.
+    // Consumer: offset_Hz(i) = bin0_Hz + i*width; i=HALF is DC.
     m = snprintf(body, sizeof(body),
-                 "{\"dcfine_bin0_Hz\":%d,\"dcfine_bin_Hz_width\":1221,"
+                 "{\"dcfine_bin0_Hz\":%d,\"dcfine_bin_Hz_width\":%d,"
                  "\"dcfine_total\":%u,\"dcfine\":[",
-                 -(WORKER_DCFINE_HALF * 1221), (unsigned)total);
+                 WORKER_DCFINE_BIN0_HZ_REPORT, WORKER_DCFINE_BIN_HZ_REPORT, (unsigned)total);
     if (m > 0) n = m;
     for (int i = 0; i < WORKER_DCFINE_BINS; i++) {
         if (n >= (int)sizeof(body) - 2) break;

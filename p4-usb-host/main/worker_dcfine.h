@@ -11,6 +11,12 @@
 #define WORKER_DCFINE_HALF 192
 #define WORKER_DCFINE_BINS (2 * WORKER_DCFINE_HALF) // 384
 
+// Rounded bin width for human-readable JSON reporting only (diag_dcfine_get).
+// The exact value used for *bucketing* in worker_dcfine_index() below is the
+// unrounded 2048.0f/2500000.0f; do not use these for index math.
+#define WORKER_DCFINE_BIN_HZ_REPORT 1221
+#define WORKER_DCFINE_BIN0_HZ_REPORT (-(WORKER_DCFINE_HALF * WORKER_DCFINE_BIN_HZ_REPORT))
+
 // Map a detection's offset-from-LO (Hz) to a fine-histogram bucket.
 // Returns 0..WORKER_DCFINE_BINS-1, or -1 if outside the ±HALF window.
 static inline int worker_dcfine_index(float rel_freq_hz)
