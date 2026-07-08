@@ -305,6 +305,13 @@ target_include_directories(test_dcfine_index PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(test_dcfine_index PRIVATE m)
 add_test(NAME test_dcfine_index COMMAND test_dcfine_index)
 
+# Autotune gain-set generation + inverted-U peak-pick selection
+# (autotune_gainset.h). Pure R828D-step arithmetic, factored out of the
+# device autotune.c so the sweep/selection logic is host-testable.
+add_executable(test_autotune_gainset test_autotune_gainset.c)
+target_include_directories(test_autotune_gainset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
+add_test(NAME test_autotune_gainset COMMAND test_autotune_gainset)
+
 # Phase 3.6.M: C direct-IF decimator vs Python scipy reference. For
 # one burst, runs the same rotate+decim in C and compares NMSE
 # against /tmp/host_direct_if/burst_NNN.cf32 (the Python output).
