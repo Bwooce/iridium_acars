@@ -58,6 +58,21 @@ static inline uint64_t fbt_now_us(void)
 
 #define N FBT_FFT_SIZE
 
+// Configurable near-DC exclusion window (near-DC tagger-mask work,
+// 2026-07-08). Signed FFT-bin offsets from DC (N/2). lo>hi = DISABLED.
+// File-static (not a struct field) so sizeof(fft_burst_tagger_t) stays
+// byte-identical — growing the struct trips the P4 PIE position bug.
+// Matches the tagger's existing singleton file-static idiom (s_clamp_run).
+static int s_dc_mask_lo = 1; // default: empty range => disabled
+static int s_dc_mask_hi = -1;
+
+static inline bool bin_in_dc_mask(int bin)
+{
+    int lo = (N / 2) + s_dc_mask_lo;
+    int hi = (N / 2) + s_dc_mask_hi;
+    return bin >= lo && bin <= hi; // false for all bins when lo>hi
+}
+
 // ESP32-P4 PIE (arp4) 8-lane kernels for the two per-bin hot loops.
 // Defined in fft_burst_tagger_arp4.S, which self-gates on the same
 // condition so it compiles to nothing on host / non-PIE targets. When
@@ -589,6 +604,16 @@ void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start)
     t->d_index = start;
 }
 
+void fft_burst_tagger_set_dc_mask(fft_burst_tagger_t *t, int lo, int hi)
+{
+    (void)t; // window is process-global (single detector); t kept for API symmetry
+    // Clamp so DC+lo / DC+hi stay in [0, N-1]; an inverted range = disabled.
+    if (lo < -(N / 2)) lo = -(N / 2);
+    if (hi > (N / 2) - 1) hi = (N / 2) - 1;
+    s_dc_mask_lo = lo;
+    s_dc_mask_hi = hi;
+}
+
 // Pure scalar Q15 window-multiply kernel. Exported (declared in
 // fft_burst_tagger.h) so the host golden-fixture harness
 // (tests/host/test_window_multiply_golden.c) exercises the EXACT
@@ -753,7 +778,7 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
 
     int margin = t->burst_width / 2;
     for (int bin = margin; bin < N - margin; bin++) {
-        if (!t->burst_mask[bin]) continue;
+        if (!t->burst_mask[bin] || bin_in_dc_mask(bin)) continue;
         int32_t mag2 = t->magnitude_shifted[bin];
         int32_t base = t->baseline_sum[bin];
         if (above_threshold(mag2, base, t->threshold_q15)) {

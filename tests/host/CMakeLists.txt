@@ -257,6 +257,19 @@ target_include_directories(test_fft_burst_tagger PRIVATE
 )
 target_link_libraries(test_fft_burst_tagger PRIVATE m)
 
+# Configurable near-DC exclusion window (near-DC tagger-mask, Task 2):
+# TDD for fft_burst_tagger_set_dc_mask. Mirrors test_fft_burst_tagger's
+# source list / include dirs (compiles fft_burst_tagger.c directly).
+add_executable(test_tagger_dc_mask
+    test_tagger_dc_mask.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_tagger_dc_mask PRIVATE
+    ${COMMON_DIR}
+)
+target_link_libraries(test_tagger_dc_mask PRIVATE m)
+
 # T50 golden-fixture bit-exact harness for the tagger window-multiply
 # (chain C prerequisite, perf-decoupling design 2026-07-04 §T50). Pins
 # the scalar fbt_window_multiply_q15 output over deterministic vectors
@@ -1149,6 +1162,7 @@ add_test(NAME resample_split        COMMAND test_resample_split)
 add_test(NAME resample_tile         COMMAND test_resample_tile)
 add_test(NAME resample_pie_model    COMMAND test_resample_pie_model)
 add_test(NAME fft_burst_tagger      COMMAND test_fft_burst_tagger)
+add_test(NAME test_tagger_dc_mask   COMMAND test_tagger_dc_mask)
 add_test(NAME test_scanner_tagger_reset COMMAND test_scanner_tagger_reset)
 add_test(NAME tagger_latch_release  COMMAND test_tagger_latch_release)
 add_test(NAME tagger_carrier_absorption COMMAND test_tagger_carrier_absorption)

@@ -129,6 +129,13 @@ void fft_burst_tagger_destroy(fft_burst_tagger_t *t);
 // steps advance by FBT_FFT_SIZE each. Call once after init.
 void fft_burst_tagger_set_start(fft_burst_tagger_t *t, uint64_t start);
 
+// Set the near-DC new-burst exclusion window. `lo`/`hi` are signed FFT-bin
+// offsets from DC (N/2); bins in [DC+lo, DC+hi] can never spawn a new burst.
+// `lo > hi` disables the window (default). Process-global (single detector);
+// safe to call live to re-tune. Does not affect the noise-floor EMA — only
+// new-burst declaration.
+void fft_burst_tagger_set_dc_mask(fft_burst_tagger_t *t, int lo, int hi);
+
 // Process one FFT-size chunk of complex int16 samples.
 //
 // `input` must point to 2*FBT_FFT_SIZE int16 (FBT_FFT_SIZE complex IQ).
