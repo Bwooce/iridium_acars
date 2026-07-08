@@ -1,4 +1,5 @@
 #include <string.h>
+#include <assert.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
@@ -18,24 +19,28 @@ static const char *TAG = "SIG_BUF";
 // an earlier comment claimed — MSPI-750 is a v3.0-only erratum and does
 // not affect our v1.x silicon; it's also about USB/SDMMC unaligned reads,
 // not GDMA writes.) The real concern is purely GDMA arbitration mode: our
-// PSRAM writes use 4-byte alignment (n_samples * 4 bytes per transfer,
-// head_bytes = head * 4 for the destination offset), which GDMA accepts
+// PSRAM writes use 2-byte alignment (n_samples * 2 bytes per transfer,
+// head_bytes = head * 2 for the destination offset), which GDMA accepts
 // while weighted-arbitration is OFF. If a future build turns on
 // CONFIG_GDMA_ENABLE_WEIGHTED_ARBITRATION, GDMA raises the required
-// alignment to dma_burst_size (= 64 below) and our 4-byte-multiple
+// alignment to dma_burst_size (= 64 below) and our 2-byte-multiple
 // lengths could fail validation, silently dropping into a slow fallback
 // or returning an error. Catch that at compile time.
 #ifdef CONFIG_GDMA_ENABLE_WEIGHTED_ARBITRATION
 _Static_assert(0,
                "GDMA weighted arbitration raises alignment to dma_burst_size; review "
-               "signal_buffer_push's 4-byte multiples vs dma_burst_size=64 before "
+               "signal_buffer_push's 2-byte multiples vs dma_burst_size=64 before "
                "enabling.");
 #endif
 
-// 4 MB circular buffer in PSRAM. int16 IQ pairs:
-//   circular_buf[head*2 + 0] = I
-//   circular_buf[head*2 + 1] = Q
-static int16_t *circular_buf = NULL;
+// 16 MB circular buffer in PSRAM. int8 IQ pairs, each = (I>>8),(Q>>8):
+//   circular_buf[head*2 + 0] = I>>8
+//   circular_buf[head*2 + 1] = Q>>8
+// The RTL ADC is 8-bit and ingest's uint8->int16 conversion is exactly
+// (byte-128)<<8, so the low 8 bits of every stored int16 are always zero.
+// Storing int8 = int16>>8 and re-expanding int16 = int8<<8 at read time is
+// bit-exact lossless, halves ring memory / DMA bytes, and doubles the window.
+static int8_t  *circular_buf = NULL;
 static uint32_t head         = 0; // in complex samples
 
 // T44: 64-bit monotonic cumulative complex-sample counter. `head` alone is
@@ -83,10 +88,10 @@ static uint64_t read_head_total(void)
 static async_memcpy_handle_t s_dma = NULL;
 
 // 64-byte cache-line alignment infrastructure for the DMA path (#125).
-// Pre-quick-wins, signal_buffer_push passed raw n_complex×4 byte lengths
+// Pre-quick-wins, signal_buffer_push passed raw n_complex×2 byte lengths
 // straight to esp_async_memcpy. The destination offset (head_bytes) is
-// 64-aligned at allocation, but advanced by n_complex×4 each push — so
-// any push with n_complex not a multiple of 16 left head_bytes mis-
+// 64-aligned at allocation, but advanced by n_complex×2 each push — so
+// any push with n_complex not a multiple of 32 left head_bytes mis-
 // aligned for the NEXT push. GDMA then fell into the cache-alignment
 // split path on every push, which itself allocates a "stash buffer" per
 // transfer from DMA-INT — at ~300/min that path overran fragmentation
@@ -94,22 +99,22 @@ static async_memcpy_handle_t s_dma = NULL;
 // #106/#107 absorbed the visible ESP_ERR_NO_MEM hits, but ~0.16% of
 // chunks were silently dropped each minute.
 //
-// Fix: round each push down to a 16-complex (64-byte) multiple and
-// carry the 0..15-complex tail forward into the next push. All DMA
+// Fix: round each push down to a 32-complex (64-byte) multiple and
+// carry the 0..31-complex tail forward into the next push. All DMA
 // submits now use 64-byte-aligned src offset (start of scratch),
 // 64-byte-aligned dest offset (head_bytes always advances by multiples
 // of 64), and 64-byte-multiple length. No more split path triggered.
 //
 // Scratch must be DMA-readable and 64-aligned. PSRAM (cap-DMA) is fine
 // for source; sized to fit one max push (INGEST_SLOT_ELEMS complex =
-// 32 KB).
-#define ALIGN_COMPLEX 16 // 16 complex × 4 B = 64 B = one cache line
-#define ALIGN_BYTES (ALIGN_COMPLEX * 4)
-#define ALIGN_SCRATCH_MAX_BYTES (16 * 1024 * 4) // 16 K complex × 4 B = 64 KB
-static int16_t *s_align_scratch = NULL;
-// Carry: 0..15 complex samples = at most 60 bytes of "left over" from
+// 32 KB int8).
+#define ALIGN_COMPLEX 32 // 32 complex × 2 B = 64 B = one cache line
+#define ALIGN_BYTES (ALIGN_COMPLEX * 2)
+#define ALIGN_SCRATCH_MAX_BYTES (16 * 1024 * 2) // 16 K complex × 2 B = 32 KB
+static int8_t *s_align_scratch = NULL;
+// Carry: 0..31 complex samples = at most 62 bytes of "left over" from
 // the previous push, prepended to the next push so no samples are lost.
-static int16_t s_carry[ALIGN_COMPLEX * 2]; // 16 complex × 2 int16 = 64 B
+static int8_t  s_carry[ALIGN_COMPLEX * 2]; // 32 complex × 2 int8 = 64 B
 static uint8_t s_carry_n_complex = 0;
 
 // Binary semaphore given by the completion ISR. Pre-given at init so the
@@ -295,15 +300,25 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
 {
     if (!circular_buf || !s_dma) return;
 
-    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4; // complex samples
+    const uint32_t total_cap = SIGNAL_BUF_SIZE / 2; // complex samples
 
     // Cache-line alignment via carry-forward (#125). Available = previous
-    // carry + this push. If less than ALIGN_COMPLEX (16), accumulate in
+    // carry + this push. If less than ALIGN_COMPLEX (32), accumulate in
     // carry and return — no DMA this cycle, no head advance.
     size_t total_avail = (size_t)s_carry_n_complex + n_samples;
     if (total_avail < ALIGN_COMPLEX) {
         if (n_samples > 0) {
-            memcpy(s_carry + (size_t)s_carry_n_complex * 2, samples, n_samples * 4);
+            // Narrow int16 -> int8 (each stored int8 = int16 >> 8). The low
+            // byte is always zero (RTL 8-bit ADC via (byte-128)<<8), so the
+            // shift is bit-exact lossless.
+            for (size_t i = 0; i < n_samples; i++) {
+                assert(((uint16_t)samples[i * 2 + 0] & 0xFF) == 0);
+                assert(((uint16_t)samples[i * 2 + 1] & 0xFF) == 0);
+                s_carry[((size_t)s_carry_n_complex + i) * 2 + 0] =
+                    (int8_t)(samples[i * 2 + 0] >> 8);
+                s_carry[((size_t)s_carry_n_complex + i) * 2 + 1] =
+                    (int8_t)(samples[i * 2 + 1] >> 8);
+            }
             s_carry_n_complex = (uint8_t)total_avail;
         }
         return;
@@ -313,14 +328,14 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
     // samples become the new carry for the next push (no sample loss).
     size_t aligned_count   = total_avail & ~((size_t)(ALIGN_COMPLEX - 1));
     size_t new_carry_count = total_avail - aligned_count;
-    size_t aligned_bytes   = aligned_count * 4;
+    size_t aligned_bytes   = aligned_count * 2;
     // Sanity: scratch is sized for one max push; very large overruns are
     // a caller error. Clamp defensively rather than overflow.
     if (aligned_bytes > (size_t)ALIGN_SCRATCH_MAX_BYTES) {
         ESP_LOGW(TAG, "push %u complex exceeds scratch (%d B max) — clamping",
                  (unsigned)aligned_count, (int)ALIGN_SCRATCH_MAX_BYTES);
         aligned_bytes   = ALIGN_SCRATCH_MAX_BYTES & ~((size_t)63);
-        aligned_count   = aligned_bytes / 4;
+        aligned_count   = aligned_bytes / 2;
         new_carry_count = total_avail - aligned_count;
         // The carry buffer holds at most ALIGN_COMPLEX-1 samples and its
         // count is a uint8_t. An oversized push would overflow both —
@@ -350,15 +365,21 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
     //   [s_carry_n_complex carry samples] then [aligned_count - s_carry_n
     //    samples from caller's src]. Both copies into 64-aligned scratch,
     //    cumulative length = aligned_bytes (multiple of 64).
-    size_t carry_bytes = (size_t)s_carry_n_complex * 4;
+    size_t carry_bytes = (size_t)s_carry_n_complex * 2;
     size_t src_take    = aligned_count - s_carry_n_complex;
     if (carry_bytes) {
+        // int8 carry -> int8 scratch: plain byte copy, no narrowing.
         memcpy(s_align_scratch, s_carry, carry_bytes);
     }
-    memcpy(((uint8_t *)s_align_scratch) + carry_bytes, samples, src_take * 4);
+    // Narrow the caller's int16 source into the int8 scratch after the carry.
+    // src_take complex = src_take*2 int16 values -> src_take*2 int8 values.
+    for (size_t j = 0; j < src_take * 2; j++) {
+        assert(((uint16_t)samples[j] & 0xFF) == 0);
+        s_align_scratch[carry_bytes + j] = (int8_t)(samples[j] >> 8);
+    }
 
     uint8_t *dst_base     = (uint8_t *)circular_buf;
-    uint32_t head_bytes   = head * 4; // 64-aligned by invariant (#125)
+    uint32_t head_bytes   = head * 2; // 64-aligned by invariant (#125)
     size_t   bytes_to_end = (uint32_t)SIGNAL_BUF_SIZE - head_bytes;
 
     esp_err_t r;
@@ -501,9 +522,14 @@ void signal_buffer_push(const int16_t *samples, size_t n_samples)
     s_head_total_seq++; // -> even: consistent
 
     // Update carry with the tail of THIS push's source (samples we deferred).
+    // Narrow int16 -> int8 as we stash (each = int16 >> 8, low byte zero).
     if (new_carry_count) {
         size_t tail_offset_complex = n_samples - new_carry_count;
-        memcpy(s_carry, samples + tail_offset_complex * 2, new_carry_count * 4);
+        for (size_t k = 0; k < new_carry_count * 2; k++) {
+            int16_t v = samples[tail_offset_complex * 2 + k];
+            assert(((uint16_t)v & 0xFF) == 0);
+            s_carry[k] = (int8_t)(v >> 8);
+        }
     }
     s_carry_n_complex = (uint8_t)new_carry_count;
 }
@@ -530,7 +556,7 @@ uint64_t signal_buffer_stream_epoch_us(void)
 
 bool signal_buffer_burst_valid(uint64_t start_idx, uint32_t length)
 {
-    const uint32_t total_cap = SIGNAL_BUF_SIZE / 4;
+    const uint32_t total_cap = SIGNAL_BUF_SIZE / 2;
     if (length == 0 || length >= total_cap) return false;
 
     // T44: absolute-index staleness. `start_idx` is the tagger's 64-bit
@@ -573,46 +599,14 @@ static void invalidate_ring_segment(uint8_t *base, size_t off, size_t len)
     }
 }
 
-void signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest)
-{
-    if (!circular_buf) return;
-
-    // The DMA writes into PSRAM bypass any CPU caches on Core 0. Core 1's
-    // CPU caches may hold stale lines for the region we just wrote, so
-    // invalidate before the worker reads. M2C + INVALIDATE drops cached
-    // lines so the next reads pull fresh data from PSRAM.
-    const uint32_t total_cap     = SIGNAL_BUF_SIZE / 4;
-    uint32_t       actual_start  = start_idx % total_cap;
-    size_t         bytes_to_read = length * 4;
-    uint8_t       *base          = (uint8_t *)circular_buf;
-    uint32_t       start_bytes   = actual_start * 4;
-    size_t         to_end_bytes  = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
-
-    if (bytes_to_read <= to_end_bytes) {
-        invalidate_ring_segment(base, start_bytes, bytes_to_read);
-    } else {
-        invalidate_ring_segment(base, start_bytes, to_end_bytes);
-        invalidate_ring_segment(base, 0, bytes_to_read - to_end_bytes);
-    }
-
-    // Per-element copy across the wrap. Runs once per detected burst (not
-    // per sample on the hot path), so the loop overhead is fine relative
-    // to the rest of the worker pipeline.
-    for (uint32_t i = 0; i < length; i++) {
-        uint32_t idx    = (actual_start + i) % total_cap;
-        dest[i * 2 + 0] = circular_buf[idx * 2 + 0];
-        dest[i * 2 + 1] = circular_buf[idx * 2 + 1];
-    }
-}
-
 void signal_buffer_invalidate_range(uint32_t start_idx, uint32_t length)
 {
     if (!circular_buf) return;
-    const uint32_t total_cap     = SIGNAL_BUF_SIZE / 4;
+    const uint32_t total_cap     = SIGNAL_BUF_SIZE / 2;
     uint32_t       actual_start  = start_idx % total_cap;
-    size_t         bytes_to_read = length * 4;
+    size_t         bytes_to_read = length * 2;
     uint8_t       *base          = (uint8_t *)circular_buf;
-    uint32_t       start_bytes   = actual_start * 4;
+    uint32_t       start_bytes   = actual_start * 2;
     size_t         to_end_bytes  = (uint32_t)SIGNAL_BUF_SIZE - start_bytes;
 
     if (bytes_to_read <= to_end_bytes) {
@@ -626,19 +620,33 @@ void signal_buffer_invalidate_range(uint32_t start_idx, uint32_t length)
 void signal_buffer_read_chunk(uint32_t start_idx, uint32_t length, int16_t *dest)
 {
     if (!circular_buf) return;
-    const uint32_t total_cap    = SIGNAL_BUF_SIZE / 4;
+    const uint32_t total_cap    = SIGNAL_BUF_SIZE / 2;
     uint32_t       actual_start = start_idx % total_cap;
-    // Fast path: chunk is fully contiguous (no wrap). memcpy beats the
-    // per-element loop -- it can do 16-byte burst PSRAM reads via the
-    // L2 cache prefetcher.
+    // Expand int8 ring back to the int16 public API: int16 = int8 << 8
+    // (bit-exact inverse of the push-side >>8 narrow). int8 -> int32 is
+    // sign-extending, so the <<8 recovers the original signed int16.
     if (actual_start + length <= total_cap) {
-        memcpy(dest, &circular_buf[actual_start * 2],
-               (size_t)length * 4);
+        // Fast path: chunk is fully contiguous (no wrap).
+        for (uint32_t i = 0; i < length; i++) {
+            dest[i * 2 + 0] =
+                (int16_t)((int32_t)circular_buf[(actual_start + i) * 2 + 0] << 8);
+            dest[i * 2 + 1] =
+                (int16_t)((int32_t)circular_buf[(actual_start + i) * 2 + 1] << 8);
+        }
         return;
     }
-    // Wrap: two memcpys.
+    // Wrap: split at the ring end.
     uint32_t to_end = total_cap - actual_start;
-    memcpy(dest, &circular_buf[actual_start * 2], (size_t)to_end * 4);
-    memcpy(dest + to_end * 2, &circular_buf[0],
-           (size_t)(length - to_end) * 4);
+    for (uint32_t i = 0; i < to_end; i++) {
+        dest[i * 2 + 0] =
+            (int16_t)((int32_t)circular_buf[(actual_start + i) * 2 + 0] << 8);
+        dest[i * 2 + 1] =
+            (int16_t)((int32_t)circular_buf[(actual_start + i) * 2 + 1] << 8);
+    }
+    for (uint32_t i = 0; i < length - to_end; i++) {
+        dest[(to_end + i) * 2 + 0] =
+            (int16_t)((int32_t)circular_buf[i * 2 + 0] << 8);
+        dest[(to_end + i) * 2 + 1] =
+            (int16_t)((int32_t)circular_buf[i * 2 + 1] << 8);
+    }
 }

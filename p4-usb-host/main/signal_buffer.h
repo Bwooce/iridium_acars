@@ -5,17 +5,19 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
-// 16MB circular buffer = ~1.6s at 2.56 MSPS SC16 (T59 experiment): the
-// detector runs behind live ingest under high signal load, so a 4MB/~400ms
-// ring made every burst stale (ring-lapped) before the worker could read it.
-// A larger freshness window lets bursts survive the detector lag long enough
-// to decode. 16 MB fits the 32 MB PSRAM alongside the 4 MB tagger baseline.
-// Multiple of 64 (wrap-path DMA alignment) and /4 is a multiple of 16.
+// 16MB circular buffer. The ring stores int8 IQ (2 bytes/complex): the RTL
+// ADC is 8-bit and ingest's uint8->int16 conversion is exactly (byte-128)<<8,
+// so the low 8 bits of every stored int16 are always zero. Storing int8 =
+// int16>>8 and re-expanding int16 = int8<<8 at read time is bit-exact
+// lossless, so 16 MB now holds ~3.36 s at 2.5 MSPS (twice the int16 window).
+// The detector runs behind live ingest under high signal load, so a larger
+// freshness window lets bursts survive the detector lag long enough to
+// decode. 16 MB fits the 32 MB PSRAM alongside the 4 MB tagger baseline.
+// Multiple of 64 (wrap-path DMA alignment) and /2 is a multiple of 32.
 #define SIGNAL_BUF_SIZE (16 * 1024 * 1024)
 
 esp_err_t signal_buffer_init();
 void      signal_buffer_push(const int16_t *samples, size_t n_samples);
-void      signal_buffer_extract(uint32_t start_idx, uint32_t length, int16_t *dest);
 
 // Invalidate L2 cache lines covering [start_idx, start_idx + length) of the
 // circular buffer (modulo wrap). Call once per burst before reading chunks
