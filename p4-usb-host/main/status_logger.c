@@ -15,6 +15,8 @@
 #include "esp_heap_caps.h"
 #include "status_logger.h"
 #include "esp_iot_log.h"
+#include "app_config.h"
+#include "dsp_processor.h" // FS_DETECT_HZ (listening bandwidth)
 #include "signal_buffer.h"
 #include "ingest_core1.h"
 #include "esp_libusb.h"
@@ -224,13 +226,22 @@ static void emit(const status_snapshot_t *s)
     // finished and handed off this window. This distinction was the
     // source of a 14-hour bench-monitoring misread (steps=~883/s at the
     // nominal USB rate was mistaken for a burst rate).
+    // Listening band: LO centre + the ±FS_DETECT_HZ/2 window we cover.
+    // Self-documents every capture (which band produced these bursts /
+    // decodes) and lets a log reader confirm the tuned LO without the
+    // serial [SCMD] interface.
+    app_config_t cfg_snap;
+    app_config_snapshot(&cfg_snap);
+    double lo_mhz   = (double)cfg_snap.lo_freq_hz / 1e6;
+    double half_mhz = ((double)FS_DETECT_HZ / 2.0) / 1e6;
     ESP_LOGI(TAG, "STATUS: rate=%.2f MB/s steps=%u bursts=%u processed=%u "
                   "triage_rej=%u bch_decoded=%u bch_unknown=%u drops=%u "
-                  "dsp_cap=%.0f%% worker_cap=%.0f%%",
+                  "dsp_cap=%.0f%% worker_cap=%.0f%% lo=%.4fMHz band=%.3f-%.3fMHz",
              rate_inst, s->dsp_frame_count, s->dsp.gone_bursts,
              s->ws.bursts_processed, s->ws.bursts_triage_rejected,
              s->ws.bursts_bch_decoded, s->ws.bursts_bch_unknown,
-             s->us.rb_full_drops, dsp_pct, worker_pct);
+             s->us.rb_full_drops, dsp_pct, worker_pct,
+             lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz);
     iot_log(IOT_LOG_INFO,
             "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%%",
             rate_inst,
