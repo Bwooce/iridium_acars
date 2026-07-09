@@ -25,8 +25,27 @@ static const char *TAG = "CLASS"; // match the original tag for log continuity
 
 static QueueHandle_t s_queue;
 
+// Most recent emitted snapshot, for the HTTP /status page (see
+// status_logger_get_last). Written once per second by the logger task;
+// read cross-core by the http task. Unlocked — a torn read is benign for
+// a diagnostic display and avoids adding a mutex to the 1 Hz hot(ish) path.
+static status_snapshot_t s_last;
+static volatile bool     s_have_last = false;
+
+bool status_logger_get_last(status_snapshot_t *out)
+{
+    if (!s_have_last || !out) return false;
+    *out = s_last; // struct copy
+    return true;
+}
+
 static void emit(const status_snapshot_t *s)
 {
+    // Cache first, BEFORE the verbose/quiet fork: the STATUS-line fields the
+    // /status page surfaces must be captured regardless of build config.
+    s_last      = *s;
+    s_have_last = true;
+
     double window_s = s->window_us / 1000000.0;
     if (window_s <= 0) window_s = 1.0;
 

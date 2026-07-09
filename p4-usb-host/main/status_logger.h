@@ -56,4 +56,13 @@ esp_err_t status_logger_init(void);
 // from class_driver_task on Core 0.
 bool status_logger_post(const status_snapshot_t *snap);
 
+// Copy the most recently emitted snapshot into *out. Returns false if no
+// snapshot has been emitted yet (nothing to show). Non-resetting, purely a
+// read of the last logged values — the HTTP /status page uses this to
+// surface the same fields the STATUS log line prints WITHOUT calling the
+// resetting worker/dsp getters (which would steal counts from the logger's
+// own 1 s window). The read is unlocked and cross-core (http on Core 0 vs
+// logger on Core 1); a torn field is harmless for a diagnostic display.
+bool status_logger_get_last(status_snapshot_t *out);
+
 #endif
