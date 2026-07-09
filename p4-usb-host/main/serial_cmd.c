@@ -4,9 +4,8 @@
 #include "scanner.h"
 #include "autotune.h"
 #include "autotune_gainset.h"
-#include "class_driver.h"
+#include "class_driver.h" // incl. class_driver_prepare_for_reboot()
 #include "wifi_link.h"
-#include "class_driver.h" // class_driver_prepare_for_reboot()
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"
