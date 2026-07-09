@@ -2108,7 +2108,7 @@ esp_err_t http_server_start(void)
     cfg.server_port      = 80;
     cfg.max_uri_handlers = HTTPD_URI_LIMIT;
     cfg.lru_purge_enable = true;
-    cfg.stack_size       = 6144;
+    cfg.stack_size       = 12288; // HTML dashboard render (status_html_get: snapshot+cfg on stack + framework) overflowed 6144 (Stack protection fault)
     // Pin to Core 0: Core 1 is ~98% saturated (ingest + worker), so a
     // no-affinity httpd task can get parked there and barely run. Core 0
     // has ~23% idle headroom. Prio 5 sits BELOW class_driver (6) on
