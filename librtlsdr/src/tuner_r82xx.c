@@ -594,12 +594,26 @@ static int r82xx_write_arr(struct r82xx_priv *priv, uint8_t reg, const uint8_t *
 			}
 		}
 
-		rc = rtlsdr_i2c_write_fn(priv->rtl_dev, priv->cfg->i2c_addr,
-					 priv->buf, size + 1);
+		/* retune-stability (dma-int-fix): retry the I2C write on a
+		 * transient failure. A single EP0 STALL / i2c glitch over the
+		 * USB control endpoint otherwise aborts the retune mid-sequence
+		 * with the tuner's registers HALF-WRITTEN -> wedged tuner after
+		 * a few hops (the "i2c wr failed" wedge). priv->buf is unchanged
+		 * between attempts, so re-issuing the identical write is safe;
+		 * the USB round-trip is itself the inter-attempt spacing. */
+		{
+			int attempt;
+			for (attempt = 0; attempt < 3; attempt++) {
+				rc = rtlsdr_i2c_write_fn(priv->rtl_dev, priv->cfg->i2c_addr,
+							 priv->buf, size + 1);
+				if (rc == size + 1)
+					break;
+				fprintf(stderr, "%s: i2c wr failed=%d reg=%02x len=%d (attempt %d/3)\n",
+					   __FUNCTION__, rc, reg, size, attempt + 1);
+			}
+		}
 
 		if (rc != size + 1) {
-			fprintf(stderr, "%s: i2c wr failed=%d reg=%02x len=%d\n",
-				   __FUNCTION__, rc, reg, size);
 			if (rc < 0)
 				return rc;
 			return -1;
@@ -1285,8 +1299,24 @@ static int r82xx_set_tv_standard(struct r82xx_priv *priv,
 			if (rc < 0)
 				return rc;
 
-			priv->tuner_pll_set = 0;
-			rc = r82xx_set_pll(priv, priv->rf_freq);
+			/* retune-stability (dma-int-fix): retry the whole PLL
+			 * program on a lock miss. A "PLL not locked" read is
+			 * frequently SPURIOUS during a frequency change — and at
+			 * our >1500 MHz L-band the R828D is thermally marginal, so
+			 * misses are more likely; the PLL locks on a re-attempt
+			 * (the upstream driver relies on this). Failing on the
+			 * first miss (as before) leaves the tuner mis-tuned after a
+			 * hop -> the wedge-after-a-few-hops. Each attempt
+			 * re-programs all PLL registers + re-checks the lock bit. */
+			{
+				int pll_try;
+				for (pll_try = 0; pll_try < 3; pll_try++) {
+					priv->tuner_pll_set = 0;
+					rc = r82xx_set_pll(priv, priv->rf_freq);
+					if (rc >= 0 && priv->has_lock)
+						break;
+				}
+			}
 			if (rc < 0 || !priv->has_lock)
 				return rc;
 
