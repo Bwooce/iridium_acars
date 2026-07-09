@@ -26,6 +26,7 @@
 #include "fault_inject.h"
 #include "worker_core1.h"
 #include "worker_dcfine.h"
+#include "status_logger.h" // status_logger_get_last() — /status HTML dashboard
 #include "aggregator_ingest.h"
 #include "frame_link.h"
 #include "dsp_processor.h"
@@ -50,6 +51,10 @@ static httpd_handle_t s_server = NULL;
 // escape user-controlled strings (SSID, out_host, ota_url, error text)
 // before embedding them in JSON (M17).
 static size_t json_escape(char *out, size_t outsz, const char *in);
+
+// Human-facing HTML dashboard for GET /status when the client is a browser
+// (Accept: text/html). Defined after the shared page-chrome helpers.
+static esp_err_t status_html_get(httpd_req_t *req);
 
 // Pre-allocated PSRAM read buffer for /capture/file (T49b: was DMA-INT,
 // moved to PSRAM to return 4 KB to the tight USB-pool budget). SDMMC
@@ -134,6 +139,22 @@ static void tune_apply_reboot_task(void *arg)
 
 static esp_err_t status_get(httpd_req_t *req)
 {
+    // Content negotiation: a browser (Accept: text/html) gets the human
+    // dashboard; curl / monitors / Accept:*/* fall through to the JSON
+    // below, UNCHANGED — the existing /status API is preserved (no known
+    // consumer sends Accept: text/html; verified against scripts/).
+    //
+    // Don't gate on the ESP_OK return: browsers send long Accept headers
+    // that overflow this buffer and return ESP_ERR_HTTPD_RESULT_TRUNC, but
+    // "text/html" leads the value so the (NUL-terminated) truncated copy
+    // still contains it. On not-found the buffer stays "" (zero-init), so
+    // an unconditional strstr is correct either way.
+    char accept[160] = {0};
+    httpd_req_get_hdr_value_str(req, "Accept", accept, sizeof(accept));
+    if (strstr(accept, "text/html")) {
+        return status_html_get(req);
+    }
+
     app_config_t cfg;
     app_config_snapshot(&cfg);
 
@@ -536,29 +557,55 @@ static size_t html_attr_escape(char *dst, size_t cap, const char *src)
     return w;
 }
 
-// Static page head + style + intro — same for every render.
-static const char s_index_head[] =
-    "<!doctype html><html><head><meta charset=\"utf-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>Iridium ACARS — config</title>"
-    "<style>"
-    "body{font-family:system-ui,sans-serif;max-width:480px;margin:2em auto;padding:0 1em;color:#222;background:#fafafa}"
-    "h1{font-size:1.3em}h2{font-size:1.05em;margin-top:1.8em;color:#555}"
-    "label{display:block;margin:1em 0 .3em;font-size:.9em;color:#555}"
-    "input[type=text],input[type=password],input[type=number]{width:100%;padding:.5em;border:1px solid #ccc;border-radius:4px;font-size:1em;box-sizing:border-box}"
-    "button{margin-top:1.5em;padding:.7em 1.5em;border:0;background:#1976d2;color:#fff;border-radius:4px;font-size:1em}"
-    "small{color:#888}"
-    "</style></head><body>"
-    "<h1>Iridium ACARS</h1>"
-    "<p>Configure the device. Wi-Fi changes reboot the device on save; "
-    "UDP push fields take effect immediately.</p>";
+// Shared page chrome — ONE source of nav truth for every HTML page (DRY).
+// send_page_head() emits doctype + head + minimal inline CSS + the nav bar;
+// the caller then streams its body and finishes with send_page_foot().
+// refresh_s > 0 adds a meta-refresh (used by the live /status dashboard).
+// All responses are chunked, so callers must set no content-length.
+static void send_page_head(httpd_req_t *req, const char *title, int refresh_s)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    char refresh[64] = {0};
+    if (refresh_s > 0) {
+        snprintf(refresh, sizeof(refresh),
+                 "<meta http-equiv=\"refresh\" content=\"%d\">", refresh_s);
+    }
+    char head[1536];
+    int  n = snprintf(head, sizeof(head),
+                      "<!doctype html><html><head><meta charset=\"utf-8\">"
+                       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                       "%s<title>%s</title><style>"
+                       "body{font-family:system-ui,sans-serif;max-width:640px;margin:0 auto 2em;padding:0 1em;color:#222;background:#fafafa}"
+                       "h1{font-size:1.3em}h2{font-size:1.05em;margin-top:1.8em;color:#555}"
+                       "nav{margin:0 -1em 1.2em;padding:.6em 1em;background:#1976d2}"
+                       "nav a{color:#fff;text-decoration:none;margin-right:1em;font-size:.95em}"
+                       "nav a:hover{text-decoration:underline}"
+                       "label{display:block;margin:1em 0 .3em;font-size:.9em;color:#555}"
+                       "input[type=text],input[type=password],input[type=number],select{width:100%%;padding:.5em;border:1px solid #ccc;border-radius:4px;font-size:1em;box-sizing:border-box}"
+                       "button{margin-top:1.5em;padding:.7em 1.5em;border:0;background:#1976d2;color:#fff;border-radius:4px;font-size:1em}"
+                       "small{color:#888}table{border-collapse:collapse;width:100%%}"
+                       "td,th{text-align:left;padding:.25em .5em;border-bottom:1px solid #eee;font-size:.9em}"
+                       "td.v{font-family:ui-monospace,monospace;text-align:right}"
+                       "</style></head><body>"
+                       "<nav><a href=\"/\">Config</a><a href=\"/status\">Status</a>"
+                       "<a href=\"/messages\">Messages</a><a href=\"/tasks\">Tasks</a>"
+                       "<a href=\"/capture/status\">Capture</a></nav>"
+                       "<h1>%s</h1>",
+                      refresh, title, title);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(head)) n = sizeof(head);
+    httpd_resp_send_chunk(req, head, n);
+}
 
-// Static footer (after form / after optional reset block).
-static const char s_index_foot[] =
-    "<p><small>Current status: <a href=\"/status\">/status</a> · "
-    "Messages: <a href=\"/messages\">/messages</a> · "
-    "OTA progress: <a href=\"/ota\">/ota</a></small></p>"
-    "</body></html>";
+static void send_page_foot(httpd_req_t *req)
+{
+    static const char foot[] =
+        "<p><small>JSON APIs: <a href=\"/status\">/status</a> (curl) · "
+        "<a href=\"/messages\">/messages</a> · <a href=\"/ota\">/ota</a></small></p>"
+        "</body></html>";
+    httpd_resp_send_chunk(req, foot, sizeof(foot) - 1);
+    httpd_resp_send_chunk(req, NULL, 0);
+}
 
 // Shown only in STA mode (we're already at the form when in AP).
 static const char s_index_reset_block[] =
@@ -569,8 +616,12 @@ static const char s_index_reset_block[] =
 
 static esp_err_t index_get(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send_chunk(req, s_index_head, sizeof(s_index_head) - 1);
+    send_page_head(req, "Iridium ACARS", 0);
+    httpd_resp_send_chunk(req,
+                          "<p>Configure the device. Wi-Fi changes reboot on save; "
+                          "UDP push fields take effect immediately. SDR tuning changes "
+                          "reboot to re-program the tuner.</p>",
+                          HTTPD_RESP_USE_STRLEN);
 
     // Build the form with the current config pre-filled so the user
     // can see what's saved (SSID was missing from the rendered form
@@ -596,7 +647,7 @@ static esp_err_t index_get(httpd_req_t *req)
                        "<input type=\"text\" name=\"ssid\" required maxlength=\"32\" value=\"%s\">"
                        "<label>Password</label>"
                        "<input type=\"password\" name=\"psk\" maxlength=\"63\" value=\"%s\">"
-                       "<h2>SDR</h2>"
+                       "<h2>SDR (bias tee)</h2>"
                        "<label><input type=\"checkbox\" name=\"bias_tee\" value=\"1\"%s> "
                        "Enable RTL-SDR v4 bias tee (5 V on antenna line, for active antennas / LNAs)</label>"
                        "<h2>ACARS push (optional, UDP)</h2>"
@@ -618,12 +669,155 @@ static esp_err_t index_get(httpd_req_t *req)
     if (n > (int)sizeof(form)) n = sizeof(form);
     httpd_resp_send_chunk(req, form, n);
 
+    // Separate SDR-tuning form, posting to /sdrcfg (a body-parsed endpoint
+    // that NEVER touches Wi-Fi). All fields are pre-filled from the live
+    // config so a submit rewrites SDR config safely — untouched fields
+    // resubmit their current values (same Wi-Fi-safety principle as the
+    // form above). /tune and /autotune are query-param endpoints (curl/
+    // scripts); a no-JS form can't drive them, hence one consolidated POST.
+    char sdrform[1400];
+    int  sn = snprintf(sdrform, sizeof(sdrform),
+                       "<form method=\"POST\" action=\"/sdrcfg\">"
+                        "<h2>SDR tuning</h2>"
+                        "<label>LO frequency (Hz, Iridium 1615000000-1628000000)</label>"
+                        "<input type=\"number\" name=\"lo_hz\" min=\"1615000000\" max=\"1628000000\" required value=\"%u\">"
+                        "<label>Gain mode</label>"
+                        "<select name=\"gain_mode\">"
+                        "<option value=\"0\"%s>Tuner AGC</option>"
+                        "<option value=\"1\"%s>Manual</option>"
+                        "<option value=\"2\"%s>Software AGC</option>"
+                        "</select>"
+                        "<label>Manual gain (dB; used only in Manual mode)</label>"
+                        "<input type=\"number\" name=\"gain_db\" step=\"0.1\" required value=\"%.1f\">"
+                        "<label>Tagger threshold (dB above noise floor)</label>"
+                        "<input type=\"number\" name=\"tag_thr\" step=\"0.1\" required value=\"%.1f\">"
+                        "<label>Coalesce min bursts (0/1 = disabled)</label>"
+                        "<input type=\"number\" name=\"coal_n\" min=\"0\" max=\"255\" required value=\"%u\">"
+                        "<label>Autotune LO re-scan interval (s; 0 = off)</label>"
+                        "<input type=\"number\" name=\"at_lo_s\" min=\"0\" required value=\"%u\">"
+                        "<label>Autotune gain re-cal interval (s; 0 = off)</label>"
+                        "<input type=\"number\" name=\"at_gain_s\" min=\"0\" required value=\"%u\">"
+                        "<button type=\"submit\">Apply &amp; reboot</button>"
+                        "</form>",
+                       (unsigned)cfg.lo_freq_hz,
+                      cfg.gain_mode == GAIN_MODE_TUNER_AGC ? " selected" : "",
+                      cfg.gain_mode == GAIN_MODE_MANUAL ? " selected" : "",
+                      cfg.gain_mode == GAIN_MODE_SOFTWARE_AGC ? " selected" : "",
+                       (double)cfg.gain_db_x10 / 10.0,
+                       (double)cfg.tagger_threshold_db,
+                       (unsigned)cfg.coalesce_min_bursts,
+                       (unsigned)cfg.autotune_lo_interval_s,
+                       (unsigned)cfg.autotune_gain_interval_s);
+    if (sn < 0) sn = 0;
+    if (sn > (int)sizeof(sdrform)) sn = sizeof(sdrform);
+    httpd_resp_send_chunk(req, sdrform, sn);
+
     if (!wifi_link_is_ap_mode()) {
         httpd_resp_send_chunk(req, s_index_reset_block,
                               sizeof(s_index_reset_block) - 1);
     }
-    httpd_resp_send_chunk(req, s_index_foot, sizeof(s_index_foot) - 1);
-    return httpd_resp_send_chunk(req, NULL, 0);
+    send_page_foot(req);
+    return ESP_OK;
+}
+
+// GET /status (browser variant). Surfaces the live STATUS-line fields as an
+// HTML table with a 5 s meta-refresh. Reads the last logged snapshot via
+// status_logger_get_last() (non-resetting — it does NOT call the resetting
+// worker_core1_get_stats(), which would steal counts from the logger's own
+// 1 s window) plus cumulative getters (decode counts, USB totals, DMA heap,
+// stash fails). curl / monitors get the JSON variant (see status_get).
+static esp_err_t status_html_get(httpd_req_t *req)
+{
+    send_page_head(req, "Status", 5); // 5 s meta-refresh — live dashboard
+
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    const esp_app_desc_t *app = esp_app_get_description();
+
+    status_snapshot_t s;
+    bool              have = status_logger_get_last(&s);
+
+    // Cumulative, non-resetting counters — safe to read from the http task.
+    uint32_t bch_dec = 0, bch_unk = 0;
+    worker_core1_get_decode_counts(&bch_dec, &bch_unk);
+    usb_stream_totals_t usbt = {0};
+    esp_libusb_get_stream_totals(&usbt);
+    uint32_t dma_free    = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    uint32_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    uint32_t stash_fails = signal_buffer_stash_alloc_fails();
+
+    double lo_mhz   = (double)cfg.lo_freq_hz / 1e6;
+    double half_mhz = ((double)FS_DETECT_HZ / 2.0) / 1e6;
+
+    char gain_str[28];
+    if (cfg.gain_mode == GAIN_MODE_MANUAL)
+        snprintf(gain_str, sizeof(gain_str), "%.1f dB (manual)", (double)cfg.gain_db_x10 / 10.0);
+    else if (cfg.gain_mode == GAIN_MODE_SOFTWARE_AGC)
+        snprintf(gain_str, sizeof(gain_str), "software AGC");
+    else
+        snprintf(gain_str, sizeof(gain_str), "tuner AGC");
+
+    int64_t uptime_s = esp_timer_get_time() / 1000000;
+    char    body[2700];
+    int     n = snprintf(body, sizeof(body),
+                         "<p><small>build %s &middot; %s &middot; uptime %llds &middot; "
+                             "auto-refresh 5 s</small></p>",
+                         app->version, app->date, (long long)uptime_s);
+    httpd_resp_send_chunk(req, body, n > 0 ? n : 0);
+
+    if (!have) {
+        httpd_resp_send_chunk(req,
+                              "<p><em>No STATUS snapshot yet — the USB stream may still be "
+                              "starting. Reload in a moment.</em></p>",
+                              HTTPD_RESP_USE_STRLEN);
+        send_page_foot(req);
+        return ESP_OK;
+    }
+
+    // Derived per-window figures — same formulas as status_logger emit().
+    double rate = 0, dsp_cap = 0, worker_cap = 0;
+    if (s.window_us > 0) {
+        double w   = (double)s.window_us;
+        rate       = (s.bytes_window / (1024.0 * 1024.0)) / (w / 1e6);
+        dsp_cap    = 100.0 * (double)s.dsp_total_time_us / w;
+        worker_cap = 100.0 * ((double)s.ws.bursts_processed * (double)s.ws.avg_burst_us + (double)s.ws.bursts_triage_rejected * (double)s.ws.triage_rej_us) /
+                     w;
+    }
+
+    n = snprintf(body, sizeof(body),
+                 "<table><tr><th>Metric</th><th>Value</th></tr>"
+                 "<tr><td>USB rate</td><td class=v>%.2f MB/s</td></tr>"
+                 "<tr><td>FFT steps / window</td><td class=v>%u</td></tr>"
+                 "<tr><td>Bursts dispatched</td><td class=v>%u</td></tr>"
+                 "<tr><td>Processed</td><td class=v>%u</td></tr>"
+                 "<tr><td>Triage rejected</td><td class=v>%u</td></tr>"
+                 "<tr><td>BCH decoded / unknown (window)</td><td class=v>%u / %u</td></tr>"
+                 "<tr><td>BCH decoded / unknown (since boot)</td><td class=v>%u / %u</td></tr>"
+                 "<tr><td>rb_full drops (window)</td><td class=v>%u</td></tr>"
+                 "<tr><td>rb_full drops (since boot)</td><td class=v>%llu</td></tr>"
+                 "<tr><td>DSP capacity</td><td class=v>%.0f %%</td></tr>"
+                 "<tr><td>Worker capacity</td><td class=v>%.0f %%</td></tr>"
+                 "<tr><td>LO frequency</td><td class=v>%.4f MHz</td></tr>"
+                 "<tr><td>Listening band</td><td class=v>%.3f - %.3f MHz</td></tr>"
+                 "<tr><td>Gain</td><td class=v>%s</td></tr>"
+                 "<tr><td>DMA-INT free / largest</td><td class=v>%u / %u KB</td></tr>"
+                 "<tr><td>Stash alloc fails</td><td class=v>%u</td></tr>"
+                 "</table>",
+                 rate, (unsigned)s.dsp_frame_count, (unsigned)s.dsp.gone_bursts,
+                 (unsigned)s.ws.bursts_processed, (unsigned)s.ws.bursts_triage_rejected,
+                 (unsigned)s.ws.bursts_bch_decoded, (unsigned)s.ws.bursts_bch_unknown,
+                 (unsigned)bch_dec, (unsigned)bch_unk,
+                 (unsigned)s.us.rb_full_drops, (unsigned long long)usbt.rb_full_drops,
+                 dsp_cap, worker_cap,
+                 lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz,
+                 gain_str, (unsigned)(dma_free / 1024), (unsigned)(dma_largest / 1024),
+                 (unsigned)stash_fails);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(body)) n = sizeof(body);
+    httpd_resp_send_chunk(req, body, n);
+
+    send_page_foot(req);
+    return ESP_OK;
 }
 
 // URL-decode a single %XX or '+' from src to dst in-place. Returns bytes
@@ -1243,12 +1437,15 @@ static esp_err_t scan_post(httpd_req_t *req)
 // resets the board via DTR) — HTTP avoids that. NVS write can't run on this
 // PSRAM-stacked httpd task, so it hands off to an internal-stack task (same
 // pattern as tune_apply_reboot_task), which grace­fully parks the tuner first.
-typedef struct { uint32_t lo_s; uint32_t gain_s; } autotune_cfg_args_t;
+typedef struct {
+    uint32_t lo_s;
+    uint32_t gain_s;
+} autotune_cfg_args_t;
 static void autotune_cfg_reboot_task(void *arg)
 {
-    autotune_cfg_args_t *a = (autotune_cfg_args_t *)arg;
-    esp_err_t r1 = app_config_set_autotune_lo_interval_s(a->lo_s);
-    esp_err_t r2 = app_config_set_autotune_gain_interval_s(a->gain_s);
+    autotune_cfg_args_t *a  = (autotune_cfg_args_t *)arg;
+    esp_err_t            r1 = app_config_set_autotune_lo_interval_s(a->lo_s);
+    esp_err_t            r2 = app_config_set_autotune_gain_interval_s(a->gain_s);
     ESP_LOGI(TAG, "/autotune: lo_interval_s=%lu gain_interval_s=%lu (%s/%s) — rebooting to apply",
              (unsigned long)a->lo_s, (unsigned long)a->gain_s,
              esp_err_to_name(r1), esp_err_to_name(r2));
@@ -1270,7 +1467,7 @@ static esp_err_t autotune_post(httpd_req_t *req)
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_sendstr(req, "oom\n");
     }
-    a->lo_s = lo;
+    a->lo_s   = lo;
     a->gain_s = gain;
     char body[112];
     int  n = snprintf(body, sizeof(body),
@@ -1281,6 +1478,138 @@ static esp_err_t autotune_post(httpd_req_t *req)
     if (xTaskCreate(autotune_cfg_reboot_task, "at_cfg", 4096, a, 5, NULL) != pdPASS) {
         free(a);
         ESP_LOGE(TAG, "/autotune: failed to spawn apply task");
+    }
+    return ESP_OK;
+}
+
+// POST /sdrcfg — apply the SDR-tuning knobs from the config form. Body is
+// urlencoded (a no-JS form posts its inputs in the body; /tune and /autotune
+// are query-param endpoints for curl and can't be driven from a form, so this
+// one consolidated endpoint covers LO + gain mode/level + tagger threshold +
+// coalesce + both autotune intervals in a single form/reboot). It NEVER calls
+// a Wi-Fi setter, so a partial/garbled submit here can't strand the device
+// off-network. The NVS writes can't run on this PSRAM-stacked httpd task, so
+// it hands off to an internal-SRAM-stacked task that writes all keys and
+// reboots (same pattern as tune_apply_reboot_task); LO/tagger/coalesce/gain
+// are programmed at stream/detector start, hence the reboot to apply.
+typedef struct {
+    uint32_t    lo_hz;
+    gain_mode_t gain_mode;
+    int16_t     gain_dbx10;
+    float       tag_thr_db;
+    uint8_t     coal_n;
+    uint32_t    at_lo_s;
+    uint32_t    at_gain_s;
+} sdrcfg_args_t;
+
+static void sdrcfg_apply_reboot_task(void *arg)
+{
+    sdrcfg_args_t *a  = (sdrcfg_args_t *)arg;
+    esp_err_t      r1 = app_config_set_lo_freq_hz(a->lo_hz);
+    esp_err_t      r2 = app_config_set_gain_mode(a->gain_mode);
+    esp_err_t      r3 = app_config_set_gain_db_x10(a->gain_dbx10);
+    esp_err_t      r4 = app_config_set_tagger_threshold_db(a->tag_thr_db);
+    esp_err_t      r5 = app_config_set_coalesce_min_bursts(a->coal_n);
+    esp_err_t      r6 = app_config_set_autotune_lo_interval_s(a->at_lo_s);
+    esp_err_t      r7 = app_config_set_autotune_gain_interval_s(a->at_gain_s);
+    ESP_LOGI(TAG,
+             "/sdrcfg: lo=%u mode=%d gain_dbx10=%d tag=%.1f coal=%u at_lo=%u at_gain=%u "
+             "(%s/%s/%s/%s/%s/%s/%s) — rebooting to apply",
+             (unsigned)a->lo_hz, (int)a->gain_mode, (int)a->gain_dbx10,
+             (double)a->tag_thr_db, (unsigned)a->coal_n, (unsigned)a->at_lo_s,
+             (unsigned)a->at_gain_s, esp_err_to_name(r1), esp_err_to_name(r2),
+             esp_err_to_name(r3), esp_err_to_name(r4), esp_err_to_name(r5),
+             esp_err_to_name(r6), esp_err_to_name(r7));
+    free(a);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
+    esp_restart();
+}
+
+static esp_err_t sdrcfg_post(httpd_req_t *req)
+{
+    static char body[512]; // single serve task — static is race-free (see config_post)
+    if (req->content_len >= sizeof(body)) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "form body too large\n", HTTPD_RESP_USE_STRLEN);
+    }
+    int total = 0, timeouts = 0;
+    while (total < (int)req->content_len) {
+        int r = httpd_req_recv(req, body + total, sizeof(body) - 1 - total);
+        if (r <= 0) {
+            if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 3) continue;
+            break;
+        }
+        total += r;
+    }
+    body[total] = '\0';
+
+    // Every numeric field is pre-filled by the form, so a MISSING field means
+    // a truncated/garbled body — reject rather than silently writing 0 (which
+    // would misconfigure gain/threshold). No bias_tee here: it stays on the
+    // Wi-Fi-safe /config form where it's already preserved.
+    char lo_s[16] = {0}, gm_s[4] = {0}, gain_s[12] = {0}, tag_s[12] = {0},
+         coal_s[6] = {0}, atlo_s[12] = {0}, atg_s[12] = {0};
+    if (form_field(body, total, "lo_hz", lo_s, sizeof(lo_s)) != ESP_OK ||
+        form_field(body, total, "gain_mode", gm_s, sizeof(gm_s)) != ESP_OK ||
+        form_field(body, total, "gain_db", gain_s, sizeof(gain_s)) != ESP_OK ||
+        form_field(body, total, "tag_thr", tag_s, sizeof(tag_s)) != ESP_OK ||
+        form_field(body, total, "coal_n", coal_s, sizeof(coal_s)) != ESP_OK ||
+        form_field(body, total, "at_lo_s", atlo_s, sizeof(atlo_s)) != ESP_OK ||
+        form_field(body, total, "at_gain_s", atg_s, sizeof(atg_s)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "all SDR fields required (submit the form intact)\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    uint32_t lo_hz = (uint32_t)strtoul(lo_s, NULL, 10);
+    if (lo_hz < 1615000000u || lo_hz > 1628000000u) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        char m[112];
+        int  mn = snprintf(m, sizeof(m),
+                           "lo_hz=%u out of Iridium band [1615000000, 1628000000]\n",
+                           (unsigned)lo_hz);
+        return httpd_resp_send(req, m, mn);
+    }
+
+    unsigned gm = (unsigned)strtoul(gm_s, NULL, 10);
+    if (gm > 2) gm = 0;
+    double        gain_db    = strtod(gain_s, NULL);
+    int16_t       gain_dbx10 = (int16_t)(gain_db * 10.0 + (gain_db >= 0 ? 0.5 : -0.5));
+    float         tag_thr    = strtof(tag_s, NULL);
+    unsigned long coal       = strtoul(coal_s, NULL, 10);
+    if (coal > 255) coal = 255;
+
+    sdrcfg_args_t *a = calloc(1, sizeof(*a));
+    if (!a) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "alloc failed\n", HTTPD_RESP_USE_STRLEN);
+    }
+    a->lo_hz      = lo_hz;
+    a->gain_mode  = (gain_mode_t)gm;
+    a->gain_dbx10 = gain_dbx10;
+    a->tag_thr_db = tag_thr;
+    a->coal_n     = (uint8_t)coal;
+    a->at_lo_s    = (uint32_t)strtoul(atlo_s, NULL, 10);
+    a->at_gain_s  = (uint32_t)strtoul(atg_s, NULL, 10);
+
+    // Reply BEFORE spawning the writer (NVS commit disables flash cache,
+    // which can disrupt the socket send — mirror config_post's ordering).
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    const char *ok =
+        "<!doctype html><html><body style=\"font-family:system-ui;max-width:480px;margin:2em auto;padding:0 1em\">"
+        "<h1>SDR config saved — rebooting</h1>"
+        "<p>The device is applying the new tuning and will reboot in a few seconds. "
+        "<a href=\"/\">Back to config</a> &middot; <a href=\"/status\">Status</a></p>"
+        "</body></html>";
+    httpd_resp_send(req, ok, HTTPD_RESP_USE_STRLEN);
+
+    if (xTaskCreate(sdrcfg_apply_reboot_task, "sdrcfg", 4096, a, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "/sdrcfg: failed to spawn apply task");
+        free(a);
     }
     return ESP_OK;
 }
@@ -1788,6 +2117,7 @@ esp_err_t http_server_start(void)
         {.uri = "/debug/fault_inject", .method = HTTP_POST, .handler = debug_fault_inject_post, .user_ctx = NULL},
 #endif
         {.uri = "/tune", .method = HTTP_POST, .handler = tune_post, .user_ctx = NULL},
+        {.uri = "/sdrcfg", .method = HTTP_POST, .handler = sdrcfg_post, .user_ctx = NULL},
         {.uri = "/sd/mount", .method = HTTP_POST, .handler = sd_mount_post, .user_ctx = NULL},
         {.uri = "/sd/format", .method = HTTP_POST, .handler = sd_format_post, .user_ctx = NULL},
         {.uri = "/sd/delete", .method = HTTP_POST, .handler = sd_delete_post, .user_ctx = NULL},
