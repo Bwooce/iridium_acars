@@ -50,6 +50,7 @@ static dsp_processor_t *s_dsp = NULL;
 #define ACTION_EXIT 0x40
 #define ACTION_START_STREAM 0x80
 #define ACTION_RETUNE 0x100
+#define ACTION_GRACEFUL_STOP 0x200
 
 static const char   *TAG               = "CLASS";
 static rtlsdr_dev_t *rtldev            = NULL;
@@ -66,6 +67,11 @@ static volatile int  s_last_gain_dbx10 = -1;
 static volatile uint32_t s_pending_retune_hz = 0;
 static SemaphoreHandle_t s_retune_done       = NULL;
 static volatile bool     s_last_retune_ok    = false;
+
+// Graceful pre-reboot park (see class_driver_prepare_for_reboot()). The
+// requesting task posts ACTION_GRACEFUL_STOP and blocks on s_graceful_done;
+// the pump loop drains the stream + standbys the tuner, then gives it.
+static SemaphoreHandle_t s_graceful_done = NULL;
 
 // T48 (docs/perf-decoupling-design-2026-07-04.md §T48): the combined
 // class_driver loop is split into two Core-0 tasks:
@@ -261,6 +267,22 @@ esp_err_t class_driver_retune(uint32_t hz)
     return s_last_retune_ok ? ESP_OK : ESP_FAIL;
 }
 
+void class_driver_prepare_for_reboot(void)
+{
+    // Nothing to park if no device is open — the caller reboots immediately.
+    if (!rtldev) return;
+    if (!s_graceful_done) {
+        s_graceful_done = xSemaphoreCreateBinary();
+        if (!s_graceful_done) return; // OOM: skip graceful path, caller reboots
+    }
+    // Clear any stale completion so we wait for THIS request.
+    (void)xSemaphoreTake(s_graceful_done, 0);
+    s_driver_obj.actions |= ACTION_GRACEFUL_STOP;
+    // Bounded wait: if usb_pump is wedged (the health-wdt reboot case) this
+    // times out and the caller reboots regardless — the park is best-effort.
+    (void)xSemaphoreTake(s_graceful_done, pdMS_TO_TICKS(1500));
+}
+
 static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg)
 {
     class_driver_t *driver_obj = &s_driver_obj;
@@ -435,6 +457,23 @@ static void action_start_stream(class_driver_t *driver_obj)
     driver_obj->actions &= ~ACTION_START_STREAM;
 }
 
+// Runs on usb_pump in response to ACTION_GRACEFUL_STOP: drain the in-flight
+// bulk stream then park the tuner in standby, so an imminent esp_restart()
+// leaves the dongle quiescent rather than latched mid-I2C (the reboot-wedge).
+// Both steps are bounded (pause_stream ~300 ms; the standby's control
+// transfers carry their own timeout). Does NOT resume the stream — the reboot
+// follows immediately. See class_driver_prepare_for_reboot().
+static void action_graceful_stop(class_driver_t *driver_obj)
+{
+    ESP_LOGW(TAG, "graceful pre-reboot: draining stream + tuner standby");
+    esp_libusb_pause_stream(driver_obj);
+    if (rtldev) {
+        int r = rtlsdr_standby(rtldev);
+        ESP_LOGW(TAG, "graceful pre-reboot: tuner standby -> %d", r);
+    }
+    if (s_graceful_done) xSemaphoreGive(s_graceful_done);
+}
+
 static void action_close_dev(class_driver_t *driver_obj)
 {
     ESP_LOGI(TAG, "Closing device");
@@ -607,6 +646,10 @@ void class_driver_task(void *arg)
             ESP_LOGI(TAG, "retune to %lu Hz -> r=%d (stream resumed)", (unsigned long)hz, r);
             s_last_retune_ok = (r == 0);
             if (s_retune_done) xSemaphoreGive(s_retune_done);
+        }
+        if (s_driver_obj.actions & ACTION_GRACEFUL_STOP) {
+            s_driver_obj.actions &= ~ACTION_GRACEFUL_STOP;
+            action_graceful_stop(&s_driver_obj);
         }
         if (s_driver_obj.actions & ACTION_CLOSE_DEV) action_close_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_EXIT) break;

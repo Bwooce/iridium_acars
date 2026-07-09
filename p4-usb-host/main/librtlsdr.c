@@ -1474,6 +1474,26 @@ found:
     return 0;
 }
 
+int rtlsdr_standby(rtlsdr_dev_t *dev)
+{
+    int r = -1;
+    if (!dev)
+        return -1;
+    // Park the tuner in its low-power idle (r82xx_standby via tuner->exit)
+    // so an imminent reboot re-enumerates a quiescent tuner instead of one
+    // latched mid-I2C — the reboot-wedge documented in
+    // feedback_crashloop_wedges_rtlsdr_tuner. Uses the same i2c-repeater
+    // framing as rtlsdr_set_center_freq() so the register writes land the
+    // same way a normal retune's do.
+    if (dev->tuner && dev->tuner->exit)
+    {
+        rtlsdr_set_i2c_repeater(dev, 1);
+        r = dev->tuner->exit(dev);
+        rtlsdr_set_i2c_repeater(dev, 0);
+    }
+    return r;
+}
+
 int rtlsdr_close(rtlsdr_dev_t *dev)
 {
     (void)dev;

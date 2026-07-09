@@ -34,6 +34,11 @@ RTLSDR_API int  rtlsdr_open(rtlsdr_dev_t **dev, uint8_t index, usb_host_client_h
 
 RTLSDR_API int rtlsdr_close(rtlsdr_dev_t *dev);
 
+/* Park the tuner in low-power standby (best-effort) ahead of a reboot, so the
+ * next boot re-enumerates a quiescent tuner rather than one latched mid-I2C.
+ * Returns the tuner exit() result (0 = ok), or -1 if dev/tuner is unavailable. */
+RTLSDR_API int rtlsdr_standby(rtlsdr_dev_t *dev);
+
 /* configuration functions */
 
 /*!

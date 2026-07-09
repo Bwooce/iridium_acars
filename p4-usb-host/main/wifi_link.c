@@ -222,6 +222,7 @@ static void health_wdt_task(void *arg)
                 ESP_LOGE(TAG, "health-wdt: USB stream frozen %d cycles — dumping diag then esp_restart() [#105]",
                          s_stream_stalls);
                 class_driver_dump_stall_diag(); // forensics → serial before reboot
+                class_driver_prepare_for_reboot(); // park tuner (best-effort; times out if pump wedged)
                 fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
@@ -242,6 +243,7 @@ static void health_wdt_task(void *arg)
                          s_wdt_fails);
                 fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(200));
+                class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
                 esp_restart();
             }
         }

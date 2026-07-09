@@ -34,6 +34,7 @@
 #include "esp_heap_caps.h"
 
 #include "app_config.h"
+#include "class_driver.h" // class_driver_prepare_for_reboot()
 
 static const char *TAG = "OTA";
 
@@ -149,6 +150,7 @@ static void ota_task(void *arg)
     }
     ESP_LOGI(TAG, "OTA success — %d bytes staged, rebooting in 2 s", final_bytes);
     vTaskDelay(pdMS_TO_TICKS(2000));
+    class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
     esp_restart();
 
 done:

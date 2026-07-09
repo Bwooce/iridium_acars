@@ -31,3 +31,13 @@ esp_err_t class_driver_retune(uint32_t hz);
 // reboots a stalled stream (#105), so every recovery leaves a trace. Safe
 // from any task (no flash ops).
 void class_driver_dump_stall_diag(void);
+
+// Park the dongle cleanly just before an esp_restart(): drain the in-flight
+// bulk stream and put the tuner in standby so the next boot re-enumerates a
+// quiescent tuner rather than one latched mid-I2C (the reboot-wedge). Signals
+// the usb_pump task — the only task permitted to pause the stream / drive
+// tuner I2C — and waits a bounded time for it. Best-effort and always
+// bounded: if usb_pump is wedged (exactly the health-wdt reboot case) the
+// wait times out and the caller must reboot regardless. Safe to call from any
+// task; a no-op if no device is open. Call immediately before esp_restart().
+void class_driver_prepare_for_reboot(void);

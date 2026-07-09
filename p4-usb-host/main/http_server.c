@@ -17,6 +17,7 @@
 #include "msg_ring.h"
 #include "frame_decoder.h"
 #include "ota_runner.h"
+#include "class_driver.h" // class_driver_prepare_for_reboot()
 #include "sd_log.h"
 #include "sd_capture.h"
 #include "acars_push.h"
@@ -109,6 +110,7 @@ static void nvs_save_and_reboot_task(void *arg)
     // get out before Wi-Fi tears down.
     vTaskDelay(pdMS_TO_TICKS(500));
     ESP_LOGI(TAG, "rebooting to apply new config");
+    class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
     esp_restart();
 }
 
@@ -125,6 +127,7 @@ static void tune_apply_reboot_task(void *arg)
     ESP_LOGI(TAG, "/tune: set lo_freq_hz=%u (%s) — rebooting to apply",
              (unsigned)hz, esp_err_to_name(r));
     vTaskDelay(pdMS_TO_TICKS(500));
+    class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
     esp_restart();
 }
 

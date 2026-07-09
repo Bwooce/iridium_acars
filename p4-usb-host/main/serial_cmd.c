@@ -3,6 +3,7 @@
 #include "dsp_processor.h"
 #include "scanner.h"
 #include "wifi_link.h"
+#include "class_driver.h" // class_driver_prepare_for_reboot()
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -282,6 +283,7 @@ static void dispatch(char *line)
     if (strcmp(cmd, "reboot") == 0) {
         uart_puts("OK rebooting\r\n");
         vTaskDelay(pdMS_TO_TICKS(100));
+        class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
         esp_restart();
         return;
     }
