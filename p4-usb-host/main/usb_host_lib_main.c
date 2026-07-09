@@ -13,6 +13,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "usb/usb_host.h"
+#include "esp_libusb.h" // esp_libusb_get_dev_hdl() — gate the idle-nag on real enumeration
 #include "sdkconfig.h"
 #include "app_config.h"
 #include "agc.h"
@@ -135,7 +136,17 @@ void host_lib_daemon_task(void *arg)
         }
         int64_t now = esp_timer_get_time();
         if (now - last_idle_log >= 5 * 1000000) {
-            ESP_LOGI(TAG, "Host lib idle (no NEW_DEV yet — check D+/D- polarity on Picoblade pigtail, VBUS at device)");
+            // Only nag when NO device is actually enumerated. This daemon loop
+            // sees library-level events (NO_CLIENTS/ALL_FREE), never the
+            // client-level NEW_DEV, so it used to print "no NEW_DEV yet" every
+            // 5 s even while streaming — a spurious, misleading heartbeat.
+            // Gate on the real enumeration state: a non-NULL device handle
+            // means the class driver has the RTL-SDR open and (usually)
+            // streaming, so stay quiet. When truly idle/wedged (no handle),
+            // keep the diagnostic hint.
+            if (esp_libusb_get_dev_hdl() == NULL) {
+                ESP_LOGI(TAG, "Host lib idle (no device enumerated yet — check D+/D- polarity on Picoblade pigtail, VBUS at device)");
+            }
             last_idle_log = now;
         }
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
