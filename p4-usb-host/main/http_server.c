@@ -19,6 +19,7 @@
 #include "ota_runner.h"
 #include "class_driver.h" // class_driver_prepare_for_reboot()
 #include "scanner.h"      // scanner_scan() — /scan sustained-hop test endpoint
+#include "autotune.h"     // autotune_run_manual() — /gaincal manual trigger
 #include "sd_log.h"
 #include "sd_capture.h"
 #include "acars_push.h"
@@ -1285,6 +1286,44 @@ static esp_err_t autotune_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// POST /gaincal[?dwell=<s>] — manually trigger the autotune GAIN-CAL now
+// (autotune_run_manual): hop to the IRA reference LO, sweep the R828D gain steps,
+// measure bch decodes per gain, pick the best, park back at the ACARS LO + apply.
+// Runs on an internal-SRAM-stack task (it does NVS writes — chosen gain, optional
+// dwell — which must NOT run on the PSRAM-stacked httpd task). Optional
+// ?dwell=<s> overrides the per-gain dwell (default 180 s) so a full sweep can be
+// validated in ~90 s (e.g. dwell=10). Unlike the serial `autotune` command, this
+// does NOT reset the board (no DTR). Watch serial for "GAINCAL" + per-gain lines.
+static void gaincal_task(void *arg)
+{
+    uint32_t dwell = (uint32_t)(uintptr_t)arg;
+    if (dwell > 0) {
+        esp_err_t r = app_config_set_autotune_gain_dwell_s(dwell);
+        ESP_LOGW("GAINCAL", "manual trigger: dwell override = %lu s (%s)",
+                 (unsigned long)dwell, esp_err_to_name(r));
+    }
+    ESP_LOGW("GAINCAL", "=== manual gain-cal starting (watch for wedge/hang) ===");
+    autotune_run_manual();
+    ESP_LOGW("GAINCAL", "=== manual gain-cal returned cleanly ===");
+    vTaskDelete(NULL);
+}
+static esp_err_t gaincal_post(httpd_req_t *req)
+{
+    char     query[48] = {0}, s[12] = {0};
+    uint32_t dwell = 0; // 0 = use the configured dwell
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "dwell", s, sizeof(s)) == ESP_OK) {
+        dwell = (uint32_t)strtoul(s, NULL, 10);
+    }
+    httpd_resp_set_type(req, "text/plain");
+    // prio 4: below worker/ingest — mostly waits on dwells + validated retunes.
+    if (xTaskCreate(gaincal_task, "gaincal", 6144, (void *)(uintptr_t)dwell, 4, NULL) != pdPASS) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "failed to spawn gaincal task\n");
+    }
+    return httpd_resp_sendstr(req, "gain-cal started — watch serial (GAINCAL / gain steps)\n");
+}
+
 static esp_err_t sd_mount_post(httpd_req_t *req)
 {
     esp_err_t      r = sd_log_force_mount();
@@ -1799,6 +1838,7 @@ esp_err_t http_server_start(void)
         {.uri = "/capture/file", .method = HTTP_GET, .handler = capture_file_get, .user_ctx = NULL},
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
+        {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
     };
     _Static_assert(sizeof(routes) / sizeof(routes[0]) <= HTTPD_URI_LIMIT,
                    "route count exceeds HTTPD_URI_LIMIT; bump HTTPD_URI_LIMIT "

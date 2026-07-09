@@ -34,14 +34,18 @@ static const char *NVS_NS = "iridium";
 #define DEFAULT_AUTOTUNE_GAIN_MAX_DBX10 460    // skip the 48/49.6 dB saturating top
 #define DEFAULT_AUTOTUNE_GAIN_STRIDE 3         // coarse: every 3rd R828D step
 #define DEFAULT_AUTOTUNE_ON_BOOT false         // don't eat a boot on every reboot
-#define DEFAULT_AUTOTUNE_GAIN_INTERVAL_S 3600u // hourly (RFI/thermal-driven, slow)
-#define DEFAULT_AUTOTUNE_LO_INTERVAL_S 3600u   // hourly. ENABLED 2026-07-09: the automated
-                                               // scanner_scan() is validated safe (42 live retunes /
-                                               // 7 sweeps, 0 wedges — the old "still-blocked" note
-                                               // predated the URB-reuse/retune-retry/graceful fixes).
-                                               // Only runs when gain_mode==MANUAL (like gain-cal). Each
-                                               // run logs a distinctive AUTOTUNE-START marker so any
-                                               // future wedge can be correlated to the hop that caused it.
+// Split cadence (design doc §Recalibration period): gain drifts SLOWLY (RFI/
+// thermal) and its cal is EXPENSIVE (~30 min IRA sweep, ~10 gains × 180 s), so
+// run it rarely — every 12 h = only ~4% duty off-ACARS. The LO/density re-scan
+// is satellite-driven (~100 min LEO, frequent handoffs) and cheap (~1 min), so
+// run it more often. NB: best-LO is noisy/mean-reverting (see
+// reference_freq_coverage_analysis) — 30 min is a safe interim until multi-scan
+// averaging lands; the design's ~600 s ideal would thrash on single snapshots.
+#define DEFAULT_AUTOTUNE_GAIN_INTERVAL_S 43200u // 12 h (RFI/thermal-driven, slow, ~30 min pass)
+#define DEFAULT_AUTOTUNE_LO_INTERVAL_S 1800u    // 30 min (satellite-driven; validated 42-hop scan).
+                                               // Only runs when gain_mode==MANUAL. Each run logs a
+                                               // distinctive AUTOTUNE-START marker so any future wedge
+                                               // can be correlated to the hop that caused it.
 #define DEFAULT_STATION_ID "p4-iridium-1"
 #define DEFAULT_WIFI_SSID ""
 #define DEFAULT_WIFI_PSK ""
