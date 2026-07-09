@@ -102,15 +102,20 @@ static void autotune_sched_task(void *arg)
 
         int64_t t = now_s();
         if (autotune_is_due(last_gain_run, t, cfg.autotune_gain_interval_s)) {
-            ESP_LOGI(TAG, "periodic gain-cal due (interval=%lu s)",
+            // Distinctive WARN marker: autotune hops the tuner, so if the RTL
+            // ever wedges (no NEW_DEV / EP0 STALL) shortly after this line,
+            // the gain-cal hop is the prime suspect. grep AUTOTUNE-START.
+            ESP_LOGW(TAG, "AUTOTUNE-START gain-cal (interval=%lu s) — hops tuner; watch for a wedge after this",
                      (unsigned long)cfg.autotune_gain_interval_s);
             autotune_run_manual();
+            ESP_LOGW(TAG, "AUTOTUNE-DONE gain-cal");
             last_gain_run = now_s();
         }
         if (autotune_is_due(last_lo_run, t, cfg.autotune_lo_interval_s)) {
-            ESP_LOGI(TAG, "periodic LO rescan due (interval=%lu s)",
+            ESP_LOGW(TAG, "AUTOTUNE-START LO-rescan (interval=%lu s) — multi-hop scanner_scan; watch for a wedge after this",
                      (unsigned long)cfg.autotune_lo_interval_s);
             autotune_run_lo_rescan();
+            ESP_LOGW(TAG, "AUTOTUNE-DONE LO-rescan");
             last_lo_run = now_s();
         }
     }

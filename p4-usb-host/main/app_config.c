@@ -35,10 +35,13 @@ static const char *NVS_NS = "iridium";
 #define DEFAULT_AUTOTUNE_GAIN_STRIDE 3         // coarse: every 3rd R828D step
 #define DEFAULT_AUTOTUNE_ON_BOOT false         // don't eat a boot on every reboot
 #define DEFAULT_AUTOTUNE_GAIN_INTERVAL_S 3600u // hourly (RFI/thermal-driven, slow)
-#define DEFAULT_AUTOTUNE_LO_INTERVAL_S 0u      // DISABLED by default: periodic LO rescan uses the
-                                               // still-blocked automated scanner_scan() (DMA-INT churn,
-                                               // 9638816), and best-LO is mean-reverting so a hot rescan
-                                               // isn't needed anyway. Opt-in once the scanner is unblocked.
+#define DEFAULT_AUTOTUNE_LO_INTERVAL_S 3600u   // hourly. ENABLED 2026-07-09: the automated
+                                               // scanner_scan() is validated safe (42 live retunes /
+                                               // 7 sweeps, 0 wedges — the old "still-blocked" note
+                                               // predated the URB-reuse/retune-retry/graceful fixes).
+                                               // Only runs when gain_mode==MANUAL (like gain-cal). Each
+                                               // run logs a distinctive AUTOTUNE-START marker so any
+                                               // future wedge can be correlated to the hop that caused it.
 #define DEFAULT_STATION_ID "p4-iridium-1"
 #define DEFAULT_WIFI_SSID ""
 #define DEFAULT_WIFI_PSK ""
