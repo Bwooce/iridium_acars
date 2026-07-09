@@ -16,6 +16,14 @@
 // transfer/response_buf state (#T8).
 bool class_driver_set_tuner_gain_dbx10(int gain_dbx10);
 
+// Like the above, but sets the gain with the bulk stream QUIESCED on the
+// usb_pump task (pause -> set -> resume), so the R828D gain-register control
+// transfers don't race in-flight bulk URBs. Use this from the gain-cal sweep:
+// the bare version fails intermittently under the IRA burst-flood ("set
+// failed"). Blocks up to ~3 s; returns false on timeout/failure. Must NOT be
+// called from the usb_pump task itself (it posts an action to that task).
+bool class_driver_set_gain_quiesced(int gain_dbx10);
+
 // Returns the most recently applied tuner gain in tenths of dB,
 // or -1 if not yet set. Useful for AGC state tracking.
 int class_driver_get_tuner_gain_dbx10(void);

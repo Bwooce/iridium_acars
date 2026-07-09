@@ -92,7 +92,7 @@ static void autotune_run_manual_locked(void)
     }
 
     for (int i = 0; i < ng; i++) {
-        if (!class_driver_set_tuner_gain_dbx10(gains[i])) {
+        if (!class_driver_set_gain_quiesced(gains[i])) {
             ESP_LOGW(TAG, "  gain %d.%d dB: set failed, skipping",
                      gains[i] / 10, gains[i] % 10);
             decoded[i] = -1; // invalid: pick_best won't choose a negative
@@ -124,7 +124,7 @@ static void autotune_run_manual_locked(void)
         ESP_LOGE(TAG, "WARNING: failed to hop back to ACARS LO %lu Hz",
                  (unsigned long)saved_lo);
     }
-    if (!class_driver_set_tuner_gain_dbx10(chosen_gain)) {
+    if (!class_driver_set_gain_quiesced(chosen_gain)) {
         ESP_LOGE(TAG, "WARNING: failed to apply gain %d.%d dB",
                  chosen_gain / 10, chosen_gain % 10);
     }

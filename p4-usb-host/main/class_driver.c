@@ -51,6 +51,7 @@ static dsp_processor_t *s_dsp = NULL;
 #define ACTION_START_STREAM 0x80
 #define ACTION_RETUNE 0x100
 #define ACTION_GRACEFUL_STOP 0x200
+#define ACTION_SET_GAIN 0x400
 
 static const char   *TAG               = "CLASS";
 static rtlsdr_dev_t *rtldev            = NULL;
@@ -67,6 +68,13 @@ static volatile int  s_last_gain_dbx10 = -1;
 static volatile uint32_t s_pending_retune_hz = 0;
 static SemaphoreHandle_t s_retune_done       = NULL;
 static volatile bool     s_last_retune_ok    = false;
+
+// Quiesced tuner-gain set (class_driver_set_gain_quiesced): the gain-cal must
+// set gains with the bulk stream paused (like retune), else the R828D
+// gain-register control transfers race in-flight bulk URBs and fail under load.
+static volatile int      s_pending_gain_dbx10 = 0;
+static SemaphoreHandle_t s_setgain_done       = NULL;
+static volatile bool     s_last_setgain_ok    = false;
 
 // Graceful pre-reboot park (see class_driver_prepare_for_reboot()). The
 // requesting task posts ACTION_GRACEFUL_STOP and blocks on s_graceful_done;
@@ -265,6 +273,27 @@ esp_err_t class_driver_retune(uint32_t hz)
     if (xSemaphoreTake(s_retune_done, pdMS_TO_TICKS(3000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
     return s_last_retune_ok ? ESP_OK : ESP_FAIL;
+}
+
+bool class_driver_set_gain_quiesced(int gain_dbx10)
+{
+    // Set the tuner gain with the bulk stream quiesced, on the usb_pump task —
+    // the SAME quiesce the retune uses. A bare rtlsdr_set_tuner_gain() from the
+    // caller races the live bulk URBs (its R828D register writes are USB control
+    // transfers) and fails intermittently under load — exactly what broke the
+    // gain-cal sweep ("gain X.X dB: set failed"). Posts ACTION_SET_GAIN and
+    // blocks (bounded) for the pump task to pause/set/resume.
+    if (!rtldev || gain_dbx10 < 0) return false;
+    if (!s_setgain_done) {
+        s_setgain_done = xSemaphoreCreateBinary();
+        if (!s_setgain_done) return false;
+    }
+    (void)xSemaphoreTake(s_setgain_done, 0);
+    s_pending_gain_dbx10 = gain_dbx10;
+    s_driver_obj.actions |= ACTION_SET_GAIN;
+    if (xSemaphoreTake(s_setgain_done, pdMS_TO_TICKS(3000)) != pdTRUE)
+        return false;
+    return s_last_setgain_ok;
 }
 
 void class_driver_prepare_for_reboot(void)
@@ -646,6 +675,25 @@ void class_driver_task(void *arg)
             ESP_LOGI(TAG, "retune to %lu Hz -> r=%d (stream resumed)", (unsigned long)hz, r);
             s_last_retune_ok = (r == 0);
             if (s_retune_done) xSemaphoreGive(s_retune_done);
+        }
+        if (s_driver_obj.actions & ACTION_SET_GAIN) {
+            // Quiesced gain set (usb_pump): pause the bulk stream so the R828D
+            // gain-register control transfers don't race in-flight bulk URBs,
+            // set the gain, resume. Mirrors the retune quiesce above — the
+            // gain-cal calls class_driver_set_gain_quiesced() per gain instead
+            // of a bare set_tuner_gain that failed intermittently under load.
+            s_driver_obj.actions &= ~ACTION_SET_GAIN;
+            int g = s_pending_gain_dbx10;
+            esp_libusb_pause_stream(&s_driver_obj);
+            int r  = rtlsdr_set_tuner_gain(rtldev, g);
+            int rr = esp_libusb_resume_stream(&s_driver_obj, 0x81);
+            if (r == 0) s_last_gain_dbx10 = g;
+            if (rr != 0)
+                ESP_LOGE(TAG, "resume_stream returned %d after gain set %d.%d dB",
+                         rr, g / 10, g % 10);
+            ESP_LOGI(TAG, "gain set %d.%d dB -> r=%d (stream resumed)", g / 10, g % 10, r);
+            s_last_setgain_ok = (r == 0);
+            if (s_setgain_done) xSemaphoreGive(s_setgain_done);
         }
         if (s_driver_obj.actions & ACTION_GRACEFUL_STOP) {
             s_driver_obj.actions &= ~ACTION_GRACEFUL_STOP;
