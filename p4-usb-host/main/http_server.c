@@ -18,6 +18,7 @@
 #include "frame_decoder.h"
 #include "ota_runner.h"
 #include "class_driver.h" // class_driver_prepare_for_reboot()
+#include "scanner.h"      // scanner_scan() — /scan sustained-hop test endpoint
 #include "sd_log.h"
 #include "sd_capture.h"
 #include "acars_push.h"
@@ -1208,6 +1209,34 @@ static esp_err_t tune_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// POST /scan — TEST endpoint: drives ONE full scanner_scan() multi-hop sweep
+// (1616-1626 MHz, 2.5 MHz step, ~5 live retunes, 2 s dwell each) on an
+// internal-stack task, exercising the live-retune scanner path under real
+// streaming. Purpose: verify sustained hopping survives on main (URB-reuse +
+// retune-retry + graceful-shutdown all landed) before investing in the
+// async-memcpy bypass. Call repeatedly for dozens of hops; watch serial for
+// wedge / worker drops. Returns immediately.
+static void scan_test_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGW("SCANTEST", "=== /scan: starting scanner_scan sweep ===");
+    scanner_scan(SCAN_START_HZ, SCAN_STOP_HZ, SCAN_STEP_HZ, SCAN_DWELL_MS);
+    ESP_LOGW("SCANTEST", "=== /scan: sweep complete ===");
+    vTaskDelete(NULL);
+}
+
+static esp_err_t scan_post(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/plain");
+    // prio 4: below worker/ingest so the scan orchestration (mostly waiting on
+    // retune completion + dwell) can't starve the DSP hot path.
+    if (xTaskCreate(scan_test_task, "scan_test", 4096, NULL, 4, NULL) != pdPASS) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "failed to spawn scan task\n");
+    }
+    return httpd_resp_sendstr(req, "scan sweep started — watch serial\n");
+}
+
 static esp_err_t sd_mount_post(httpd_req_t *req)
 {
     esp_err_t      r = sd_log_force_mount();
@@ -1720,6 +1749,7 @@ esp_err_t http_server_start(void)
         {.uri = "/capture/stop", .method = HTTP_POST, .handler = capture_stop_post, .user_ctx = NULL},
         {.uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get, .user_ctx = NULL},
         {.uri = "/capture/file", .method = HTTP_GET, .handler = capture_file_get, .user_ctx = NULL},
+        {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
     };
     _Static_assert(sizeof(routes) / sizeof(routes[0]) <= HTTPD_URI_LIMIT,
                    "route count exceeds HTTPD_URI_LIMIT; bump HTTPD_URI_LIMIT "
