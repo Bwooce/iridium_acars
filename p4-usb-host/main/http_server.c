@@ -571,7 +571,9 @@ static void send_page_head(httpd_req_t *req, const char *title, int refresh_s)
         snprintf(refresh, sizeof(refresh),
                  "<meta http-equiv=\"refresh\" content=\"%d\">", refresh_s);
     }
-    char head[1536];
+    static char head[1536]; // httpd task stack is only 6144 B (PSRAM) — big
+                            // buffers MUST be static (single serve task = race-free)
+                            // or the HTML handlers overflow the stack and reset the conn
     int  n = snprintf(head, sizeof(head),
                       "<!doctype html><html><head><meta charset=\"utf-8\">"
                        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -640,7 +642,7 @@ static esp_err_t index_get(httpd_req_t *req)
     html_attr_escape(host_esc, sizeof(host_esc), cfg.out_host);
     html_attr_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
 
-    char form[2048];
+    static char form[2048]; // static: 6144 B httpd stack (see head[] note)
     int  n = snprintf(form, sizeof(form),
                       "<form method=\"POST\" action=\"/config\">"
                        "<h2>Wi-Fi</h2>"
@@ -759,7 +761,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
         snprintf(gain_str, sizeof(gain_str), "tuner AGC");
 
     int64_t uptime_s = esp_timer_get_time() / 1000000;
-    char    body[2700];
+    static char body[2700]; // static: 6144 B httpd stack (see send_page_head note)
     int     n = snprintf(body, sizeof(body),
                          "<p><small>build %s &middot; %s &middot; uptime %llds &middot; "
                              "auto-refresh 5 s</small></p>",
