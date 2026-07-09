@@ -1050,22 +1050,44 @@ static esp_err_t messages_html_get(httpd_req_t *req)
     uint64_t total = msg_ring_total();
     int64_t  now_us = esp_timer_get_time();
 
-    static char body[512];
+    // Cumulative decode-type totals (since boot) — same getters the /status
+    // JSON uses. These count every classified frame, not just what fits in the
+    // 32-entry ring, so they keep climbing after the ring wraps.
+    frame_decoder_class_counts_t cc = {0};
+    frame_decoder_get_class_counts(&cc);
+    uint64_t acars_total = frame_decoder_acars_decoded_total();
+    uint64_t sbd_total   = frame_decoder_sbd_complete_total();
+
+    static char body[768];
     int  bn = snprintf(body, sizeof(body),
-                       "<p><small>%llu decoded since boot &middot; showing last %u "
-                       "&middot; auto-refresh 10 s</small></p>",
-                       (unsigned long long)total, (unsigned)n);
-    httpd_resp_send_chunk(req, body, bn > 0 ? bn : 0);
+                       "<p><small>%llu messages in ring &middot; showing last %u "
+                       "&middot; auto-refresh 10 s</small></p>"
+                       "<h2>Decoded totals (since boot)</h2>"
+                       "<table><tr><th>ACARS</th><th>SBD</th><th>MS</th><th>TL</th>"
+                       "<th>BC</th><th>LW·DA</th><th>LW·oth</th><th>Unknown</th></tr>"
+                       "<tr><td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
+                       "<td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
+                       "<td class=v>%llu</td><td class=v>%llu</td></tr></table>",
+                       (unsigned long long)total, (unsigned)n,
+                       (unsigned long long)acars_total, (unsigned long long)sbd_total,
+                       (unsigned long long)cc.ms, (unsigned long long)cc.tl,
+                       (unsigned long long)cc.bc, (unsigned long long)cc.lw_da,
+                       (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown);
+    if (bn < 0) bn = 0;
+    if (bn > (int)sizeof(body)) bn = sizeof(body);
+    httpd_resp_send_chunk(req, body, bn);
 
     if (n == 0) {
         httpd_resp_send_chunk(req,
-                              "<p><em>No ACARS messages decoded yet. IRA ring-alert "
+                              "<p><em>No ACARS messages in the ring yet. IRA ring-alert "
                               "frames are common; IDA data frames (the ones with text) "
                               "are rarer — leave it running.</em></p>",
                               HTTPD_RESP_USE_STRLEN);
         send_page_foot(req);
         return ESP_OK;
     }
+
+    httpd_resp_send_chunk(req, "<h2>Recent messages</h2>", HTTPD_RESP_USE_STRLEN);
 
     httpd_resp_send_chunk(req,
                           "<table><tr><th>Age</th><th>Dir</th><th>Mode</th><th>Label</th>"
