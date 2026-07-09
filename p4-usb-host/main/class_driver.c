@@ -570,23 +570,18 @@ void class_driver_task(void *arg)
     int64_t start_time  = esp_timer_get_time();
     int64_t last_report = start_time;
 
-    uint64_t      cycle_handle_events_us = 0; // time blocked in usb_host_client_handle_events
-    int64_t       last_idle_log          = esp_timer_get_time();
-    int64_t       last_taskdump          = esp_timer_get_time();
-    int64_t       last_recovery_us       = esp_timer_get_time();
-    int           recovery_attempts      = 0;
-    const int     MAX_RECOVERY_ATTEMPTS  = 3;
-    const int64_t RECOVERY_INTERVAL_US   = 6 * 1000000;
+    uint64_t cycle_handle_events_us = 0; // time blocked in usb_host_client_handle_events
+    int64_t  last_idle_log          = esp_timer_get_time();
+    int64_t  last_taskdump          = esp_timer_get_time();
 
     // Stream-stall watchdog (task #72): when a device IS enumerated but
     // USB bytes_window stays effectively zero across several seconds,
     // the controller / endpoint has wedged. Cycle the root port power
     // to force re-attach (same recovery as the no-device path above).
     int            stall_seconds         = 0;
+    bool           stall_escalated       = false;      // logged this episode's escalation
     const int      STALL_TRIGGER_SECONDS = 5;          // tolerate brief noise dips
     const uint64_t STALL_BYTES_FLOOR     = 100 * 1024; // <100 KB/s is "stuck", not "quiet"
-    int            stall_recoveries      = 0;
-    const int      MAX_STALL_RECOVERIES  = 3;
 
     while (1) {
         // Reset task watchdog. The loop runs hot (no vTaskDelay) because the
@@ -606,7 +601,18 @@ void class_driver_task(void *arg)
         cycle_handle_events_us += (uint64_t)(esp_timer_get_time() - t_he0);
         atomic_fetch_add_explicit(&s_pump_iter, 1, memory_order_relaxed);
 
-        // Periodic status / recovery watchdog while no device is open.
+        // Periodic status while no device is open. We deliberately do NOT
+        // cycle root-port power here anymore. This board has no switchable
+        // VBUS (project_no_switchable_vbus_confirmed — schematic-confirmed),
+        // so the old power(false)/power(true) cycle could never physically
+        // re-power a stuck dongle; it only raced IDF's own hub-driver port
+        // recovery (producing the misleading "power(true) -> INVALID_STATE"
+        // log) and forced the device gone. IDF re-enumerates a genuinely
+        // re-attached device on its own. A boot-time dongle that half-attaches
+        // and never enumerates needs a physical reseat regardless — no
+        // firmware lever exists. NB: the health watchdog (wifi_link.c) does
+        // NOT reboot for a never-streamed boot (deliberately, to avoid a boot
+        // reboot-loop), so this path now simply waits for enumeration.
         if (s_driver_obj.dev_addr == 0) {
             int64_t now_us = esp_timer_get_time();
             if (now_us - last_idle_log >= 5 * 1000000) {
@@ -614,28 +620,6 @@ void class_driver_task(void *arg)
                          s_driver_obj.dev_addr, (unsigned long)s_driver_obj.actions);
                 last_idle_log = now_us;
             }
-            // If nothing has enumerated for RECOVERY_INTERVAL_US, cycle root port power.
-            // This forces SOFs to stop and re-evaluates attach state, which recovers
-            // most stuck-device cases without requiring physical unplug. Capped at
-            // MAX_RECOVERY_ATTEMPTS so we don't loop forever if the hardware is
-            // genuinely broken.
-            if (recovery_attempts < MAX_RECOVERY_ATTEMPTS &&
-                now_us - last_recovery_us >= RECOVERY_INTERVAL_US) {
-                ESP_LOGW(TAG, "Recovery: cycling root port power (attempt %d/%d)",
-                         recovery_attempts + 1, MAX_RECOVERY_ATTEMPTS);
-                esp_err_t r = usb_host_lib_set_root_port_power(false);
-                ESP_LOGW(TAG, "  power(false) -> 0x%x (%s)", r, esp_err_to_name(r));
-                vTaskDelay(pdMS_TO_TICKS(500));
-                r = usb_host_lib_set_root_port_power(true);
-                ESP_LOGW(TAG, "  power(true)  -> 0x%x (%s)", r, esp_err_to_name(r));
-                recovery_attempts++;
-                last_recovery_us = esp_timer_get_time();
-            }
-        } else {
-            // Reset the recovery counter on successful enumeration so we can
-            // recover again from a future hot-disconnect.
-            recovery_attempts = 0;
-            last_recovery_us  = esp_timer_get_time();
         }
 
         if (s_driver_obj.actions & ACTION_OPEN_DEV) action_open_dev(&s_driver_obj);
@@ -789,26 +773,37 @@ void class_driver_task(void *arg)
                 // reset) instead of a separate local — same value the
                 // old combined loop's bare `bytes_window` local held here.
                 if (snap.bytes_window < STALL_BYTES_FLOOR) {
-                    stall_seconds++;
-                    ESP_LOGW(TAG, "stream stall #%d/%d (%llu B in last 1s, threshold %llu)",
-                             stall_seconds, STALL_TRIGGER_SECONDS,
-                             (unsigned long long)snap.bytes_window,
-                             (unsigned long long)STALL_BYTES_FLOOR);
+                    // Count up to the trigger, logging progress once per second,
+                    // then cap — so a permanently-wedged dongle (needs a reseat;
+                    // no VBUS lever) doesn't spam this line forever, as it used to.
+                    if (stall_seconds < STALL_TRIGGER_SECONDS) {
+                        stall_seconds++;
+                        ESP_LOGW(TAG, "stream stall #%d/%d (%llu B in last 1s, threshold %llu)",
+                                 stall_seconds, STALL_TRIGGER_SECONDS,
+                                 (unsigned long long)snap.bytes_window,
+                                 (unsigned long long)STALL_BYTES_FLOOR);
+                    }
                 } else {
-                    stall_seconds = 0;
+                    stall_seconds   = 0;
+                    stall_escalated = false; // stream recovered — re-arm for next episode
                 }
-                if (stall_seconds >= STALL_TRIGGER_SECONDS &&
-                    stall_recoveries < MAX_STALL_RECOVERIES) {
-                    ESP_LOGE(TAG, "STREAM STALL: cycling root port power "
-                                  "(recovery %d/%d)",
-                             stall_recoveries + 1, MAX_STALL_RECOVERIES);
-                    esp_err_t r = usb_host_lib_set_root_port_power(false);
-                    ESP_LOGW(TAG, "  power(false) -> 0x%x (%s)", r, esp_err_to_name(r));
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    r = usb_host_lib_set_root_port_power(true);
-                    ESP_LOGW(TAG, "  power(true)  -> 0x%x (%s)", r, esp_err_to_name(r));
-                    stall_seconds = 0;
-                    stall_recoveries++;
+                if (stall_seconds >= STALL_TRIGGER_SECONDS && !stall_escalated) {
+                    // Log the escalation ONCE per stall episode (not every second).
+                    // No in-loop power-cycle recovery: this board has no
+                    // switchable VBUS (project_no_switchable_vbus_confirmed),
+                    // so usb_host_lib_set_root_port_power() can't physically
+                    // re-power the dongle. The old power(false)/power(true)
+                    // here only raced IDF's hub-driver port recovery (the
+                    // "power(true) -> INVALID_STATE" log) and forced the device
+                    // gone. A stall that surfaces as a USB port error is
+                    // auto-recovered by IDF itself; this silent byte-stall has
+                    // no port event, so it escalates to the health watchdog
+                    // below. Latch stall_escalated so this fires once, not
+                    // every second, until the stream recovers.
+                    ESP_LOGE(TAG, "STREAM STALL: %d s at <%llu B/s — leaving the port "
+                                  "to IDF; health watchdog will reboot if it persists",
+                             stall_seconds, (unsigned long long)STALL_BYTES_FLOOR);
+                    stall_escalated = true;
                 }
                 // NOTE: the esp_restart() escalation that used to live here
                 // is gone — it could never fire when this loop itself blocked
@@ -816,13 +811,11 @@ void class_driver_task(void *arg)
                 // the dongle-silent stall wedges the pipeline. Reboot recovery
                 // now lives in the independent health watchdog (wifi_link.c,
                 // health_wdt) which monitors usb.completed from OUTSIDE this
-                // loop. The cheap root-port cycle above stays as an in-loop
-                // first-try for the loop-still-alive case (#103/#105).
+                // loop — now the SOLE recovery for a silent byte-stall, since
+                // the in-loop root-port cycle is gone (no VBUS lever; #103/#105).
             } else {
-                stall_seconds = 0;
-                // Re-arm the stall watchdog when a device re-enumerates
-                // — covers the "USB cable yanked and replugged" path.
-                if (s_driver_obj.dev_addr != 0) stall_recoveries = 0;
+                stall_seconds   = 0;
+                stall_escalated = false;
             }
 
             // T48: only cycle_handle_events_us is still a plain local
