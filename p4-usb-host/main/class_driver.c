@@ -579,9 +579,28 @@ void class_driver_task(void *arg)
             // the caller — see esp_libusb_pause_stream()'s doc comment.
             s_driver_obj.actions &= ~ACTION_RETUNE;
             uint32_t hz = s_pending_retune_hz;
+            // DMA-INT churn instrumentation (dma-int-fix): sample the
+            // DMA-capable-internal free + largest-block at each retune
+            // stage so a single hop pinpoints which stage consumes the
+            // heap (pause vs control-transfer vs resume), and repeated
+            // hops reveal a monotonic leak vs steady churn. Per-hop only
+            // (not per-sample) so the log cost is negligible.
+#define DMAINT_FREE() heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)
+#define DMAINT_LARGE() heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)
+            size_t d0f = DMAINT_FREE(), d0l = DMAINT_LARGE();
             esp_libusb_pause_stream(&s_driver_obj);
-            int r  = rtlsdr_set_center_freq(rtldev, hz);
-            int rr = esp_libusb_resume_stream(&s_driver_obj, 0x81);
+            size_t d1f = DMAINT_FREE(), d1l = DMAINT_LARGE();
+            int    r   = rtlsdr_set_center_freq(rtldev, hz);
+            size_t d2f = DMAINT_FREE(), d2l = DMAINT_LARGE();
+            int    rr  = esp_libusb_resume_stream(&s_driver_obj, 0x81);
+            size_t d3f = DMAINT_FREE(), d3l = DMAINT_LARGE();
+            ESP_LOGW(TAG,
+                     "DMAINT hop %lu Hz (bytes): pre free=%u lg=%u | postpause free=%u lg=%u | "
+                     "postctrl free=%u lg=%u | postresume free=%u lg=%u | net=%d",
+                     (unsigned long)hz, (unsigned)d0f, (unsigned)d0l, (unsigned)d1f, (unsigned)d1l,
+                     (unsigned)d2f, (unsigned)d2l, (unsigned)d3f, (unsigned)d3l, (int)d3f - (int)d0f);
+#undef DMAINT_FREE
+#undef DMAINT_LARGE
             if (rr != 0)
                 ESP_LOGE(TAG, "resume_stream returned %d after retune to %lu Hz — sample stream may be degraded/down",
                          rr, (unsigned long)hz);
