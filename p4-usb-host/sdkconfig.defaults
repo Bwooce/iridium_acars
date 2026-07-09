@@ -186,3 +186,15 @@ CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=64
 CONFIG_ESP_COREDUMP_UART_DELAY=0
+
+# Silence ESP_RETURN/GOTO_ON_* check-macro logs. This compiles the check macros
+# (incl. the ISR variant, esp_check.h:121) down to a bare `return err_code;` with
+# NO log. Kills the dominant hot-path spam — IDF dma_utils "no mem for stash
+# buffer" (ESP_RETURN_ON_FALSE_ISR, esp_dma_utils.c:54) fired ~9/sec on Core 1
+# under our tight-DMA-INT condition (benign: CPU-memcpy fallback recovers
+# losslessly, count collated in STATUS-ERR stash_fails). That log uses
+# ESP_EARLY_LOGE which bypasses esp_log_level_set / esp_log_set_vprintf, so this
+# compile-time config is the only clean (non-vendor-patch) suppression. Global:
+# also silences other terse check-macro messages, but real errors are logged
+# explicitly via ESP_LOGE. Bonus: slightly smaller code.
+CONFIG_COMPILER_OPTIMIZATION_CHECKS_SILENT=y
