@@ -54,8 +54,15 @@ typedef struct
 //  - 4 x 8 KB (32 KB) fits in the constrained pool but throttles
 //    the SDR to ~0.85 MB/s vs 2.5 MB/s needed -> rb_full_drops.
 //  - 8 x 8 KB (64 KB) is the post-s_conv-move setting. Verified the
-//    DMA-internal heap accommodates this comfortably.
-#define ASYNC_TRANSFER_COUNT 8
+//    DMA-internal heap accommodates this comfortably (~6 KB steady-state
+//    margin — too tight: the per-RX cache-align stash fails during hops).
+//  - 6 x 8 KB (48 KB): DMA-INT-reclaim experiment (dma-int-fix) — frees
+//    16 KB so the stash + control transfers have headroom during retune
+//    hops. RISK per the 4x8 history above: fewer transfers can reintroduce
+//    rb_full_drops under consumer lag — the per-hop DMAINT instrumentation
+//    + STATUS rb_full watch confirm whether this trades cleanly. Revert to
+//    8 if it throttles.
+#define ASYNC_TRANSFER_COUNT 6
 #define ASYNC_TRANSFER_SIZE (8 * 1024)
 
 // PSRAM stream ring size. Single source of truth for both the
