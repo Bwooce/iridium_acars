@@ -168,10 +168,18 @@ void host_lib_daemon_task(void *arg)
 
 void app_main(void)
 {
-    // (The IDF dma_utils "no mem for stash buffer" hot-path spam is silenced at
-    // compile time via CONFIG_COMPILER_OPTIMIZATION_CHECKS_SILENT in
-    // sdkconfig.defaults — it's an ESP_EARLY_LOGE that esp_log_level_set can't
-    // filter. See that config's comment.)
+    // Silence the IDF dma_utils "no mem for stash buffer" ERROR. It fires on
+    // the DSP hot path (Core 1) every time esp_async_memcpy can't grab its
+    // cache-align stash — ~9-10x/sec under our steady tight-DMA-INT condition
+    // (measured 9044 lines in ~16 min = the single biggest log producer, 3x
+    // everything else combined). The condition is BENIGN: the CPU-memcpy
+    // fallback recovers losslessly (worker dropped=0, drops=0), and the count
+    // is already collated into the 1 Hz STATUS-ERR line (stash_fails=N). So
+    // this is pure hot-path noise stealing Core-1 cycles (format + UART) at
+    // exactly the moment we're CPU-short. Suppress the per-event spam; keep
+    // the periodic summary. See feedback_dma_int_budget_audit / the T54
+    // analysis in signal_buffer.c.
+    esp_log_level_set("dma_utils", ESP_LOG_NONE);
 
     // Log the reset reason on every boot so we can see at a glance
     // whether the previous run ended via a panic, brownout, watchdog,
