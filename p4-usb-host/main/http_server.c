@@ -715,6 +715,18 @@ static esp_err_t index_get(httpd_req_t *req)
     if (sn > (int)sizeof(sdrform)) sn = sizeof(sdrform);
     httpd_resp_send_chunk(req, sdrform, sn);
 
+    // Graceful reboot control — always available (both AP and STA). Parks the
+    // tuner first (see reboot_post), so it's the safe way to restart without a
+    // physical power-cycle. Lives here rather than on /status because that
+    // page's 5 s meta-refresh would cancel the confirm() dialog mid-click.
+    static const char reboot_block[] =
+        "<hr style=\"margin-top:2em\">"
+        "<form method=\"POST\" action=\"/reboot\" "
+        "onsubmit=\"return confirm('Reboot the device now? The stream drops for ~10 s.');\">"
+        "<button type=\"submit\" style=\"background:#e67e22\">Reboot device</button>"
+        "</form>";
+    httpd_resp_send_chunk(req, reboot_block, sizeof(reboot_block) - 1);
+
     if (!wifi_link_is_ap_mode()) {
         httpd_resp_send_chunk(req, s_index_reset_block,
                               sizeof(s_index_reset_block) - 1);
@@ -1024,8 +1036,100 @@ static size_t json_escape(char *out, size_t outsz, const char *in)
     return w;
 }
 
+// GET /messages (browser variant). Renders the decoded-ACARS ring as an HTML
+// table styled like the /status dashboard (shared chrome + CSS from
+// send_page_head), newest-first, with a 10 s meta-refresh. curl / monitors
+// get the JSON variant below (content-negotiated in messages_get). Streams one
+// chunk per row so no single buffer has to hold the whole ring.
+static esp_err_t messages_html_get(httpd_req_t *req)
+{
+    send_page_head(req, "Messages", 10); // 10 s meta-refresh — live feed
+
+    static EXT_RAM_BSS_ATTR acars_msg_t s_snap[MSG_RING_CAPACITY];
+    size_t n = msg_ring_snapshot(0, s_snap, MSG_RING_CAPACITY);
+    uint64_t total = msg_ring_total();
+    int64_t  now_us = esp_timer_get_time();
+
+    static char body[512];
+    int  bn = snprintf(body, sizeof(body),
+                       "<p><small>%llu decoded since boot &middot; showing last %u "
+                       "&middot; auto-refresh 10 s</small></p>",
+                       (unsigned long long)total, (unsigned)n);
+    httpd_resp_send_chunk(req, body, bn > 0 ? bn : 0);
+
+    if (n == 0) {
+        httpd_resp_send_chunk(req,
+                              "<p><em>No ACARS messages decoded yet. IRA ring-alert "
+                              "frames are common; IDA data frames (the ones with text) "
+                              "are rarer — leave it running.</em></p>",
+                              HTTPD_RESP_USE_STRLEN);
+        send_page_foot(req);
+        return ESP_OK;
+    }
+
+    httpd_resp_send_chunk(req,
+                          "<table><tr><th>Age</th><th>Dir</th><th>Mode</th><th>Label</th>"
+                          "<th>Flight</th><th>Msg#</th><th>CRC</th><th>SNR</th><th>Text</th></tr>",
+                          HTTPD_RESP_USE_STRLEN);
+
+    static char esc_txt[2 * MSG_RING_TXT_MAX + 8];
+    static char esc_flight[16];
+    static char esc_label[16];
+    static char esc_msgnum[24];
+    static char row[2 * MSG_RING_TXT_MAX + 512];
+    // Newest first: the snapshot is oldest→newest, so walk it in reverse.
+    for (size_t k = n; k > 0; k--) {
+        const acars_msg_t *m = &s_snap[k - 1];
+
+        double age_s = (double)(now_us - (int64_t)m->timestamp_us) / 1e6;
+        char   age[16];
+        if (age_s < 0) age_s = 0;
+        if (age_s < 120.0)      snprintf(age, sizeof(age), "%.0fs", age_s);
+        else if (age_s < 7200.0) snprintf(age, sizeof(age), "%.0fm", age_s / 60.0);
+        else                     snprintf(age, sizeof(age), "%.1fh", age_s / 3600.0);
+
+        char label_buf[3] = {m->label[0], m->label[1], 0};
+        html_attr_escape(esc_label, sizeof(esc_label), label_buf);
+        html_attr_escape(esc_msgnum, sizeof(esc_msgnum), m->msg_num);
+        html_attr_escape(esc_flight, sizeof(esc_flight), m->flight_id);
+        html_attr_escape(esc_txt, sizeof(esc_txt), m->txt);
+
+        int rn = snprintf(row, sizeof(row),
+                          "<tr><td class=v>%s</td><td>%s</td><td class=v>%c</td>"
+                          "<td class=v>%s</td><td class=v>%s</td><td class=v>%s</td>"
+                          "<td><span style=\"color:%s\">%s</span></td>"
+                          "<td class=v>%.1f</td><td>%s</td></tr>",
+                          age,
+                          m->uplink ? "UL" : "DL",
+                          (m->mode >= 0x20 && m->mode < 0x7f) ? m->mode : '?',
+                          esc_label,
+                          esc_flight,
+                          esc_msgnum,
+                          m->crc_ok ? "#2e7d32" : "#c62828",
+                          m->crc_ok ? "OK" : "bad",
+                          (double)m->snr_db,
+                          esc_txt);
+        if (rn < 0) rn = 0;
+        if (rn > (int)sizeof(row)) rn = sizeof(row);
+        httpd_resp_send_chunk(req, row, rn);
+    }
+
+    httpd_resp_send_chunk(req, "</table>", 8);
+    send_page_foot(req);
+    return ESP_OK;
+}
+
 static esp_err_t messages_get(httpd_req_t *req)
 {
+    // Content negotiation: browsers get the HTML dashboard; curl / monitors /
+    // Accept:*/* fall through to the JSON below, UNCHANGED. Same rationale as
+    // status_get — see its comment on not gating on the return code.
+    char accept[160] = {0};
+    httpd_req_get_hdr_value_str(req, "Accept", accept, sizeof(accept));
+    if (strstr(accept, "text/html")) {
+        return messages_html_get(req);
+    }
+
     uint64_t since_id = 0;
     char     qbuf[64];
     if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
@@ -2083,6 +2187,51 @@ static esp_err_t reset_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Plain restart (no NVS write). Parks the tuner first so the RTL-SDR survives
+// the reboot (same graceful path as the config reboots — see
+// tune_apply_reboot_task); without this the dongle latches mid-I2C and the
+// next boot has to re-enumerate a wedged tuner. Runs on its own internal-SRAM
+// task because esp_restart() + class_driver_prepare_for_reboot() must not run
+// on the PSRAM-stacked httpd task. The short delay lets the HTTP reply flush.
+static void reboot_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(300));
+    ESP_LOGW(TAG, "/reboot: operator-requested restart");
+    class_driver_prepare_for_reboot();
+    esp_restart();
+}
+
+// POST /reboot — operator-triggered graceful restart. Content-negotiated:
+// browsers (Accept: text/html) get a self-refreshing "rebooting" page that
+// returns to /status; curl / scripts get JSON. Reply is sent BEFORE the task
+// is spawned so the client sees the confirmation before the link drops.
+static esp_err_t reboot_post(httpd_req_t *req)
+{
+    char accept[160] = {0};
+    httpd_req_get_hdr_value_str(req, "Accept", accept, sizeof(accept));
+    if (strstr(accept, "text/html")) {
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_sendstr(req,
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<meta http-equiv=\"refresh\" content=\"12;url=/status\"></head>"
+            "<body style=\"font-family:system-ui;max-width:480px;margin:2em auto;padding:0 1em\">"
+            "<h1>Rebooting…</h1>"
+            "<p>Parking the tuner and restarting — typically ~10 s. This page "
+            "will return to <a href=\"/status\">Status</a> automatically.</p>"
+            "</body></html>");
+    } else {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"result\":\"ok\",\"reboot\":true}");
+    }
+
+    if (xTaskCreate(reboot_task, "reboot", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "/reboot: failed to spawn reboot task");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t http_server_start(void)
 {
     if (s_server) return ESP_OK;
@@ -2172,6 +2321,7 @@ esp_err_t http_server_start(void)
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
         {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
+        {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post, .user_ctx = NULL},
     };
     _Static_assert(sizeof(routes) / sizeof(routes[0]) <= HTTPD_URI_LIMIT,
                    "route count exceeds HTTPD_URI_LIMIT; bump HTTPD_URI_LIMIT "
