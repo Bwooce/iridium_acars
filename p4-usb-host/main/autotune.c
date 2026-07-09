@@ -178,16 +178,16 @@ void autotune_run_lo_rescan(void)
         return;
     }
 
-    // NOTE (backlog #7, docs/superpowers/HANDOFF-2026-07-08-post-path-a.md):
-    // automated multi-hop `scanner_scan()` is NOT yet confirmed safe --
-    // DMA-internal-heap churn across repeated retunes is an open issue and
-    // the control-URB-reuse fix for it was reverted (9638816). scanner_scan
-    // is nonetheless the only implemented LO-density routine (design doc
-    // step 3), and autotune_lo_interval_s=0 remains the operator's escape
-    // hatch if this wedges the RTL in the field. MUST be validated by
-    // device-smoke before this path merges to main (mandatory per project
-    // policy for any DSP/RF-control-path change) -- see the design doc's
-    // "Empirical findings" section for why the interval defaults long
+    // Automated multi-hop `scanner_scan()` is VALIDATED SAFE on main
+    // (2026-07-09): 42 live retunes across 7 sweeps via the POST /scan test
+    // endpoint, 42/42 r=0, 0 wedges, 0 EP0 STALL, 0 worker drops, stream
+    // steady at 4.7 MB/s. The earlier "not yet confirmed safe" note here was
+    // a STALE NEGATIVE — it predated the control-URB-reuse fix (ce6bfb3, now
+    // on main; the reverted 9638816 was re-applied), retune-retry (575982c),
+    // and graceful-shutdown. The DMA-internal-heap stash churn across retunes
+    // is BENIGN (fully recovered, zero drops). autotune_lo_interval_s=0 stays
+    // the DEFAULT (operator opt-in), but enabling it is now safe. See the
+    // design doc's "Empirical findings" for why the interval defaults long
     // (hourly) rather than the original 600 s satellite-handoff estimate.
     ESP_LOGI(TAG, "=== autotune LO rescan: sweeping %lu-%lu Hz step %lu Hz ===",
              (unsigned long)SCAN_START_HZ, (unsigned long)SCAN_STOP_HZ,
