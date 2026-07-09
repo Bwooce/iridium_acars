@@ -1237,6 +1237,54 @@ static esp_err_t scan_post(httpd_req_t *req)
     return httpd_resp_sendstr(req, "scan sweep started — watch serial\n");
 }
 
+// POST /autotune?lo=<s>&gain=<s> — set the periodic autotune intervals in NVS
+// and reboot to apply. Both default to 3600 (hourly) if the param is omitted;
+// pass 0 to disable. Exists because autotune config was serial-only (which
+// resets the board via DTR) — HTTP avoids that. NVS write can't run on this
+// PSRAM-stacked httpd task, so it hands off to an internal-stack task (same
+// pattern as tune_apply_reboot_task), which grace­fully parks the tuner first.
+typedef struct { uint32_t lo_s; uint32_t gain_s; } autotune_cfg_args_t;
+static void autotune_cfg_reboot_task(void *arg)
+{
+    autotune_cfg_args_t *a = (autotune_cfg_args_t *)arg;
+    esp_err_t r1 = app_config_set_autotune_lo_interval_s(a->lo_s);
+    esp_err_t r2 = app_config_set_autotune_gain_interval_s(a->gain_s);
+    ESP_LOGI(TAG, "/autotune: lo_interval_s=%lu gain_interval_s=%lu (%s/%s) — rebooting to apply",
+             (unsigned long)a->lo_s, (unsigned long)a->gain_s,
+             esp_err_to_name(r1), esp_err_to_name(r2));
+    free(a);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
+    esp_restart();
+}
+static esp_err_t autotune_post(httpd_req_t *req)
+{
+    char     query[80] = {0}, s[16] = {0};
+    uint32_t lo = 3600, gain = 3600; // default hourly if omitted
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "lo", s, sizeof(s)) == ESP_OK) lo = (uint32_t)strtoul(s, NULL, 10);
+        if (httpd_query_key_value(query, "gain", s, sizeof(s)) == ESP_OK) gain = (uint32_t)strtoul(s, NULL, 10);
+    }
+    autotune_cfg_args_t *a = malloc(sizeof(*a));
+    if (!a) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "oom\n");
+    }
+    a->lo_s = lo;
+    a->gain_s = gain;
+    char body[112];
+    int  n = snprintf(body, sizeof(body),
+                      "{\"lo_interval_s\":%lu,\"gain_interval_s\":%lu,\"reboot\":true}",
+                      (unsigned long)lo, (unsigned long)gain);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, n);
+    if (xTaskCreate(autotune_cfg_reboot_task, "at_cfg", 4096, a, 5, NULL) != pdPASS) {
+        free(a);
+        ESP_LOGE(TAG, "/autotune: failed to spawn apply task");
+    }
+    return ESP_OK;
+}
+
 static esp_err_t sd_mount_post(httpd_req_t *req)
 {
     esp_err_t      r = sd_log_force_mount();
@@ -1750,6 +1798,7 @@ esp_err_t http_server_start(void)
         {.uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get, .user_ctx = NULL},
         {.uri = "/capture/file", .method = HTTP_GET, .handler = capture_file_get, .user_ctx = NULL},
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
+        {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
     };
     _Static_assert(sizeof(routes) / sizeof(routes[0]) <= HTTPD_URI_LIMIT,
                    "route count exceeds HTTPD_URI_LIMIT; bump HTTPD_URI_LIMIT "

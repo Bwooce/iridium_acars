@@ -6,8 +6,14 @@
 
 #define SCAN_START_HZ 1616000000u
 #define SCAN_STOP_HZ 1626000000u
-#define SCAN_STEP_HZ 2500000u
-#define SCAN_DWELL_MS 2000u
+// 1.25 MHz step = half the 2.5 MHz RX window (50% overlap), so centers resolve
+// the density peak instead of the old 2.5 MHz grid whose tiles straddled it
+// (the ACARS peak ~1620.6 fell between 1618.5 and 1621). ~9 centers over the band.
+#define SCAN_STEP_HZ 1250000u
+// 5 s dwell (was 2 s): density swings wildly second-to-second with satellite
+// passes (observed 0.5 -> 295 nb/s on one center in ~1 min), so a longer dwell
+// averages it out for a more stable best-LO pick. ~9 centers x ~6.5 s = ~1 min/scan, hourly.
+#define SCAN_DWELL_MS 5000u
 #define SCAN_SETTLE_MS 500u
 
 // Wire the scanner to the running detector (for density reads + baseline
