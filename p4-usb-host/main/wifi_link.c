@@ -214,6 +214,11 @@ static void health_wdt_task(void *arg)
             last_completed  = ut.completed;
             s_stream_live   = true;
             s_stream_stalls = 0;
+        } else if (class_driver_in_maintenance()) {
+            // Stream is DELIBERATELY paused for a C6 OTA (c6_ota.c) — a frozen
+            // usb.completed here is expected, not a wedge. Don't count it / don't
+            // reboot, or we'd kill the OTA mid-transfer.
+            s_stream_stalls = 0;
         } else if (s_stream_live) {
             s_stream_stalls++;
             ESP_LOGW(TAG, "health-wdt: USB stream frozen at %llu (%d/%d)",

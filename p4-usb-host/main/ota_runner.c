@@ -20,6 +20,7 @@
 #include "ota_runner.h"
 
 #include <string.h>
+#include <stdatomic.h>
 
 #include "esp_log.h"
 #include "esp_https_ota.h"
@@ -41,6 +42,7 @@ static const char *TAG = "OTA";
 static SemaphoreHandle_t s_status_mu = NULL;
 static ota_status_t      s_status    = {0};
 static volatile bool     s_running   = false;
+static atomic_bool       s_abort     = false; // request the in-flight OTA to stop
 
 static void set_status_error(const char *fmt, ...)
 {
@@ -67,6 +69,13 @@ static void ota_task(void *arg)
     }
 
     ESP_LOGI(TAG, "starting OTA from %s", cfg.ota_url);
+
+    // Quiesce the DSP (pause the bulk stream) + disarm the stall/health
+    // watchdogs for the whole download, so the OTA gets full CPU/network and a
+    // multi-minute pause isn't rebooted as a wedge. Cleared on every exit path
+    // (done:); on success we reboot anyway. Give usb_pump a moment to pause.
+    class_driver_set_maintenance(true);
+    vTaskDelay(pdMS_TO_TICKS(600));
 
     esp_http_client_config_t http_cfg = {
         .url               = cfg.ota_url,
@@ -110,6 +119,11 @@ static void ota_task(void *arg)
     }
 
     while (1) {
+        if (atomic_load(&s_abort)) {
+            esp_https_ota_abort(handle);
+            set_status_error("aborted — re-trigger POST /ota to restart");
+            goto done;
+        }
         r = esp_https_ota_perform(handle);
         if (r != ESP_ERR_HTTPS_OTA_IN_PROGRESS) break;
         int bytes = esp_https_ota_get_image_len_read(handle);
@@ -154,6 +168,7 @@ static void ota_task(void *arg)
     esp_restart();
 
 done:
+    class_driver_set_maintenance(false); // resume the DSP stream (failure paths)
     s_running = false;
     vTaskDelete(NULL);
 }
@@ -165,6 +180,7 @@ esp_err_t ota_runner_start(void)
         if (!s_status_mu) return ESP_ERR_NO_MEM;
     }
     if (s_running) return ESP_ERR_INVALID_STATE;
+    atomic_store(&s_abort, false);
 
     xSemaphoreTake(s_status_mu, portMAX_DELAY);
     s_status.state         = OTA_RUNNING;
@@ -195,6 +211,14 @@ esp_err_t ota_runner_start(void)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+void ota_runner_abort(void)
+{
+    if (s_running) {
+        atomic_store(&s_abort, true);
+        ESP_LOGW(TAG, "abort requested — OTA will stop at the next perform() cycle");
+    }
 }
 
 void ota_runner_get_status(ota_status_t *out)

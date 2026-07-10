@@ -40,6 +40,12 @@ typedef struct {
 
 void ota_runner_get_status(ota_status_t *out);
 
+// Request the in-flight OTA to stop at its next perform() cycle, so a stalled
+// download can be restarted (re-trigger ota_runner_start()). No-op if idle. A
+// network stall already errors out on the HTTP timeout (also restartable); this
+// is the explicit user-triggered abort.
+void ota_runner_abort(void);
+
 // Call once early in app_main, after the core services have come up.
 // Marks the current firmware as "valid" so the bootloader stops
 // counting boots against the rollback window. Safe to call any

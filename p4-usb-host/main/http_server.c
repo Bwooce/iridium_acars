@@ -20,6 +20,7 @@
 #include "class_driver.h" // class_driver_prepare_for_reboot()
 #include "scanner.h"      // scanner_scan() — /scan sustained-hop test endpoint
 #include "autotune.h"     // autotune_run_manual() — /gaincal manual trigger
+#include "c6_ota.h"       // c6_ota_* — POST /c6ota (Method B: C6 firmware update)
 #include "sd_log.h"
 #include "sd_capture.h"
 #include "acars_push.h"
@@ -1276,6 +1277,18 @@ static esp_err_t messages_get(httpd_req_t *req)
 
 static esp_err_t ota_post(httpd_req_t *req)
 {
+    // POST /ota?abort=1 — stop a stalled P4 OTA so it can be restarted.
+    char qbuf[64];
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(qbuf, "abort", val, sizeof(val)) == ESP_OK &&
+            (val[0] == '1' || val[0] == 't')) {
+            ota_runner_abort();
+            httpd_resp_set_type(req, "text/plain");
+            return httpd_resp_send(req, "P4 OTA abort requested — re-POST /ota to restart\n",
+                                   HTTPD_RESP_USE_STRLEN);
+        }
+    }
     esp_err_t r = ota_runner_start();
     if (r == ESP_ERR_INVALID_STATE) {
         httpd_resp_set_status(req, "409 Conflict");
@@ -1296,6 +1309,77 @@ static esp_err_t ota_post(httpd_req_t *req)
         "Poll <a href=\"/ota\">/ota</a> for progress.</p>"
         "</body></html>";
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+// C6 (esp_hosted slave) firmware update — Method B (docs/c6-firmware-update.md).
+//   POST /c6ota?url=<fw_url>  — download + stream to the C6's INACTIVE partition
+//                              (SAFE: the C6 keeps running its current firmware;
+//                              DSP is quiesced during the transfer).
+//   POST /c6ota?activate=1    — switch the C6 to the new image (RISKY, may drop
+//                              Wi-Fi on a headless device).
+//   POST /c6ota?abort=1       — stop a stalled transfer; restart with ?url=.
+//   GET  /c6ota               — status.
+static esp_err_t c6ota_post(httpd_req_t *req)
+{
+    char qbuf[300] = {0};
+    char body[320];
+    int  n;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(qbuf, "abort", val, sizeof(val)) == ESP_OK &&
+            (val[0] == '1' || val[0] == 't')) {
+            c6_ota_abort();
+            n = snprintf(body, sizeof(body), "{\"abort\":\"ok\",\"status\":\"%s\"}", c6_ota_status());
+            return httpd_resp_send(req, body, n > 0 ? n : 0);
+        }
+        if (httpd_query_key_value(qbuf, "activate", val, sizeof(val)) == ESP_OK &&
+            (val[0] == '1' || val[0] == 't')) {
+            esp_err_t r = c6_ota_activate();
+            n = snprintf(body, sizeof(body), "{\"activate\":\"%s\",\"status\":\"%s\"}",
+                         esp_err_to_name(r), c6_ota_status());
+            return httpd_resp_send(req, body, n > 0 ? n : 0);
+        }
+        char uval[220];
+        if (httpd_query_key_value(qbuf, "url", uval, sizeof(uval)) == ESP_OK) {
+            char   url[220];
+            size_t ul = url_decode(url, uval, strlen(uval));
+            url[ul]   = '\0';
+            esp_err_t r = c6_ota_transfer_start(url);
+            if (r == ESP_ERR_INVALID_STATE) {
+                httpd_resp_set_status(req, "409 Conflict");
+                n = snprintf(body, sizeof(body),
+                             "{\"error\":\"transfer already running\",\"status\":\"%s\"}",
+                             c6_ota_status());
+            } else if (r != ESP_OK) {
+                httpd_resp_set_status(req, "400 Bad Request");
+                n = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", esp_err_to_name(r));
+            } else {
+                n = snprintf(body, sizeof(body),
+                             "{\"transfer\":\"started\",\"note\":\"DSP quiesced; poll GET /c6ota\","
+                             "\"status\":\"%s\"}",
+                             c6_ota_status());
+            }
+            return httpd_resp_send(req, body, n > 0 ? n : 0);
+        }
+    }
+    httpd_resp_set_status(req, "400 Bad Request");
+    n = snprintf(body, sizeof(body),
+                 "{\"error\":\"need ?url=, ?activate=1, or ?abort=1\",\"status\":\"%s\"}",
+                 c6_ota_status());
+    return httpd_resp_send(req, body, n > 0 ? n : 0);
+}
+
+static esp_err_t c6ota_get(httpd_req_t *req)
+{
+    char body[240];
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    int n = snprintf(body, sizeof(body), "{\"busy\":%s,\"status\":\"%s\"}",
+                     c6_ota_busy() ? "true" : "false", c6_ota_status());
+    return httpd_resp_send(req, body, n > 0 ? n : 0);
 }
 
 static esp_err_t ota_get(httpd_req_t *req)
@@ -2383,6 +2467,8 @@ esp_err_t http_server_start(void)
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
         {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
         {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post, .user_ctx = NULL},
+        {.uri = "/c6ota", .method = HTTP_POST, .handler = c6ota_post, .user_ctx = NULL},
+        {.uri = "/c6ota", .method = HTTP_GET, .handler = c6ota_get, .user_ctx = NULL},
     };
     _Static_assert(sizeof(routes) / sizeof(routes[0]) <= HTTPD_URI_LIMIT,
                    "route count exceeds HTTPD_URI_LIMIT; bump HTTPD_URI_LIMIT "

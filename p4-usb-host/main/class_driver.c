@@ -81,6 +81,15 @@ static volatile bool     s_last_setgain_ok    = false;
 // the pump loop drains the stream + standbys the tuner, then gives it.
 static SemaphoreHandle_t s_graceful_done = NULL;
 
+// Maintenance mode (C6 OTA): quiesce the DSP by pausing the bulk stream and
+// suppress the stall/health watchdogs, so a deliberate multi-minute pause isn't
+// mistaken for a wedge and rebooted mid-OTA. Set by c6_ota around the transfer;
+// usb_pump pauses/resumes the stream on the transition, and wifi_link's health
+// watchdog skips its stream-stall reboot while this is set.
+static atomic_bool s_maintenance = false;
+void class_driver_set_maintenance(bool on) { atomic_store(&s_maintenance, on); }
+bool class_driver_in_maintenance(void) { return atomic_load(&s_maintenance); }
+
 // T48 (docs/perf-decoupling-design-2026-07-04.md §T48): the combined
 // class_driver loop is split into two Core-0 tasks:
 //   - usb_pump: this function (class_driver_task) keeps its name/entry
@@ -580,6 +589,7 @@ void class_driver_task(void *arg)
     // to force re-attach (same recovery as the no-device path above).
     int            stall_seconds         = 0;
     bool           stall_escalated       = false;      // logged this episode's escalation
+    bool           maint_paused          = false;      // stream paused for C6-OTA maintenance
     const int      STALL_TRIGGER_SECONDS = 5;          // tolerate brief noise dips
     const uint64_t STALL_BYTES_FLOOR     = 100 * 1024; // <100 KB/s is "stuck", not "quiet"
 
@@ -686,6 +696,24 @@ void class_driver_task(void *arg)
         if (s_driver_obj.actions & ACTION_CLOSE_DEV) action_close_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_EXIT) break;
 
+        // Maintenance pause (C6 OTA): quiesce the DSP by pausing URB resubmit
+        // while an OTA runs, so the SDIO link + CPU aren't contended and the
+        // transfer gets its best chance. Pause/resume MUST run on this task.
+        // The stall watchdog below and wifi_link's health-wdt both skip their
+        // reboot while class_driver_in_maintenance().
+        if (s_driver_obj.dev_addr != 0) {
+            bool want = class_driver_in_maintenance();
+            if (want && !maint_paused) {
+                esp_libusb_pause_stream(&s_driver_obj);
+                maint_paused = true;
+                ESP_LOGW(TAG, "maintenance: stream PAUSED (DSP quiesced for OTA)");
+            } else if (!want && maint_paused) {
+                esp_libusb_resume_stream(&s_driver_obj, 0x81);
+                maint_paused = false;
+                ESP_LOGW(TAG, "maintenance: stream RESUMED");
+            }
+        }
+
         // T48: the ring-drain / dispatch / DSP-feed cycle that used to
         // run right here now runs in dsp_feed_task(). This task has
         // nothing else to do per-iteration besides the periodic report
@@ -767,7 +795,8 @@ void class_driver_task(void *arg)
             // is enumerated AND we're past initial warm-up (start_time
             // + 3 s) so transient zero-byte windows during enumeration
             // don't trigger.
-            if (s_driver_obj.dev_addr != 0 && (now - start_time) > 3 * 1000000) {
+            if (s_driver_obj.dev_addr != 0 && (now - start_time) > 3 * 1000000 &&
+                !class_driver_in_maintenance()) {
                 // T48: use the bytes_window value just exchanged into
                 // snap above (already the feeder's window total, already
                 // reset) instead of a separate local — same value the

@@ -49,3 +49,11 @@ void class_driver_dump_stall_diag(void);
 // wait times out and the caller must reboot regardless. Safe to call from any
 // task; a no-op if no device is open. Call immediately before esp_restart().
 void class_driver_prepare_for_reboot(void);
+
+// Maintenance mode for the C6 OTA (c6_ota.c): while ON, usb_pump pauses the
+// bulk stream (DSP quiesces) and both the in-loop stall watchdog and the
+// wifi_link health watchdog skip their stream-stall reboot — so a deliberate
+// multi-minute pause during an OTA isn't mistaken for a wedge. Safe from any
+// task. Always pair set(true) before the OTA with set(false) after.
+void class_driver_set_maintenance(bool on);
+bool class_driver_in_maintenance(void);
