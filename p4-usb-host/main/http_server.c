@@ -199,6 +199,11 @@ static esp_err_t status_get(httpd_req_t *req)
     wifi_link_wdt_status(&wdt_gw, &wdt_armed, &wdt_fails,
                          &wdt_stream_live, &wdt_stream_stalls);
 
+    // Load telemetry (peak vs mean burst/capacity since boot) for remote
+    // monitoring of a headless deployment.
+    status_capacity_t cap;
+    status_logger_get_capacity(&cap);
+
     // JSON-escape the free-form string fields (M17): SSID, push host and
     // OTA URL are operator input; mount_error carries errno/driver text.
     // Any embedded quote/backslash would otherwise break the JSON. 2× the
@@ -246,6 +251,10 @@ static esp_err_t status_get(httpd_req_t *req)
                        "},"
                        "\"health_wdt\":{\"gw\":\"%u.%u.%u.%u\",\"gw_armed\":%s,\"gw_fails\":%d,"
                        "\"stream_live\":%s,\"stream_stalls\":%d},"
+                       "\"load\":{"
+                       "\"bursts_win_mean\":%.0f,\"bursts_win_peak\":%u,"
+                       "\"worker_cap_peak\":%.0f,\"worker_ge90_pct\":%.0f,"
+                       "\"dsp_cap_peak\":%.0f},"
                        "\"sd\":{"
                        "\"mounted\":%s,\"log_open\":%s,"
                        "\"messages_written\":%u,\"bytes_written\":%llu,"
@@ -283,6 +292,8 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned)((wdt_gw >> 16) & 0xff), (unsigned)((wdt_gw >> 24) & 0xff),
                      wdt_armed ? "true" : "false", wdt_fails,
                      wdt_stream_live ? "true" : "false", wdt_stream_stalls,
+                      cap.mean_bursts, (unsigned)cap.peak_bursts,
+                      cap.peak_worker_cap, cap.worker_ge90_pct, cap.peak_dsp_cap,
                      sd.mounted ? "true" : "false",
                      sd.log_open ? "true" : "false",
                       (unsigned)sd.messages_written,
@@ -827,6 +838,25 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz,
                  gain_str, (unsigned)(dma_free / 1024), (unsigned)(dma_largest / 1024),
                  (unsigned)stash_fails);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(body)) n = sizeof(body);
+    httpd_resp_send_chunk(req, body, n);
+
+    // Load telemetry (peak vs mean since boot) — the "transient vs sustained"
+    // gauge for remotely watching a headless deployment. Separate chunk so the
+    // main table above stays within its buffer.
+    status_capacity_t cap;
+    status_logger_get_capacity(&cap);
+    n = snprintf(body, sizeof(body),
+                 "<h2>Load (since boot)</h2>"
+                 "<table><tr><th>Metric</th><th>Value</th></tr>"
+                 "<tr><td>Bursts/window mean / peak</td><td class=v>%.0f / %u</td></tr>"
+                 "<tr><td>Worker capacity peak</td><td class=v>%.0f %%</td></tr>"
+                 "<tr><td>Worker &ge;90%% of windows</td><td class=v>%.0f %%</td></tr>"
+                 "<tr><td>DSP/tagger capacity peak</td><td class=v>%.0f %%</td></tr>"
+                 "</table>",
+                 cap.mean_bursts, (unsigned)cap.peak_bursts,
+                 cap.peak_worker_cap, cap.worker_ge90_pct, cap.peak_dsp_cap);
     if (n < 0) n = 0;
     if (n > (int)sizeof(body)) n = sizeof(body);
     httpd_resp_send_chunk(req, body, n);

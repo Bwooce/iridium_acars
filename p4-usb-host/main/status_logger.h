@@ -65,4 +65,18 @@ bool status_logger_post(const status_snapshot_t *snap);
 // logger on Core 1); a torn field is harmless for a diagnostic display.
 bool status_logger_get_last(status_snapshot_t *out);
 
+// Capacity telemetry accumulated since boot, for remote monitoring of a
+// headless deployment. Peak vs mean answers "is the burst load transient or
+// sustained" — i.e. whether a backlog buffer would drain. Same unlocked
+// cross-core read caveat as status_logger_get_last().
+typedef struct {
+    uint32_t windows;         // sampled 1 s windows since boot
+    uint32_t peak_bursts;     // max tagger bursts dispatched in any window
+    float    mean_bursts;     // mean tagger bursts/window
+    float    peak_worker_cap; // max Core-1 worker capacity %
+    float    peak_dsp_cap;    // max Core-0 DSP/tagger capacity %
+    float    worker_ge90_pct; // % of windows with worker cap >= 90 (headroom gauge)
+} status_capacity_t;
+void status_logger_get_capacity(status_capacity_t *out);
+
 #endif

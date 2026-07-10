@@ -32,11 +32,34 @@ static QueueHandle_t s_queue;
 static status_snapshot_t s_last;
 static volatile bool     s_have_last = false;
 
+// Capacity telemetry accumulated since boot, for remote monitoring when the
+// device runs headless outside (poll /status or watch iot_log). Peak vs mean
+// answers "is the load transient-bursty or sustained." Updated once/sec in
+// emit(); read cross-core by the http task (unlocked — torn read is benign for
+// a diagnostic gauge, same rationale as s_last).
+static uint32_t s_cap_windows     = 0; // sampled 1 s windows
+static uint64_t s_cap_sum_bursts  = 0; // Σ tagger bursts/window (for mean)
+static uint32_t s_cap_peak_bursts = 0; // max tagger bursts in any window
+static float    s_cap_peak_worker = 0.0f; // max Core-1 worker cap %
+static float    s_cap_peak_dsp    = 0.0f; // max Core-0 DSP/tagger cap %
+static uint32_t s_cap_worker_ge90 = 0; // windows with worker cap >= 90 %
+
 bool status_logger_get_last(status_snapshot_t *out)
 {
     if (!s_have_last || !out) return false;
     *out = s_last; // struct copy
     return true;
+}
+
+void status_logger_get_capacity(status_capacity_t *out)
+{
+    if (!out) return;
+    out->windows         = s_cap_windows;
+    out->peak_bursts     = s_cap_peak_bursts;
+    out->mean_bursts     = s_cap_windows ? (float)((double)s_cap_sum_bursts / (double)s_cap_windows) : 0.0f;
+    out->peak_worker_cap = s_cap_peak_worker;
+    out->peak_dsp_cap    = s_cap_peak_dsp;
+    out->worker_ge90_pct = s_cap_windows ? (100.0f * (float)s_cap_worker_ge90 / (float)s_cap_windows) : 0.0f;
 }
 
 static void emit(const status_snapshot_t *s)
@@ -45,6 +68,23 @@ static void emit(const status_snapshot_t *s)
     // /status page surfaces must be captured regardless of build config.
     s_last      = *s;
     s_have_last = true;
+
+    // Capacity peak/mean tracking (see the s_cap_* statics). Same
+    // worker_pct/dsp_pct formulas as the emit branches below, computed once
+    // here so it runs regardless of the verbose/quiet build fork. A handful of
+    // comparisons/sec on the low-prio logger task — negligible.
+    if (s->window_us > 0) {
+        double   wdiv = (double)s->window_us;
+        float    dcap = (float)(100.0 * (double)s->dsp_total_time_us / wdiv);
+        float    wcap = (float)(100.0 * ((double)s->ws.bursts_processed * (double)s->ws.avg_burst_us + (double)s->ws.bursts_triage_rejected * (double)s->ws.triage_rej_us) / wdiv);
+        uint32_t b    = s->dsp.gone_bursts; // tagger bursts dispatched this window
+        s_cap_windows++;
+        s_cap_sum_bursts += b;
+        if (b > s_cap_peak_bursts) s_cap_peak_bursts = b;
+        if (dcap > s_cap_peak_dsp) s_cap_peak_dsp = dcap;
+        if (wcap > s_cap_peak_worker) s_cap_peak_worker = wcap;
+        if (wcap >= 90.0f) s_cap_worker_ge90++;
+    }
 
     double window_s = s->window_us / 1000000.0;
     if (window_s <= 0) window_s = 1.0;
@@ -262,17 +302,23 @@ static void emit(const status_snapshot_t *s)
              s->us.rb_full_drops, dsp_pct, worker_pct,
              lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz);
     iot_log(IOT_LOG_INFO,
-            "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%%",
+            "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%% "
+            "bursts=%u pk_bursts=%u pk_wk=%u%%",
             rate_inst,
             (unsigned long)s->ws.bursts_bch_decoded,
             (unsigned long)s->ws.bursts_bch_unknown,
             (unsigned long)s->us.rb_full_drops,
-            (unsigned)dsp_pct, (unsigned)worker_pct);
+            (unsigned)dsp_pct, (unsigned)worker_pct,
+            (unsigned)s->dsp.gone_bursts, (unsigned)s_cap_peak_bursts,
+            (unsigned)s_cap_peak_worker);
     iot_log_metric("rate_x100", (int32_t)(rate_inst * 100));
     iot_log_metric("bch_dec", (int32_t)s->ws.bursts_bch_decoded);
     iot_log_metric("drops", (int32_t)s->us.rb_full_drops);
     iot_log_metric("dsp_cap", (int32_t)dsp_pct);
     iot_log_metric("wk_cap", (int32_t)worker_pct);
+    iot_log_metric("bursts_win", (int32_t)s->dsp.gone_bursts);
+    iot_log_metric("pk_bursts", (int32_t)s_cap_peak_bursts);
+    iot_log_metric("pk_wk_cap", (int32_t)s_cap_peak_worker);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
     // any drop / recovery counter ticks. Field names match
