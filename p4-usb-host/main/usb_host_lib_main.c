@@ -278,6 +278,13 @@ void app_main(void)
         if (snap.station_id[0]) {
             iot_cfg.device_name = snap.station_id;
         }
+        // Unicast override: multicast TX is dropped by the C6 esp_hosted link
+        // (see project_esp_hosted_multicast_tx_broken), so when iot_log_host is
+        // configured, send telemetry as unicast to it (parsed during init; the
+        // stack `snap` pointer need only live across this call).
+        if (snap.iot_log_host[0]) {
+            iot_cfg.unicast_ip = snap.iot_log_host;
+        }
         iot_log_init(&iot_cfg);
     }
     http_server_start();

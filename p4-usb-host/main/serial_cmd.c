@@ -41,6 +41,8 @@ static void cmd_config(void)
     uart_puts(buf);
     snprintf(buf, sizeof(buf), "out_port=%u\r\n", (unsigned)c.out_port);
     uart_puts(buf);
+    snprintf(buf, sizeof(buf), "iot_log_host=%s\r\n", c.iot_log_host);
+    uart_puts(buf);
     snprintf(buf, sizeof(buf), "station_id=%s\r\n", c.station_id);
     uart_puts(buf);
     snprintf(buf, sizeof(buf), "lo_hz=%lu\r\n", (unsigned long)c.lo_freq_hz);
@@ -89,6 +91,8 @@ static void cmd_get(const char *key)
         snprintf(buf, sizeof(buf), "%s\r\n", c.out_host);
     else if (strcmp(key, "out_port") == 0)
         snprintf(buf, sizeof(buf), "%u\r\n", (unsigned)c.out_port);
+    else if (strcmp(key, "iot_log_host") == 0)
+        snprintf(buf, sizeof(buf), "%s\r\n", c.iot_log_host);
     else if (strcmp(key, "station_id") == 0)
         snprintf(buf, sizeof(buf), "%s\r\n", c.station_id);
     else if (strcmp(key, "lo_hz") == 0)
@@ -145,6 +149,8 @@ static void cmd_set(const char *key, const char *val)
         rc = app_config_set_out_host(val);
     else if (strcmp(key, "out_port") == 0)
         rc = app_config_set_out_port((uint16_t)atoi(val));
+    else if (strcmp(key, "iot_log_host") == 0)
+        rc = app_config_set_iot_log_host(val);
     else if (strcmp(key, "station_id") == 0)
         rc = app_config_set_station_id(val);
     else if (strcmp(key, "lo_hz") == 0)

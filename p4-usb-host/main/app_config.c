@@ -43,9 +43,9 @@ static const char *NVS_NS = "iridium";
 // averaging lands; the design's ~600 s ideal would thrash on single snapshots.
 #define DEFAULT_AUTOTUNE_GAIN_INTERVAL_S 43200u // 12 h (RFI/thermal-driven, slow, ~30 min pass)
 #define DEFAULT_AUTOTUNE_LO_INTERVAL_S 1800u    // 30 min (satellite-driven; validated 42-hop scan).
-                                               // Only runs when gain_mode==MANUAL. Each run logs a
-                                               // distinctive AUTOTUNE-START marker so any future wedge
-                                               // can be correlated to the hop that caused it.
+                                                // Only runs when gain_mode==MANUAL. Each run logs a
+                                                // distinctive AUTOTUNE-START marker so any future wedge
+                                                // can be correlated to the hop that caused it.
 #define DEFAULT_STATION_ID "p4-iridium-1"
 #define DEFAULT_WIFI_SSID ""
 #define DEFAULT_WIFI_PSK ""
@@ -150,6 +150,7 @@ esp_err_t app_config_init(void)
     s_cfg.wifi_psk[0]                               = '\0';
     s_cfg.out_host[0]                               = '\0';
     s_cfg.out_port                                  = 0;
+    s_cfg.iot_log_host[0]                           = '\0';
     s_cfg.ota_url[0]                                = '\0';
 
     esp_err_t r = nvs_flash_init();
@@ -211,6 +212,7 @@ esp_err_t app_config_init(void)
         }
     }
     s_cfg.out_port = out_port;
+    nvs_get_str_or(h, "iot_log_host", s_cfg.iot_log_host, APP_CONFIG_IOT_LOG_HOST_LEN, "");
     nvs_get_str_or(h, "ota_url", s_cfg.ota_url, APP_CONFIG_OTA_URL_LEN, "");
     // gm is whatever byte was stored in NVS — validate against the
     // known enum range before the cast; a stale/corrupt/foreign value
@@ -389,6 +391,10 @@ esp_err_t app_config_set_out_port(uint16_t port)
     nvs_close(h);
     return r;
 }
+esp_err_t app_config_set_iot_log_host(const char *host)
+{
+    return set_str_field(s_cfg.iot_log_host, APP_CONFIG_IOT_LOG_HOST_LEN, "iot_log_host", host);
+}
 esp_err_t app_config_set_ota_url(const char *url)
 {
     return set_str_field(s_cfg.ota_url, APP_CONFIG_OTA_URL_LEN, "ota_url", url);
@@ -419,6 +425,11 @@ void app_config_log(void)
         ESP_LOGI(TAG, "UDP push: %s:%u", c.out_host, (unsigned)c.out_port);
     } else {
         ESP_LOGI(TAG, "UDP push: disabled (out_host/out_port unset)");
+    }
+    if (c.iot_log_host[0]) {
+        ESP_LOGI(TAG, "iot_log unicast: %s", c.iot_log_host);
+    } else {
+        ESP_LOGI(TAG, "iot_log unicast: disabled (iot_log_host unset)");
     }
     if (c.ota_url[0]) {
         ESP_LOGI(TAG, "OTA URL: %s", c.ota_url);

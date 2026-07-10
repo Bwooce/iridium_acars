@@ -84,6 +84,7 @@ typedef struct {
     char     psk[64];
     char     out_host[64];
     uint16_t out_port;
+    char     iot_log_host[64];
     char     ota_url[128];
     bool     bias_tee;
     bool     clear_only; // true = reset_post path (clear SSID+PSK, ignore other fields)
@@ -93,7 +94,7 @@ static void nvs_save_and_reboot_task(void *arg)
 {
     nvs_save_args_t *a = (nvs_save_args_t *)arg;
 
-    esp_err_t r1, r2, r3 = ESP_OK, r4 = ESP_OK, r5 = ESP_OK, r6 = ESP_OK;
+    esp_err_t r1, r2, r3 = ESP_OK, r4 = ESP_OK, r5 = ESP_OK, r6 = ESP_OK, r7 = ESP_OK;
     if (a->clear_only) {
         r1 = app_config_set_wifi_ssid("");
         r2 = app_config_set_wifi_psk("");
@@ -104,12 +105,14 @@ static void nvs_save_and_reboot_task(void *arg)
         r4 = app_config_set_out_port(a->out_port);
         r5 = app_config_set_ota_url(a->ota_url);
         r6 = app_config_set_bias_tee(a->bias_tee);
+        r7 = app_config_set_iot_log_host(a->iot_log_host);
     }
-    if (r1 || r2 || r3 || r4 || r5 || r6) {
-        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s bias=%s",
+    if (r1 || r2 || r3 || r4 || r5 || r6 || r7) {
+        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s bias=%s iot_log=%s",
                  esp_err_to_name(r1), esp_err_to_name(r2),
                  esp_err_to_name(r3), esp_err_to_name(r4),
-                 esp_err_to_name(r5), esp_err_to_name(r6));
+                 esp_err_to_name(r5), esp_err_to_name(r6),
+                 esp_err_to_name(r7));
     }
 
     free(a);
@@ -516,7 +519,7 @@ static esp_err_t diag_dcfine_get(httpd_req_t *req)
     worker_core1_get_dcfine(dc, WORKER_DCFINE_BINS, &total);
 
     static EXT_RAM_BSS_ATTR char body[4096];
-    int         n = 0, m;
+    int                          n = 0, m;
     // bin0_Hz = -HALF * width; width = WORKER_DCFINE_BIN_HZ_REPORT = round(FS/N) = 1221.
     // Consumer: offset_Hz(i) = bin0_Hz + i*width; i=HALF is DC.
     m = snprintf(body, sizeof(body),
@@ -588,29 +591,29 @@ static void send_page_head(httpd_req_t *req, const char *title, int refresh_s)
                  "<meta http-equiv=\"refresh\" content=\"%d\">", refresh_s);
     }
     static EXT_RAM_BSS_ATTR char head[1536]; // httpd task stack is only 6144 B (PSRAM) — big
-                            // buffers MUST be static (single serve task = race-free)
-                            // or the HTML handlers overflow the stack and reset the conn
-    int  n = snprintf(head, sizeof(head),
-                      "<!doctype html><html><head><meta charset=\"utf-8\">"
-                       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                       "%s<title>%s</title><style>"
-                       "body{font-family:system-ui,sans-serif;max-width:640px;margin:0 auto 2em;padding:0 1em;color:#222;background:#fafafa}"
-                       "h1{font-size:1.3em}h2{font-size:1.05em;margin-top:1.8em;color:#555}"
-                       "nav{margin:0 -1em 1.2em;padding:.6em 1em;background:#1976d2}"
-                       "nav a{color:#fff;text-decoration:none;margin-right:1em;font-size:.95em}"
-                       "nav a:hover{text-decoration:underline}"
-                       "label{display:block;margin:1em 0 .3em;font-size:.9em;color:#555}"
-                       "input[type=text],input[type=password],input[type=number],select{width:100%%;padding:.5em;border:1px solid #ccc;border-radius:4px;font-size:1em;box-sizing:border-box}"
-                       "button{margin-top:1.5em;padding:.7em 1.5em;border:0;background:#1976d2;color:#fff;border-radius:4px;font-size:1em}"
-                       "small{color:#888}table{border-collapse:collapse;width:100%%}"
-                       "td,th{text-align:left;padding:.25em .5em;border-bottom:1px solid #eee;font-size:.9em}"
-                       "td.v{font-family:ui-monospace,monospace;text-align:right}"
-                       "</style></head><body>"
-                       "<nav><a href=\"/\">Config</a><a href=\"/status\">Status</a>"
-                       "<a href=\"/messages\">Messages</a><a href=\"/tasks\">Tasks</a>"
-                       "<a href=\"/capture/status\">Capture</a></nav>"
-                       "<h1>%s</h1>",
-                      refresh, title, title);
+                                             // buffers MUST be static (single serve task = race-free)
+                                             // or the HTML handlers overflow the stack and reset the conn
+    int n = snprintf(head, sizeof(head),
+                     "<!doctype html><html><head><meta charset=\"utf-8\">"
+                     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                     "%s<title>%s</title><style>"
+                     "body{font-family:system-ui,sans-serif;max-width:640px;margin:0 auto 2em;padding:0 1em;color:#222;background:#fafafa}"
+                     "h1{font-size:1.3em}h2{font-size:1.05em;margin-top:1.8em;color:#555}"
+                     "nav{margin:0 -1em 1.2em;padding:.6em 1em;background:#1976d2}"
+                     "nav a{color:#fff;text-decoration:none;margin-right:1em;font-size:.95em}"
+                     "nav a:hover{text-decoration:underline}"
+                     "label{display:block;margin:1em 0 .3em;font-size:.9em;color:#555}"
+                     "input[type=text],input[type=password],input[type=number],select{width:100%%;padding:.5em;border:1px solid #ccc;border-radius:4px;font-size:1em;box-sizing:border-box}"
+                     "button{margin-top:1.5em;padding:.7em 1.5em;border:0;background:#1976d2;color:#fff;border-radius:4px;font-size:1em}"
+                     "small{color:#888}table{border-collapse:collapse;width:100%%}"
+                     "td,th{text-align:left;padding:.25em .5em;border-bottom:1px solid #eee;font-size:.9em}"
+                     "td.v{font-family:ui-monospace,monospace;text-align:right}"
+                     "</style></head><body>"
+                     "<nav><a href=\"/\">Config</a><a href=\"/status\">Status</a>"
+                     "<a href=\"/messages\">Messages</a><a href=\"/tasks\">Tasks</a>"
+                     "<a href=\"/capture/status\">Capture</a></nav>"
+                     "<h1>%s</h1>",
+                     refresh, title, title);
     if (n < 0) n = 0;
     if (n > (int)sizeof(head)) n = sizeof(head);
     httpd_resp_send_chunk(req, head, n);
@@ -652,38 +655,44 @@ static esp_err_t index_get(httpd_req_t *req)
     char ssid_esc[2 * sizeof(cfg.wifi_ssid) + 8];
     char psk_esc[2 * sizeof(cfg.wifi_psk) + 8];
     char host_esc[2 * sizeof(cfg.out_host) + 8];
+    char iot_log_host_esc[2 * sizeof(cfg.iot_log_host) + 8];
     char ota_esc[2 * sizeof(cfg.ota_url) + 8];
     html_attr_escape(ssid_esc, sizeof(ssid_esc), cfg.wifi_ssid);
     html_attr_escape(psk_esc, sizeof(psk_esc), cfg.wifi_psk);
     html_attr_escape(host_esc, sizeof(host_esc), cfg.out_host);
+    html_attr_escape(iot_log_host_esc, sizeof(iot_log_host_esc), cfg.iot_log_host);
     html_attr_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
 
     static EXT_RAM_BSS_ATTR char form[2048]; // static: 6144 B httpd stack (see head[] note)
-    int  n = snprintf(form, sizeof(form),
-                      "<form method=\"POST\" action=\"/config\">"
-                       "<h2>Wi-Fi</h2>"
-                       "<label>SSID</label>"
-                       "<input type=\"text\" name=\"ssid\" required maxlength=\"32\" value=\"%s\">"
-                       "<label>Password</label>"
-                       "<input type=\"password\" name=\"psk\" maxlength=\"63\" value=\"%s\">"
-                       "<h2>SDR (bias tee)</h2>"
-                       "<label><input type=\"checkbox\" name=\"bias_tee\" value=\"1\"%s> "
-                       "Enable RTL-SDR v4 bias tee (5 V on antenna line, for active antennas / LNAs)</label>"
-                       "<h2>ACARS push (optional, UDP)</h2>"
-                       "<label>Host (IP or hostname; leave empty to disable)</label>"
-                       "<input type=\"text\" name=\"out_host\" maxlength=\"63\" value=\"%s\">"
-                       "<label>Port</label>"
-                       "<input type=\"number\" name=\"out_port\" min=\"0\" max=\"65535\" placeholder=\"e.g. 6700\" value=\"%u\">"
-                       "<h2>OTA</h2>"
-                       "<label>Firmware URL (http:// or https://)</label>"
-                       "<input type=\"text\" name=\"ota_url\" maxlength=\"127\" placeholder=\"http://server/p4-usb-host.bin\" value=\"%s\">"
-                       "<button type=\"submit\">Save &amp; reboot</button>"
-                       "</form>",
-                      ssid_esc, psk_esc,
+    int                          n = snprintf(form, sizeof(form),
+                                              "<form method=\"POST\" action=\"/config\">"
+                                                                       "<h2>Wi-Fi</h2>"
+                                                                       "<label>SSID</label>"
+                                                                       "<input type=\"text\" name=\"ssid\" required maxlength=\"32\" value=\"%s\">"
+                                                                       "<label>Password</label>"
+                                                                       "<input type=\"password\" name=\"psk\" maxlength=\"63\" value=\"%s\">"
+                                                                       "<h2>SDR (bias tee)</h2>"
+                                                                       "<label><input type=\"checkbox\" name=\"bias_tee\" value=\"1\"%s> "
+                                                                       "Enable RTL-SDR v4 bias tee (5 V on antenna line, for active antennas / LNAs)</label>"
+                                                                       "<h2>ACARS push (optional, UDP)</h2>"
+                                                                       "<label>Host (IP or hostname; leave empty to disable)</label>"
+                                                                       "<input type=\"text\" name=\"out_host\" maxlength=\"63\" value=\"%s\">"
+                                                                       "<label>Port</label>"
+                                                                       "<input type=\"number\" name=\"out_port\" min=\"0\" max=\"65535\" placeholder=\"e.g. 6700\" value=\"%u\">"
+                                                                       "<h2>IoT log (optional, UDP unicast)</h2>"
+                                                                       "<label>Host (IP or hostname; leave empty to disable)</label>"
+                                                                       "<input type=\"text\" name=\"iot_log_host\" maxlength=\"63\" value=\"%s\">"
+                                                                       "<h2>OTA</h2>"
+                                                                       "<label>Firmware URL (http:// or https://)</label>"
+                                                                       "<input type=\"text\" name=\"ota_url\" maxlength=\"127\" placeholder=\"http://server/p4-usb-host.bin\" value=\"%s\">"
+                                                                       "<button type=\"submit\">Save &amp; reboot</button>"
+                                                                       "</form>",
+                                              ssid_esc, psk_esc,
                      cfg.bias_tee ? " checked" : "",
-                      host_esc,
-                      (unsigned)cfg.out_port,
-                      ota_esc);
+                                              host_esc,
+                                              (unsigned)cfg.out_port,
+                                              iot_log_host_esc,
+                                              ota_esc);
     if (n < 0) n = 0;
     if (n > (int)sizeof(form)) n = sizeof(form);
     httpd_resp_send_chunk(req, form, n);
@@ -788,12 +797,12 @@ static esp_err_t status_html_get(httpd_req_t *req)
     else
         snprintf(gain_str, sizeof(gain_str), "tuner AGC");
 
-    int64_t uptime_s = esp_timer_get_time() / 1000000;
+    int64_t                      uptime_s = esp_timer_get_time() / 1000000;
     static EXT_RAM_BSS_ATTR char body[2700]; // static: 6144 B httpd stack (see send_page_head note)
-    int     n = snprintf(body, sizeof(body),
-                         "<p><small>build %s &middot; %s &middot; uptime %llds &middot; "
-                             "auto-refresh 5 s</small></p>",
-                         app->version, app->date, (long long)uptime_s);
+    int                          n = snprintf(body, sizeof(body),
+                                              "<p><small>build %s &middot; %s &middot; uptime %llds &middot; "
+                                                                       "auto-refresh 5 s</small></p>",
+                                              app->version, app->date, (long long)uptime_s);
     httpd_resp_send_chunk(req, body, n > 0 ? n : 0);
 
     if (!have) {
@@ -928,9 +937,12 @@ static esp_err_t config_post(httpd_req_t *req)
     // Form body buffer. static (not stack, not heap): esp_http_server
     // runs every handler on its single serve task, so one static buffer
     // is race-free and avoids a per-request alloc. 1024 covers the full
-    // form worst case (ssid 32 + psk 63 + out_host 63 + ota_url 127,
-    // each up to 3× expanded by %XX url-encoding, plus keys) — the old
-    // 256-byte buffer silently truncated long PSK+URL combinations.
+    // form worst case (ssid 32 + psk 63 + out_host 63 + iot_log_host 63 +
+    // ota_url 127, each up to 3× expanded by %XX url-encoding, plus keys)
+    // — the old 256-byte buffer silently truncated long PSK+URL
+    // combinations. NB: a request maxing out every field at once is
+    // rejected with 413 rather than truncated (see the content_len check
+    // below) — safe, but worth knowing if the math ever gets this tight.
     static EXT_RAM_BSS_ATTR char body[1024];
     if (req->content_len >= sizeof(body)) {
         httpd_resp_set_status(req, "413 Payload Too Large");
@@ -976,6 +988,10 @@ static esp_err_t config_post(httpd_req_t *req)
     form_field(body, total, "out_port", out_port_s, sizeof(out_port_s));
     uint16_t out_port = (uint16_t)strtoul(out_port_s, NULL, 10);
 
+    // Optional iot_log unicast target. Empty = disabled.
+    char iot_log_host[64] = {0};
+    form_field(body, total, "iot_log_host", iot_log_host, sizeof(iot_log_host));
+
     // Optional OTA URL.
     char ota_url[128] = {0};
     form_field(body, total, "ota_url", ota_url, sizeof(ota_url));
@@ -986,9 +1002,10 @@ static esp_err_t config_post(httpd_req_t *req)
     bool bias_tee      = (form_field(body, total, "bias_tee", bias_tee_s,
                                      sizeof(bias_tee_s)) == ESP_OK);
 
-    ESP_LOGI(TAG, "/config POST: ssid='%s' (psk %s), bias_tee=%d, out=%s:%u, ota_url=%s",
+    ESP_LOGI(TAG, "/config POST: ssid='%s' (psk %s), bias_tee=%d, out=%s:%u, iot_log_host=%s, ota_url=%s",
              ssid, psk[0] ? "set" : "empty", (int)bias_tee,
              out_host[0] ? out_host : "(none)", (unsigned)out_port,
+             iot_log_host[0] ? iot_log_host : "(none)",
              ota_url[0] ? ota_url : "(none)");
 
     // Marshal form fields into a heap-allocated struct and hand off
@@ -1003,6 +1020,7 @@ static esp_err_t config_post(httpd_req_t *req)
     strlcpy(args->psk, psk, sizeof(args->psk));
     strlcpy(args->out_host, out_host, sizeof(args->out_host));
     args->out_port = out_port;
+    strlcpy(args->iot_log_host, iot_log_host, sizeof(args->iot_log_host));
     strlcpy(args->ota_url, ota_url, sizeof(args->ota_url));
     args->bias_tee   = bias_tee;
     args->clear_only = false;
@@ -1086,9 +1104,9 @@ static esp_err_t messages_html_get(httpd_req_t *req)
     send_page_head(req, "Messages", 10); // 10 s meta-refresh — live feed
 
     static EXT_RAM_BSS_ATTR acars_msg_t s_snap[MSG_RING_CAPACITY];
-    size_t n = msg_ring_snapshot(0, s_snap, MSG_RING_CAPACITY);
-    uint64_t total = msg_ring_total();
-    int64_t  now_us = esp_timer_get_time();
+    size_t                              n      = msg_ring_snapshot(0, s_snap, MSG_RING_CAPACITY);
+    uint64_t                            total  = msg_ring_total();
+    int64_t                             now_us = esp_timer_get_time();
 
     // Cumulative decode-type totals (since boot) — same getters the /status
     // JSON uses. These count every classified frame, not just what fits in the
@@ -1099,20 +1117,20 @@ static esp_err_t messages_html_get(httpd_req_t *req)
     uint64_t sbd_total   = frame_decoder_sbd_complete_total();
 
     static EXT_RAM_BSS_ATTR char body[768];
-    int  bn = snprintf(body, sizeof(body),
-                       "<p><small>%llu messages in ring &middot; showing last %u "
-                       "&middot; auto-refresh 10 s</small></p>"
-                       "<h2>Decoded totals (since boot)</h2>"
-                       "<table><tr><th>ACARS</th><th>SBD</th><th>MS</th><th>TL</th>"
-                       "<th>BC</th><th>LW·DA</th><th>LW·oth</th><th>Unknown</th></tr>"
-                       "<tr><td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
-                       "<td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
-                       "<td class=v>%llu</td><td class=v>%llu</td></tr></table>",
-                       (unsigned long long)total, (unsigned)n,
-                       (unsigned long long)acars_total, (unsigned long long)sbd_total,
-                       (unsigned long long)cc.ms, (unsigned long long)cc.tl,
-                       (unsigned long long)cc.bc, (unsigned long long)cc.lw_da,
-                       (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown);
+    int                          bn = snprintf(body, sizeof(body),
+                                               "<p><small>%llu messages in ring &middot; showing last %u "
+                                                                        "&middot; auto-refresh 10 s</small></p>"
+                                                                        "<h2>Decoded totals (since boot)</h2>"
+                                                                        "<table><tr><th>ACARS</th><th>SBD</th><th>MS</th><th>TL</th>"
+                                                                        "<th>BC</th><th>LW·DA</th><th>LW·oth</th><th>Unknown</th></tr>"
+                                                                        "<tr><td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
+                                                                        "<td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
+                                                                        "<td class=v>%llu</td><td class=v>%llu</td></tr></table>",
+                                               (unsigned long long)total, (unsigned)n,
+                                               (unsigned long long)acars_total, (unsigned long long)sbd_total,
+                                               (unsigned long long)cc.ms, (unsigned long long)cc.tl,
+                                               (unsigned long long)cc.bc, (unsigned long long)cc.lw_da,
+                                               (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown);
     if (bn < 0) bn = 0;
     if (bn > (int)sizeof(body)) bn = sizeof(body);
     httpd_resp_send_chunk(req, body, bn);
@@ -1135,9 +1153,9 @@ static esp_err_t messages_html_get(httpd_req_t *req)
                           HTTPD_RESP_USE_STRLEN);
 
     static EXT_RAM_BSS_ATTR char esc_txt[2 * MSG_RING_TXT_MAX + 8];
-    static char esc_flight[16];
-    static char esc_label[16];
-    static char esc_msgnum[24];
+    static char                  esc_flight[16];
+    static char                  esc_label[16];
+    static char                  esc_msgnum[24];
     static EXT_RAM_BSS_ATTR char row[2 * MSG_RING_TXT_MAX + 512];
     // Newest first: the snapshot is oldest→newest, so walk it in reverse.
     for (size_t k = n; k > 0; k--) {
@@ -1146,9 +1164,12 @@ static esp_err_t messages_html_get(httpd_req_t *req)
         double age_s = (double)(now_us - (int64_t)m->timestamp_us) / 1e6;
         char   age[16];
         if (age_s < 0) age_s = 0;
-        if (age_s < 120.0)      snprintf(age, sizeof(age), "%.0fs", age_s);
-        else if (age_s < 7200.0) snprintf(age, sizeof(age), "%.0fm", age_s / 60.0);
-        else                     snprintf(age, sizeof(age), "%.1fh", age_s / 3600.0);
+        if (age_s < 120.0)
+            snprintf(age, sizeof(age), "%.0fs", age_s);
+        else if (age_s < 7200.0)
+            snprintf(age, sizeof(age), "%.0fm", age_s / 60.0);
+        else
+            snprintf(age, sizeof(age), "%.1fh", age_s / 3600.0);
 
         char label_buf[3] = {m->label[0], m->label[1], 0};
         html_attr_escape(esc_label, sizeof(esc_label), label_buf);
@@ -1338,15 +1359,15 @@ static esp_err_t c6ota_post(httpd_req_t *req)
         if (httpd_query_key_value(qbuf, "activate", val, sizeof(val)) == ESP_OK &&
             (val[0] == '1' || val[0] == 't')) {
             esp_err_t r = c6_ota_activate();
-            n = snprintf(body, sizeof(body), "{\"activate\":\"%s\",\"status\":\"%s\"}",
-                         esp_err_to_name(r), c6_ota_status());
+            n           = snprintf(body, sizeof(body), "{\"activate\":\"%s\",\"status\":\"%s\"}",
+                                   esp_err_to_name(r), c6_ota_status());
             return httpd_resp_send(req, body, n > 0 ? n : 0);
         }
         char uval[220];
         if (httpd_query_key_value(qbuf, "url", uval, sizeof(uval)) == ESP_OK) {
             char   url[220];
-            size_t ul = url_decode(url, uval, strlen(uval));
-            url[ul]   = '\0';
+            size_t ul   = url_decode(url, uval, strlen(uval));
+            url[ul]     = '\0';
             esp_err_t r = c6_ota_transfer_start(url);
             if (r == ESP_ERR_INVALID_STATE) {
                 httpd_resp_set_status(req, "409 Conflict");
@@ -1689,13 +1710,17 @@ static esp_err_t scan_post(httpd_req_t *req)
 // resets the board via DTR) — HTTP avoids that. NVS write can't run on this
 // PSRAM-stacked httpd task, so it hands off to an internal-stack task (same
 // pattern as tune_apply_reboot_task), which grace­fully parks the tuner first.
-typedef struct { uint32_t lo_s; uint32_t gain_s; uint32_t dwell_s; } autotune_cfg_args_t;
+typedef struct {
+    uint32_t lo_s;
+    uint32_t gain_s;
+    uint32_t dwell_s;
+} autotune_cfg_args_t;
 static void autotune_cfg_reboot_task(void *arg)
 {
-    autotune_cfg_args_t *a = (autotune_cfg_args_t *)arg;
-    esp_err_t r1 = app_config_set_autotune_lo_interval_s(a->lo_s);
-    esp_err_t r2 = app_config_set_autotune_gain_interval_s(a->gain_s);
-    esp_err_t r3 = ESP_OK;
+    autotune_cfg_args_t *a  = (autotune_cfg_args_t *)arg;
+    esp_err_t            r1 = app_config_set_autotune_lo_interval_s(a->lo_s);
+    esp_err_t            r2 = app_config_set_autotune_gain_interval_s(a->gain_s);
+    esp_err_t            r3 = ESP_OK;
     if (a->dwell_s > 0) r3 = app_config_set_autotune_gain_dwell_s(a->dwell_s); // 0 = leave unchanged
     ESP_LOGI(TAG, "/autotune: lo_interval_s=%lu gain_interval_s=%lu gain_dwell_s=%lu (%s/%s/%s) — rebooting",
              (unsigned long)a->lo_s, (unsigned long)a->gain_s, (unsigned long)a->dwell_s,
@@ -1720,8 +1745,8 @@ static esp_err_t autotune_post(httpd_req_t *req)
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_sendstr(req, "oom\n");
     }
-    a->lo_s   = lo;
-    a->gain_s = gain;
+    a->lo_s    = lo;
+    a->gain_s  = gain;
     a->dwell_s = dwell;
     char body[128];
     int  n = snprintf(body, sizeof(body),
@@ -2358,13 +2383,13 @@ static esp_err_t reboot_post(httpd_req_t *req)
     if (strstr(accept, "text/html")) {
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_sendstr(req,
-            "<!doctype html><html><head><meta charset=\"utf-8\">"
-            "<meta http-equiv=\"refresh\" content=\"12;url=/status\"></head>"
-            "<body style=\"font-family:system-ui;max-width:480px;margin:2em auto;padding:0 1em\">"
-            "<h1>Rebooting…</h1>"
-            "<p>Parking the tuner and restarting — typically ~10 s. This page "
-            "will return to <a href=\"/status\">Status</a> automatically.</p>"
-            "</body></html>");
+                           "<!doctype html><html><head><meta charset=\"utf-8\">"
+                           "<meta http-equiv=\"refresh\" content=\"12;url=/status\"></head>"
+                           "<body style=\"font-family:system-ui;max-width:480px;margin:2em auto;padding:0 1em\">"
+                           "<h1>Rebooting…</h1>"
+                           "<p>Parking the tuner and restarting — typically ~10 s. This page "
+                           "will return to <a href=\"/status\">Status</a> automatically.</p>"
+                           "</body></html>");
     } else {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"result\":\"ok\",\"reboot\":true}");
