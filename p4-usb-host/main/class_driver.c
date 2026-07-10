@@ -81,6 +81,15 @@ static volatile bool     s_last_setgain_ok    = false;
 // the pump loop drains the stream + standbys the tuner, then gives it.
 static SemaphoreHandle_t s_graceful_done = NULL;
 
+// USB-reinstall probe (usb_reinstall.h). The daemon sets s_reinstall_quiesce_req
+// to ask this task (usb_pump) to tear down the USB layer + deregister its
+// client so the host library can be uninstalled. Only the USB layer is torn
+// down; the DSP/PIE layer stays allocated (re-arm is a deliberate later step).
+// The pump loop breaks on the flag, runs the teardown, gives
+// s_reinstall_quiesced_sem, and parks (no re-arm — reboot restores streaming).
+static atomic_bool       s_reinstall_quiesce_req  = false;
+static SemaphoreHandle_t s_reinstall_quiesced_sem = NULL;
+
 // T48 (docs/perf-decoupling-design-2026-07-04.md §T48): the combined
 // class_driver loop is split into two Core-0 tasks:
 //   - usb_pump: this function (class_driver_task) keeps its name/entry
@@ -294,6 +303,24 @@ bool class_driver_set_gain_quiesced(int gain_dbx10)
     if (xSemaphoreTake(s_setgain_done, pdMS_TO_TICKS(3000)) != pdTRUE)
         return false;
     return s_last_setgain_ok;
+}
+
+bool class_driver_quiesce_for_reinstall(uint32_t timeout_ms)
+{
+    // Called from the daemon task for the USB-reinstall probe. Signals the
+    // usb_pump task to break its loop and tear down the USB layer (stream +
+    // device + client), then waits (bounded) for it to ack. The teardown MUST
+    // run on usb_pump itself (it owns client_handle_events + the device), so
+    // this only posts the request and blocks. Returns true if usb_pump
+    // quiesced within the timeout; false means it's wedged (caller proceeds to
+    // free_all/uninstall anyway and reports the timeout).
+    if (!s_reinstall_quiesced_sem) {
+        s_reinstall_quiesced_sem = xSemaphoreCreateBinary();
+        if (!s_reinstall_quiesced_sem) return false;
+    }
+    (void)xSemaphoreTake(s_reinstall_quiesced_sem, 0); // drop any stale ack
+    atomic_store(&s_reinstall_quiesce_req, true);
+    return xSemaphoreTake(s_reinstall_quiesced_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
 void class_driver_prepare_for_reboot(void)
@@ -685,6 +712,9 @@ void class_driver_task(void *arg)
         }
         if (s_driver_obj.actions & ACTION_CLOSE_DEV) action_close_dev(&s_driver_obj);
         if (s_driver_obj.actions & ACTION_EXIT) break;
+        // USB-reinstall probe: the daemon asked us to quiesce. Break the pump
+        // loop and handle it after the loop (teardown must run on this task).
+        if (atomic_load_explicit(&s_reinstall_quiesce_req, memory_order_relaxed)) break;
 
         // T48: the ring-drain / dispatch / DSP-feed cycle that used to
         // run right here now runs in dsp_feed_task(). This task has
@@ -824,6 +854,35 @@ void class_driver_task(void *arg)
             last_report            = now;
             cycle_handle_events_us = 0;
         }
+    }
+
+    // USB-reinstall probe: we broke the pump loop because the daemon asked us
+    // to quiesce (not a real device-gone EXIT). Tear down ONLY the USB layer —
+    // stop dsp_feed, free the stream (transfers + ring), close the device,
+    // deregister the client — leaving the DSP/PIE layer fully allocated. Then
+    // ack the daemon and park. No re-arm yet: a reboot restores streaming.
+    if (atomic_load_explicit(&s_reinstall_quiesce_req, memory_order_relaxed)) {
+        ESP_LOGW(TAG, "reinstall-probe: quiescing USB layer (DSP/PIE layer kept)");
+        stop_dsp_feed_task();
+        esp_libusb_stop_stream(&s_driver_obj);
+        if (rtldev) {
+            rtlsdr_close_full(rtldev);
+            rtldev = NULL;
+        }
+        s_driver_obj.dev_hdl  = NULL;
+        s_driver_obj.dev_addr = 0;
+        esp_libusb_set_dev_hdl(NULL); // clear adsbdev's cached handle too, so the
+                                      // daemon's idle-log gate doesn't read stale
+        if (s_driver_obj.client_hdl) {
+            esp_err_t dr = usb_host_client_deregister(s_driver_obj.client_hdl);
+            ESP_LOGW(TAG, "reinstall-probe: client_deregister -> 0x%x (%s)",
+                     dr, esp_err_to_name(dr));
+            s_driver_obj.client_hdl = NULL;
+        }
+        atomic_store(&s_reinstall_quiesce_req, false);
+        if (s_reinstall_quiesced_sem) xSemaphoreGive(s_reinstall_quiesced_sem);
+        ESP_LOGW(TAG, "reinstall-probe: quiesced + parked (no stream re-arm; reboot to restore)");
+        vTaskSuspend(NULL); // probe: no re-arm — this task is done until reboot
     }
 
     // T48 defensive second call: ACTION_EXIT is only ever set from

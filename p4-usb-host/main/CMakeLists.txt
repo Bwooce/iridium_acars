@@ -1,7 +1,7 @@
 set(_app_srcs
     "class_driver.c" "esp_libusb.c" "tuner_r82xx.c" "tuner_fc2580.c"
     "tuner_fc0013.c" "tuner_fc0012.c" "tuner_e4k.c" "librtlsdr.c"
-    "usb_host_lib_main.c" "dsp_processor.c" "signal_buffer.c"
+    "usb_host_lib_main.c" "usb_reinstall.c" "dsp_processor.c" "signal_buffer.c"
     "worker_core1.c" "ingest_core1.c" "usbring.c" "status_logger.c" "smoke_test.c"
     "frame_decoder.c" "pie_fft_diff_test.c" "app_config.c" "agc.c"
     "wifi_link.c" "http_server.c" "msg_ring.c" "captive_dns.c"

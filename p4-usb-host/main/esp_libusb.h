@@ -122,6 +122,15 @@ int esp_libusb_pause_stream(class_driver_t *driver_obj);
 // block). MUST be called from the usb_pump task, same as the pause
 // call it pairs with.
 int esp_libusb_resume_stream(class_driver_t *driver_obj, unsigned char endpoint);
+// Full stream teardown for the USB-reinstall probe (usb_reinstall.h): unlike
+// pause_stream (which PARKS transfers for a later resume), this drains + FREES
+// the bulk transfer pool AND usbring_deinit()s the PSRAM ring, so the device
+// can be closed and the host library uninstalled. A wedged dongle (URBs that
+// never complete) gets an endpoint halt+flush before the free. MUST run on the
+// usb_pump task with dsp_feed already stopped (it reads the ring this frees).
+// Returns 0 on a clean drain, -1 if URBs were still in flight after halt+flush
+// (freed best-effort anyway). Best-effort + logged; never aborts.
+int esp_libusb_stop_stream(class_driver_t *driver_obj);
 // Zero-copy stream read (T49a): peeks the usbring instead of memcpy'ing
 // into a caller buffer. On success (return 0), *out_ptr points directly
 // into the ring's PSRAM backing store and *received is the contiguous

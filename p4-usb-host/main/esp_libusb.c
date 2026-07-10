@@ -489,6 +489,56 @@ int esp_libusb_resume_stream(class_driver_t *driver_obj, unsigned char endpoint)
     return (n > 0) ? 0 : -1; // success if at least one URB is back in flight
 }
 
+int esp_libusb_stop_stream(class_driver_t *driver_obj)
+{
+    class_adsb_dev *dev = adsbdev;
+    if (!dev) return -1;
+    usb_device_handle_t dev_hdl = driver_obj->dev_hdl ? driver_obj->dev_hdl : dev->dev_hdl;
+
+    // Stop resubmission (stream_transfer_cb parks completing URBs instead of
+    // recycling them) and drain the in-flight ones, bounded so a wedged dongle
+    // can't spin us forever.
+    dev->streaming     = false;
+    int64_t deadline_us = esp_timer_get_time() + 300 * 1000;
+    while (atomic_load_explicit(&s_live_xfers, memory_order_relaxed) != 0 &&
+           esp_timer_get_time() < deadline_us) {
+        usb_host_client_handle_events(driver_obj->client_hdl, pdMS_TO_TICKS(10));
+    }
+    int live = atomic_load_explicit(&s_live_xfers, memory_order_relaxed);
+
+    if (live != 0 && dev_hdl) {
+        // Wedged: URBs never completed on their own. Halt the endpoint then
+        // flush it — flush completes all pending transfers (callbacks fire and
+        // decrement s_live_xfers), so the free below isn't a use-after-free.
+        ESP_LOGW("LIBUSB", "stop_stream: %d URBs still in flight — halt+flush EP 0x81", live);
+        esp_err_t rh = usb_host_endpoint_halt(dev_hdl, 0x81);
+        esp_err_t rf = usb_host_endpoint_flush(dev_hdl, 0x81);
+        ESP_LOGW("LIBUSB", "stop_stream: halt=0x%x (%s) flush=0x%x (%s)",
+                 rh, esp_err_to_name(rh), rf, esp_err_to_name(rf));
+        deadline_us = esp_timer_get_time() + 300 * 1000;
+        while (atomic_load_explicit(&s_live_xfers, memory_order_relaxed) != 0 &&
+               esp_timer_get_time() < deadline_us) {
+            usb_host_client_handle_events(driver_obj->client_hdl, pdMS_TO_TICKS(10));
+        }
+        live = atomic_load_explicit(&s_live_xfers, memory_order_relaxed);
+    }
+
+    // Free the (now idle) bulk transfer pool + the PSRAM ring. dsp_feed is
+    // stopped by the caller, so nothing else reads the ring.
+    int freed = 0;
+    for (int i = 0; i < ASYNC_TRANSFER_COUNT; i++) {
+        if (dev->transfers[i]) {
+            usb_host_transfer_free(dev->transfers[i]);
+            dev->transfers[i] = NULL;
+            freed++;
+        }
+    }
+    usbring_deinit();
+    ESP_LOGW("LIBUSB", "stop_stream: freed %d transfers, ring deinit'd (live_xfers=%d)",
+             freed, live);
+    return (live == 0) ? 0 : -1;
+}
+
 int esp_libusb_read_stream(const uint8_t **out_ptr, size_t max_length, size_t *received)
 {
     if (!adsbdev) {
