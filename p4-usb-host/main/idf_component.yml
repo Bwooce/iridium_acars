@@ -27,6 +27,9 @@ dependencies:
     rules:
       - if: "target in [esp32p4, esp32h2]"
   espressif/esp_hosted:
-    version: ">=2.11.0"
+    # >=2.12.10: fixes the SDIO RX heap corruption that corrupts large downloads
+    # (OTA verify-fail). Our SDIO transport checksum + lwip IP/UDP checks are both
+    # off (offload-assumed), so nothing else catches an RX-buffer byte error.
+    version: ">=2.12.10"
     rules:
       - if: "target in [esp32p4, esp32h2]"

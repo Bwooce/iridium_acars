@@ -197,3 +197,12 @@ CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
 # bootloops before that call, the bootloader reverts to the previous ota_N slot on
 # the next reset. Essential once the device is deployed off-USB (no port to reflash).
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# esp_hosted SDIO software checksum. Default-off ("optional - SDIO HW handles it"),
+# but the SD-bus CRC only protects the wire, NOT the RX heap buffers. esp_hosted
+# corrupts a byte in a large sustained RX transfer (proven: OTA downloads verify-fail
+# at both 2.12.9 AND 2.12.10), and with this + lwip IP/UDP checks all off, nothing
+# catches it. With this on, the host drops a corrupt SDIO frame (sdio_drv.c) -> TCP
+# retransmits -> reliable downloads. MUST match the C6 slave's CONFIG_ESP_SDIO_CHECKSUM.
+# Cost is network-frame-only (the RTL-SDR stream is USB, not SDIO) - negligible.
+CONFIG_ESP_HOSTED_SDIO_CHECKSUM=y
