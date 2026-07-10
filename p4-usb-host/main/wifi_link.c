@@ -210,8 +210,12 @@ static void health_wdt_task(void *arg)
         // boot can't reboot-loop.
         usb_stream_totals_t ut = {0};
         esp_libusb_get_stream_totals(&ut);
-        if (ut.completed > last_completed) {
-            last_completed  = ut.completed;
+        // Use the RAW urb_completions, NOT `completed`: the latter is grace-gated
+        // and resume_stream resets the grace on every retune, so during an LO
+        // rescan (~10 retunes) `completed` barely advances even though the stream
+        // is healthy — which falsely tripped this watchdog (2026-07-10).
+        if (ut.urb_completions > last_completed) {
+            last_completed  = ut.urb_completions;
             s_stream_live   = true;
             s_stream_stalls = 0;
         } else if (class_driver_in_maintenance()) {

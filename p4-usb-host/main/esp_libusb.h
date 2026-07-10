@@ -171,10 +171,17 @@ void esp_libusb_get_stream_stats(usb_stream_stats_t *out);
 // compute deltas across an arbitrary window without racing
 // status_logger's reset-on-read.
 typedef struct {
-    uint64_t completed;     // total successful transfers since boot
+    uint64_t completed;     // total successful transfers since boot (POST-GRACE:
+                            // gated by STREAM_STATS_GRACE_US, which resume_stream
+                            // RESETS on every retune — do NOT use for liveness)
     uint64_t rb_full_drops; // total transfers dropped at ringbuf-send
     uint64_t status_errors; // total transfers with non-COMPLETED status
     uint64_t short_xfers;   // total transfers where actual_bytes < requested
+    uint64_t urb_completions; // RAW completion count — increments on EVERY
+                              // completed URB, no grace gate. The correct
+                              // liveness signal for the health watchdog: unlike
+                              // `completed`, a retune's grace reset can't blind
+                              // it (the LO-rescan false-reboot, 2026-07-10).
 } usb_stream_totals_t;
 
 void esp_libusb_get_stream_totals(usb_stream_totals_t *out);

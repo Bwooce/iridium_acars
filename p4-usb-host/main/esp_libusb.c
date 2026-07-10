@@ -40,6 +40,7 @@ static volatile uint8_t  s_xfer_last_error      = 0;
 #define STREAM_STATS_GRACE_US (5 * 1000 * 1000)
 static volatile int64_t  s_stream_start_us     = 0;
 static volatile uint64_t s_total_completed     = 0;
+static volatile uint64_t s_total_urb_completions = 0; // raw liveness (no grace)
 static volatile uint64_t s_total_rb_full_drops = 0;
 static volatile uint64_t s_total_status_errors = 0;
 static volatile uint64_t s_total_short_xfers   = 0;
@@ -216,6 +217,7 @@ void stream_transfer_cb(usb_transfer_t *transfer)
 
     if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_xfer_completed++;
+        s_total_urb_completions++; // RAW liveness — NO grace gate (see .h)
         if (post_grace) s_total_completed++;
         s_xfer_actual_bytes += (uint32_t)transfer->actual_num_bytes;
         s_xfer_requested_bytes += (uint32_t)transfer->num_bytes;
@@ -315,10 +317,11 @@ void esp_libusb_get_stream_stats(usb_stream_stats_t *out)
 void esp_libusb_get_stream_totals(usb_stream_totals_t *out)
 {
     if (!out) return;
-    out->completed     = s_total_completed;
-    out->rb_full_drops = s_total_rb_full_drops;
-    out->status_errors = s_total_status_errors;
-    out->short_xfers   = s_total_short_xfers;
+    out->completed        = s_total_completed;
+    out->rb_full_drops    = s_total_rb_full_drops;
+    out->status_errors    = s_total_status_errors;
+    out->short_xfers      = s_total_short_xfers;
+    out->urb_completions  = s_total_urb_completions;
 }
 
 void esp_libusb_set_dev_hdl(usb_device_handle_t hdl)

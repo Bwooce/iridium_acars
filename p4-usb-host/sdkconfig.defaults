@@ -186,3 +186,7 @@ CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=64
 CONFIG_ESP_COREDUMP_UART_DELAY=0
+
+# Allow OTA from a plain-HTTP LAN server (the ota_runner uses no cert bundle;
+# without this esp_https_ota_begin returns INVALID_ARG — the P4 OTA never worked).
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
