@@ -500,7 +500,7 @@ static esp_err_t diag_dcfine_get(httpd_req_t *req)
     uint32_t        total = 0;
     worker_core1_get_dcfine(dc, WORKER_DCFINE_BINS, &total);
 
-    static char body[4096];
+    static EXT_RAM_BSS_ATTR char body[4096];
     int         n = 0, m;
     // bin0_Hz = -HALF * width; width = WORKER_DCFINE_BIN_HZ_REPORT = round(FS/N) = 1221.
     // Consumer: offset_Hz(i) = bin0_Hz + i*width; i=HALF is DC.
@@ -572,7 +572,7 @@ static void send_page_head(httpd_req_t *req, const char *title, int refresh_s)
         snprintf(refresh, sizeof(refresh),
                  "<meta http-equiv=\"refresh\" content=\"%d\">", refresh_s);
     }
-    static char head[1536]; // httpd task stack is only 6144 B (PSRAM) — big
+    static EXT_RAM_BSS_ATTR char head[1536]; // httpd task stack is only 6144 B (PSRAM) — big
                             // buffers MUST be static (single serve task = race-free)
                             // or the HTML handlers overflow the stack and reset the conn
     int  n = snprintf(head, sizeof(head),
@@ -643,7 +643,7 @@ static esp_err_t index_get(httpd_req_t *req)
     html_attr_escape(host_esc, sizeof(host_esc), cfg.out_host);
     html_attr_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
 
-    static char form[2048]; // static: 6144 B httpd stack (see head[] note)
+    static EXT_RAM_BSS_ATTR char form[2048]; // static: 6144 B httpd stack (see head[] note)
     int  n = snprintf(form, sizeof(form),
                       "<form method=\"POST\" action=\"/config\">"
                        "<h2>Wi-Fi</h2>"
@@ -774,7 +774,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
         snprintf(gain_str, sizeof(gain_str), "tuner AGC");
 
     int64_t uptime_s = esp_timer_get_time() / 1000000;
-    static char body[2700]; // static: 6144 B httpd stack (see send_page_head note)
+    static EXT_RAM_BSS_ATTR char body[2700]; // static: 6144 B httpd stack (see send_page_head note)
     int     n = snprintf(body, sizeof(body),
                          "<p><small>build %s &middot; %s &middot; uptime %llds &middot; "
                              "auto-refresh 5 s</small></p>",
@@ -892,7 +892,7 @@ static esp_err_t config_post(httpd_req_t *req)
     // form worst case (ssid 32 + psk 63 + out_host 63 + ota_url 127,
     // each up to 3× expanded by %XX url-encoding, plus keys) — the old
     // 256-byte buffer silently truncated long PSK+URL combinations.
-    static char body[1024];
+    static EXT_RAM_BSS_ATTR char body[1024];
     if (req->content_len >= sizeof(body)) {
         httpd_resp_set_status(req, "413 Payload Too Large");
         httpd_resp_set_type(req, "text/plain");
@@ -1059,7 +1059,7 @@ static esp_err_t messages_html_get(httpd_req_t *req)
     uint64_t acars_total = frame_decoder_acars_decoded_total();
     uint64_t sbd_total   = frame_decoder_sbd_complete_total();
 
-    static char body[768];
+    static EXT_RAM_BSS_ATTR char body[768];
     int  bn = snprintf(body, sizeof(body),
                        "<p><small>%llu messages in ring &middot; showing last %u "
                        "&middot; auto-refresh 10 s</small></p>"
@@ -1095,11 +1095,11 @@ static esp_err_t messages_html_get(httpd_req_t *req)
                           "<th>Flight</th><th>Msg#</th><th>CRC</th><th>SNR</th><th>Text</th></tr>",
                           HTTPD_RESP_USE_STRLEN);
 
-    static char esc_txt[2 * MSG_RING_TXT_MAX + 8];
+    static EXT_RAM_BSS_ATTR char esc_txt[2 * MSG_RING_TXT_MAX + 8];
     static char esc_flight[16];
     static char esc_label[16];
     static char esc_msgnum[24];
-    static char row[2 * MSG_RING_TXT_MAX + 512];
+    static EXT_RAM_BSS_ATTR char row[2 * MSG_RING_TXT_MAX + 512];
     // Newest first: the snapshot is oldest→newest, so walk it in reverse.
     for (size_t k = n; k > 0; k--) {
         const acars_msg_t *m = &s_snap[k - 1];
@@ -1697,7 +1697,7 @@ static void sdrcfg_apply_reboot_task(void *arg)
 
 static esp_err_t sdrcfg_post(httpd_req_t *req)
 {
-    static char body[512]; // single serve task — static is race-free (see config_post)
+    static EXT_RAM_BSS_ATTR char body[512]; // single serve task — static is race-free (see config_post)
     if (req->content_len >= sizeof(body)) {
         httpd_resp_set_status(req, "413 Payload Too Large");
         httpd_resp_set_type(req, "text/plain");
