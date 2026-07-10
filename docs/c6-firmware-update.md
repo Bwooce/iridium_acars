@@ -24,6 +24,30 @@ esp_hosted, Method B becomes the clean path for future updates.
 
 ---
 
+## Current state (2026-07-11)
+
+- **C6 is now on esp_hosted 2.12.10** (version-matched to the host), flashed via
+  **Method B (SDIO slave-OTA) — now proven end-to-end** (`POST /c6ota?url=…` then
+  `?activate=1`; wired into the P4 app as `c6_ota.c`). Method A is no longer needed
+  for routine updates, only for recovery if the SDIO link is ever broken.
+- **SDIO transport checksum is ON** on both ends: host `CONFIG_ESP_HOSTED_SDIO_CHECKSUM=y`
+  + slave `CONFIG_ESP_SDIO_CHECKSUM=y`. **These MUST match.** The header layout is
+  fixed regardless, so the safe rollout order is **slave-first** (a checksum-on slave
+  + checksum-off host works — host ignores the field; the reverse drops every frame).
+  Build the slave with the symbol in `slave/sdkconfig.defaults.esp32c6`.
+- **Multicast TX is still broken at 2.12.10** — the version bump did NOT fix it; the
+  drop is in the C6's closed esp_wifi blob, not the slave version. Confirmed live
+  (`nettest`: 0/10 mcast, 5/5 unicast). Remote telemetry must use unicast or HTTP
+  `/status` — see `memory/project_esp_hosted_multicast_tx_broken`.
+- **Unrelated: P4 app OTA (`POST /ota`) verify-fails on this board** — upstream
+  esp-idf#17855 (ESP32-P4 + PSRAM: `esp_image_verify` reads the just-written image
+  back through a stale flash mmap cache → false "New image failed verification"; the
+  write itself is correct, download-mode ROM read-back is byte-identical). Fails safe
+  (rejected before any partition switch, no brick). **Until upstream fixes it, update
+  the P4 app over USB** (`scripts/flash.sh`), not OTA.
+
+---
+
 ## Method A — flash the C6 over its UART (reliable)
 
 1. **Get the version-matched slave binary.** From Espressif's `esp_hosted` repo,
