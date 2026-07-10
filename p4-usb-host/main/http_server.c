@@ -254,7 +254,9 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"load\":{"
                        "\"bursts_win_mean\":%.0f,\"bursts_win_peak\":%u,"
                        "\"worker_cap_peak\":%.0f,\"worker_ge90_pct\":%.0f,"
-                       "\"dsp_cap_peak\":%.0f},"
+                       "\"dsp_cap_peak\":%.0f,"
+                       "\"accepted_peak\":%u,\"queue_drops_peak\":%u,"
+                       "\"prefilter_accept_pct\":%.0f},"
                        "\"sd\":{"
                        "\"mounted\":%s,\"log_open\":%s,"
                        "\"messages_written\":%u,\"bytes_written\":%llu,"
@@ -294,6 +296,8 @@ static esp_err_t status_get(httpd_req_t *req)
                      wdt_stream_live ? "true" : "false", wdt_stream_stalls,
                       cap.mean_bursts, (unsigned)cap.peak_bursts,
                       cap.peak_worker_cap, cap.worker_ge90_pct, cap.peak_dsp_cap,
+                      (unsigned)cap.peak_processed, (unsigned)cap.peak_queue_drops,
+                      cap.prefilter_accept_pct,
                      sd.mounted ? "true" : "false",
                      sd.log_open ? "true" : "false",
                       (unsigned)sd.messages_written,
@@ -850,12 +854,17 @@ static esp_err_t status_html_get(httpd_req_t *req)
     n = snprintf(body, sizeof(body),
                  "<h2>Load (since boot)</h2>"
                  "<table><tr><th>Metric</th><th>Value</th></tr>"
-                 "<tr><td>Bursts/window mean / peak</td><td class=v>%.0f / %u</td></tr>"
+                 "<tr><td>Bursts/window mean / peak (detected)</td><td class=v>%.0f / %u</td></tr>"
+                 "<tr><td>Accepted+serviced peak</td><td class=v>%u /win</td></tr>"
+                 "<tr><td>Queue-drops peak (backlog target)</td><td class=v>%u /win</td></tr>"
+                 "<tr><td>Pre-filter accept</td><td class=v>%.0f %%</td></tr>"
                  "<tr><td>Worker capacity peak</td><td class=v>%.0f %%</td></tr>"
                  "<tr><td>Worker &ge;90%% of windows</td><td class=v>%.0f %%</td></tr>"
                  "<tr><td>DSP/tagger capacity peak</td><td class=v>%.0f %%</td></tr>"
                  "</table>",
                  cap.mean_bursts, (unsigned)cap.peak_bursts,
+                 (unsigned)cap.peak_processed, (unsigned)cap.peak_queue_drops,
+                 cap.prefilter_accept_pct,
                  cap.peak_worker_cap, cap.worker_ge90_pct, cap.peak_dsp_cap);
     if (n < 0) n = 0;
     if (n > (int)sizeof(body)) n = sizeof(body);

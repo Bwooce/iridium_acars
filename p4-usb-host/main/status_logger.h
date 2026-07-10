@@ -76,6 +76,9 @@ typedef struct {
     float    peak_worker_cap; // max Core-1 worker capacity %
     float    peak_dsp_cap;    // max Core-0 DSP/tagger capacity %
     float    worker_ge90_pct; // % of windows with worker cap >= 90 (headroom gauge)
+    uint32_t peak_processed;      // max accepted+serviced bursts/window (demod throughput)
+    uint32_t peak_queue_drops;    // max bursts dropped at the SNR queue/window (backlog salvage target)
+    float    prefilter_accept_pct;// % of pre-filtered bursts that passed (drops real vs junk)
 } status_capacity_t;
 void status_logger_get_capacity(status_capacity_t *out);
 

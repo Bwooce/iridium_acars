@@ -43,6 +43,15 @@ static uint32_t s_cap_peak_bursts = 0; // max tagger bursts in any window
 static float    s_cap_peak_worker = 0.0f; // max Core-1 worker cap %
 static float    s_cap_peak_dsp    = 0.0f; // max Core-0 DSP/tagger cap %
 static uint32_t s_cap_worker_ge90 = 0; // windows with worker cap >= 90 %
+// Accepted-burst / backlog-sizing telemetry (Option B scoping). "Accepted" =
+// passed the pre-filter and ran the full demod (bursts_processed); it's
+// throughput-capped, so also track the queue-drops (bursts lost at the
+// SNR-priority queue before they could be serviced — what a backlog would
+// salvage) and the pre-filter accept ratio (are those drops real or junk).
+static uint32_t s_cap_peak_processed = 0; // max accepted+serviced bursts/window
+static uint32_t s_cap_peak_qdrops    = 0; // max bursts dropped/evicted at queue/window
+static uint64_t s_cap_sum_processed  = 0; // Σ processed (for accept ratio)
+static uint64_t s_cap_sum_triagerej  = 0; // Σ pre-filter rejected (for accept ratio)
 
 bool status_logger_get_last(status_snapshot_t *out)
 {
@@ -60,6 +69,10 @@ void status_logger_get_capacity(status_capacity_t *out)
     out->peak_worker_cap = s_cap_peak_worker;
     out->peak_dsp_cap    = s_cap_peak_dsp;
     out->worker_ge90_pct = s_cap_windows ? (100.0f * (float)s_cap_worker_ge90 / (float)s_cap_windows) : 0.0f;
+    out->peak_processed   = s_cap_peak_processed;
+    out->peak_queue_drops = s_cap_peak_qdrops;
+    uint64_t pf_total     = s_cap_sum_processed + s_cap_sum_triagerej;
+    out->prefilter_accept_pct = pf_total ? (100.0f * (float)s_cap_sum_processed / (float)pf_total) : 0.0f;
 }
 
 static void emit(const status_snapshot_t *s)
@@ -84,6 +97,13 @@ static void emit(const status_snapshot_t *s)
         if (dcap > s_cap_peak_dsp) s_cap_peak_dsp = dcap;
         if (wcap > s_cap_peak_worker) s_cap_peak_worker = wcap;
         if (wcap >= 90.0f) s_cap_worker_ge90++;
+
+        uint32_t proc  = s->ws.bursts_processed;
+        uint32_t qdrop = s->ws.bursts_dropped + s->ws.bursts_evicted;
+        s_cap_sum_processed += proc;
+        s_cap_sum_triagerej += s->ws.bursts_triage_rejected;
+        if (proc > s_cap_peak_processed) s_cap_peak_processed = proc;
+        if (qdrop > s_cap_peak_qdrops) s_cap_peak_qdrops = qdrop;
     }
 
     double window_s = s->window_us / 1000000.0;
@@ -319,6 +339,8 @@ static void emit(const status_snapshot_t *s)
     iot_log_metric("bursts_win", (int32_t)s->dsp.gone_bursts);
     iot_log_metric("pk_bursts", (int32_t)s_cap_peak_bursts);
     iot_log_metric("pk_wk_cap", (int32_t)s_cap_peak_worker);
+    iot_log_metric("pk_accepted", (int32_t)s_cap_peak_processed);
+    iot_log_metric("pk_qdrops", (int32_t)s_cap_peak_qdrops);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
     // any drop / recovery counter ticks. Field names match
