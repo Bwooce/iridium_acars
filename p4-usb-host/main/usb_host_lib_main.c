@@ -33,8 +33,6 @@
 #include "esp_iot_log.h"
 #include "esp_heap_caps.h"
 #include "autotune_sched.h"
-#include "class_driver.h"  // class_driver_quiesce_for_reinstall()
-#include "usb_reinstall.h" // USB host-stack reinstall probe
 
 // One-line snapshot of internal-DMA-capable heap (the pool the USB
 // transfer ring competes for). Temporary diagnostic for the SD-link
@@ -94,70 +92,6 @@ static const char *TAG = "DAEMON";
 // with the signal-buffer DMA, audit the PSRAM access ordering — APM-560
 // recovery is system-reset-only on v1.3.
 
-// USB host-stack reinstall probe (usb_reinstall.h), run on the daemon task.
-// Tears down the USB layer, uninstalls the host library, reinstalls it, and
-// re-powers the root port — all in place, no reboot. First cut is a PROBE: it
-// does NOT re-arm the stream (that re-touches the PIE/DSP layer), so after it
-// runs the device has a fresh host with no client; a reboot restores full
-// streaming. Every step's return code is logged and reported; NOTHING here
-// uses ESP_ERROR_CHECK — a test built to avoid a reboot must not panic on its
-// own failure.
-static void daemon_run_reinstall_probe(void)
-{
-    usb_reinstall_result_t res = {0};
-    ESP_LOGW(TAG, "=== USB reinstall probe: START (no stream re-arm) ===");
-
-    // 1. Ask usb_pump to tear down the USB layer + deregister its client so
-    //    NO_CLIENTS can be reached. Bounded — a wedged usb_pump won't ack.
-    res.quiesced = class_driver_quiesce_for_reinstall(5000);
-    ESP_LOGW(TAG, "reinstall: class_driver quiesced=%d", (int)res.quiesced);
-
-    // 2. Free devices, then pump lib events until ALL_FREE + NO_CLIENTS
-    //    (usb_host_uninstall requires both). Bounded.
-    usb_host_device_free_all();
-    int64_t deadline = esp_timer_get_time() + 3 * 1000000;
-    while (esp_timer_get_time() < deadline && !(res.all_free && res.no_clients)) {
-        uint32_t ef = 0;
-        usb_host_lib_handle_events(pdMS_TO_TICKS(100), &ef);
-        if (ef & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) res.all_free = true;
-        if (ef & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) res.no_clients = true;
-    }
-    ESP_LOGW(TAG, "reinstall: all_free=%d no_clients=%d", (int)res.all_free, (int)res.no_clients);
-
-    // 3. Uninstall (checked, never ESP_ERROR_CHECK).
-    log_dma_int_heap("reinstall: before uninstall");
-    res.uninstall_rc = usb_host_uninstall();
-    ESP_LOGW(TAG, "reinstall: usb_host_uninstall -> 0x%x (%s)",
-             res.uninstall_rc, esp_err_to_name(res.uninstall_rc));
-    // The DMA-capable internal SRAM available here decides whether the fresh
-    // usb_host_install() below can get its buffers (it failed ESP_ERR_NO_MEM in
-    // the first probe run — this pins down by how much).
-    log_dma_int_heap("reinstall: after uninstall (pre-install)");
-
-    // 4. Reinstall + re-power, only if uninstall succeeded.
-    if (res.uninstall_rc == ESP_OK) {
-        usb_host_config_t hc = {
-            .skip_phy_setup      = false,
-            .root_port_unpowered = true,
-            .intr_flags          = ESP_INTR_FLAG_LEVEL1,
-        };
-        res.install_rc = usb_host_install(&hc);
-        ESP_LOGW(TAG, "reinstall: usb_host_install -> 0x%x (%s)",
-                 res.install_rc, esp_err_to_name(res.install_rc));
-        if (res.install_rc == ESP_OK) {
-            res.power_rc = usb_host_lib_set_root_port_power(true);
-            ESP_LOGW(TAG, "reinstall: root_port_power(true) -> 0x%x (%s)",
-                     res.power_rc, esp_err_to_name(res.power_rc));
-        }
-    }
-
-    res.done = true;
-    usb_reinstall_report(&res);
-    ESP_LOGW(TAG, "=== USB reinstall probe: DONE (uninstall=0x%x install=0x%x power=0x%x) — "
-                  "host reinstalled, no stream; reboot to restore ===",
-             res.uninstall_rc, res.install_rc, res.power_rc);
-}
-
 void host_lib_daemon_task(void *arg)
 {
     SemaphoreHandle_t signaling_sem = (SemaphoreHandle_t)arg;
@@ -189,13 +123,10 @@ void host_lib_daemon_task(void *arg)
     xSemaphoreGive(signaling_sem);
     vTaskDelay(10); // Short delay to let client task spin up
 
+    bool    has_clients   = true;
+    bool    has_devices   = true;
     int64_t last_idle_log = esp_timer_get_time();
-    // Runs forever. In normal operation the class_driver client never
-    // deregisters, so the old `while (has_clients || has_devices)` terminal
-    // condition (and the ESP_ERROR_CHECK(usb_host_uninstall()) + app_main
-    // task-delete handshake it fed) never fired — it was effectively dead. The
-    // USB-reinstall probe below manages uninstall/install explicitly instead.
-    while (1) {
+    while (has_clients || has_devices) {
         uint32_t  event_flags = 0;
         esp_err_t r           = usb_host_lib_handle_events(pdMS_TO_TICKS(2000), &event_flags);
         if (r != ESP_OK && r != ESP_ERR_TIMEOUT) {
@@ -219,12 +150,20 @@ void host_lib_daemon_task(void *arg)
             }
             last_idle_log = now;
         }
-        // Operator-triggered USB host-stack reinstall probe (POST /usbreinstall).
-        if (usb_reinstall_pending()) {
-            usb_reinstall_clear_pending();
-            daemon_run_reinstall_probe();
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            has_clients = false;
+        }
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
+            has_devices = false;
         }
     }
+    ESP_LOGI(TAG, "No more clients and devices");
+
+    // Uninstall the USB Host Library
+    ESP_ERROR_CHECK(usb_host_uninstall());
+    // Wait to be deleted
+    xSemaphoreGive(signaling_sem);
+    vTaskSuspend(NULL);
 }
 
 void app_main(void)

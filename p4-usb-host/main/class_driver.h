@@ -49,11 +49,3 @@ void class_driver_dump_stall_diag(void);
 // wait times out and the caller must reboot regardless. Safe to call from any
 // task; a no-op if no device is open. Call immediately before esp_restart().
 void class_driver_prepare_for_reboot(void);
-
-// USB-reinstall probe (usb_reinstall.h): ask the usb_pump task to tear down the
-// USB layer (stream + device + client) and park, leaving the DSP/PIE layer
-// allocated. Called from the daemon task; posts the request and blocks up to
-// timeout_ms for usb_pump to ack. Returns true if it quiesced in time, false if
-// usb_pump is wedged (caller proceeds with uninstall anyway and reports it).
-// After this the usb_pump task is parked until reboot (no stream re-arm yet).
-bool class_driver_quiesce_for_reinstall(uint32_t timeout_ms);

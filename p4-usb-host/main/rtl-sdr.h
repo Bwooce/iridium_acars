@@ -34,14 +34,6 @@ RTLSDR_API int  rtlsdr_open(rtlsdr_dev_t **dev, uint8_t index, usb_host_client_h
 
 RTLSDR_API int rtlsdr_close(rtlsdr_dev_t *dev);
 
-// Real device teardown for the USB-reinstall probe (usb_reinstall.h): unlike
-// the rtlsdr_close() stub, this frees the control URB, releases the claimed
-// interface, and closes the USB device handle, so the host library can be
-// uninstalled. Caller MUST have stopped the bulk stream first
-// (esp_libusb_stop_stream) — releasing an interface with live URBs is a
-// use-after-free. Best-effort + logged; returns 0 iff release + close both OK.
-RTLSDR_API int rtlsdr_close_full(rtlsdr_dev_t *dev);
-
 /* Park the tuner in low-power standby (best-effort) ahead of a reboot, so the
  * next boot re-enumerates a quiescent tuner rather than one latched mid-I2C.
  * Returns the tuner exit() result (0 = ok), or -1 if dev/tuner is unavailable. */

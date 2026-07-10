@@ -1539,27 +1539,6 @@ int rtlsdr_close(rtlsdr_dev_t *dev)
     return 0;
 }
 
-int rtlsdr_close_full(rtlsdr_dev_t *dev)
-{
-    // Real device teardown for the USB-reinstall probe (see rtl-sdr.h). The
-    // caller (class_driver quiesce) has already stopped the bulk stream via
-    // esp_libusb_stop_stream(), so no URBs are in flight on the interface.
-    deinit_adsb_dev(); // free control URB + response_buf (same as rtlsdr_close)
-    if (!dev || !dev->driver_obj)
-        return -1;
-    usb_host_client_handle_t client = dev->driver_obj->client_hdl;
-    usb_device_handle_t      dh      = dev->driver_obj->dev_hdl;
-    if (!client || !dh)
-        return -1;
-    // Mirror rtlsdr_open(): it claimed interface 0, so release interface 0.
-    esp_err_t ri = usb_host_interface_release(client, dh, 0);
-    esp_err_t rc = usb_host_device_close(client, dh);
-    ESP_LOGW(TAG_ADSB,
-             "rtlsdr_close_full: interface_release=0x%x (%s) device_close=0x%x (%s)",
-             ri, esp_err_to_name(ri), rc, esp_err_to_name(rc));
-    return (ri == ESP_OK && rc == ESP_OK) ? 0 : -1;
-}
-
 int rtlsdr_reset_buffer(rtlsdr_dev_t *dev)
 {
     if (!dev)

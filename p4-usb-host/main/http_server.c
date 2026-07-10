@@ -20,7 +20,6 @@
 #include "class_driver.h" // class_driver_prepare_for_reboot()
 #include "scanner.h"      // scanner_scan() — /scan sustained-hop test endpoint
 #include "autotune.h"     // autotune_run_manual() — /gaincal manual trigger
-#include "usb_reinstall.h" // usb_reinstall_request() — POST /usbreinstall probe
 #include "sd_log.h"
 #include "sd_capture.h"
 #include "acars_push.h"
@@ -2255,41 +2254,6 @@ static esp_err_t reboot_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-// POST /usbreinstall — operator-triggered USB host-stack reinstall probe
-// (usb_reinstall.h). Requests the probe, blocks (bounded) for the daemon to run
-// it, and returns the per-step return codes as JSON. PROBE: does not re-arm the
-// stream, so streaming stays down until a reboot — the response says so. This
-// is a diagnostic experiment (does uninstall->install work in place?), not a
-// recovery path yet.
-static esp_err_t reinstall_post(httpd_req_t *req)
-{
-    usb_reinstall_request();
-    usb_reinstall_result_t res = {0};
-    bool                   got = usb_reinstall_wait(&res, 15000);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    char body[360];
-    int  n;
-    if (!got) {
-        n = snprintf(body, sizeof(body),
-                     "{\"result\":\"timeout\",\"note\":\"probe did not report within 15 s; "
-                     "see serial log 'USB reinstall probe'\"}");
-    } else {
-        n = snprintf(body, sizeof(body),
-                     "{\"result\":\"ok\",\"quiesced\":%s,\"no_clients\":%s,\"all_free\":%s,"
-                     "\"uninstall_rc\":%d,\"install_rc\":%d,\"power_rc\":%d,\"streaming\":false,"
-                     "\"note\":\"host reinstalled in place; NO stream re-arm — reboot to restore streaming\"}",
-                     res.quiesced ? "true" : "false",
-                     res.no_clients ? "true" : "false",
-                     res.all_free ? "true" : "false",
-                     (int)res.uninstall_rc, (int)res.install_rc, (int)res.power_rc);
-    }
-    if (n < 0) n = 0;
-    if (n > (int)sizeof(body)) n = sizeof(body);
-    return httpd_resp_send(req, body, n);
-}
-
 esp_err_t http_server_start(void)
 {
     if (s_server) return ESP_OK;
@@ -2380,7 +2344,6 @@ esp_err_t http_server_start(void)
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
         {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
         {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post, .user_ctx = NULL},
-        {.uri = "/usbreinstall", .method = HTTP_POST, .handler = reinstall_post, .user_ctx = NULL},
     };
     _Static_assert(sizeof(routes) / sizeof(routes[0]) <= HTTPD_URI_LIMIT,
                    "route count exceeds HTTPD_URI_LIMIT; bump HTTPD_URI_LIMIT "
