@@ -9,11 +9,17 @@
 // ADC is 8-bit and ingest's uint8->int16 conversion is exactly (byte-128)<<8,
 // so the low 8 bits of every stored int16 are always zero. Storing int8 =
 // int16>>8 and re-expanding int16 = int8<<8 at read time is bit-exact
-// lossless, so 16 MB now holds ~3.36 s at 2.5 MSPS (twice the int16 window).
+// lossless, so 16 MB holds ~3.36 s at 2.5 MSPS (int8, 2 B/complex).
 // The detector runs behind live ingest under high signal load, so a larger
-// freshness window lets bursts survive the detector lag long enough to
-// decode. 16 MB fits the 32 MB PSRAM alongside the 4 MB tagger baseline.
-// Multiple of 64 (wrap-path DMA alignment) and /2 is a multiple of 32.
+// freshness window lets bursts survive the detector lag long enough to decode.
+//
+// CANNOT be grown (measured 2026-07-10, the "grow the ring" hedge from the
+// Option-B scoping): both 20 MB and 24 MB OOM the 4 MB usbring allocated after
+// this (`LIBUSB: Failed to create stream ring in PSRAM: ESP_ERR_NO_MEM`) and
+// kill the stream. PSRAM is at its ceiling here — 16 MB signal + 4 MB usbring +
+// ~12 MB task/http PSRAM stacks ≈ full 32 MB. So a bigger stale-drop horizon is
+// NOT available on this board; reducing per-burst demod cost is the only
+// structural compute lever left (see project_worker_compute_profile_2026_07_10).
 #define SIGNAL_BUF_SIZE (16 * 1024 * 1024)
 
 // Ring capacity in COMPLEX samples — the SINGLE source of truth. The ring
