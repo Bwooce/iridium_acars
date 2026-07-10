@@ -190,3 +190,10 @@ CONFIG_ESP_COREDUMP_UART_DELAY=0
 # Allow OTA from a plain-HTTP LAN server (the ota_runner uses no cert bundle;
 # without this esp_https_ota_begin returns INVALID_ARG — the P4 OTA never worked).
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+
+# App rollback: a bad remote OTA self-heals instead of bricking. With this on,
+# esp_ota_set_boot_partition() marks the new app PENDING_VERIFY; ota_runner_mark_valid()
+# (called in app_main after core services are up) confirms it. If the new image
+# bootloops before that call, the bootloader reverts to the previous ota_N slot on
+# the next reset. Essential once the device is deployed off-USB (no port to reflash).
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
