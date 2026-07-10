@@ -275,6 +275,11 @@ void app_main(void)
         app_config_t snap;
         app_config_snapshot(&snap);
         iot_log_config_t iot_cfg = IOT_LOG_CONFIG_DEFAULT();
+        // Multicast TX is dropped by the C6 esp_hosted link on this board, so mDNS
+        // discovery can never succeed — skip it entirely to reclaim the ~4 KB mDNS
+        // task + buffers (internal RAM is razor-thin here). Telemetry goes via the
+        // unicast override below (iot_log_host) or HTTP /status.
+        iot_cfg.disable_mdns = true;
         if (snap.station_id[0]) {
             iot_cfg.device_name = snap.station_id;
         }
