@@ -631,6 +631,13 @@ static void send_page_foot(httpd_req_t *req)
     static const char foot[] =
         "<p><small>JSON APIs: <a href=\"/status\">/status</a> (curl) · "
         "<a href=\"/messages\">/messages</a> · <a href=\"/ota\">/ota</a></small></p>"
+        "<p><small>Diagnostics: "
+        "<a href=\"/diag/reassembler\">reassembler</a> · "
+        "<a href=\"/diag/dsp_health\">dsp_health</a> · "
+        "<a href=\"/diag/recovery_counters\">recovery_counters</a> · "
+        "<a href=\"/diag/histograms\">histograms</a> · "
+        "<a href=\"/diag/dcfine\">dcfine</a> · "
+        "<a href=\"/sd/list\">sd/list</a></small></p>"
         "</body></html>";
     httpd_resp_send_chunk(req, foot, sizeof(foot) - 1);
     httpd_resp_send_chunk(req, NULL, 0);
