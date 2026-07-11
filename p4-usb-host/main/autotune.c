@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "AUTOTUNE";
 
@@ -39,6 +40,62 @@ static bool autotune_try_begin(void)
 static void autotune_end(void)
 {
     atomic_store(&s_autotune_busy, false);
+}
+
+// Persist an autotune result to NVS from a stack-safe context.
+//
+// nvs_commit() calls spi_flash_disable_interrupts_caches_and_other_cpu(),
+// which asserts (cache_utils.c:114, esp_task_stack_is_sane_cache_disabled)
+// that the running task's stack is NOT in PSRAM — a PSRAM-backed stack becomes
+// inaccessible once the cache is disabled for the flash write. But autotune
+// runs on autotune_sched's task, whose stack IS in PSRAM (it mostly sleeps, so
+// it was placed there to spare internal RAM). Calling app_config_set_*()
+// directly therefore aborts the device — the ~24.7-min boot-sweep crash loop.
+//
+// Route the write through a short-lived task with a default (internal-RAM)
+// stack — same reason http_server's tune-apply task uses an internal stack —
+// and block until it completes. Transient, so no permanent internal-RAM cost
+// (the DMA-INT/URB budget is razor-thin; a permanent 4 KB stack there is risky).
+typedef struct {
+    bool              is_lo;
+    int32_t           val;
+    SemaphoreHandle_t done;
+} autotune_persist_req_t;
+
+static void autotune_persist_task(void *arg)
+{
+    autotune_persist_req_t *r = (autotune_persist_req_t *)arg;
+    // Copy args out of the caller's PSRAM stack BEFORE any flash op (which
+    // disables the cache and would make that PSRAM read fault).
+    bool              is_lo = r->is_lo;
+    int32_t           val   = r->val;
+    SemaphoreHandle_t done  = r->done;
+    if (is_lo) {
+        (void)app_config_set_lo_freq_hz((uint32_t)val);
+    } else {
+        (void)app_config_set_gain_db_x10((int16_t)val);
+    }
+    xSemaphoreGive(done);
+    vTaskDelete(NULL);
+}
+
+static void autotune_persist(bool is_lo, int32_t val)
+{
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) {
+        ESP_LOGW(TAG, "persist: no sem; skipping NVS write (val=%ld is_lo=%d)",
+                 (long)val, (int)is_lo);
+        return;
+    }
+    autotune_persist_req_t req = {.is_lo = is_lo, .val = val, .done = done};
+    // Default xTaskCreate => internal-RAM stack, so nvs_commit's cache-disable
+    // is legal. 4096 B mirrors http_server's tune-apply task.
+    if (xTaskCreate(autotune_persist_task, "at_persist", 4096, &req, 5, NULL) == pdPASS) {
+        xSemaphoreTake(done, portMAX_DELAY);
+    } else {
+        ESP_LOGW(TAG, "persist: task create failed; NVS write skipped");
+    }
+    vSemaphoreDelete(done);
 }
 
 // Body of the manual/boot/periodic gain-calibration pass. Caller must hold
@@ -133,7 +190,9 @@ static void autotune_run_manual_locked(void)
     if (have_signal) {
         // Persist so the pick survives reboot (mode is MANUAL, so gain_db_x10
         // is applied at boot). Only gain_db_x10 is written; mode untouched.
-        (void)app_config_set_gain_db_x10((int16_t)chosen_gain);
+        // Via autotune_persist (internal-stack task): this runs on the PSRAM-
+        // stacked autotune_sched task, so a direct nvs_commit would abort.
+        autotune_persist(false, (int32_t)chosen_gain);
         ESP_LOGI(TAG,
                  "=== autotune done: chose gain %d.%d dB (bch_decoded=%d), "
                  "persisted + parked at LO %lu Hz ===",
@@ -199,7 +258,9 @@ void autotune_run_lo_rescan(void)
     // reboot, persist whatever it landed on.
     uint32_t hot_hz = scanner_last_hot_hz();
     if (hot_hz) {
-        (void)app_config_set_lo_freq_hz(hot_hz);
+        // Internal-stack task (see autotune_persist): a direct nvs_commit from
+        // this PSRAM-stacked task aborts at the cache-disable sanity assert.
+        autotune_persist(true, (int32_t)hot_hz);
         ESP_LOGI(TAG, "=== autotune LO rescan done: persisted center %lu Hz ===",
                  (unsigned long)hot_hz);
     } else {
