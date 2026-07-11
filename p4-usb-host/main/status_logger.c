@@ -13,6 +13,7 @@
 #include "freertos/idf_additions.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h" // esp_reset_reason() — reboot-cause telemetry over iot_log
 #include "status_logger.h"
 #include "esp_iot_log.h"
 #include "app_config.h"
@@ -75,8 +76,52 @@ void status_logger_get_capacity(status_capacity_t *out)
     out->prefilter_accept_pct = pf_total ? (100.0f * (float)s_cap_sum_processed / (float)pf_total) : 0.0f;
 }
 
+static const char *reset_reason_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:
+        return "POWERON";
+    case ESP_RST_EXT:
+        return "EXT";
+    case ESP_RST_SW:
+        return "SW"; // esp_restart() — incl. our health-wdt / OTA / C6-recover
+    case ESP_RST_PANIC:
+        return "PANIC"; // crash / abort()
+    case ESP_RST_INT_WDT:
+        return "INT_WDT";
+    case ESP_RST_TASK_WDT:
+        return "TASK_WDT"; // a task starved the task-wdt
+    case ESP_RST_WDT:
+        return "OTHER_WDT";
+    case ESP_RST_DEEPSLEEP:
+        return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:
+        return "BROWNOUT"; // power sag
+    case ESP_RST_SDIO:
+        return "SDIO";
+    case ESP_RST_USB:
+        return "USB";
+    case ESP_RST_JTAG:
+        return "JTAG";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 static void emit(const status_snapshot_t *s)
 {
+    // Reboot-cause telemetry: usb_host_lib_main logs the reset reason via
+    // ESP_LOGW at early boot (serial only, before the iot_log transport is up),
+    // so on a wireless deployment the reason is invisible. Re-emit it over
+    // iot_log from here — the one path proven to reach the receiver — for the
+    // first few windows (WiFi is up + STATUS lines are landing by then; the
+    // repeat survives an early sendto that drops before the link settles).
+    static int s_rst_emits = 0;
+    if (s_rst_emits < 6) {
+        s_rst_emits++;
+        esp_reset_reason_t rr = esp_reset_reason();
+        iot_log(IOT_LOG_WARN, "BOOT reset_reason=%s (%d)", reset_reason_name(rr), (int)rr);
+    }
     // Cache first, BEFORE the verbose/quiet fork: the STATUS-line fields the
     // /status page surfaces must be captured regardless of build config.
     s_last      = *s;
