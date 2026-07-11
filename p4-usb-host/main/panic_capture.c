@@ -5,6 +5,8 @@
 #include "esp_attr.h"                   // RTC_NOINIT_ATTR
 #include "esp_private/panic_internal.h" // panic_info_t
 #include "riscv/rvruntime-frames.h"     // RvExcFrame (mepc/ra/...)
+#include "freertos/FreeRTOS.h"          // pcTaskGetName — which task crashed
+#include "freertos/task.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -23,6 +25,7 @@ typedef struct {
     uint32_t addr;   // panic_info_t.addr (IDF's computed fault instr addr)
     int32_t  core;
     uint32_t is_abort; // 1 if this was an abort()/assert (see desc)
+    char     task[16]; // name of the task that was running when it crashed
     // For an abort()/assert, the real message (incl. "assert failed: file:line
     // (expr)") lives in g_panic_abort_details, NOT info->description/reason —
     // those are NULL'd inside esp_panic_handler, which runs AFTER our --wrap.
@@ -73,6 +76,17 @@ void __wrap_esp_panic_handler(panic_info_t *info)
     }
     s_cap.desc[i] = '\0';
 
+    // Which task was running on the faulting core. pcTaskGetName(NULL) reads
+    // the current TCB's name (same thing IDF's own panic printout does) — the
+    // single most useful identifier for "who did this". Guard against a NULL
+    // return (scheduler not started).
+    const char *tn = pcTaskGetName(NULL);
+    size_t      j  = 0;
+    for (; tn && j < sizeof(s_cap.task) - 1 && tn[j]; j++) {
+        s_cap.task[j] = tn[j];
+    }
+    s_cap.task[j] = '\0';
+
     s_cap.magic = PANIC_CAP_MAGIC; // commit last: record is now valid to read
 
     __real_esp_panic_handler(info); // reboots; never returns
@@ -86,10 +100,10 @@ bool panic_capture_report(char *out, size_t out_len)
     s_cap.magic = 0; // consume: emit the record once, not every window
 
     snprintf(out, out_len,
-             "PANIC-BT core=%ld %s=\"%s\" mepc=0x%08lx ra=0x%08lx sp=0x%08lx "
-             "mcause=%lu mtval=0x%08lx addr=0x%08lx",
-             (long)s_cap.core, s_cap.is_abort ? "abort" : "reason", s_cap.desc,
-             (unsigned long)s_cap.mepc, (unsigned long)s_cap.ra,
+             "PANIC-BT core=%ld task=%s %s=\"%s\" mepc=0x%08lx ra=0x%08lx "
+             "sp=0x%08lx mcause=%lu mtval=0x%08lx addr=0x%08lx",
+             (long)s_cap.core, s_cap.task, s_cap.is_abort ? "abort" : "reason",
+             s_cap.desc, (unsigned long)s_cap.mepc, (unsigned long)s_cap.ra,
              (unsigned long)s_cap.sp, (unsigned long)s_cap.mcause,
              (unsigned long)s_cap.mtval, (unsigned long)s_cap.addr);
     return true;
