@@ -8,6 +8,7 @@ set(_app_srcs
     "acars_push.c" "ota_runner.c" "serial_cmd.c" "fault_inject.c"
     "frame_pdu.c" "aggregator_ingest.c" "frame_link.c"
     "scanner.c" "scanner_map.c" "autotune.c" "autotune_sched.c"
+    "panic_capture.c"
 )
 set(_app_reqs
     usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash
@@ -19,6 +20,9 @@ set(_app_reqs
     # comes from sd_log.c calling these APIs; that source file is what
     # the CONFIG_ENABLE_SD_LOG gate actually excludes.
     esp_driver_sdmmc fatfs esp_driver_gpio esp_driver_uart esp_iot_log
+    # esp_system: esp_private/panic_internal.h (panic_info_t) for the
+    # --wrap=esp_panic_handler crash-capture hook. riscv: RvExcFrame.
+    esp_system riscv
 )
 # SD log subsystem (#63): opt-in via CONFIG_ENABLE_SD_LOG. Off by
 # default. When off, sd_log.c isn't compiled and sd_log.h exposes
@@ -31,6 +35,12 @@ endif()
 idf_component_register(SRCS ${_app_srcs}
                     INCLUDE_DIRS "." "../../tests/fixtures"
                     PRIV_REQUIRES ${_app_reqs})
+
+# Remote crash forensics (panic_capture.c): intercept esp_panic_handler() so we
+# can stash the RISC-V exception frame to RTC memory before the reboot. --wrap
+# redirects the call in esp_system's panic_handler.c to __wrap_esp_panic_handler
+# and exposes the original as __real_esp_panic_handler.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")
 set_source_files_properties(class_driver.c
     PROPERTIES COMPILE_FLAGS
     -Wno-restrict

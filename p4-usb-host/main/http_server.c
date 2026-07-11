@@ -70,7 +70,7 @@ static uint8_t *s_download_buf = NULL;
 // httpd slot table AND in a static_assert on the routes[] array length,
 // so adding a route past the limit breaks the build instead of panic-
 // looping at boot. Each slot is ~32 bytes; 32 slots = ~1 KB negligible.
-#define HTTPD_URI_LIMIT 32
+#define HTTPD_URI_LIMIT 34
 
 // NVS-write + reboot helper. MUST run with an internal-SRAM stack:
 // nvs_commit() takes spi_flash_disable_interrupts_caches_and_other_cpu(),
@@ -2481,6 +2481,46 @@ static esp_err_t reboot_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Positive control for the remote crash-capture path (panic_capture.c):
+// deliberately fault at a known PC so we can confirm the RTC stash -> boot
+// report -> offline addr2line chain works BEFORE trusting it on the real
+// ~25-min crash. Gated by ?confirm=crash so it can never fire by accident.
+// TEMPORARY — remove once the periodic PANIC is diagnosed.
+static void __attribute__((noinline)) debug_force_crash(void)
+{
+    volatile uint32_t *p = (volatile uint32_t *)0x00000000; // unmapped low addr
+    *p                   = 0xDEADBEEFu;                     // Store access fault; mepc lands here
+}
+
+static void debug_crash_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(200)); // let the HTTP response flush first
+    debug_force_crash();
+    vTaskDelete(NULL); // unreachable
+}
+
+static esp_err_t debug_crash_post(httpd_req_t *req)
+{
+    char q[48] = {0}, val[16] = {0};
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+        httpd_query_key_value(q, "confirm", val, sizeof(val)) != ESP_OK ||
+        strcmp(val, "crash") != 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(
+            req, "POST /debug/crash?confirm=crash to force a test panic\n",
+            HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req,
+                    "forcing a test panic in 200 ms — watch iot_log for a "
+                    "PANIC-BT line after the reboot\n",
+                    HTTPD_RESP_USE_STRLEN);
+    xTaskCreate(debug_crash_task, "dbgcrash", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
 // /diag/reassembler: internal counters of the three-stage lw_da -> ida -> sbd
 // -> ACARS reassembly chain, so "why don't decoded frames become messages" is
 // inspectable instead of a black box. Reading it: lw_da_gate_rejected high =
@@ -2608,6 +2648,7 @@ esp_err_t http_server_start(void)
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
         {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
         {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post, .user_ctx = NULL},
+        {.uri = "/debug/crash", .method = HTTP_POST, .handler = debug_crash_post, .user_ctx = NULL},
         {.uri = "/c6ota", .method = HTTP_POST, .handler = c6ota_post, .user_ctx = NULL},
         {.uri = "/c6ota", .method = HTTP_GET, .handler = c6ota_get, .user_ctx = NULL},
     };

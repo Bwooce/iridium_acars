@@ -13,7 +13,8 @@
 #include "freertos/idf_additions.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_system.h" // esp_reset_reason() — reboot-cause telemetry over iot_log
+#include "esp_system.h"    // esp_reset_reason() — reboot-cause telemetry over iot_log
+#include "panic_capture.h" // remote crash frame (mepc/ra) recovered from RTC
 #include "status_logger.h"
 #include "esp_iot_log.h"
 #include "app_config.h"
@@ -118,11 +119,22 @@ static void emit(const status_snapshot_t *s)
     // iot_log from here — the one path proven to reach the receiver — for the
     // first few windows (WiFi is up + STATUS lines are landing by then; the
     // repeat survives an early sendto that drops before the link settles).
-    static int s_rst_emits = 0;
+    static int  s_rst_emits  = 0;
+    static bool s_bt_checked = false;
+    static bool s_have_bt    = false;
+    static char s_bt[176];
+    if (!s_bt_checked) {
+        s_bt_checked = true;
+        s_have_bt    = panic_capture_report(s_bt, sizeof(s_bt));
+    }
     if (s_rst_emits < 6) {
         s_rst_emits++;
         esp_reset_reason_t rr = esp_reset_reason();
         iot_log(IOT_LOG_WARN, "BOOT reset_reason=%s (%d)", reset_reason_name(rr), (int)rr);
+        // If that reboot was a panic our --wrap hook captured, surface the
+        // crash frame too — repeated over the same first-6-windows so a UDP
+        // drop during link settling doesn't lose it.
+        if (s_have_bt) iot_log(IOT_LOG_ERROR, "%s", s_bt);
     }
     // Cache first, BEFORE the verbose/quiet fork: the STATUS-line fields the
     // /status page surfaces must be captured regardless of build config.
