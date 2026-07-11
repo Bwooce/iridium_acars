@@ -22,7 +22,13 @@ typedef struct {
     uint32_t mtval;  // faulting address / bad value
     uint32_t addr;   // panic_info_t.addr (IDF's computed fault instr addr)
     int32_t  core;
-    char     desc[32]; // panic_info_t.description, e.g. "Load access fault"
+    uint32_t is_abort; // 1 if this was an abort()/assert (see desc)
+    // For an abort()/assert, the real message (incl. "assert failed: file:line
+    // (expr)") lives in g_panic_abort_details, NOT info->description/reason —
+    // those are NULL'd inside esp_panic_handler, which runs AFTER our --wrap.
+    // Capture the abort details directly; fall back to the exception
+    // description otherwise. Wide enough for a typical assert string.
+    char desc[112];
 } panic_cap_t;
 
 // RTC_NOINIT: preserved across a SW/panic reset, NOT zeroed by the C runtime.
@@ -30,6 +36,12 @@ static RTC_NOINIT_ATTR panic_cap_t s_cap;
 
 // The genuine handler, resolved by the linker's -Wl,--wrap=esp_panic_handler.
 extern void __real_esp_panic_handler(panic_info_t *info);
+
+// IDF panic.c globals: set by panic_abort() before it traps. g_panic_abort is
+// true when the panic is an abort()/assert; g_panic_abort_details is its
+// message (e.g. "assert failed: <func> <file>:<line> (<expr>)").
+extern bool  g_panic_abort;
+extern char *g_panic_abort_details;
 
 // Runs in panic context: interrupts off, minimal stack, no heap/locks. Keep it
 // to trivial reads of the already-valid frame struct and fixed RTC writes — no
@@ -47,9 +59,14 @@ void __wrap_esp_panic_handler(panic_info_t *info)
     s_cap.mtval         = f ? (uint32_t)f->mtval : 0;
     s_cap.addr          = info ? (uint32_t)info->addr : 0;
     s_cap.core          = info ? info->core : -1;
+    s_cap.is_abort      = g_panic_abort ? 1u : 0u;
 
-    const char *d = (info && info->description) ? info->description
-                                                : ((info && info->reason) ? info->reason : "?");
+    // Prefer the abort details (the real assert message) when this is an abort;
+    // else the exception description/reason.
+    const char *d = (g_panic_abort && g_panic_abort_details) ? g_panic_abort_details
+                    : (info && info->description)            ? info->description
+                    : (info && info->reason)                 ? info->reason
+                                                             : "?";
     size_t      i = 0;
     for (; i < sizeof(s_cap.desc) - 1 && d[i]; i++) {
         s_cap.desc[i] = d[i];
@@ -69,9 +86,9 @@ bool panic_capture_report(char *out, size_t out_len)
     s_cap.magic = 0; // consume: emit the record once, not every window
 
     snprintf(out, out_len,
-             "PANIC-BT core=%ld reason=%s mepc=0x%08lx ra=0x%08lx sp=0x%08lx "
+             "PANIC-BT core=%ld %s=\"%s\" mepc=0x%08lx ra=0x%08lx sp=0x%08lx "
              "mcause=%lu mtval=0x%08lx addr=0x%08lx",
-             (long)s_cap.core, s_cap.desc,
+             (long)s_cap.core, s_cap.is_abort ? "abort" : "reason", s_cap.desc,
              (unsigned long)s_cap.mepc, (unsigned long)s_cap.ra,
              (unsigned long)s_cap.sp, (unsigned long)s_cap.mcause,
              (unsigned long)s_cap.mtval, (unsigned long)s_cap.addr);

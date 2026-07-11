@@ -122,7 +122,7 @@ static void emit(const status_snapshot_t *s)
     static int  s_rst_emits  = 0;
     static bool s_bt_checked = false;
     static bool s_have_bt    = false;
-    static char s_bt[176];
+    static char s_bt[288];
     if (!s_bt_checked) {
         s_bt_checked = true;
         s_have_bt    = panic_capture_report(s_bt, sizeof(s_bt));
