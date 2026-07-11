@@ -792,6 +792,25 @@ static esp_err_t status_html_get(httpd_req_t *req)
     uint32_t dma_free    = heap_caps_get_free_size(MALLOC_CAP_DMA);
     uint32_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
     uint32_t stash_fails = signal_buffer_stash_alloc_fails();
+    // Internal SRAM (all internal, incl. the tiny DMA-capable slice tracked
+    // above) and PSRAM headroom — the "do we have room for a burst buffer /
+    // new .bss" question, surfaced live instead of grepped from the boot log.
+    uint32_t       sram_free     = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t       sram_largest  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    uint32_t       psram_free    = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t       psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    sd_log_stats_t sdst          = {0};
+    sd_log_get_stats(&sdst);
+    char sd_err_esc[2 * sizeof(sdst.mount_error) + 1];
+    html_attr_escape(sd_err_esc, sizeof(sd_err_esc), sdst.mount_error);
+    char sd_str[176];
+    if (sdst.mounted)
+        snprintf(sd_str, sizeof(sd_str), "mounted (%u msgs, %u write errs)",
+                 (unsigned)sdst.messages_written, (unsigned)sdst.write_errors);
+    else if (sd_err_esc[0])
+        snprintf(sd_str, sizeof(sd_str), "not mounted — %s", sd_err_esc);
+    else
+        snprintf(sd_str, sizeof(sd_str), "not mounted");
 
     double lo_mhz   = (double)cfg.lo_freq_hz / 1e6;
     double half_mhz = ((double)FS_DETECT_HZ / 2.0) / 1e6;
@@ -861,7 +880,10 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  "<tr><td>Listening band</td><td class=v>%.3f - %.3f MHz</td></tr>"
                  "<tr><td>Gain</td><td class=v>%s</td></tr>"
                  "<tr><td>DMA-INT free / largest</td><td class=v>%u / %u KB</td></tr>"
+                 "<tr><td>Internal SRAM free / largest</td><td class=v>%u / %u KB</td></tr>"
+                 "<tr><td>PSRAM free / largest</td><td class=v>%u / %u KB</td></tr>"
                  "<tr><td>Stash alloc fails</td><td class=v>%u</td></tr>"
+                 "<tr><td>SD card</td><td class=v>%s</td></tr>"
                  "</table>",
                  wifi_link_ssid(), wifi_link_is_connected() ? "connected" : "down",
                  (int)wrssi, wconn_str,
@@ -873,7 +895,9 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  dsp_cap, worker_cap,
                  lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz,
                  gain_str, (unsigned)(dma_free / 1024), (unsigned)(dma_largest / 1024),
-                 (unsigned)stash_fails);
+                 (unsigned)(sram_free / 1024), (unsigned)(sram_largest / 1024),
+                 (unsigned)(psram_free / 1024), (unsigned)(psram_largest / 1024),
+                 (unsigned)stash_fails, sd_str);
     if (n < 0) n = 0;
     if (n > (int)sizeof(body)) n = sizeof(body);
     httpd_resp_send_chunk(req, body, n);
