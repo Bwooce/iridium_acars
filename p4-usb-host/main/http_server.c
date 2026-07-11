@@ -218,6 +218,9 @@ static esp_err_t status_get(httpd_req_t *req)
     char mnt_err_esc[2 * sizeof(sd.mount_error) + 1];
     char station_id_esc[2 * sizeof(cfg.station_id) + 1];
     json_escape(ssid_esc, sizeof(ssid_esc), wifi_link_ssid());
+    int8_t   wifi_rssi   = 0;
+    uint32_t wifi_conn_s = 0;
+    wifi_link_get_signal(&wifi_rssi, &wifi_conn_s);
     json_escape(host_esc, sizeof(host_esc), cfg.out_host);
     json_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
     json_escape(mnt_err_esc, sizeof(mnt_err_esc), sd.mount_error);
@@ -232,6 +235,8 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"wifi_ssid\":\"%s\","
                        "\"wifi_up\":%s,"
                        "\"ip\":\"%s\","
+                       "\"wifi_rssi_dbm\":%d,"
+                       "\"wifi_connected_s\":%u,"
                        "\"uptime_s\":%lld,"
                        "\"station_id\":\"%s\","
                        "\"lo_freq_hz\":%u,"
@@ -274,6 +279,8 @@ static esp_err_t status_get(httpd_req_t *req)
                       ssid_esc,
                      wifi_link_is_connected() ? "true" : "false",
                       ip_str,
+                      (int)wifi_rssi,
+                      (unsigned)wifi_conn_s,
                       (long long)(uptime_us / 1000000),
                       station_id_esc,
                       (unsigned)cfg.lo_freq_hz,
@@ -824,8 +831,21 @@ static esp_err_t status_html_get(httpd_req_t *req)
                      w;
     }
 
+    int8_t   wrssi = 0;
+    uint32_t wconn = 0;
+    wifi_link_get_signal(&wrssi, &wconn);
+    char wconn_str[24];
+    if (wconn < 120)
+        snprintf(wconn_str, sizeof(wconn_str), "%us", (unsigned)wconn);
+    else if (wconn < 7200)
+        snprintf(wconn_str, sizeof(wconn_str), "%um", (unsigned)(wconn / 60));
+    else
+        snprintf(wconn_str, sizeof(wconn_str), "%uh%02um", (unsigned)(wconn / 3600),
+                 (unsigned)((wconn % 3600) / 60));
+
     n = snprintf(body, sizeof(body),
                  "<table><tr><th>Metric</th><th>Value</th></tr>"
+                 "<tr><td>Wi-Fi</td><td class=v>%s (%s), %d dBm, up %s</td></tr>"
                  "<tr><td>USB rate</td><td class=v>%.2f MB/s</td></tr>"
                  "<tr><td>FFT steps / window</td><td class=v>%u</td></tr>"
                  "<tr><td>Bursts dispatched</td><td class=v>%u</td></tr>"
@@ -843,6 +863,8 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  "<tr><td>DMA-INT free / largest</td><td class=v>%u / %u KB</td></tr>"
                  "<tr><td>Stash alloc fails</td><td class=v>%u</td></tr>"
                  "</table>",
+                 wifi_link_ssid(), wifi_link_is_connected() ? "connected" : "down",
+                 (int)wrssi, wconn_str,
                  rate, (unsigned)s.dsp_frame_count, (unsigned)s.dsp.gone_bursts,
                  (unsigned)s.ws.bursts_processed, (unsigned)s.ws.bursts_triage_rejected,
                  (unsigned)s.ws.bursts_bch_decoded, (unsigned)s.ws.bursts_bch_unknown,

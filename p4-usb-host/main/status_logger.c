@@ -21,6 +21,7 @@
 #include "signal_buffer.h"
 #include "ingest_core1.h"
 #include "esp_libusb.h"
+#include "frame_decoder.h" // lw_da / CRC-fail / sbd reception telemetry
 
 static const char *TAG = "CLASS"; // match the original tag for log continuity
 
@@ -372,9 +373,20 @@ static void emit(const status_snapshot_t *s)
     // pk_qd fold in the only two fields that weren't already here, so no
     // telemetry is lost. (iot_log_metric() remains available in the component
     // API; we just don't spam it every window.)
+    // ACARS/SBD reception telemetry (since boot): lwda = ACARS-data frames
+    // seen, lwda_bad = those that failed the IDA CRC/header gate (marginal SNR,
+    // NOT fed downstream), sbd = SBD envelopes completed. Surfaces reception
+    // activity + quality even when 0 messages complete — "we ARE hearing them,
+    // N% are too weak to CRC" — instead of a silent 0. Full breakdown lives at
+    // /diag/reassembler.
+    frame_decoder_reasm_stats_t rs;
+    frame_decoder_get_reasm_stats(&rs);
+    uint32_t lwda_bad = (rs.lw_da >= rs.lw_da_valid) ? (uint32_t)(rs.lw_da - rs.lw_da_valid) : 0;
+
     iot_log(IOT_LOG_INFO,
             "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%% "
-            "bursts=%u pk_bursts=%u pk_wk=%u%% pk_acc=%u pk_qd=%u",
+            "bursts=%u pk_bursts=%u pk_wk=%u%% pk_acc=%u pk_qd=%u "
+            "lwda=%lu lwda_bad=%lu sbd=%lu",
             rate_inst,
             (unsigned long)s->ws.bursts_bch_decoded,
             (unsigned long)s->ws.bursts_bch_unknown,
@@ -382,7 +394,9 @@ static void emit(const status_snapshot_t *s)
             (unsigned)dsp_pct, (unsigned)worker_pct,
             (unsigned)s->dsp.gone_bursts, (unsigned)s_cap_peak_bursts,
             (unsigned)s_cap_peak_worker,
-            (unsigned)s_cap_peak_processed, (unsigned)s_cap_peak_qdrops);
+            (unsigned)s_cap_peak_processed, (unsigned)s_cap_peak_qdrops,
+            (unsigned long)rs.lw_da, (unsigned long)lwda_bad,
+            (unsigned long)rs.sbd_complete);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
     // any drop / recovery counter ticks. Field names match

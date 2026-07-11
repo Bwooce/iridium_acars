@@ -31,6 +31,11 @@ const char *wifi_link_ssid(void);
 // STA-mode IP (network order). Zero in AP mode (use 192.168.4.1).
 uint32_t wifi_link_ip_u32(void);
 
+// Wi-Fi signal telemetry for /status. rssi: associated-AP RSSI in dBm (0 if
+// AP mode / not associated / RPC fails). connected_s: seconds the current STA
+// connection has been continuously up (0 if down). Either pointer may be NULL.
+void wifi_link_get_signal(int8_t *rssi, uint32_t *connected_s);
+
 // Health watchdog (#104 gateway + #105 USB stream) state for diagnostics.
 // gw_addr: STA gateway IPv4 (network order, 0 if none). gw_armed: a gateway
 // ping has succeeded once (gw side can fire). gw_fails: consecutive failed

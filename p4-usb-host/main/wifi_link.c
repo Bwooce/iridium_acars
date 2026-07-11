@@ -37,12 +37,13 @@ static char                 s_ssid[33];     // active SSID (STA target, or AP se
 static esp_ip4_addr_t       s_ip = {0};
 
 // WiFi link-loss watchdog (#104) state.
-static volatile uint32_t s_gw_addr      = 0;     // STA gateway IPv4 (ping target)
-static volatile bool     s_ever_got_ip  = false; // gate: don't reboot pre-first-IP
-static volatile bool     s_ping_ever_ok = false; // gate: gateway answered ICMP once
-static SemaphoreHandle_t s_ping_done    = NULL;
-static volatile uint32_t s_ping_replies = 0;
-static volatile int      s_wdt_fails    = 0; // consecutive failed gw-ping cycles
+static volatile uint32_t s_gw_addr            = 0;     // STA gateway IPv4 (ping target)
+static volatile bool     s_ever_got_ip        = false; // gate: don't reboot pre-first-IP
+static volatile int64_t  s_connected_since_us = 0;     // esp_timer stamp of the current STA connection (0 = down)
+static volatile bool     s_ping_ever_ok       = false; // gate: gateway answered ICMP once
+static SemaphoreHandle_t s_ping_done          = NULL;
+static volatile uint32_t s_ping_replies       = 0;
+static volatile int      s_wdt_fails          = 0; // consecutive failed gw-ping cycles
 // USB stream liveness (folded into the same health watchdog, #105).
 static volatile bool s_stream_live   = false; // usb.completed advanced at least once
 static volatile int  s_stream_stalls = 0;     // consecutive frozen cycles
@@ -92,6 +93,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             break;
         case WIFI_EVENT_STA_DISCONNECTED: {
             s_up                             = false;
+            s_connected_since_us             = 0; // reset connected-time on drop
             wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
             ESP_LOGW(TAG, "STA_DISCONNECTED reason=%d → reconnect in 5s",
                      e ? e->reason : -1);
@@ -125,6 +127,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         s_up          = true;
         s_gw_addr     = e->ip_info.gw.addr; // ping target for the link-wdt
         s_ever_got_ip = true;
+        // Stamp the start of THIS continuous connection (only on a fresh
+        // connect, not a mid-session IP renewal) so /status can show uptime
+        // of the link independent of device uptime.
+        if (s_connected_since_us == 0) s_connected_since_us = esp_timer_get_time();
     }
 }
 
@@ -411,4 +417,24 @@ const char *wifi_link_ssid(void)
 uint32_t wifi_link_ip_u32(void)
 {
     return s_ip.addr;
+}
+
+void wifi_link_get_signal(int8_t *rssi_out, uint32_t *connected_s_out)
+{
+    if (rssi_out) {
+        *rssi_out = 0;
+        wifi_ap_record_t ap;
+        // STA-only: RSSI of the associated AP. Over esp_hosted this is an RPC
+        // to the C6; on any failure (AP mode, not associated, RPC error) we
+        // report 0 rather than a stale value.
+        if (s_mode == LINK_STA && s_up && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            *rssi_out = ap.rssi;
+        }
+    }
+    if (connected_s_out) {
+        int64_t since    = s_connected_since_us;
+        *connected_s_out = (s_up && since > 0)
+                               ? (uint32_t)((esp_timer_get_time() - since) / 1000000)
+                               : 0;
+    }
 }
