@@ -835,8 +835,8 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  "<tr><td>BCH decoded / unknown (since boot)</td><td class=v>%u / %u</td></tr>"
                  "<tr><td>rb_full drops (window)</td><td class=v>%u</td></tr>"
                  "<tr><td>rb_full drops (since boot)</td><td class=v>%llu</td></tr>"
-                 "<tr><td>DSP capacity</td><td class=v>%.0f %%</td></tr>"
-                 "<tr><td>Worker capacity</td><td class=v>%.0f %%</td></tr>"
+                 "<tr><td>DSP load (%% used, &gt;100%% = overloaded)</td><td class=v>%.0f %%</td></tr>"
+                 "<tr><td>Worker load (%% used, &gt;100%% = overloaded)</td><td class=v>%.0f %%</td></tr>"
                  "<tr><td>LO frequency</td><td class=v>%.4f MHz</td></tr>"
                  "<tr><td>Listening band</td><td class=v>%.3f - %.3f MHz</td></tr>"
                  "<tr><td>Gain</td><td class=v>%s</td></tr>"
@@ -868,9 +868,9 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  "<tr><td>Accepted+serviced peak</td><td class=v>%u /win</td></tr>"
                  "<tr><td>Queue-drops peak (backlog target)</td><td class=v>%u /win</td></tr>"
                  "<tr><td>Pre-filter accept</td><td class=v>%.0f %%</td></tr>"
-                 "<tr><td>Worker capacity peak</td><td class=v>%.0f %%</td></tr>"
+                 "<tr><td>Worker load peak (%% used)</td><td class=v>%.0f %%</td></tr>"
                  "<tr><td>Worker &ge;90%% of windows</td><td class=v>%.0f %%</td></tr>"
-                 "<tr><td>DSP/tagger capacity peak</td><td class=v>%.0f %%</td></tr>"
+                 "<tr><td>DSP/tagger load peak (%% used)</td><td class=v>%.0f %%</td></tr>"
                  "</table>",
                  cap.mean_bursts, (unsigned)cap.peak_bursts,
                  (unsigned)cap.peak_processed, (unsigned)cap.peak_queue_drops,
@@ -1137,9 +1137,7 @@ static esp_err_t messages_html_get(httpd_req_t *req)
 
     if (n == 0) {
         httpd_resp_send_chunk(req,
-                              "<p><em>No ACARS messages in the ring yet. IRA ring-alert "
-                              "frames are common; IDA data frames (the ones with text) "
-                              "are rarer — leave it running.</em></p>",
+                              "<p><em>No ACARS messages yet.</em></p>",
                               HTTPD_RESP_USE_STRLEN);
         send_page_foot(req);
         return ESP_OK;
