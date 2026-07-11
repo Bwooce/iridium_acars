@@ -116,24 +116,28 @@ static void emit(const status_snapshot_t *s)
     // Reboot-cause telemetry: usb_host_lib_main logs the reset reason via
     // ESP_LOGW at early boot (serial only, before the iot_log transport is up),
     // so on a wireless deployment the reason is invisible. Re-emit it over
-    // iot_log from here — the one path proven to reach the receiver — for the
-    // first few windows (WiFi is up + STATUS lines are landing by then; the
-    // repeat survives an early sendto that drops before the link settles).
-    static int  s_rst_emits  = 0;
-    static bool s_bt_checked = false;
-    static bool s_have_bt    = false;
+    // iot_log from here — the one path proven to reach the receiver.
+    //
+    // Gate on WiFi being CONNECTED, not a raw window count: after a crash
+    // reboot the STA sometimes re-associates slowly (~10 s), and a fixed
+    // first-N-window budget is spent at uptime 1-6 s — before iot_log can
+    // deliver — silently dropping both lines (observed 2026-07-12: a crash
+    // whose recovery associated at ~10 s lost its PANIC-BT entirely). Also
+    // defer CONSUMING the RTC record (panic_capture_report clears it) until
+    // connected, so a slow-link boot doesn't burn the one-shot report into a
+    // dropped sendto. Repeat a few windows once up for UDP-drop resilience.
+    static int  s_rst_emits = 0;
+    static bool s_bt_taken  = false;
+    static bool s_have_bt   = false;
     static char s_bt[288];
-    if (!s_bt_checked) {
-        s_bt_checked = true;
-        s_have_bt    = panic_capture_report(s_bt, sizeof(s_bt));
-    }
-    if (s_rst_emits < 6) {
+    if (wifi_link_is_connected() && s_rst_emits < 8) {
+        if (!s_bt_taken) {
+            s_bt_taken = true;
+            s_have_bt  = panic_capture_report(s_bt, sizeof(s_bt));
+        }
         s_rst_emits++;
         esp_reset_reason_t rr = esp_reset_reason();
         iot_log(IOT_LOG_WARN, "BOOT reset_reason=%s (%d)", reset_reason_name(rr), (int)rr);
-        // If that reboot was a panic our --wrap hook captured, surface the
-        // crash frame too — repeated over the same first-6-windows so a UDP
-        // drop during link settling doesn't lose it.
         if (s_have_bt) iot_log(IOT_LOG_ERROR, "%s", s_bt);
     }
     // Cache first, BEFORE the verbose/quiet fork: the STATUS-line fields the
