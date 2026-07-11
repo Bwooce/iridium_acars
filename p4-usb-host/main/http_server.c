@@ -2508,6 +2508,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
              "\"orphan\":%u,\"overflow\":%u,\"expired\":%u},"
              "\"sbd\":{\"short\":%u,\"single\":%u,\"assembled\":%u,\"multi\":%u,"
              "\"broken\":%u,\"filtered\":%u},"
+             "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u},"
              "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
         (unsigned long long)r.lw_da, (unsigned long long)r.lw_da_valid,
         (unsigned long long)gate_rej,
@@ -2516,6 +2517,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)r.ida_expired,
         (unsigned)r.sbd_short, (unsigned)r.sbd_single, (unsigned)r.sbd_assembled,
         (unsigned)r.sbd_multi, (unsigned)r.sbd_broken, (unsigned)r.sbd_filtered,
+        (unsigned)r.salvage_ok, (unsigned)r.salvage_rejected, (unsigned)r.dirty_cont,
         (unsigned long long)r.sbd_complete, (unsigned long long)r.acars_fragments,
         (unsigned long long)r.acars_decoded);
     if (n < 0) n = 0;

@@ -85,6 +85,12 @@ typedef struct {
     uint32_t ida_orphan, ida_overflow, ida_expired;
     // Stage 2 — sbd_reassembler (SBD envelope, msgno/msgcnt)
     uint32_t sbd_short, sbd_single, sbd_assembled, sbd_multi, sbd_broken, sbd_filtered;
+    // Chain salvage (§9): partials reaped from timed-out IDA chains.
+    uint32_t salvage_ok;       // reaped partial that classifies as an SBD type
+    uint32_t salvage_rejected; // reaped partial that is non-SBD (control traffic)
+    uint32_t dirty_cont;       // clean continuation frame dropped ONLY for crc=BAD
+                               // (upstream ida.py would still chain it) — sizes
+                               // the dirty-continuation-admission lever (Task C)
 } frame_decoder_reasm_stats_t;
 void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out);
 

@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_iot_log.h" // SALVAGE lines over the connectionless log for the soak
 #include "esp_timer.h"
 #include "frame_decoder.h"
 #include "frame_queue.h"
@@ -81,6 +82,41 @@ static _Atomic uint64_t  s_sbd_complete      = 0; // SBD messages reassembled
 static _Atomic uint64_t  s_acars_decoded     = 0; // ACARS messages successfully parsed
 static _Atomic uint64_t  s_acars_fragments   = 0; // ACARS fragments awaiting reassembly
 static _Atomic uint64_t  s_class_lw_da_valid = 0; // LW.DA frames that passed the ida_decode gate (fed to the chain)
+
+// Chain salvage (§9). Counters written ONLY by the single decoder task; plain
+// reads elsewhere (torn read benign for a diagnostic snapshot, same as the
+// s_ida_reasm.cnt_* counters).
+static uint32_t s_salvage_ok       = 0; // reaped partial that classifies as SBD
+static uint32_t s_salvage_rejected = 0; // reaped partial that is non-SBD control
+static uint32_t s_dirty_cont       = 0; // clean continuation dropped only on crc=BAD
+
+// Reap every timed-out IDA chain and, for each, best-effort classify the
+// partial (truncated) SBD envelope. B3 = OBSERVE ONLY: log + count; emitting an
+// actual PARTIAL message is B4. The type gate (sbd_salvage_parse() != 1) drops
+// non-SBD control chains — ~100 % of standalone traffic — exactly as the SBD
+// filter does, so noise never surfaces as salvage. Provenance is already
+// guaranteed: only frames that passed ida.ok && header_ok && crc_ok ever entered
+// the IDA table, so a reaped chain's bytes are trustworthy, only truncated.
+static void ida_salvage_drain(uint64_t now_us)
+{
+    ida_salvage_t sv;
+    while (ida_reassembler_reap(&s_ida_reasm, now_us, &sv)) {
+        sbd_salvage_info_t info;
+        if (sbd_salvage_parse(sv.payload, sv.payload_len, sv.uplink, &info) != 1) {
+            s_salvage_rejected++; // non-SBD chain (control traffic)
+            continue;
+        }
+        s_salvage_ok++;
+        ESP_LOGI(TAG, "SALVAGE: type=%s %s frags=%u len=%d body=%d msg=%d/%d%s",
+                 sbd_type_wire_name(info.type), sv.uplink ? "UL" : "DL",
+                 (unsigned)sv.frags, sv.payload_len, info.body_len, info.msg_no,
+                 info.msg_cnt, info.truncated ? " TRUNC" : "");
+        iot_log(IOT_LOG_INFO, "SALVAGE type=%s %s frags=%u len=%d body=%d msg=%d/%d%s",
+                sbd_type_wire_name(info.type), sv.uplink ? "UL" : "DL",
+                (unsigned)sv.frags, sv.payload_len, info.body_len, info.msg_no,
+                info.msg_cnt, info.truncated ? " TRUNC" : "");
+    }
+}
 
 // D14: libacars reassembly context. Maintains per-flight-id session
 // state so multi-block ACARS messages (block_id > 0, more_blocks_follow)
@@ -390,6 +426,10 @@ static void process_one(const frame_queue_item_t *it)
                      ida.crc_ok ? "OK" : "BAD");
             if (rc_ida == 0 && ida.ok && ida.header_ok && ida.crc_ok) {
                 atomic_fetch_add_explicit(&s_class_lw_da_valid, 1, memory_order_relaxed);
+                // Reap-before-feed: salvage any chain that timed out (and free
+                // its table slot) before this fragment might need one. Uses the
+                // frame's own timestamp clock, same as feed() below.
+                ida_salvage_drain(it->timestamp_us);
                 // Stage 1: chain cross-burst IDA fragments (da_cont/
                 // da_ctr) into one complete SBD envelope -- a single
                 // physical LW.DA burst caps at 24 payload bytes, but
@@ -419,6 +459,15 @@ static void process_one(const frame_queue_item_t *it)
                         try_acars(&sbd, it->peak_bin, it->snr_db);
                     }
                 }
+            } else if (rc_ida == 0 && ida.ok && ida.header_ok && !ida.crc_ok &&
+                       ida.da_ctr > 0) {
+                // Task C sizing: a continuation frame (ctr>0) that demodulated
+                // cleanly (all BCH + header OK) but failed ONLY its own CRC.
+                // Upstream ida.py chains on cont/ctr regardless of any single
+                // fragment's CRC, so admitting these as continuations could
+                // COMPLETE chains we currently drop. Count how often it happens
+                // to size that lever before building it.
+                s_dirty_cont++;
             }
         } else {
             atomic_fetch_add_explicit(&s_class_lw_other, 1, memory_order_relaxed);
@@ -490,6 +539,10 @@ static void decoder_task(void *arg)
         uint64_t now = (uint64_t)esp_timer_get_time();
         if (now - last_tick > 1000000ULL) {
             sbd_reassembler_tick(&s_sbd, now);
+            // Salvage IDA chains that timed out with no new frames arriving —
+            // reap() no longer auto-expires inside feed(), so this tick is what
+            // catches idle stalls (the common case: opener received, no more).
+            ida_salvage_drain(now);
             last_tick = now;
         }
         if (got) {
@@ -655,17 +708,20 @@ void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out)
     out->acars_fragments = atomic_load_explicit(&s_acars_fragments, memory_order_relaxed);
     // Plain reads of the reassembler counters: single writer (this decoder
     // task), 32-bit aligned, torn read benign for a diagnostic snapshot.
-    out->ida_standalone = s_ida_reasm.cnt_standalone;
-    out->ida_opened     = s_ida_reasm.cnt_opened;
-    out->ida_merged     = s_ida_reasm.cnt_merged;
-    out->ida_completed  = s_ida_reasm.cnt_completed;
-    out->ida_orphan     = s_ida_reasm.cnt_orphan;
-    out->ida_overflow   = s_ida_reasm.cnt_overflow;
-    out->ida_expired    = s_ida_reasm.cnt_expired;
-    out->sbd_short      = s_sbd.cnt_short;
-    out->sbd_single     = s_sbd.cnt_single;
-    out->sbd_assembled  = s_sbd.cnt_assembled;
-    out->sbd_multi      = s_sbd.cnt_multi;
-    out->sbd_broken     = s_sbd.cnt_broken;
-    out->sbd_filtered   = s_sbd.cnt_filtered;
+    out->ida_standalone   = s_ida_reasm.cnt_standalone;
+    out->ida_opened       = s_ida_reasm.cnt_opened;
+    out->ida_merged       = s_ida_reasm.cnt_merged;
+    out->ida_completed    = s_ida_reasm.cnt_completed;
+    out->ida_orphan       = s_ida_reasm.cnt_orphan;
+    out->ida_overflow     = s_ida_reasm.cnt_overflow;
+    out->ida_expired      = s_ida_reasm.cnt_expired;
+    out->sbd_short        = s_sbd.cnt_short;
+    out->sbd_single       = s_sbd.cnt_single;
+    out->sbd_assembled    = s_sbd.cnt_assembled;
+    out->sbd_multi        = s_sbd.cnt_multi;
+    out->sbd_broken       = s_sbd.cnt_broken;
+    out->sbd_filtered     = s_sbd.cnt_filtered;
+    out->salvage_ok       = s_salvage_ok;
+    out->salvage_rejected = s_salvage_rejected;
+    out->dirty_cont       = s_dirty_cont;
 }
