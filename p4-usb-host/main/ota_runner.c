@@ -90,6 +90,15 @@ static void ota_task(void *arg)
     };
     esp_https_ota_config_t ota_cfg = {
         .http_config = &http_cfg,
+        // The esp_hosted C6 SDIO link cannot reliably sustain one 1.4 MB
+        // transfer — it throttles/stalls partway (600 B/s–17 KB/s observed).
+        // Download in bounded Range-request chunks instead: each HTTP GET
+        // pulls at most max_http_request_size bytes, so the link only has to
+        // survive a 32 KB burst before a fresh request resets the flow. Needs
+        // CONFIG_ESP_HTTP_CLIENT_ENABLE_GET_CONTENT_RANGE (server must honour
+        // Range — Python http.server 3.7+ does).
+        .partial_http_download = true,
+        .max_http_request_size = 32768,
     };
 
     esp_https_ota_handle_t handle = NULL;

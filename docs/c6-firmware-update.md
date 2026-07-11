@@ -39,12 +39,19 @@ esp_hosted, Method B becomes the clean path for future updates.
   drop is in the C6's closed esp_wifi blob, not the slave version. Confirmed live
   (`nettest`: 0/10 mcast, 5/5 unicast). Remote telemetry must use unicast or HTTP
   `/status` — see `memory/project_esp_hosted_multicast_tx_broken`.
-- **Unrelated: P4 app OTA (`POST /ota`) verify-fails on this board** — upstream
-  esp-idf#17855 (ESP32-P4 + PSRAM: `esp_image_verify` reads the just-written image
-  back through a stale flash mmap cache → false "New image failed verification"; the
-  write itself is correct, download-mode ROM read-back is byte-identical). Fails safe
-  (rejected before any partition switch, no brick). **Until upstream fixes it, update
-  the P4 app over USB** (`scripts/flash.sh`), not OTA.
+- **P4 app OTA (`POST /ota`) — FIXED, works end-to-end** (2026-07-11). The
+  verify-fail was upstream esp-idf#17855 (ESP32-P4 + PSRAM: `esp_image_verify`
+  read the just-written image back through a stale flash mmap cache → false "New
+  image failed verification"; the write itself is correct, download-mode ROM
+  read-back is byte-identical). Worked around by `patches/0007` (invalidate the
+  mmap cache before the app-side verify read) plus `partial_http_download` in
+  `ota_runner` (bounded 32 KB Range requests so the flaky C6 SDIO link can carry
+  the 1.4 MB image). Verified 3/3 device OTAs (download → verify → partition
+  switch → boot new slot → rollback-cancel). NOTE: the download still crawls when
+  the device is warmed up (DMA-INT exhausted) — reliable but slow; freeing the DSP
+  DMA-INT at OTA start (planned) will make it fast. Failure mode remains safe
+  (rejected before switch, no brick); USB reflash (`scripts/flash.sh`) is still
+  the fallback.
 
 ---
 

@@ -17,6 +17,7 @@ git apply ../patches/0001-esp_dma_utils-defer-stash-alloc-until-overflow-confirm
 git apply ../patches/0003-freertos-riscv-coproc-save-area-in-internal-ram-for-psram-stacks.patch
 git apply ../patches/0004-freertos-riscv-pie-coproc-trap-storm-watchdog.patch   # apply AFTER 0003
 git apply ../patches/0006-freertos-riscv-pie-coproc-force-aligned-cfg-in-save-restore.patch   # apply AFTER 0004
+git apply ../patches/0007-bootloader_support-invalidate-mmap-cache-before-app-ota-verify.patch
 ```
 
 **0005 and 0006 are mutually exclusive** — both edit the
@@ -350,3 +351,37 @@ bit count for display.
 Independently upstreamable (no interaction with the best-effort feature
 itself -- it's a standalone contract-violation bugfix). AI-assisted; see
 git history for authorship.
+
+## 0007 — bootloader_support: invalidate flash mmap cache before app-side OTA verify
+
+**File:** `components/bootloader_support/src/esp_image_format.c`
+**IDF version:** v6.1 — vendored checkout tracks `release/v6.1`. Re-verify on IDF updates.
+**Upstream:** esp-idf#17855 (ESP32-P4 + PSRAM, UNFIXED upstream as of this writing).
+
+`esp_ota_end()` (via `esp_https_ota_finish()`) calls `esp_image_verify()`,
+which re-reads the just-written image out of flash and re-hashes it. In app
+mode that read goes through `bootloader_mmap()` — a **cached** flash mapping —
+in `process_segment_data()`. On ESP32-P4 + PSRAM the CPU data cache still holds
+**stale lines** for the reused mmap vaddr window: the OTA payload was written to
+flash over SPI (`esp_ota_write` → `spi_flash_write`), not through this cache, and
+nothing invalidates it before the verify read. The SHA is therefore computed
+over stale bytes and verification fails with `ESP_ERR_OTA_VALIDATE_FAILED` even
+though flash is byte-correct — proven by an `esptool read-flash 0x620000` of the
+rejected `ota_1` matching the source SHA256. (The header/appended-digest reads
+use `bootloader_flash_read`, which is uncached/fresh, so they pass — only the
+segment mmap read is stale.)
+
+Fix: right after the `bootloader_mmap()` in `process_segment_data()`, invalidate
+the mapped span (page-aligned, mirroring the post-remap invalidate in
+`spi_flash/flash_mmap.c`) via `cache_hal_invalidate_addr()` so every read below
+fetches fresh flash. The invalidate is **synchronous** (ROM `Cache_Invalidate_Addr`),
+so no race with the SHA read — verified deterministic across 3/3 device OTAs
+(both fresh-boot fast-download and warmed-up `dma_free=2KB` slow-download
+regimes; the slow regime reproduced the pre-fix failure). Guarded
+`#if !defined(BOOTLOADER_BUILD)`: the second-stage bootloader verifies from a
+cold post-reset cache and must not gain this runtime dependency; its binary is
+byte-unchanged by this patch. A quiet `ESP_LOGD` records the invalidate
+(`OTA17855: segN ... ok=1`) for field diagnosis.
+
+Adds `#include "hal/cache_hal.h"` (the file already pulls `hal/cache_ll.h`);
+uses `SPI_FLASH_MMU_PAGE_SIZE` and `ALIGN_UP`, both already available in the file.

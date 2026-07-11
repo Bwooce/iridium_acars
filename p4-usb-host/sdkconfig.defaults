@@ -191,6 +191,14 @@ CONFIG_ESP_COREDUMP_UART_DELAY=0
 # without this esp_https_ota_begin returns INVALID_ARG — the P4 OTA never worked).
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
 
+# Enable HTTP Content-Range parsing so ota_runner can use partial_http_download:
+# the 1.4 MB image is pulled in bounded 32 KB Range requests instead of one
+# sustained transfer the flaky esp_hosted C6 SDIO link stalls partway through.
+CONFIG_ESP_HTTP_CLIENT_ENABLE_GET_CONTENT_RANGE=y
+# Compiles in the partial_http_download / max_http_request_size fields that
+# ota_runner sets (gated off by default in esp_https_ota).
+CONFIG_ESP_HTTPS_OTA_ENABLE_PARTIAL_DOWNLOAD=y
+
 # App rollback: a bad remote OTA self-heals instead of bricking. With this on,
 # esp_ota_set_boot_partition() marks the new app PENDING_VERIFY; ota_runner_mark_valid()
 # (called in app_main after core services are up) confirms it. If the new image

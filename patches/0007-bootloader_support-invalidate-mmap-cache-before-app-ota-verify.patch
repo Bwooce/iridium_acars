@@ -1,0 +1,41 @@
+diff --git a/components/bootloader_support/src/esp_image_format.c b/components/bootloader_support/src/esp_image_format.c
+index eb60325a48..1053e0c8d3 100644
+--- a/components/bootloader_support/src/esp_image_format.c
++++ b/components/bootloader_support/src/esp_image_format.c
+@@ -22,6 +22,7 @@
+ #include "bootloader_memory_utils.h"
+ #include "soc/soc_caps.h"
+ #include "hal/cache_ll.h"
++#include "hal/cache_hal.h"
+ #include "spi_flash_mmap.h"
+ #include "hal/efuse_hal.h"
+ #include "sdkconfig.h"
+@@ -760,6 +761,28 @@ static esp_err_t process_segment_data(const process_segment_data_t *segment_data
+         return ESP_FAIL;
+     }
+ 
++#if !defined(BOOTLOADER_BUILD)
++    // esp-idf#17855 workaround (ESP32-P4 + PSRAM): esp_ota_end()'s runtime
++    // esp_image_verify() reads the just-written image back through this flash
++    // mmap, but the CPU data cache still holds STALE lines for the reused mmap
++    // vaddr window — the OTA payload was written to flash via SPI, not through
++    // this cache — so the SHA loop below hashes stale bytes and verification
++    // falsely fails even though flash is byte-correct (proven: an esptool
++    // read-back of the rejected image matches the source SHA256). Invalidate
++    // the mapped span, page-aligned (mirroring the post-remap invalidate in
++    // spi_flash/flash_mmap.c), so every read below fetches fresh flash.
++    // BOOTLOADER_BUILD is exempt: it verifies from a cold post-reset cache and
++    // must not gain this runtime dependency.
++    {
++        uint32_t inv_vaddr = (uint32_t)data & ~(SPI_FLASH_MMU_PAGE_SIZE - 1);
++        uint32_t inv_size  = ALIGN_UP((uint32_t)data + segment_data->data_len,
++                                      SPI_FLASH_MMU_PAGE_SIZE) - inv_vaddr;
++        bool inv_ok = cache_hal_invalidate_addr(inv_vaddr, inv_size);
++        ESP_LOGD(TAG, "OTA17855: seg%d inval vaddr=0x%08"PRIx32" size=0x%"PRIx32" ok=%d",
++                 segment_data->segment, inv_vaddr, inv_size, (int)inv_ok);
++    }
++#endif
++
+     if (segment_data->checksum == NULL && segment_data->sha_handle == NULL) {
+         memcpy((void *)segment_data->load_addr, data, segment_data->data_len);
+ #if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
