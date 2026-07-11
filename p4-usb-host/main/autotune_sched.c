@@ -3,7 +3,8 @@
 #include "autotune_sched.h"
 #include "app_config.h"
 #include "autotune.h"
-#include "esp_libusb.h" // usb_stream_totals_t / esp_libusb_get_stream_totals
+#include "esp_libusb.h"  // usb_stream_totals_t / esp_libusb_get_stream_totals
+#include "esp_iot_log.h" // AUTOTUNE markers over the (connectionless) iot_log
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -107,15 +108,19 @@ static void autotune_sched_task(void *arg)
             // the gain-cal hop is the prime suspect. grep AUTOTUNE-START.
             ESP_LOGW(TAG, "AUTOTUNE-START gain-cal (interval=%lu s) — hops tuner; watch for a wedge after this",
                      (unsigned long)cfg.autotune_gain_interval_s);
+            iot_log(IOT_LOG_WARN, "AUTOTUNE-START gain-cal");
             autotune_run_manual();
             ESP_LOGW(TAG, "AUTOTUNE-DONE gain-cal");
+            iot_log(IOT_LOG_WARN, "AUTOTUNE-DONE gain-cal");
             last_gain_run = now_s();
         }
         if (autotune_is_due(last_lo_run, t, cfg.autotune_lo_interval_s)) {
             ESP_LOGW(TAG, "AUTOTUNE-START LO-rescan (interval=%lu s) — multi-hop scanner_scan; watch for a wedge after this",
                      (unsigned long)cfg.autotune_lo_interval_s);
+            iot_log(IOT_LOG_WARN, "AUTOTUNE-START LO-rescan");
             autotune_run_lo_rescan();
             ESP_LOGW(TAG, "AUTOTUNE-DONE LO-rescan");
+            iot_log(IOT_LOG_WARN, "AUTOTUNE-DONE LO-rescan");
             last_lo_run = now_s();
         }
     }

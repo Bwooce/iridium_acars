@@ -22,6 +22,7 @@
 #include "ingest_core1.h"
 #include "esp_libusb.h"
 #include "frame_decoder.h" // lw_da / CRC-fail / sbd reception telemetry
+#include "wifi_link.h"     // gw-watchdog / stream-stall counts for reboot-cause tracing
 
 static const char *TAG = "CLASS"; // match the original tag for log continuity
 
@@ -383,10 +384,19 @@ static void emit(const status_snapshot_t *s)
     frame_decoder_get_reasm_stats(&rs);
     uint32_t lwda_bad = (rs.lw_da >= rs.lw_da_valid) ? (uint32_t)(rs.lw_da - rs.lw_da_valid) : 0;
 
+    // Health-watchdog counters for reboot-cause tracing: gwf = consecutive
+    // failed gateway pings (reboots at GW_FAIL_LIMIT), stall = consecutive
+    // frozen-stream cycles. Watching these climb in the log tells us WHICH
+    // watchdog fired before an SW reboot (gateway vs stream), and correlating
+    // gwf's climb with an AUTOTUNE-START marker shows if the LO rescan is what
+    // knocks the gateway offline.
+    int gwf = 0, stall = 0;
+    wifi_link_wdt_status(NULL, NULL, &gwf, NULL, &stall);
+
     iot_log(IOT_LOG_INFO,
             "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%% "
             "bursts=%u pk_bursts=%u pk_wk=%u%% pk_acc=%u pk_qd=%u "
-            "lwda=%lu lwda_bad=%lu sbd=%lu",
+            "lwda=%lu lwda_bad=%lu sbd=%lu gwf=%d stall=%d",
             rate_inst,
             (unsigned long)s->ws.bursts_bch_decoded,
             (unsigned long)s->ws.bursts_bch_unknown,
@@ -396,7 +406,7 @@ static void emit(const status_snapshot_t *s)
             (unsigned)s_cap_peak_worker,
             (unsigned)s_cap_peak_processed, (unsigned)s_cap_peak_qdrops,
             (unsigned long)rs.lw_da, (unsigned long)lwda_bad,
-            (unsigned long)rs.sbd_complete);
+            (unsigned long)rs.sbd_complete, gwf, stall);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
     // any drop / recovery counter ticks. Field names match
