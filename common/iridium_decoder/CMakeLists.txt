@@ -166,3 +166,17 @@ set_source_files_properties(fft_burst_tagger.c
     PROPERTIES COMPILE_FLAGS
     "-O3 -funroll-loops"
 )
+
+# The worker's two heaviest consumers were left at the global -O2 despite being
+# the actual hot path (the tagger files above are Core 0; these are the Core 1
+# demod). uw_correlator.c is ~76% of the worker (per-lag complex MAC over the UW
+# template); fft_sc16_2048.c is the 2048-pt matched-filter FFT (radix-2 butterflies).
+# Both are tight scalar/int loops the compiler unrolls + schedules much better at -O3.
+# Optimisation-only (no algorithm change) — gated by the device smoke (SMOKE_PASS)
+# + host ctests. Does not raise the reception-limited decode rate; buys worker
+# headroom under burst oversubscription. NOTE: the smoke perf report covers the
+# tagger, not the worker, so the speedup here is not directly measured on-device.
+set_source_files_properties(uw_correlator.c fft_sc16_2048.c
+    PROPERTIES COMPILE_FLAGS
+    "-O3 -funroll-loops"
+)
