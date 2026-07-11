@@ -38,12 +38,12 @@ static volatile uint8_t  s_xfer_last_error      = 0;
 // monitors don't get a misleading 0.86% lifetime drop rate driven
 // entirely by boot transients.
 #define STREAM_STATS_GRACE_US (5 * 1000 * 1000)
-static volatile int64_t  s_stream_start_us     = 0;
-static volatile uint64_t s_total_completed     = 0;
+static volatile int64_t  s_stream_start_us       = 0;
+static volatile uint64_t s_total_completed       = 0;
 static volatile uint64_t s_total_urb_completions = 0; // raw liveness (no grace)
-static volatile uint64_t s_total_rb_full_drops = 0;
-static volatile uint64_t s_total_status_errors = 0;
-static volatile uint64_t s_total_short_xfers   = 0;
+static volatile uint64_t s_total_rb_full_drops   = 0;
+static volatile uint64_t s_total_status_errors   = 0;
+static volatile uint64_t s_total_short_xfers     = 0;
 // Producer-side ringbuffer fill tracking. The class_driver consumer measures
 // HWM after each read which biases towards 0; these are sampled in the USB
 // callback (the producer) so we capture the actual peak fills.
@@ -59,6 +59,12 @@ static volatile uint32_t s_producer_samples         = 0;
 // polls this down to 0 (bounded) to know the bulk pipe is quiesced
 // before a retune's control transfers run.
 static _Atomic(int) s_live_xfers = 0;
+
+// Set by esp_libusb_free_stream_transfers() when the bulk URB pool has been
+// freed (to reclaim its DMA-internal SRAM during an OTA). While true,
+// esp_libusb_resume_stream() re-allocates the pool instead of re-submitting
+// the (now-freed) parked objects. Cleared once the pool is back.
+static bool s_transfers_freed = false;
 
 // Mutex-take timeout for the control/bulk transfer critical section (#T8).
 // Generous relative to a single USB control transfer (CTRL_TIMEOUT=300 ms in
@@ -317,11 +323,11 @@ void esp_libusb_get_stream_stats(usb_stream_stats_t *out)
 void esp_libusb_get_stream_totals(usb_stream_totals_t *out)
 {
     if (!out) return;
-    out->completed        = s_total_completed;
-    out->rb_full_drops    = s_total_rb_full_drops;
-    out->status_errors    = s_total_status_errors;
-    out->short_xfers      = s_total_short_xfers;
-    out->urb_completions  = s_total_urb_completions;
+    out->completed       = s_total_completed;
+    out->rb_full_drops   = s_total_rb_full_drops;
+    out->status_errors   = s_total_status_errors;
+    out->short_xfers     = s_total_short_xfers;
+    out->urb_completions = s_total_urb_completions;
 }
 
 void esp_libusb_set_dev_hdl(usb_device_handle_t hdl)
@@ -464,6 +470,45 @@ int esp_libusb_pause_stream(class_driver_t *driver_obj)
     return 0;
 }
 
+// Free the parked bulk-transfer pool to reclaim its DMA-internal SRAM
+// (ASYNC_TRANSFER_COUNT * ASYNC_TRANSFER_SIZE = 48 KB) for the duration of an
+// OTA. The esp_hosted C6 SDIO download starves on the razor-thin DMA-INT heap
+// (dma_free ~2 KB in steady state — the USB pool holds most of it), which
+// throttles the download to a ~400 B/s crawl. The DSP stream is paused during
+// an OTA, so these URBs sit idle holding memory the download needs.
+//
+// PRECONDITION: the stream is paused — esp_libusb_pause_stream() must have
+// drained s_live_xfers to 0 first, so every URB is completed and owned by us;
+// freeing an in-flight URB would be a use-after-free (the whole reason the
+// pause does a bounded drain). esp_libusb_resume_stream() re-allocates the pool
+// if it finds it freed (only the OTA-abort exit path resumes; an OTA success
+// reboots and never returns here). Returns bytes of DMA-INT reclaimed.
+size_t esp_libusb_free_stream_transfers(void)
+{
+    class_adsb_dev *dev = adsbdev;
+    if (!dev) return 0;
+    int live = atomic_load_explicit(&s_live_xfers, memory_order_relaxed);
+    if (live != 0) {
+        ESP_LOGW("LIBUSB", "free_stream_transfers: %d URBs still live — refusing (not paused)", live);
+        return 0;
+    }
+    size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    int    freed  = 0;
+    for (int i = 0; i < ASYNC_TRANSFER_COUNT; i++) {
+        if (dev->transfers[i]) {
+            usb_host_transfer_free(dev->transfers[i]);
+            dev->transfers[i] = NULL;
+            freed++;
+        }
+    }
+    s_transfers_freed = true;
+    size_t after      = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    ESP_LOGW("LIBUSB", "freed %d bulk URBs; DMA-internal free %u -> %u KB (+%u KB for OTA download)",
+             freed, (unsigned)(before / 1024), (unsigned)(after / 1024),
+             (unsigned)((after - before) / 1024));
+    return after - before;
+}
+
 // Task 8 (park transfers): resume after esp_libusb_pause_stream().
 // Deliberately does NOT call esp_libusb_start_stream() or
 // submit_stream_transfers() — those alloc new transfers, and the
@@ -473,10 +518,30 @@ int esp_libusb_pause_stream(class_driver_t *driver_obj)
 // the pause drain. No allocation happens here.
 int esp_libusb_resume_stream(class_driver_t *driver_obj, unsigned char endpoint)
 {
-    (void)endpoint; // transfers already carry their endpoint from boot submit
     class_adsb_dev *dev = adsbdev;
     if (!dev) return -1;
 
+    // If the pool was freed to reclaim DMA-INT during an OTA that then aborted
+    // (rather than rebooting on success), re-allocate it from scratch instead
+    // of re-submitting freed objects — DMA-INT is available again now that the
+    // OTA download's buffers are gone. submit_stream_transfers() does the
+    // alloc+submit and carries the endpoint (0x81 bulk IN).
+    if (s_transfers_freed) {
+        usb_device_handle_t dev_hdl = driver_obj->dev_hdl ? driver_obj->dev_hdl : dev->dev_hdl;
+        if (!dev_hdl) {
+            ESP_LOGE("LIBUSB", "resume: NULL device handle, cannot re-alloc pool");
+            return -1;
+        }
+        usbring_reset();
+        dev->streaming    = true;
+        s_stream_start_us = esp_timer_get_time();
+        int rc            = submit_stream_transfers(driver_obj, dev_hdl, endpoint ? endpoint : 0x81);
+        s_transfers_freed = false; // left the freed state; a partial-alloc failure -> health-wdt reboot
+        ESP_LOGW("LIBUSB", "stream resumed: bulk URB pool re-allocated (rc=%d)", rc);
+        return rc;
+    }
+
+    (void)endpoint; // parked transfers already carry their endpoint from boot submit
     usbring_reset();
     dev->streaming    = true;
     s_stream_start_us = esp_timer_get_time();

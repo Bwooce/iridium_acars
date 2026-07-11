@@ -87,8 +87,14 @@ static SemaphoreHandle_t s_graceful_done = NULL;
 // usb_pump pauses/resumes the stream on the transition, and wifi_link's health
 // watchdog skips its stream-stall reboot while this is set.
 static atomic_bool s_maintenance = false;
-void class_driver_set_maintenance(bool on) { atomic_store(&s_maintenance, on); }
-bool class_driver_in_maintenance(void) { return atomic_load(&s_maintenance); }
+void               class_driver_set_maintenance(bool on)
+{
+    atomic_store(&s_maintenance, on);
+}
+bool class_driver_in_maintenance(void)
+{
+    return atomic_load(&s_maintenance);
+}
 
 // T48 (docs/perf-decoupling-design-2026-07-04.md §T48): the combined
 // class_driver loop is split into two Core-0 tasks:
@@ -705,8 +711,15 @@ void class_driver_task(void *arg)
             bool want = class_driver_in_maintenance();
             if (want && !maint_paused) {
                 esp_libusb_pause_stream(&s_driver_obj);
-                maint_paused = true;
-                ESP_LOGW(TAG, "maintenance: stream PAUSED (DSP quiesced for OTA)");
+                // Hand the paused bulk-URB pool's DMA-INT (48 KB) to the OTA
+                // download — the esp_hosted SDIO link starves on the ~2 KB
+                // steady-state DMA-INT heap and crawls otherwise. Safe now: the
+                // pause above drained every in-flight URB. resume_stream()
+                // re-allocs on the OTA-abort exit; OTA success reboots.
+                size_t reclaimed = esp_libusb_free_stream_transfers();
+                maint_paused     = true;
+                ESP_LOGW(TAG, "maintenance: stream PAUSED + %u KB DMA-INT reclaimed for OTA",
+                         (unsigned)(reclaimed / 1024));
             } else if (!want && maint_paused) {
                 esp_libusb_resume_stream(&s_driver_obj, 0x81);
                 maint_paused = false;

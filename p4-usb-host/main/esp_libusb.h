@@ -114,6 +114,13 @@ int  esp_libusb_start_stream(class_driver_t *driver_obj, unsigned char endpoint)
 // usb_host_client_handle_events (usb_pump / class_driver_task) — the
 // drain loop itself calls that function.
 int esp_libusb_pause_stream(class_driver_t *driver_obj);
+// Free the parked bulk-transfer pool (48 KB of DMA-internal SRAM) to hand it to
+// the esp_hosted C6 SDIO OTA download, which otherwise starves the tiny DMA-INT
+// heap and crawls. MUST be called AFTER esp_libusb_pause_stream() has drained
+// every in-flight URB (freeing a live URB is a use-after-free). The next
+// esp_libusb_resume_stream() re-allocates the pool; on OTA success the device
+// reboots and never resumes. Returns bytes of DMA-INT reclaimed.
+size_t esp_libusb_free_stream_transfers(void);
 // Resume after esp_libusb_pause_stream(): resets the (still-allocated)
 // usbring ring and resubmits a fresh batch of transfers. Deliberately
 // does NOT call esp_libusb_start_stream() / usbring_init() — the ring
@@ -171,12 +178,12 @@ void esp_libusb_get_stream_stats(usb_stream_stats_t *out);
 // compute deltas across an arbitrary window without racing
 // status_logger's reset-on-read.
 typedef struct {
-    uint64_t completed;     // total successful transfers since boot (POST-GRACE:
-                            // gated by STREAM_STATS_GRACE_US, which resume_stream
-                            // RESETS on every retune — do NOT use for liveness)
-    uint64_t rb_full_drops; // total transfers dropped at ringbuf-send
-    uint64_t status_errors; // total transfers with non-COMPLETED status
-    uint64_t short_xfers;   // total transfers where actual_bytes < requested
+    uint64_t completed;       // total successful transfers since boot (POST-GRACE:
+                              // gated by STREAM_STATS_GRACE_US, which resume_stream
+                              // RESETS on every retune — do NOT use for liveness)
+    uint64_t rb_full_drops;   // total transfers dropped at ringbuf-send
+    uint64_t status_errors;   // total transfers with non-COMPLETED status
+    uint64_t short_xfers;     // total transfers where actual_bytes < requested
     uint64_t urb_completions; // RAW completion count — increments on EVERY
                               // completed URB, no grace gate. The correct
                               // liveness signal for the health watchdog: unlike
