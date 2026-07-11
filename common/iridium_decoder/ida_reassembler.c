@@ -40,16 +40,31 @@ static int find_matching_session(ida_reassembler_t *ctx, bool uplink,
     return -1;
 }
 
-static void expire_stale(ida_reassembler_t *ctx, uint64_t now_us)
+int ida_reassembler_reap(ida_reassembler_t *ctx, uint64_t now_us,
+                         ida_salvage_t *out)
 {
+    if (!ctx || !out) return 0;
     for (int i = 0; i < IDA_REASM_MAX_SESSIONS; i++) {
         ida_reasm_session_t *s = &ctx->sessions[i];
         if (s->active && now_us > s->last_time_us &&
             (now_us - s->last_time_us) > IDA_REASM_SESSION_TIMEOUT_US) {
-            s->active = false;
+            int n = s->payload_len;
+            if (n < 0) n = 0;
+            if (n > IDA_REASM_MAX_BYTES) n = IDA_REASM_MAX_BYTES;
+            memcpy(out->payload, s->payload, (size_t)n);
+            out->payload_len  = n;
+            out->uplink       = s->uplink;
+            out->freq_hz      = s->freq_hz;
+            out->last_time_us = s->last_time_us;
+            // next_ctr is the expected ctr of the NEXT fragment, i.e. the count
+            // of fragments received so far (opener sets it to 1).
+            out->frags = s->next_ctr;
+            s->active  = false;
             ctx->cnt_expired++;
+            return 1;
         }
     }
+    return 0;
 }
 
 int ida_reassembler_feed(ida_reassembler_t *ctx, const ida_decoded_t *ida,
@@ -58,7 +73,11 @@ int ida_reassembler_feed(ida_reassembler_t *ctx, const ida_decoded_t *ida,
 {
     if (!ctx || !ida || !out_payload || !out_len) return -1;
     *out_len = 0;
-    expire_stale(ctx, now_us);
+    // NB: expiry is NOT done here anymore — the driver calls
+    // ida_reassembler_reap() before feed() so stale chains are salvaged (and
+    // their slots freed) rather than silently discarded. A stale session that
+    // the driver hasn't reaped yet cannot capture this fragment:
+    // find_matching_session() rejects anything older than IDA_REASM_FRAG_GAP_US.
 
     // Fresh sequence (ctr==0) that also terminates here (cont==0) —
     // the common case: a self-contained frame needing no chaining.

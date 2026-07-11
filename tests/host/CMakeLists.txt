@@ -188,6 +188,13 @@ add_executable(test_sbd_reassembler
 )
 target_include_directories(test_sbd_reassembler PRIVATE ${COMMON_DIR})
 
+# Chain-salvage (Task B1): ida_reassembler_reap() partial-payload recovery.
+add_executable(test_ida_reasm_salvage
+    test_ida_reasm_salvage.c
+    ${COMMON_DIR}/ida_reassembler.c
+)
+target_include_directories(test_ida_reasm_salvage PRIVATE ${COMMON_DIR})
+
 # Phase 3.6.M: cross-validate the new Q15 2048-pt FFT (for the wideband
 # fft_burst_tagger) against a textbook direct-DFT reference. Same
 # algorithm as fft_sc16_64.c just resized for N=2048; the test catches
@@ -1168,6 +1175,7 @@ add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME ibc_decode           COMMAND test_ibc_decode)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
+add_test(NAME ida_reasm_salvage    COMMAND test_ida_reasm_salvage)
 add_test(NAME acars_tail_synthetic COMMAND test_acars_tail_synthetic)
 add_test(NAME acars_tail_real      COMMAND test_acars_tail_real)
 add_test(NAME ida_encode_roundtrip COMMAND test_ida_encode_roundtrip)

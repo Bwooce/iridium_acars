@@ -105,6 +105,34 @@ int ida_reassembler_feed(ida_reassembler_t *ctx, const ida_decoded_t *ida,
                          bool uplink, uint32_t freq_hz, uint64_t now_us,
                          uint8_t *out_payload, int out_cap, int *out_len);
 
+// A timed-out (incomplete) chain, handed to the driver for best-effort
+// PARTIAL salvage instead of being silently discarded. frags = fragments that
+// were received before the chain stalled (1 = opener only).
+typedef struct {
+    uint8_t  payload[IDA_REASM_MAX_BYTES];
+    int      payload_len;
+    bool     uplink;
+    uint32_t freq_hz;
+    uint64_t last_time_us;
+    uint8_t  frags;
+} ida_salvage_t;
+
+// Reap ONE chain that has been idle longer than IDA_REASM_SESSION_TIMEOUT_US:
+// copy its buffered partial payload into *out, mark the session inactive, bump
+// cnt_expired, return 1. Return 0 when no chain is due. Drain in a loop:
+//   ida_salvage_t s;
+//   while (ida_reassembler_reap(ctx, now_us, &s)) { /* gate + salvage s */ }
+//
+// This REPLACES the old auto-expire that ran inside feed() and discarded the
+// buffer. The driver now owns expiry, so it can salvage the partial. Contract:
+// call reap() to exhaustion each ~1 Hz tick AND immediately before feed(), so
+// stale sessions free their table slots before a new opener needs one. Safe:
+// find_matching_session already rejects fragments older than IDA_REASM_FRAG_GAP
+// _US, so an un-reaped stale session can never wrongly capture a new fragment;
+// the only coupling is slot pressure, which reap-before-feed covers.
+int ida_reassembler_reap(ida_reassembler_t *ctx, uint64_t now_us,
+                         ida_salvage_t *out);
+
 #ifdef __cplusplus
 }
 #endif
