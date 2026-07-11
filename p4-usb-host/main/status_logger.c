@@ -393,10 +393,19 @@ static void emit(const status_snapshot_t *s)
     int gwf = 0, stall = 0;
     wifi_link_wdt_status(NULL, NULL, &gwf, NULL, &stall);
 
+    // Heap-free trend (KB) — carried in the always-on STATUS line so a slow
+    // leak is visible over the connectionless iot_log without HTTP polling
+    // (the socket pool is itself a suspect). internal = general SRAM,
+    // spiram = 32 MB PSRAM, dma = DMA-INT (the razor-thin USB URB budget).
+    uint32_t sramf_kb  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+    uint32_t psramf_kb = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
+    uint32_t dmaf_kb   = heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024;
+
     iot_log(IOT_LOG_INFO,
             "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%% "
             "bursts=%u pk_bursts=%u pk_wk=%u%% pk_acc=%u pk_qd=%u "
-            "lwda=%lu lwda_bad=%lu sbd=%lu gwf=%d stall=%d",
+            "lwda=%lu lwda_bad=%lu sbd=%lu gwf=%d stall=%d "
+            "dmaf=%lu sramf=%lu psramf=%lu",
             rate_inst,
             (unsigned long)s->ws.bursts_bch_decoded,
             (unsigned long)s->ws.bursts_bch_unknown,
@@ -406,7 +415,8 @@ static void emit(const status_snapshot_t *s)
             (unsigned)s_cap_peak_worker,
             (unsigned)s_cap_peak_processed, (unsigned)s_cap_peak_qdrops,
             (unsigned long)rs.lw_da, (unsigned long)lwda_bad,
-            (unsigned long)rs.sbd_complete, gwf, stall);
+            (unsigned long)rs.sbd_complete, gwf, stall,
+            (unsigned long)dmaf_kb, (unsigned long)sramf_kb, (unsigned long)psramf_kb);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
     // any drop / recovery counter ticks. Field names match
