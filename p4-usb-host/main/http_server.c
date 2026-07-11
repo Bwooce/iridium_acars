@@ -1099,6 +1099,32 @@ static size_t json_escape(char *out, size_t outsz, const char *in)
 // send_page_head), newest-first, with a 10 s meta-refresh. curl / monitors
 // get the JSON variant below (content-negotiated in messages_get). Streams one
 // chunk per row so no single buffer has to hold the whole ring.
+// Standard ACARS message-label descriptions (ARINC 620 / common usage). Only
+// labels with a well-established fixed meaning are listed; many numeric labels
+// are airline-defined and vary by operator, so those (and anything not here)
+// render as the raw 2-char code. Meanings are from the public ACARS label
+// registry, not guessed. Shown as a hover tooltip on the /messages Label cell.
+static const char *acars_label_desc(const char *lab)
+{
+    static const struct {
+        char        l[3];
+        const char *d;
+    } tbl[] = {
+        {"A6", "ADS-C position report"},
+        {"H1", "Free-text message"},
+        {"Q0", "ACARS link test"},
+        {"RA", "Command uplink"},
+        {"RB", "Command response (aircraft)"},
+        {"QA", "Departure report"},
+        {"5U", "Weather request"},
+        {"5Z", "Airline-defined downlink"},
+        {"C1", "Cockpit-printer message"},
+    };
+    for (size_t i = 0; i < sizeof(tbl) / sizeof(tbl[0]); i++)
+        if (lab[0] == tbl[i].l[0] && lab[1] == tbl[i].l[1]) return tbl[i].d;
+    return NULL;
+}
+
 static esp_err_t messages_html_get(httpd_req_t *req)
 {
     send_page_head(req, "Messages", 10); // 10 s meta-refresh — live feed
@@ -1175,15 +1201,24 @@ static esp_err_t messages_html_get(httpd_req_t *req)
         html_attr_escape(esc_flight, sizeof(esc_flight), m->flight_id);
         html_attr_escape(esc_txt, sizeof(esc_txt), m->txt);
 
+        // Label cell: annotate with the standard meaning as a hover tooltip
+        // when the label is a known ARINC-standard one; else show the raw code.
+        const char *ldesc = acars_label_desc(label_buf);
+        char        label_cell[96];
+        if (ldesc)
+            snprintf(label_cell, sizeof(label_cell), "<td class=v title=\"%s\">%s</td>", ldesc, esc_label);
+        else
+            snprintf(label_cell, sizeof(label_cell), "<td class=v>%s</td>", esc_label);
+
         int rn = snprintf(row, sizeof(row),
                           "<tr><td class=v>%s</td><td>%s</td><td class=v>%c</td>"
-                          "<td class=v>%s</td><td class=v>%s</td><td class=v>%s</td>"
+                          "%s<td class=v>%s</td><td class=v>%s</td>"
                           "<td><span style=\"color:%s\">%s</span></td>"
                           "<td class=v>%.1f</td><td>%s</td></tr>",
                           age,
                           m->uplink ? "UL" : "DL",
                           (m->mode >= 0x20 && m->mode < 0x7f) ? m->mode : '?',
-                          esc_label,
+                          label_cell,
                           esc_flight,
                           esc_msgnum,
                           m->crc_ok ? "#2e7d32" : "#c62828",
