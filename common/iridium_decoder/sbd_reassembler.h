@@ -123,6 +123,41 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
 // now_us. Should be called periodically (~1 Hz).
 void sbd_reassembler_tick(sbd_reassembler_t *ctx, uint64_t now_us);
 
+// Result of sbd_salvage_parse() below.
+typedef struct {
+    sbd_type_t     type;      // classified type; SBD_TYPE_UNKNOWN never returned with rc=1
+    bool           truncated; // true if the envelope was cut short (missing declared bytes)
+    int            msg_no;    // 0 = short/mailbox; >=1 = data fragment index
+    int            msg_cnt;   // -1 unknown; else declared total fragment count
+    const uint8_t *body;      // pointer INTO the input at the body start (NULL if none)
+    int            body_len;  // bytes of body actually available (<= declared)
+} sbd_salvage_info_t;
+
+// Stateless, truncation-tolerant SBD envelope extractor for chain
+// salvage. Mirrors sbd_reassembler_feed()'s classify()/prehdr/0x10
+// sub-header walk on a (possibly truncated) merged IDA payload, but:
+//
+//   - performs NO session bookkeeping (no ctx, no timers, no dispatch)
+//     -- it is a pure function of the input bytes;
+//   - never rejects purely because a declared length (prehdr or the
+//     0x10 sub-header's body length) runs past the end of what we were
+//     given -- instead it sets out->truncated = true and returns
+//     whatever body bytes ARE present, bounded to SBD_MAX_PAYLOAD.
+//
+// Structural rejects that are NOT about truncation (classify() ==
+// SBD_TYPE_UNKNOWN, or a HELLO envelope whose body[0] isn't the 0x20
+// marker) still make this return 0, same as feed() would filter them.
+//
+// Never reads past payload[0..payload_len). Safe to call on arbitrarily
+// short/garbage input, including payload_len < 2.
+//
+// Returns 1 with *out filled if the type classifies to a known SBD
+// type (SBD_TYPE_UNKNOWN is never returned with rc==1); 0 if the type
+// is unknown or the payload is too short to classify (*out is
+// zeroed in this case too).
+int sbd_salvage_parse(const uint8_t *payload, int payload_len, bool uplink,
+                      sbd_salvage_info_t *out);
+
 #ifdef __cplusplus
 }
 #endif

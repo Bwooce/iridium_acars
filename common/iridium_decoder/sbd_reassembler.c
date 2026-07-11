@@ -300,3 +300,119 @@ int sbd_reassembler_feed(sbd_reassembler_t *ctx,
     ctx->cnt_filtered++;
     return -1;
 }
+
+// See sbd_reassembler.h for the contract. This mirrors ONLY the
+// classify()/prehdr/0x10-sub-header parsing done above in feed()
+// (roughly its lines up to the dispatch switch) -- it does not touch
+// sessions or dispatch at all, since salvage has no state to dispatch
+// into. The two truncation-reject points in that parse (prehdr shorter
+// than declared, and 0x10 sub-header body shorter than declared) become
+// out->truncated = true + best-effort body here instead of a hard
+// reject; every other branch (HELLO 0x20 marker check, 0x76 0x08
+// prehdr-variant selection, uplink 0x50/0x51 skip, the n<=3-but-p[0]==
+// 0x10 fallthrough) is left exactly as feed() has it.
+int sbd_salvage_parse(const uint8_t *payload, int payload_len, bool uplink,
+                      sbd_salvage_info_t *out)
+{
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    out->msg_cnt = -1;
+    if (!payload || payload_len < 0) return 0;
+
+    sbd_type_t typ = classify(payload, payload_len, uplink);
+    if (typ == SBD_TYPE_UNKNOWN) return 0;
+
+    // Consume the 2-byte type prefix (classify() guarantees payload_len>=2
+    // whenever it returns non-UNKNOWN).
+    const uint8_t *p = payload + 2;
+    int            n = payload_len - 2;
+
+    int  msg_cnt   = -1;
+    int  msg_no    = 0;
+    bool truncated = false;
+
+    if (typ == SBD_TYPE_HELLO_0600) {
+        // 0x06 0x00 path: data[0] must be 0x20. If we don't even have
+        // that byte, we simply don't know yet -- truncated, not a
+        // structural mismatch. If we DO have it and it's wrong, that's
+        // a real structural reject (matches feed()).
+        if (n < 1) {
+            truncated = true;
+            n         = 0; // no confirmed body
+        } else if (p[0] != 0x20) {
+            return 0;
+        } else if (n < 16) {
+            // Have the marker but can't reach prehdr[15] (msg_cnt).
+            truncated = true;
+            n         = 0; // don't know where prehdr ends -> no body
+        } else {
+            // Our IDA payload is at most ~22 bytes so we can't always
+            // get a full 29-byte prehdr -- Python's slice truncates and
+            // so does feed(); that's normal, not "truncated" here.
+            int prehdr_len = (n < 29) ? n : 29;
+            msg_cnt        = p[15];
+            msg_no         = (msg_cnt == 0) ? 0 : 1;
+            p += prehdr_len;
+            n -= prehdr_len;
+        }
+    } else {
+        // 0x76 0x08-0x0e path:
+        if (typ == SBD_TYPE_DATA_DL_7608) {
+            int prehdr_len;
+            if (n >= 1 && p[0] == 0x26) {
+                prehdr_len = 7;
+            } else if (n >= 1 && p[0] == 0x20) {
+                prehdr_len = 5;
+            } else {
+                prehdr_len = 7; // upstream falls through with this
+            }
+            if (n >= prehdr_len) {
+                msg_cnt = p[3];
+                p += prehdr_len;
+                n -= prehdr_len;
+            } else {
+                // Truncation point #1: can't even read the full prehdr.
+                truncated = true;
+                n         = 0; // don't know where prehdr ends -> no body
+            }
+        }
+        if (!truncated) {
+            // 0x50 / 0x51 ack/nack uplink mid-handler -- skip 3 bytes.
+            if (uplink && n >= 3 && (p[0] == 0x50 || p[0] == 0x51)) {
+                p += 3;
+                n -= 3;
+            }
+            // Body: optional 0x10 sub-header.
+            if (n == 0) {
+                msg_no = 0;
+            } else if (n > 3 && p[0] == 0x10) {
+                int hdr_payload_len = p[1];
+                msg_no              = p[2];
+                p += 3;
+                n -= 3;
+                if (n < hdr_payload_len) {
+                    // Truncation point #2: declared body runs past what
+                    // we have. Salvage what's here instead of rejecting.
+                    truncated = true;
+                } else if (n > hdr_payload_len) {
+                    n = hdr_payload_len;
+                }
+            } else {
+                // No sub-header (or too short to detect one) -- treat as
+                // single-frame, whatever's left is the body.
+                msg_no = 0;
+            }
+        }
+    }
+
+    if (n < 0) n = 0;
+    if (n > SBD_MAX_PAYLOAD) n = SBD_MAX_PAYLOAD;
+
+    out->type      = typ;
+    out->truncated = truncated;
+    out->msg_no    = msg_no;
+    out->msg_cnt   = msg_cnt;
+    out->body      = (n > 0) ? p : NULL;
+    out->body_len  = n;
+    return 1;
+}
