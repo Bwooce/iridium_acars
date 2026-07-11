@@ -37,12 +37,12 @@ static volatile bool     s_have_last = false;
 // answers "is the load transient-bursty or sustained." Updated once/sec in
 // emit(); read cross-core by the http task (unlocked — torn read is benign for
 // a diagnostic gauge, same rationale as s_last).
-static uint32_t s_cap_windows     = 0; // sampled 1 s windows
-static uint64_t s_cap_sum_bursts  = 0; // Σ tagger bursts/window (for mean)
-static uint32_t s_cap_peak_bursts = 0; // max tagger bursts in any window
+static uint32_t s_cap_windows     = 0;    // sampled 1 s windows
+static uint64_t s_cap_sum_bursts  = 0;    // Σ tagger bursts/window (for mean)
+static uint32_t s_cap_peak_bursts = 0;    // max tagger bursts in any window
 static float    s_cap_peak_worker = 0.0f; // max Core-1 worker cap %
 static float    s_cap_peak_dsp    = 0.0f; // max Core-0 DSP/tagger cap %
-static uint32_t s_cap_worker_ge90 = 0; // windows with worker cap >= 90 %
+static uint32_t s_cap_worker_ge90 = 0;    // windows with worker cap >= 90 %
 // Accepted-burst / backlog-sizing telemetry (Option B scoping). "Accepted" =
 // passed the pre-filter and ran the full demod (bursts_processed); it's
 // throughput-capped, so also track the queue-drops (bursts lost at the
@@ -63,15 +63,15 @@ bool status_logger_get_last(status_snapshot_t *out)
 void status_logger_get_capacity(status_capacity_t *out)
 {
     if (!out) return;
-    out->windows         = s_cap_windows;
-    out->peak_bursts     = s_cap_peak_bursts;
-    out->mean_bursts     = s_cap_windows ? (float)((double)s_cap_sum_bursts / (double)s_cap_windows) : 0.0f;
-    out->peak_worker_cap = s_cap_peak_worker;
-    out->peak_dsp_cap    = s_cap_peak_dsp;
-    out->worker_ge90_pct = s_cap_windows ? (100.0f * (float)s_cap_worker_ge90 / (float)s_cap_windows) : 0.0f;
-    out->peak_processed   = s_cap_peak_processed;
-    out->peak_queue_drops = s_cap_peak_qdrops;
-    uint64_t pf_total     = s_cap_sum_processed + s_cap_sum_triagerej;
+    out->windows              = s_cap_windows;
+    out->peak_bursts          = s_cap_peak_bursts;
+    out->mean_bursts          = s_cap_windows ? (float)((double)s_cap_sum_bursts / (double)s_cap_windows) : 0.0f;
+    out->peak_worker_cap      = s_cap_peak_worker;
+    out->peak_dsp_cap         = s_cap_peak_dsp;
+    out->worker_ge90_pct      = s_cap_windows ? (100.0f * (float)s_cap_worker_ge90 / (float)s_cap_windows) : 0.0f;
+    out->peak_processed       = s_cap_peak_processed;
+    out->peak_queue_drops     = s_cap_peak_qdrops;
+    uint64_t pf_total         = s_cap_sum_processed + s_cap_sum_triagerej;
     out->prefilter_accept_pct = pf_total ? (100.0f * (float)s_cap_sum_processed / (float)pf_total) : 0.0f;
 }
 
@@ -321,26 +321,23 @@ static void emit(const status_snapshot_t *s)
              s->ws.bursts_bch_decoded, s->ws.bursts_bch_unknown,
              s->us.rb_full_drops, dsp_pct, worker_pct,
              lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz);
+    // One machine-parseable STATUS line carries every field that used to also
+    // be emitted as ~10 separate IOT_LOG METRIC packets per second — those were
+    // redundant with this line and each cost an SDIO UDP send + CRC. pk_acc /
+    // pk_qd fold in the only two fields that weren't already here, so no
+    // telemetry is lost. (iot_log_metric() remains available in the component
+    // API; we just don't spam it every window.)
     iot_log(IOT_LOG_INFO,
             "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%% "
-            "bursts=%u pk_bursts=%u pk_wk=%u%%",
+            "bursts=%u pk_bursts=%u pk_wk=%u%% pk_acc=%u pk_qd=%u",
             rate_inst,
             (unsigned long)s->ws.bursts_bch_decoded,
             (unsigned long)s->ws.bursts_bch_unknown,
             (unsigned long)s->us.rb_full_drops,
             (unsigned)dsp_pct, (unsigned)worker_pct,
             (unsigned)s->dsp.gone_bursts, (unsigned)s_cap_peak_bursts,
-            (unsigned)s_cap_peak_worker);
-    iot_log_metric("rate_x100", (int32_t)(rate_inst * 100));
-    iot_log_metric("bch_dec", (int32_t)s->ws.bursts_bch_decoded);
-    iot_log_metric("drops", (int32_t)s->us.rb_full_drops);
-    iot_log_metric("dsp_cap", (int32_t)dsp_pct);
-    iot_log_metric("wk_cap", (int32_t)worker_pct);
-    iot_log_metric("bursts_win", (int32_t)s->dsp.gone_bursts);
-    iot_log_metric("pk_bursts", (int32_t)s_cap_peak_bursts);
-    iot_log_metric("pk_wk_cap", (int32_t)s_cap_peak_worker);
-    iot_log_metric("pk_accepted", (int32_t)s_cap_peak_processed);
-    iot_log_metric("pk_qdrops", (int32_t)s_cap_peak_qdrops);
+            (unsigned)s_cap_peak_worker,
+            (unsigned)s_cap_peak_processed, (unsigned)s_cap_peak_qdrops);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
     // any drop / recovery counter ticks. Field names match
