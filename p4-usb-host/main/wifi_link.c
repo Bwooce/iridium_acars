@@ -21,6 +21,7 @@
 #include "app_config.h"
 #include "esp_libusb.h"   // usb.completed liveness for the health wdt
 #include "class_driver.h" // class_driver_dump_stall_diag()
+#include "driver/gpio.h"  // C6 hardware-reset (GPIO54) on wedged-link recovery
 
 static const char *TAG = "WIFI";
 
@@ -230,7 +231,7 @@ static void health_wdt_task(void *arg)
             if (s_stream_stalls >= STREAM_STALL_LIMIT) {
                 ESP_LOGE(TAG, "health-wdt: USB stream frozen %d cycles — dumping diag then esp_restart() [#105]",
                          s_stream_stalls);
-                class_driver_dump_stall_diag(); // forensics → serial before reboot
+                class_driver_dump_stall_diag();    // forensics → serial before reboot
                 class_driver_prepare_for_reboot(); // park tuner (best-effort; times out if pump wedged)
                 fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(200));
@@ -341,7 +342,28 @@ esp_err_t wifi_link_start(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+    // esp_wifi_init is a Req_WifiInit RPC to the C6 over esp_hosted. If the C6 SDIO
+    // link is wedged (proven to happen when an OTA download thrashes it, and possible
+    // on any SDIO flap), this RPC times out. Aborting here (ESP_ERROR_CHECK) turns a
+    // transient C6 hiccup into a TIGHT crash-loop that BRICKS an unattended device
+    // until it's physically power-cycled — see the panic post-mortem (reset reason
+    // PANIC at this line, "Response not received for Req_WifiInit"). Instead:
+    // hardware-reset the C6 via its reset line (GPIO54, active-high per
+    // CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH) and reboot cleanly after a delay. The
+    // delay breaks the tight loop; the fresh boot re-inits the SDIO transport with a
+    // cleanly-reset C6. Best-effort — a wedge in the P4 SDIO peripheral itself may
+    // still need a full power cycle, but this never crash-loops.
+    esp_err_t wifi_r = esp_wifi_init(&init_cfg);
+    if (wifi_r != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed (%s) — C6 link wedged; HW-resetting C6 (GPIO%d) + clean reboot in 6 s",
+                 esp_err_to_name(wifi_r), CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE);
+        gpio_set_direction((gpio_num_t)CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE, 1); // assert reset (active-high)
+        vTaskDelay(pdMS_TO_TICKS(300));
+        gpio_set_level((gpio_num_t)CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE, 0); // release
+        vTaskDelay(pdMS_TO_TICKS(6000));                                        // let the C6 boot + settle — NOT a tight loop
+        esp_restart();
+    }
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event, NULL, NULL));
