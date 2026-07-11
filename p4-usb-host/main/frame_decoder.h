@@ -67,6 +67,27 @@ void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out);
 uint64_t frame_decoder_acars_decoded_total(void);
 uint64_t frame_decoder_sbd_complete_total(void);
 
+// Reassembly-chain diagnostics (why don't lw_da frames become messages?).
+// Surfaces the internal counters of the three-stage chain so a caller can
+// tell reception-completeness (sessions open but never complete → missing
+// fragments) from a parse/gate problem (frames rejected before a session
+// even opens). Cumulative since boot; relaxed/torn reads are benign for a
+// diagnostic. See /diag/reassembler.
+typedef struct {
+    // frame_decoder gate
+    uint64_t lw_da;        // classified LW.DA (SBD/ACARS-bearing) frames
+    uint64_t lw_da_valid;  // ...that passed ida_decode (ok+header+crc) → fed to the chain
+    uint64_t sbd_complete; // SBD envelopes reassembled
+    uint64_t acars_decoded;
+    uint64_t acars_fragments; // ACARS blocks buffered, awaiting more (libacars)
+    // Stage 1 — ida_reassembler (cross-burst da_cont/da_ctr chaining)
+    uint32_t ida_standalone, ida_opened, ida_merged, ida_completed;
+    uint32_t ida_orphan, ida_overflow, ida_expired;
+    // Stage 2 — sbd_reassembler (SBD envelope, msgno/msgcnt)
+    uint32_t sbd_short, sbd_single, sbd_assembled, sbd_multi, sbd_broken, sbd_filtered;
+} frame_decoder_reasm_stats_t;
+void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out);
+
 // Rolling decode-rate counters (#117). Sum of classified-as-known-type
 // frames over the last 1 h and 24 h, snapped on a 1-minute esp_timer
 // tick. A WARN log fires automatically when 24h>10 && 1h==0 ("we

@@ -77,9 +77,10 @@ static sbd_reassembler_t s_sbd;
 // s_sbd a complete SBD envelope even when it spanned multiple physical
 // LW.DA bursts. 4 sessions × ~330 B ≈ 1.3 KB in BSS.
 static ida_reassembler_t s_ida_reasm;
-static _Atomic uint64_t  s_sbd_complete    = 0; // SBD messages reassembled
-static _Atomic uint64_t  s_acars_decoded   = 0; // ACARS messages successfully parsed
-static _Atomic uint64_t  s_acars_fragments = 0; // ACARS fragments awaiting reassembly
+static _Atomic uint64_t  s_sbd_complete      = 0; // SBD messages reassembled
+static _Atomic uint64_t  s_acars_decoded     = 0; // ACARS messages successfully parsed
+static _Atomic uint64_t  s_acars_fragments   = 0; // ACARS fragments awaiting reassembly
+static _Atomic uint64_t  s_class_lw_da_valid = 0; // LW.DA frames that passed the ida_decode gate (fed to the chain)
 
 // D14: libacars reassembly context. Maintains per-flight-id session
 // state so multi-block ACARS messages (block_id > 0, more_blocks_follow)
@@ -388,6 +389,7 @@ static void process_one(const frame_queue_item_t *it)
                      ida.header_ok, ida.da_ctr, (unsigned)ida.payload_len,
                      ida.crc_ok ? "OK" : "BAD");
             if (rc_ida == 0 && ida.ok && ida.header_ok && ida.crc_ok) {
+                atomic_fetch_add_explicit(&s_class_lw_da_valid, 1, memory_order_relaxed);
                 // Stage 1: chain cross-burst IDA fragments (da_cont/
                 // da_ctr) into one complete SBD envelope -- a single
                 // physical LW.DA burst caps at 24 payload bytes, but
@@ -641,4 +643,29 @@ uint64_t frame_decoder_acars_decoded_total(void)
 uint64_t frame_decoder_sbd_complete_total(void)
 {
     return atomic_load_explicit(&s_sbd_complete, memory_order_relaxed);
+}
+
+void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out)
+{
+    if (!out) return;
+    out->lw_da           = atomic_load_explicit(&s_class_lw_da, memory_order_relaxed);
+    out->lw_da_valid     = atomic_load_explicit(&s_class_lw_da_valid, memory_order_relaxed);
+    out->sbd_complete    = atomic_load_explicit(&s_sbd_complete, memory_order_relaxed);
+    out->acars_decoded   = atomic_load_explicit(&s_acars_decoded, memory_order_relaxed);
+    out->acars_fragments = atomic_load_explicit(&s_acars_fragments, memory_order_relaxed);
+    // Plain reads of the reassembler counters: single writer (this decoder
+    // task), 32-bit aligned, torn read benign for a diagnostic snapshot.
+    out->ida_standalone = s_ida_reasm.cnt_standalone;
+    out->ida_opened     = s_ida_reasm.cnt_opened;
+    out->ida_merged     = s_ida_reasm.cnt_merged;
+    out->ida_completed  = s_ida_reasm.cnt_completed;
+    out->ida_orphan     = s_ida_reasm.cnt_orphan;
+    out->ida_overflow   = s_ida_reasm.cnt_overflow;
+    out->ida_expired    = s_ida_reasm.cnt_expired;
+    out->sbd_short      = s_sbd.cnt_short;
+    out->sbd_single     = s_sbd.cnt_single;
+    out->sbd_assembled  = s_sbd.cnt_assembled;
+    out->sbd_multi      = s_sbd.cnt_multi;
+    out->sbd_broken     = s_sbd.cnt_broken;
+    out->sbd_filtered   = s_sbd.cnt_filtered;
 }

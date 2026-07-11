@@ -2435,6 +2435,42 @@ static esp_err_t reboot_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// /diag/reassembler: internal counters of the three-stage lw_da -> ida -> sbd
+// -> ACARS reassembly chain, so "why don't decoded frames become messages" is
+// inspectable instead of a black box. Reading it: lw_da_gate_rejected high =
+// CRC/parse loss (marginal SNR); ida.opened>0 but ida.completed==0 = chains
+// open but never finish (missing continuation fragments -> reception); sbd
+// sessions opened (assembled/multi) but sbd_complete stuck = envelope
+// incompleteness. Cumulative since boot.
+static esp_err_t diag_reassembler_get(httpd_req_t *req)
+{
+    frame_decoder_reasm_stats_t r;
+    frame_decoder_get_reasm_stats(&r);
+    uint64_t gate_rej = (r.lw_da >= r.lw_da_valid) ? (r.lw_da - r.lw_da_valid) : 0;
+    char     body[768];
+    int      n = snprintf(
+        body, sizeof(body),
+        "{\"lw_da\":%llu,\"lw_da_valid\":%llu,\"lw_da_gate_rejected\":%llu,"
+             "\"ida\":{\"standalone\":%u,\"opened\":%u,\"merged\":%u,\"completed\":%u,"
+             "\"orphan\":%u,\"overflow\":%u,\"expired\":%u},"
+             "\"sbd\":{\"short\":%u,\"single\":%u,\"assembled\":%u,\"multi\":%u,"
+             "\"broken\":%u,\"filtered\":%u},"
+             "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
+        (unsigned long long)r.lw_da, (unsigned long long)r.lw_da_valid,
+        (unsigned long long)gate_rej,
+        (unsigned)r.ida_standalone, (unsigned)r.ida_opened, (unsigned)r.ida_merged,
+        (unsigned)r.ida_completed, (unsigned)r.ida_orphan, (unsigned)r.ida_overflow,
+        (unsigned)r.ida_expired,
+        (unsigned)r.sbd_short, (unsigned)r.sbd_single, (unsigned)r.sbd_assembled,
+        (unsigned)r.sbd_multi, (unsigned)r.sbd_broken, (unsigned)r.sbd_filtered,
+        (unsigned long long)r.sbd_complete, (unsigned long long)r.acars_fragments,
+        (unsigned long long)r.acars_decoded);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(body)) n = sizeof(body);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, body, n);
+}
+
 esp_err_t http_server_start(void)
 {
     if (s_server) return ESP_OK;
@@ -2501,6 +2537,7 @@ esp_err_t http_server_start(void)
         {.uri = "/diag/dcfine", .method = HTTP_GET, .handler = diag_dcfine_get, .user_ctx = NULL},
         {.uri = "/diag/dsp_health", .method = HTTP_GET, .handler = diag_dsp_health_get, .user_ctx = NULL},
         {.uri = "/diag/recovery_counters", .method = HTTP_GET, .handler = diag_recovery_counters_get, .user_ctx = NULL},
+        {.uri = "/diag/reassembler", .method = HTTP_GET, .handler = diag_reassembler_get, .user_ctx = NULL},
         {.uri = "/messages", .method = HTTP_GET, .handler = messages_get, .user_ctx = NULL},
         {.uri = "/ota", .method = HTTP_GET, .handler = ota_get, .user_ctx = NULL},
         {.uri = "/config", .method = HTTP_POST, .handler = config_post, .user_ctx = NULL},
