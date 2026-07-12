@@ -46,3 +46,8 @@ void scanner_reset_baseline(void);
 // re-scan) read this and persist it themselves via
 // app_config_set_lo_freq_hz().
 uint32_t scanner_last_hot_hz(void);
+
+// Live LO frequency (Hz) currently applied — updated on every scanner_hop(),
+// so during an LO rescan it tracks the sweep. 0 before the first hop. For the
+// status page's "config → now" frequency display.
+uint32_t scanner_cur_hz(void);

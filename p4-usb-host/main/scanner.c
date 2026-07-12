@@ -11,6 +11,9 @@ static dsp_processor_t *s_dsp = NULL;
 static scanner_pos_t    s_map[SCANNER_MAX_POSITIONS];
 static int              s_map_n       = 0;
 static uint32_t         s_last_hot_hz = 0;
+// Live LO frequency (updated on every successful hop). 32-bit aligned: atomic
+// read/write on RISC-V, so a plain volatile is fine for the status-page display.
+static volatile uint32_t s_cur_hz = 0;
 
 void scanner_init(dsp_processor_t *dsp)
 {
@@ -24,6 +27,7 @@ esp_err_t scanner_hop(uint32_t hz, bool persist)
         ESP_LOGW(TAG, "hop %lu Hz failed: retune err=%d", (unsigned long)hz, (int)err);
         return err;
     }
+    s_cur_hz = hz; // live LO now applied
     if (s_dsp) {
         dsp_processor_reset_tagger_baseline(s_dsp);
     }
@@ -76,6 +80,11 @@ void scanner_scan(uint32_t start_hz, uint32_t stop_hz, uint32_t step_hz, uint32_
         scanner_hop(s_map[hot].center_hz, false);
         s_last_hot_hz = s_map[hot].center_hz;
     }
+}
+
+uint32_t scanner_cur_hz(void)
+{
+    return s_cur_hz;
 }
 
 uint32_t scanner_last_hot_hz(void)

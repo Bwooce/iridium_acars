@@ -825,13 +825,33 @@ static esp_err_t status_html_get(httpd_req_t *req)
     double lo_mhz   = (double)cfg.lo_freq_hz / 1e6;
     double half_mhz = ((double)FS_DETECT_HZ / 2.0) / 1e6;
 
-    char gain_str[28];
-    if (cfg.gain_mode == GAIN_MODE_MANUAL)
-        snprintf(gain_str, sizeof(gain_str), "%.1f dB (manual)", (double)cfg.gain_db_x10 / 10.0);
-    else if (cfg.gain_mode == GAIN_MODE_SOFTWARE_AGC)
+    // Autotune scan status — drives the gain/LO "config → now" display and the
+    // scan-progress row below. 0=idle, 1=gain cal, 2=LO rescan.
+    int at_el = 0, at_rem = 0;
+    int at_type = autotune_scan_status(&at_el, &at_rem);
+    int at_gain = autotune_scan_cur_gain_dbx10();
+
+    char gain_str[56];
+    if (cfg.gain_mode == GAIN_MODE_MANUAL) {
+        if (at_type == 1 && at_gain > 0)
+            snprintf(gain_str, sizeof(gain_str), "%.1f dB (config) &rarr; now %.1f dB",
+                     (double)cfg.gain_db_x10 / 10.0, (double)at_gain / 10.0);
+        else
+            snprintf(gain_str, sizeof(gain_str), "%.1f dB (manual)", (double)cfg.gain_db_x10 / 10.0);
+    } else if (cfg.gain_mode == GAIN_MODE_SOFTWARE_AGC)
         snprintf(gain_str, sizeof(gain_str), "software AGC");
     else
         snprintf(gain_str, sizeof(gain_str), "tuner AGC");
+
+    // LO row: config, plus the live swept frequency during an LO rescan.
+    char lo_str[64];
+    if (at_type == 2) {
+        uint32_t cur_hz = scanner_cur_hz();
+        snprintf(lo_str, sizeof(lo_str), "%.4f MHz (config) &rarr; now %.4f MHz",
+                 lo_mhz, cur_hz ? (double)cur_hz / 1e6 : lo_mhz);
+    } else {
+        snprintf(lo_str, sizeof(lo_str), "%.4f MHz", lo_mhz);
+    }
 
     int64_t                      uptime_s = esp_timer_get_time() / 1000000;
     static EXT_RAM_BSS_ATTR char body[2700]; // static: 6144 B httpd stack (see send_page_head note)
@@ -872,11 +892,8 @@ static esp_err_t status_html_get(httpd_req_t *req)
         snprintf(wconn_str, sizeof(wconn_str), "%uh%02um", (unsigned)(wconn / 3600),
                  (unsigned)((wconn % 3600) / 60));
 
-    // Autotune scan progress — the on_boot gain sweep (and any LO rescan)
-    // transiently floods the DSP and dips reception; surface it so a dip has an
-    // explanation and an ETA rather than looking like a fault.
-    int  at_el = 0, at_rem = 0;
-    int  at_type = autotune_scan_status(&at_el, &at_rem);
+    // Autotune scan-progress row (scan state already computed above, with the
+    // gain/LO "config → now" rows). Surfaces WHY reception dips during a scan.
     char at_buf[64];
     if (at_type == 1)
         snprintf(at_buf, sizeof(at_buf), "gain cal — %d:%02d elapsed, ~%d:%02d left",
@@ -900,7 +917,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  "<tr><td>rb_full drops (since boot)</td><td class=v>%llu</td></tr>"
                  "<tr><td>DSP load (%% used, &gt;100%% = overloaded)</td><td class=v>%.0f %%</td></tr>"
                  "<tr><td>Worker load (%% used, &gt;100%% = overloaded)</td><td class=v>%.0f %%</td></tr>"
-                 "<tr><td>LO frequency</td><td class=v>%.4f MHz</td></tr>"
+                 "<tr><td>LO frequency</td><td class=v>%s</td></tr>"
                  "<tr><td>Listening band</td><td class=v>%.3f - %.3f MHz</td></tr>"
                  "<tr><td>Gain</td><td class=v>%s</td></tr>"
                  "<tr><td>Autotune scan</td><td class=v>%s</td></tr>"
@@ -918,7 +935,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  (unsigned)bch_dec, (unsigned)bch_unk,
                  (unsigned)s.us.rb_full_drops, (unsigned long long)usbt.rb_full_drops,
                  dsp_cap, worker_cap,
-                 lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz,
+                 lo_str, lo_mhz - half_mhz, lo_mhz + half_mhz,
                  gain_str, at_buf, (unsigned)(dma_free / 1024), (unsigned)(dma_largest / 1024),
                  (unsigned)(sram_free / 1024), (unsigned)(sram_largest / 1024),
                  (unsigned)(psram_free / 1024), (unsigned)(psram_largest / 1024),

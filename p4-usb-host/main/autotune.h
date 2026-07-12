@@ -43,3 +43,7 @@ void autotune_run_lo_rescan(void);
 // and fills elapsed_s / remaining_s (estimated) when a scan is active (both 0
 // when idle). Either pointer may be NULL. Cross-task safe (relaxed atomics).
 int autotune_scan_status(int *elapsed_s, int *remaining_s);
+
+// Live gain (dB×10) currently under test during a gain-cal scan; 0 when not
+// gain-scanning. For the status page's "config → now" gain display.
+int autotune_scan_cur_gain_dbx10(void);

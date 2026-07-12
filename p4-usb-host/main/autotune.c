@@ -105,9 +105,10 @@ static void autotune_persist(bool is_lo, int32_t val)
 // Lets the operator see WHY reception dips (the on_boot gain sweep) and how much
 // is left, instead of guessing. esp_timer µs clock; relaxed atomics (one writer
 // = the autotune task, cross-task reads from the http task are torn-read-benign).
-static _Atomic int     s_scan_type     = 0;
-static _Atomic int64_t s_scan_start_us = 0;
-static _Atomic int64_t s_scan_est_end  = 0;
+static _Atomic int     s_scan_type       = 0;
+static _Atomic int64_t s_scan_start_us   = 0;
+static _Atomic int64_t s_scan_est_end    = 0;
+static _Atomic int     s_scan_gain_dbx10 = 0; // live gain being tested (type 1)
 
 static void scan_begin(int type, int64_t est_dur_us)
 {
@@ -119,7 +120,15 @@ static void scan_begin(int type, int64_t est_dur_us)
 
 static void scan_end(void)
 {
+    atomic_store_explicit(&s_scan_gain_dbx10, 0, memory_order_relaxed);
     atomic_store_explicit(&s_scan_type, 0, memory_order_relaxed);
+}
+
+// Live gain (dB×10) currently being tested during a gain-cal scan; 0 when not
+// gain-scanning. For the status page's "config → now" display.
+int autotune_scan_cur_gain_dbx10(void)
+{
+    return atomic_load_explicit(&s_scan_gain_dbx10, memory_order_relaxed);
 }
 
 int autotune_scan_status(int *elapsed_s, int *remaining_s)
@@ -199,6 +208,7 @@ static void autotune_run_manual_locked(void)
             decoded[i] = -1; // invalid: pick_best won't choose a negative
             continue;
         }
+        atomic_store_explicit(&s_scan_gain_dbx10, gains[i], memory_order_relaxed);
         scanner_reset_baseline();                     // floor moves with gain
         vTaskDelay(pdMS_TO_TICKS(AUTOTUNE_PRIME_MS)); // discard prime transient
 
