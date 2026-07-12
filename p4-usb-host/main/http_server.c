@@ -2503,16 +2503,23 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
     frame_decoder_reasm_stats_t r;
     frame_decoder_get_reasm_stats(&r);
     uint64_t gate_rej = (r.lw_da >= r.lw_da_valid) ? (r.lw_da - r.lw_da_valid) : 0;
-    char     body[768];
-    int      n = snprintf(
+    // Burst-drop SNR histograms: stale = lost to ring-lap before demod
+    // (backlog-recoverable), pri = SNR-priority drops (junk). Buckets:
+    // <8,8-12,12-16,16-20,20-24,>=24 dB. See worker_core1.c.
+    uint32_t dstale[WORKER_DROP_SNR_NBUCKET], dpri[WORKER_DROP_SNR_NBUCKET];
+    worker_core1_get_drop_snr(dstale, dpri);
+    char body[1024];
+    int  n = snprintf(
         body, sizeof(body),
         "{\"lw_da\":%llu,\"lw_da_valid\":%llu,\"lw_da_gate_rejected\":%llu,"
-             "\"ida\":{\"standalone\":%u,\"opened\":%u,\"merged\":%u,\"completed\":%u,"
-             "\"orphan\":%u,\"overflow\":%u,\"expired\":%u},"
-             "\"sbd\":{\"short\":%u,\"single\":%u,\"assembled\":%u,\"multi\":%u,"
-             "\"broken\":%u,\"filtered\":%u},"
-             "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u},"
-             "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
+         "\"ida\":{\"standalone\":%u,\"opened\":%u,\"merged\":%u,\"completed\":%u,"
+         "\"orphan\":%u,\"overflow\":%u,\"expired\":%u},"
+         "\"sbd\":{\"short\":%u,\"single\":%u,\"assembled\":%u,\"multi\":%u,"
+         "\"broken\":%u,\"filtered\":%u},"
+         "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u},"
+         "\"burst_drops\":{\"snr_buckets\":\"<8,8-12,12-16,16-20,20-24,>=24\","
+         "\"stale\":[%u,%u,%u,%u,%u,%u],\"pri\":[%u,%u,%u,%u,%u,%u]},"
+         "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
         (unsigned long long)r.lw_da, (unsigned long long)r.lw_da_valid,
         (unsigned long long)gate_rej,
         (unsigned)r.ida_standalone, (unsigned)r.ida_opened, (unsigned)r.ida_merged,
@@ -2521,6 +2528,10 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)r.sbd_short, (unsigned)r.sbd_single, (unsigned)r.sbd_assembled,
         (unsigned)r.sbd_multi, (unsigned)r.sbd_broken, (unsigned)r.sbd_filtered,
         (unsigned)r.salvage_ok, (unsigned)r.salvage_rejected, (unsigned)r.dirty_cont,
+        (unsigned)dstale[0], (unsigned)dstale[1], (unsigned)dstale[2],
+        (unsigned)dstale[3], (unsigned)dstale[4], (unsigned)dstale[5],
+        (unsigned)dpri[0], (unsigned)dpri[1], (unsigned)dpri[2],
+        (unsigned)dpri[3], (unsigned)dpri[4], (unsigned)dpri[5],
         (unsigned long long)r.sbd_complete, (unsigned long long)r.acars_fragments,
         (unsigned long long)r.acars_decoded);
     if (n < 0) n = 0;

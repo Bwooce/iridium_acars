@@ -56,6 +56,14 @@ void worker_core1_get_stats(worker_stats_t *out);
 // and end of each dwell window and uses the delta. Either pointer may be NULL.
 void worker_core1_get_decode_counts(uint32_t *decoded, uint32_t *unknown);
 
+// Dropped/lost-burst SNR histograms (see worker_core1.c). stale[] = bursts lost
+// to a ring-lap before demod (recoverable by a sample backlog / an owned-sample
+// queue); pri[] = dropped by SNR-priority (the weakest — junk). 6 buckets of
+// 4 dB: <8, 8-12, 12-16, 16-20, 20-24, >=24 dB. Cumulative since boot.
+#define WORKER_DROP_SNR_NBUCKET 6
+void worker_core1_get_drop_snr(uint32_t stale[WORKER_DROP_SNR_NBUCKET],
+                               uint32_t pri[WORKER_DROP_SNR_NBUCKET]);
+
 // Diagnostic histograms (#116). Cumulative since boot; clients compute
 // deltas if they want a rate. Closes the design-review gap that /status
 // alone can't distinguish "antenna empty" from "demod broken in a new way."

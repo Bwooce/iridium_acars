@@ -115,6 +115,42 @@ static inline float burst_priority(const detected_burst_t *b)
     return p;
 }
 
+// Dropped/lost-burst SNR histograms — measures the raw-burst-backlog
+// opportunity (does a peak→trough sample backlog have any yield?). Split by
+// loss cause:
+//   stale = burst was admitted (strong enough) but the 3.3 s ring lapped its
+//           samples before the worker demodded it — RECOVERABLE by a backlog
+//           that copies the samples out before they're overwritten.
+//   pri   = burst dropped/evicted by SNR-priority (it was the weakest) — junk,
+//           not worth recovering.
+// If the stale histogram shows real mass at >=16 dB, a backlog pays off; if it's
+// empty or all low-SNR, it doesn't. 6 buckets of 4 dB: <8,8-12,12-16,16-20,
+// 20-24,>=24. Atomic: pri/insert-stale update under s_pq_lock (producer side),
+// pop-stale updates in the worker task — two contexts, so relaxed atomics.
+#define DROP_SNR_NBUCKET WORKER_DROP_SNR_NBUCKET // public count, from worker_core1.h
+static _Atomic uint32_t s_drop_stale_snr[DROP_SNR_NBUCKET];
+static _Atomic uint32_t s_drop_pri_snr[DROP_SNR_NBUCKET];
+
+static inline int drop_snr_bucket(float snr_db)
+{
+    if (snr_db < 8.0f) return 0;
+    int b = (int)((snr_db - 8.0f) / 4.0f) + 1;
+    return (b > DROP_SNR_NBUCKET - 1) ? (DROP_SNR_NBUCKET - 1) : b;
+}
+
+static inline void drop_snr_record(_Atomic uint32_t *hist, float snr_db)
+{
+    atomic_fetch_add_explicit(&hist[drop_snr_bucket(snr_db)], 1, memory_order_relaxed);
+}
+
+void worker_core1_get_drop_snr(uint32_t stale[DROP_SNR_NBUCKET], uint32_t pri[DROP_SNR_NBUCKET])
+{
+    for (int i = 0; i < DROP_SNR_NBUCKET; i++) {
+        stale[i] = atomic_load_explicit(&s_drop_stale_snr[i], memory_order_relaxed);
+        pri[i]   = atomic_load_explicit(&s_drop_pri_snr[i], memory_order_relaxed);
+    }
+}
+
 static int pq_insert_locked(const detected_burst_t *b)
 {
     if (s_pq_count < BURST_PQ_CAP) {
@@ -136,6 +172,9 @@ static int pq_insert_locked(const detected_burst_t *b)
         // ordering (never wrongly evicts a fresh burst).
         if (head > s_pq[i].start_sample_idx &&
             head - s_pq[i].start_sample_idx > (uint64_t)SIGNAL_BUF_CAPACITY_COMPLEX) {
+            // The evicted slot's burst was admitted but went stale (ring lapped
+            // its samples) — a backlog could have saved it. Record its SNR.
+            drop_snr_record(s_drop_stale_snr, s_pq[i].peak_snr_db);
             s_pq[i] = *b; // reclaim a doomed slot (occupied-slot give stands)
             return 0;
         }
@@ -152,9 +191,14 @@ static int pq_insert_locked(const detected_burst_t *b)
         }
     }
     if (burst_priority(b) > min_s) {
+        // Evicting the weakest queued burst for a stronger newcomer: the loser
+        // is low-priority by construction — junk, not backlog-worthy.
+        drop_snr_record(s_drop_pri_snr, s_pq[min_i].peak_snr_db);
         s_pq[min_i] = *b; // evict lowest-priority (its occupied-slot give stands)
         return 0;
     }
+    // Newcomer is weaker than everything queued — dropped. Also low-SNR.
+    drop_snr_record(s_drop_pri_snr, b->peak_snr_db);
     return -1;
 }
 
@@ -961,6 +1005,10 @@ void worker_task(void *arg)
             uint64_t check_start = burst.start_sample_idx - WB_PRE_PAD_SAMPLES;
             uint32_t check_len   = burst.length_samples + WB_PRE_PAD_SAMPLES;
             if (!signal_buffer_burst_valid(check_start, check_len)) {
+                // Admitted burst lost to a ring-lap before we could demod it —
+                // the backlog-recoverable class. Record its SNR (every one; the
+                // ESP_LOGW below is throttled, the histogram is not).
+                drop_snr_record(s_drop_stale_snr, burst.peak_snr_db);
                 // T59 lag instrument: how far behind the producer is this
                 // burst's start when we finally look at it? >ring-span means
                 // the detect chain is lagging live ingest; the magnitude tells
