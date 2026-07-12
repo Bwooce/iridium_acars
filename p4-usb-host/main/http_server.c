@@ -70,7 +70,7 @@ static uint8_t *s_download_buf = NULL;
 // httpd slot table AND in a static_assert on the routes[] array length,
 // so adding a route past the limit breaks the build instead of panic-
 // looping at boot. Each slot is ~32 bytes; 32 slots = ~1 KB negligible.
-#define HTTPD_URI_LIMIT 32
+#define HTTPD_URI_LIMIT 40
 
 // NVS-write + reboot helper. MUST run with an internal-SRAM stack:
 // nvs_commit() takes spi_flash_disable_interrupts_caches_and_other_cpu(),
