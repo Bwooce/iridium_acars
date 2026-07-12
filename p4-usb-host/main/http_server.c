@@ -1298,21 +1298,23 @@ static esp_err_t messages_html_get(httpd_req_t *req)
         else
             snprintf(label_cell, sizeof(label_cell), "<td class=v>%s</td>", esc_label);
 
-        int rn = snprintf(row, sizeof(row),
-                          "<tr><td class=v>%s</td><td>%s</td><td class=v>%c</td>"
-                          "%s<td class=v>%s</td><td class=v>%s</td>"
-                          "<td><span style=\"color:%s\">%s</span></td>"
-                          "<td class=v>%.1f</td><td>%s</td></tr>",
-                          age,
+        const char *crc_color = m->partial ? "#b8860b" : (m->crc_ok ? "#2e7d32" : "#c62828");
+        const char *crc_text  = m->partial ? "partial" : (m->crc_ok ? "OK" : "bad");
+        int         rn        = snprintf(row, sizeof(row),
+                                         "<tr><td class=v>%s</td><td>%s</td><td class=v>%c</td>"
+                                                        "%s<td class=v>%s</td><td class=v>%s</td>"
+                                                        "<td><span style=\"color:%s\">%s</span></td>"
+                                                        "<td class=v>%.1f</td><td>%s</td></tr>",
+                                         age,
                           m->uplink ? "UL" : "DL",
                           (m->mode >= 0x20 && m->mode < 0x7f) ? m->mode : '?',
-                          label_cell,
-                          esc_flight,
-                          esc_msgnum,
-                          m->crc_ok ? "#2e7d32" : "#c62828",
-                          m->crc_ok ? "OK" : "bad",
-                          (double)m->snr_db,
-                          esc_txt);
+                                         label_cell,
+                                         esc_flight,
+                                         esc_msgnum,
+                                         crc_color,
+                                         crc_text,
+                                         (double)m->snr_db,
+                                         esc_txt);
         if (rn < 0) rn = 0;
         if (rn > (int)sizeof(row)) rn = sizeof(row);
         httpd_resp_send_chunk(req, row, rn);
@@ -1391,6 +1393,7 @@ static esp_err_t messages_get(httpd_req_t *req)
                        "\"msg_num\":\"%s\","
                        "\"flight\":\"%s\","
                        "\"crc\":%s,"
+                       "\"partial\":%s,"
                        "\"peak_bin\":%ld,"
                        "\"snr_db\":%.1f,"
                        "\"txt\":\"%s\""
@@ -1405,6 +1408,7 @@ static esp_err_t messages_get(httpd_req_t *req)
                        esc_msgnum,
                        esc_flight,
                        m->crc_ok ? "true" : "false",
+                       m->partial ? "true" : "false",
                        (long)m->peak_bin,
                        (double)m->snr_db,
                        esc_txt);
@@ -1888,6 +1892,39 @@ static esp_err_t autotune_post(httpd_req_t *req)
     if (xTaskCreate(autotune_cfg_task, "at_cfg", 4096, a, 5, NULL) != pdPASS) {
         free(a);
         ESP_LOGE(TAG, "/autotune: failed to spawn apply task");
+    }
+    return ESP_OK;
+}
+
+// POST /besteffort?on=0|1 — live toggle for Task B4's chain-salvage PARTIAL
+// display (app_config.best_effort_decode, default OFF). No reboot: frame_decoder's
+// ida_salvage_drain() reads the flag live via app_config_snapshot() on every
+// salvage.ok reap, so the new value takes effect on the next reap. The NVS write
+// (app_config_set_best_effort_decode -> nvs_commit) must NOT run on the
+// PSRAM-stacked httpd task (cache_utils.c:114 assert), so it's handed off to a
+// short-lived internal-stack task, same pattern as autotune_cfg_task above.
+static void besteffort_cfg_task(void *arg)
+{
+    bool      on = (bool)(uintptr_t)arg;
+    esp_err_t r  = app_config_set_best_effort_decode(on);
+    ESP_LOGI(TAG, "/besteffort: best_effort_decode=%d (%s) — applied live (no reboot)",
+             (int)on, esp_err_to_name(r));
+    vTaskDelete(NULL);
+}
+static esp_err_t besteffort_post(httpd_req_t *req)
+{
+    char query[32] = {0}, s[8] = {0};
+    bool on = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "on", s, sizeof(s)) == ESP_OK) {
+        on = (s[0] == '1' || s[0] == 't' || s[0] == 'T');
+    }
+    char body[48];
+    int  n = snprintf(body, sizeof(body), "{\"best_effort_decode\":%s}", on ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, n);
+    if (xTaskCreate(besteffort_cfg_task, "beff_cfg", 4096, (void *)(uintptr_t)on, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "/besteffort: failed to spawn apply task");
     }
     return ESP_OK;
 }
@@ -2558,7 +2595,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
          "\"orphan\":%u,\"overflow\":%u,\"expired\":%u},"
          "\"sbd\":{\"short\":%u,\"single\":%u,\"assembled\":%u,\"multi\":%u,"
          "\"broken\":%u,\"filtered\":%u},"
-         "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u},"
+         "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u,\"acars_partial\":%llu},"
          "\"burst_drops\":{\"snr_buckets\":\"<8,8-12,12-16,16-20,20-24,>=24\","
          "\"stale\":[%u,%u,%u,%u,%u,%u],\"pri\":[%u,%u,%u,%u,%u,%u]},"
          "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
@@ -2570,6 +2607,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)r.sbd_short, (unsigned)r.sbd_single, (unsigned)r.sbd_assembled,
         (unsigned)r.sbd_multi, (unsigned)r.sbd_broken, (unsigned)r.sbd_filtered,
         (unsigned)r.salvage_ok, (unsigned)r.salvage_rejected, (unsigned)r.dirty_cont,
+        (unsigned long long)r.acars_partial,
         (unsigned)dstale[0], (unsigned)dstale[1], (unsigned)dstale[2],
         (unsigned)dstale[3], (unsigned)dstale[4], (unsigned)dstale[5],
         (unsigned)dpri[0], (unsigned)dpri[1], (unsigned)dpri[2],
@@ -2671,6 +2709,7 @@ esp_err_t http_server_start(void)
         {.uri = "/capture/file", .method = HTTP_GET, .handler = capture_file_get, .user_ctx = NULL},
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
+        {.uri = "/besteffort", .method = HTTP_POST, .handler = besteffort_post, .user_ctx = NULL},
         {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
         {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post, .user_ctx = NULL},
         {.uri = "/c6ota", .method = HTTP_POST, .handler = c6ota_post, .user_ctx = NULL},

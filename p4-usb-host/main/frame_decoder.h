@@ -91,6 +91,10 @@ typedef struct {
     uint32_t dirty_cont;       // clean continuation frame dropped ONLY for crc=BAD
                                // (upstream ida.py would still chain it) — sizes
                                // the dirty-continuation-admission lever (Task C)
+    uint64_t acars_partial;    // Task B4: salvage.ok chains actually EMITTED as a
+                               // PARTIAL /messages row (best_effort_decode gate ON).
+                               // Never counted in acars_decoded — display-only,
+                               // untrusted, crc_ok always false.
 } frame_decoder_reasm_stats_t;
 void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out);
 

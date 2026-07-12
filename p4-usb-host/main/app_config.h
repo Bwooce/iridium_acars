@@ -47,6 +47,13 @@ typedef struct {
     bool  bias_tee;            // RTL-SDR v4 bias tee on/off
     float tagger_threshold_db; // FFT burst tagger SNR threshold
 
+    // Chain-salvage best-effort display (Task B4). Gated OFF by default:
+    // when false, ida_salvage_drain() only counts salvage.ok (unchanged
+    // behaviour); when true it ALSO pushes a hard-tagged PARTIAL row to
+    // the /messages ring (display-only — never acars_push/sd_log). NVS
+    // key "best_eff".
+    bool best_effort_decode;
+
     // P1.5 companion heuristic (NON-GRI; gr-iridium has no equivalent):
     // same-instant multi-bin gone-burst coalescing in dsp_processor.
     // One band-wide impulse tags MANY narrow bursts with near-identical
@@ -123,6 +130,7 @@ esp_err_t app_config_set_sample_rate_hz(uint32_t hz);
 esp_err_t app_config_set_gain_mode(gain_mode_t mode);
 esp_err_t app_config_set_gain_db_x10(int16_t v);
 esp_err_t app_config_set_bias_tee(bool on);
+esp_err_t app_config_set_best_effort_decode(bool on);
 esp_err_t app_config_set_tagger_threshold_db(float db);
 esp_err_t app_config_set_coalesce_min_bursts(uint8_t n);
 esp_err_t app_config_set_dcmask_lo(int16_t v);

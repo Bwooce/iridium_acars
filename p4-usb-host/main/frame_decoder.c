@@ -26,6 +26,7 @@
 #include "msg_ring.h"
 #include "acars_push.h"
 #include "sd_log.h"
+#include "app_config.h" // best_effort_decode gate (Task B4)
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
 #include <libacars/reassembly.h>
@@ -90,13 +91,25 @@ static uint32_t s_salvage_ok       = 0; // reaped partial that classifies as SBD
 static uint32_t s_salvage_rejected = 0; // reaped partial that is non-SBD control
 static uint32_t s_dirty_cont       = 0; // clean continuation dropped only on crc=BAD
 
+// B4: best-effort PARTIAL rows actually pushed to /messages (gated by
+// app_config.best_effort_decode; see ida_salvage_drain). Separate from
+// s_acars_decoded -- these are NEVER a trusted full decode, so they must
+// never inflate the trusted counter. Same single-writer/plain-atomic
+// rationale as the other decoder-task counters above.
+static _Atomic uint64_t s_acars_partial = 0;
+
 // Reap every timed-out IDA chain and, for each, best-effort classify the
-// partial (truncated) SBD envelope. B3 = OBSERVE ONLY: log + count; emitting an
-// actual PARTIAL message is B4. The type gate (sbd_salvage_parse() != 1) drops
-// non-SBD control chains — ~100 % of standalone traffic — exactly as the SBD
-// filter does, so noise never surfaces as salvage. Provenance is already
-// guaranteed: only frames that passed ida.ok && header_ok && crc_ok ever entered
-// the IDA table, so a reaped chain's bytes are trustworthy, only truncated.
+// partial (truncated) SBD envelope. B3 = OBSERVE ONLY: log + count. B4 adds
+// the actual PARTIAL emit below, gated behind app_config.best_effort_decode
+// (default OFF) -- see the safety contract in the B4 design note: display-
+// only (msg_ring ONLY, never acars_push_emit/sd_log_emit), hard-tagged
+// partial=true + crc_ok=false, and counted in a SEPARATE s_acars_partial
+// counter that never touches the trusted s_acars_decoded. The type gate
+// (sbd_salvage_parse() != 1) drops non-SBD control chains — ~100 % of
+// standalone traffic — exactly as the SBD filter does, so noise never
+// surfaces as salvage. Provenance is already guaranteed: only frames that
+// passed ida.ok && header_ok && crc_ok ever entered the IDA table, so a
+// reaped chain's bytes are trustworthy, only truncated.
 static void ida_salvage_drain(uint64_t now_us)
 {
     ida_salvage_t sv;
@@ -115,6 +128,44 @@ static void ida_salvage_drain(uint64_t now_us)
                 sbd_type_wire_name(info.type), sv.uplink ? "UL" : "DL",
                 (unsigned)sv.frags, sv.payload_len, info.body_len, info.msg_no,
                 info.msg_cnt, info.truncated ? " TRUNC" : "");
+
+        // B4: only snapshot app_config on the (rare) salvage_ok path, not
+        // every reap -- cheap because this branch is already the uncommon
+        // one (real reassembly chains complete via the normal path; only
+        // stalled/truncated ones reach here at all).
+        app_config_t cfg;
+        app_config_snapshot(&cfg);
+        if (cfg.best_effort_decode) {
+            static const char hex_tab[] = "0123456789abcdef";
+            char              hex[2 * 24 + 1];
+            int               hexlen = info.body_len;
+            if (hexlen > 24) hexlen = 24;
+            if (hexlen < 0) hexlen = 0;
+            for (int i = 0; i < hexlen; i++) {
+                uint8_t b      = info.body[i];
+                hex[i * 2]     = hex_tab[(b >> 4) & 0xf];
+                hex[i * 2 + 1] = hex_tab[b & 0xf];
+            }
+            hex[hexlen * 2] = '\0';
+
+            acars_msg_t out  = {0};
+            out.partial      = true;
+            out.crc_ok       = false;
+            out.uplink       = sv.uplink;
+            out.timestamp_us = (uint64_t)esp_timer_get_time();
+            out.peak_bin     = 0;
+            out.snr_db       = 0;
+            char txt[128]; // hex-capped at 24 B (48 hex chars) -- well under MSG_RING_TXT_MAX
+            snprintf(txt, sizeof(txt),
+                     "PARTIAL %s %s f%u msg%d/%d%s %dB: %s",
+                     sbd_type_wire_name(info.type), sv.uplink ? "UL" : "DL",
+                     (unsigned)sv.frags, info.msg_no, info.msg_cnt,
+                     info.truncated ? " trunc" : "", info.body_len, hex);
+            strlcpy(out.txt, txt, sizeof(out.txt));
+
+            msg_ring_push(&out); // display-only -- NEVER acars_push_emit / sd_log_emit
+            atomic_fetch_add_explicit(&s_acars_partial, 1, memory_order_relaxed);
+        }
     }
 }
 
@@ -724,4 +775,5 @@ void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out)
     out->salvage_ok       = s_salvage_ok;
     out->salvage_rejected = s_salvage_rejected;
     out->dirty_cont       = s_dirty_cont;
+    out->acars_partial    = atomic_load_explicit(&s_acars_partial, memory_order_relaxed);
 }
