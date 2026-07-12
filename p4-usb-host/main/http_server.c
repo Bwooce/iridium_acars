@@ -17,10 +17,11 @@
 #include "msg_ring.h"
 #include "frame_decoder.h"
 #include "ota_runner.h"
-#include "class_driver.h" // class_driver_prepare_for_reboot()
-#include "scanner.h"      // scanner_scan() — /scan sustained-hop test endpoint
-#include "autotune.h"     // autotune_run_manual() — /gaincal manual trigger
-#include "c6_ota.h"       // c6_ota_* — POST /c6ota (Method B: C6 firmware update)
+#include "class_driver.h"     // class_driver_prepare_for_reboot()
+#include "scanner.h"          // scanner_scan() — /scan sustained-hop test endpoint
+#include "autotune.h"         // autotune_run_manual() — /gaincal manual trigger
+#include "autotune_gainset.h" // AUTOTUNE_R828D_GAINS/N + autotune_snap_gain — the real tuner gain steps for the /sdrcfg dropdown
+#include "c6_ota.h"           // c6_ota_* — POST /c6ota (Method B: C6 firmware update)
 #include "sd_log.h"
 #include "sd_capture.h"
 #include "acars_push.h"
@@ -720,8 +721,9 @@ static esp_err_t index_get(httpd_req_t *req)
     // resubmit their current values (same Wi-Fi-safety principle as the
     // form above). /tune and /autotune are query-param endpoints (curl/
     // scripts); a no-JS form can't drive them, hence one consolidated POST.
-    char sdrform[1400];
-    int  sn = snprintf(sdrform, sizeof(sdrform),
+    // Part A: form header through the opening of the manual-gain <select>.
+    char sdrform_a[720];
+    int  sa = snprintf(sdrform_a, sizeof(sdrform_a),
                        "<form method=\"POST\" action=\"/sdrcfg\">"
                         "<h2>SDR tuning</h2>"
                         "<label>LO frequency (Hz, Iridium 1615000000-1628000000)</label>"
@@ -733,7 +735,33 @@ static esp_err_t index_get(httpd_req_t *req)
                         "<option value=\"2\"%s>Software AGC</option>"
                         "</select>"
                         "<label>Manual gain (dB; used only in Manual mode)</label>"
-                        "<input type=\"number\" name=\"gain_db\" step=\"0.1\" required value=\"%.1f\">"
+                        "<select name=\"gain_db\">",
+                       (unsigned)cfg.lo_freq_hz,
+                      cfg.gain_mode == GAIN_MODE_TUNER_AGC ? " selected" : "",
+                      cfg.gain_mode == GAIN_MODE_MANUAL ? " selected" : "",
+                      cfg.gain_mode == GAIN_MODE_SOFTWARE_AGC ? " selected" : "");
+    if (sa < 0) sa = 0;
+    if (sa > (int)sizeof(sdrform_a)) sa = sizeof(sdrform_a);
+    httpd_resp_send_chunk(req, sdrform_a, sa);
+
+    // Part B: one <option> per real R828D gain step (single source of truth:
+    // autotune_gainset.h), pre-selecting the step nearest the configured gain.
+    // A dropdown of only supported values avoids the silent nearest-step snap a
+    // free-text field would hide (e.g. a typed 40.0 becomes 40.2 in hardware).
+    int cur_gain_snapped = autotune_snap_gain(cfg.gain_db_x10);
+    for (int gi = 0; gi < AUTOTUNE_R828D_N; gi++) {
+        int  g = AUTOTUNE_R828D_GAINS[gi];
+        char opt[64];
+        int  on = snprintf(opt, sizeof(opt),
+                           "<option value=\"%.1f\"%s>%.1f dB</option>", g / 10.0,
+                          (g == cur_gain_snapped) ? " selected" : "", g / 10.0);
+        if (on > 0) httpd_resp_send_chunk(req, opt, on);
+    }
+
+    // Part C: remainder of the SDR form + the separate manual-sweep form.
+    char sdrform_c[900];
+    int  sc = snprintf(sdrform_c, sizeof(sdrform_c),
+                       "</select>"
                         "<label>Tagger threshold (dB above noise floor)</label>"
                         "<input type=\"number\" name=\"tag_thr\" step=\"0.1\" required value=\"%.1f\">"
                         "<label>Coalesce min bursts (0/1 = disabled)</label>"
@@ -753,20 +781,15 @@ static esp_err_t index_get(httpd_req_t *req)
                        // form so it doesn't reboot / rewrite the config above.
                        "<form method=\"POST\" action=\"/gaincal\" style=\"margin-top:.4em\">"
                         "<button type=\"submit\">Run gain sweep now</button></form>",
-                       (unsigned)cfg.lo_freq_hz,
-                      cfg.gain_mode == GAIN_MODE_TUNER_AGC ? " selected" : "",
-                      cfg.gain_mode == GAIN_MODE_MANUAL ? " selected" : "",
-                      cfg.gain_mode == GAIN_MODE_SOFTWARE_AGC ? " selected" : "",
-                       (double)cfg.gain_db_x10 / 10.0,
                        (double)cfg.tagger_threshold_db,
                        (unsigned)cfg.coalesce_min_bursts,
                        (unsigned)cfg.autotune_lo_interval_s,
                        (unsigned)cfg.autotune_gain_interval_s,
                       cfg.autotune_on_boot ? " selected" : "",
                       cfg.autotune_on_boot ? "" : " selected");
-    if (sn < 0) sn = 0;
-    if (sn > (int)sizeof(sdrform)) sn = sizeof(sdrform);
-    httpd_resp_send_chunk(req, sdrform, sn);
+    if (sc < 0) sc = 0;
+    if (sc > (int)sizeof(sdrform_c)) sc = sizeof(sdrform_c);
+    httpd_resp_send_chunk(req, sdrform_c, sc);
 
     // Graceful reboot control — always available (both AP and STA). Parks the
     // tuner first (see reboot_post), so it's the safe way to restart without a
