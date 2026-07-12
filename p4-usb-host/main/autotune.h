@@ -47,3 +47,8 @@ int autotune_scan_status(int *elapsed_s, int *remaining_s);
 // Live gain (dB×10) currently under test during a gain-cal scan; 0 when not
 // gain-scanning. For the status page's "config → now" gain display.
 int autotune_scan_cur_gain_dbx10(void);
+
+// Drive the scan-progress indicator from outside autotune (the /scan test
+// endpoint, which calls scanner_scan directly). type: 1=gain, 2=LO.
+void autotune_scan_mark(int type, int est_dur_s);
+void autotune_scan_unmark(void);

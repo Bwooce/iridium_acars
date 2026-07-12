@@ -131,6 +131,18 @@ int autotune_scan_cur_gain_dbx10(void)
     return atomic_load_explicit(&s_scan_gain_dbx10, memory_order_relaxed);
 }
 
+// Public wrappers so the /scan TEST endpoint (which calls scanner_scan directly,
+// bypassing autotune_run_lo_rescan) can still drive the status-page scan
+// indicator. type: 1=gain, 2=LO. est_dur_s is the expected duration for the ETA.
+void autotune_scan_mark(int type, int est_dur_s)
+{
+    scan_begin(type, (int64_t)est_dur_s * 1000000);
+}
+void autotune_scan_unmark(void)
+{
+    scan_end();
+}
+
 int autotune_scan_status(int *elapsed_s, int *remaining_s)
 {
     int t = atomic_load_explicit(&s_scan_type, memory_order_relaxed);

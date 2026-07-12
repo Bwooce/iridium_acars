@@ -1808,7 +1808,12 @@ static void scan_test_task(void *arg)
 {
     (void)arg;
     ESP_LOGW("SCANTEST", "=== /scan: starting scanner_scan sweep ===");
+    // Surface it on the status page (LO "config → now" + scan row) like a real
+    // rescan — scanner_hop() updates scanner_cur_hz() as it sweeps.
+    int hops = (int)((SCAN_STOP_HZ - SCAN_START_HZ) / SCAN_STEP_HZ) + 1;
+    autotune_scan_mark(2, hops * (int)(SCAN_DWELL_MS / 1000));
     scanner_scan(SCAN_START_HZ, SCAN_STOP_HZ, SCAN_STEP_HZ, SCAN_DWELL_MS);
+    autotune_scan_unmark();
     ESP_LOGW("SCANTEST", "=== /scan: sweep complete ===");
     vTaskDelete(NULL);
 }
@@ -1836,20 +1841,25 @@ typedef struct {
     uint32_t gain_s;
     uint32_t dwell_s;
 } autotune_cfg_args_t;
-static void autotune_cfg_reboot_task(void *arg)
+static void autotune_cfg_task(void *arg)
 {
+    // Internal-RAM stack (default xTaskCreate) so the nvs_commit inside
+    // app_config_set_* is legal — never call these from the PSRAM-stacked httpd
+    // task directly (cache_utils.c:114 assert). No reboot: autotune_sched
+    // re-reads app_config_snapshot() every poll, so new intervals take effect
+    // live within ~30 s (the anchor stays at boot, so a due interval fires on
+    // the next poll). Removing the reboot avoids a needless ~24-min on_boot
+    // gain-sweep just to change a scheduling interval.
     autotune_cfg_args_t *a  = (autotune_cfg_args_t *)arg;
     esp_err_t            r1 = app_config_set_autotune_lo_interval_s(a->lo_s);
     esp_err_t            r2 = app_config_set_autotune_gain_interval_s(a->gain_s);
     esp_err_t            r3 = ESP_OK;
     if (a->dwell_s > 0) r3 = app_config_set_autotune_gain_dwell_s(a->dwell_s); // 0 = leave unchanged
-    ESP_LOGI(TAG, "/autotune: lo_interval_s=%lu gain_interval_s=%lu gain_dwell_s=%lu (%s/%s/%s) — rebooting",
+    ESP_LOGI(TAG, "/autotune: lo_interval_s=%lu gain_interval_s=%lu gain_dwell_s=%lu (%s/%s/%s) — applied live (no reboot)",
              (unsigned long)a->lo_s, (unsigned long)a->gain_s, (unsigned long)a->dwell_s,
              esp_err_to_name(r1), esp_err_to_name(r2), esp_err_to_name(r3));
     free(a);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
-    esp_restart();
+    vTaskDelete(NULL);
 }
 static esp_err_t autotune_post(httpd_req_t *req)
 {
@@ -1871,11 +1881,11 @@ static esp_err_t autotune_post(httpd_req_t *req)
     a->dwell_s = dwell;
     char body[128];
     int  n = snprintf(body, sizeof(body),
-                      "{\"lo_interval_s\":%lu,\"gain_interval_s\":%lu,\"gain_dwell_s\":%lu,\"reboot\":true}",
+                      "{\"lo_interval_s\":%lu,\"gain_interval_s\":%lu,\"gain_dwell_s\":%lu,\"reboot\":false,\"applied\":\"live within ~30s\"}",
                       (unsigned long)lo, (unsigned long)gain, (unsigned long)dwell);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, body, n);
-    if (xTaskCreate(autotune_cfg_reboot_task, "at_cfg", 4096, a, 5, NULL) != pdPASS) {
+    if (xTaskCreate(autotune_cfg_task, "at_cfg", 4096, a, 5, NULL) != pdPASS) {
         free(a);
         ESP_LOGE(TAG, "/autotune: failed to spawn apply task");
     }
