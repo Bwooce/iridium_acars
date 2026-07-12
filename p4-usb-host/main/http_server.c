@@ -742,8 +742,17 @@ static esp_err_t index_get(httpd_req_t *req)
                         "<input type=\"number\" name=\"at_lo_s\" min=\"0\" required value=\"%u\">"
                         "<label>Autotune gain re-cal interval (s; 0 = off)</label>"
                         "<input type=\"number\" name=\"at_gain_s\" min=\"0\" required value=\"%u\">"
+                        "<label>Gain-cal sweep on every boot</label>"
+                        "<select name=\"on_boot\">"
+                        "<option value=\"1\"%s>On</option>"
+                        "<option value=\"0\"%s>Off</option>"
+                        "</select>"
                         "<button type=\"submit\">Apply &amp; reboot</button>"
-                        "</form>",
+                        "</form>"
+                       // Manual one-shot gain sweep (POST /gaincal). Separate
+                       // form so it doesn't reboot / rewrite the config above.
+                       "<form method=\"POST\" action=\"/gaincal\" style=\"margin-top:.4em\">"
+                        "<button type=\"submit\">Run gain sweep now</button></form>",
                        (unsigned)cfg.lo_freq_hz,
                       cfg.gain_mode == GAIN_MODE_TUNER_AGC ? " selected" : "",
                       cfg.gain_mode == GAIN_MODE_MANUAL ? " selected" : "",
@@ -752,7 +761,9 @@ static esp_err_t index_get(httpd_req_t *req)
                        (double)cfg.tagger_threshold_db,
                        (unsigned)cfg.coalesce_min_bursts,
                        (unsigned)cfg.autotune_lo_interval_s,
-                       (unsigned)cfg.autotune_gain_interval_s);
+                       (unsigned)cfg.autotune_gain_interval_s,
+                      cfg.autotune_on_boot ? " selected" : "",
+                      cfg.autotune_on_boot ? "" : " selected");
     if (sn < 0) sn = 0;
     if (sn > (int)sizeof(sdrform)) sn = sizeof(sdrform);
     httpd_resp_send_chunk(req, sdrform, sn);
@@ -1844,6 +1855,7 @@ typedef struct {
     uint32_t lo_s;
     uint32_t gain_s;
     uint32_t dwell_s;
+    int8_t   on_boot; // autotune_on_boot: 0/1, or -1 = leave unchanged
 } autotune_cfg_args_t;
 static void autotune_cfg_task(void *arg)
 {
@@ -1859,6 +1871,7 @@ static void autotune_cfg_task(void *arg)
     esp_err_t            r2 = app_config_set_autotune_gain_interval_s(a->gain_s);
     esp_err_t            r3 = ESP_OK;
     if (a->dwell_s > 0) r3 = app_config_set_autotune_gain_dwell_s(a->dwell_s); // 0 = leave unchanged
+    if (a->on_boot >= 0) app_config_set_autotune_on_boot(a->on_boot != 0);     // -1 = leave unchanged
     ESP_LOGI(TAG, "/autotune: lo_interval_s=%lu gain_interval_s=%lu gain_dwell_s=%lu (%s/%s/%s) — applied live (no reboot)",
              (unsigned long)a->lo_s, (unsigned long)a->gain_s, (unsigned long)a->dwell_s,
              esp_err_to_name(r1), esp_err_to_name(r2), esp_err_to_name(r3));
@@ -1869,11 +1882,13 @@ static esp_err_t autotune_post(httpd_req_t *req)
 {
     char     query[96] = {0}, s[16] = {0};
     uint32_t lo = 3600, gain = 3600; // default hourly if omitted
-    uint32_t dwell = 0;              // 0 = leave the per-gain dwell unchanged
+    uint32_t dwell   = 0;            // 0 = leave the per-gain dwell unchanged
+    int8_t   on_boot = -1;           // -1 = leave autotune_on_boot unchanged
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "lo", s, sizeof(s)) == ESP_OK) lo = (uint32_t)strtoul(s, NULL, 10);
         if (httpd_query_key_value(query, "gain", s, sizeof(s)) == ESP_OK) gain = (uint32_t)strtoul(s, NULL, 10);
         if (httpd_query_key_value(query, "dwell", s, sizeof(s)) == ESP_OK) dwell = (uint32_t)strtoul(s, NULL, 10);
+        if (httpd_query_key_value(query, "on_boot", s, sizeof(s)) == ESP_OK) on_boot = (int8_t)(atoi(s) != 0);
     }
     autotune_cfg_args_t *a = malloc(sizeof(*a));
     if (!a) {
@@ -1883,6 +1898,7 @@ static esp_err_t autotune_post(httpd_req_t *req)
     a->lo_s    = lo;
     a->gain_s  = gain;
     a->dwell_s = dwell;
+    a->on_boot = on_boot;
     char body[128];
     int  n = snprintf(body, sizeof(body),
                       "{\"lo_interval_s\":%lu,\"gain_interval_s\":%lu,\"gain_dwell_s\":%lu,\"reboot\":false,\"applied\":\"live within ~30s\"}",
@@ -1984,6 +2000,7 @@ typedef struct {
     uint8_t     coal_n;
     uint32_t    at_lo_s;
     uint32_t    at_gain_s;
+    int8_t      on_boot; // autotune_on_boot: 0/1, or -1 = leave unchanged
 } sdrcfg_args_t;
 
 static void sdrcfg_apply_reboot_task(void *arg)
@@ -1996,6 +2013,7 @@ static void sdrcfg_apply_reboot_task(void *arg)
     esp_err_t      r5 = app_config_set_coalesce_min_bursts(a->coal_n);
     esp_err_t      r6 = app_config_set_autotune_lo_interval_s(a->at_lo_s);
     esp_err_t      r7 = app_config_set_autotune_gain_interval_s(a->at_gain_s);
+    if (a->on_boot >= 0) app_config_set_autotune_on_boot(a->on_boot != 0);
     ESP_LOGI(TAG,
              "/sdrcfg: lo=%u mode=%d gain_dbx10=%d tag=%.1f coal=%u at_lo=%u at_gain=%u "
              "(%s/%s/%s/%s/%s/%s/%s) — rebooting to apply",
@@ -2079,6 +2097,12 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     a->coal_n     = (uint8_t)coal;
     a->at_lo_s    = (uint32_t)strtoul(atlo_s, NULL, 10);
     a->at_gain_s  = (uint32_t)strtoul(atg_s, NULL, 10);
+    // on_boot is an optional field (the form's On/Off select always sends it;
+    // a curl submit without it leaves autotune_on_boot unchanged, -1).
+    char ob_s[8] = {0};
+    a->on_boot   = (form_field(body, total, "on_boot", ob_s, sizeof(ob_s)) == ESP_OK)
+                       ? (int8_t)(atoi(ob_s) != 0)
+                       : -1;
 
     // Reply BEFORE spawning the writer (NVS commit disables flash cache,
     // which can disrupt the socket send — mirror config_post's ordering).
