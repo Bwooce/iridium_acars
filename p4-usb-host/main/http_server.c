@@ -872,6 +872,20 @@ static esp_err_t status_html_get(httpd_req_t *req)
         snprintf(wconn_str, sizeof(wconn_str), "%uh%02um", (unsigned)(wconn / 3600),
                  (unsigned)((wconn % 3600) / 60));
 
+    // Autotune scan progress — the on_boot gain sweep (and any LO rescan)
+    // transiently floods the DSP and dips reception; surface it so a dip has an
+    // explanation and an ETA rather than looking like a fault.
+    int  at_el = 0, at_rem = 0;
+    int  at_type = autotune_scan_status(&at_el, &at_rem);
+    char at_buf[64];
+    if (at_type == 1)
+        snprintf(at_buf, sizeof(at_buf), "gain cal — %d:%02d elapsed, ~%d:%02d left",
+                 at_el / 60, at_el % 60, at_rem / 60, at_rem % 60);
+    else if (at_type == 2)
+        snprintf(at_buf, sizeof(at_buf), "LO rescan — %ds elapsed, ~%ds left", at_el, at_rem);
+    else
+        snprintf(at_buf, sizeof(at_buf), "idle");
+
     n = snprintf(body, sizeof(body),
                  "<table><tr><th>Metric</th><th>Value</th></tr>"
                  "<tr><td>Wi-Fi</td><td class=v>%s (%s), %d dBm, up %s</td></tr>"
@@ -889,6 +903,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  "<tr><td>LO frequency</td><td class=v>%.4f MHz</td></tr>"
                  "<tr><td>Listening band</td><td class=v>%.3f - %.3f MHz</td></tr>"
                  "<tr><td>Gain</td><td class=v>%s</td></tr>"
+                 "<tr><td>Autotune scan</td><td class=v>%s</td></tr>"
                  "<tr><td>DMA-INT free / largest</td><td class=v>%u / %u KB</td></tr>"
                  "<tr><td>Internal SRAM free / largest</td><td class=v>%u / %u KB</td></tr>"
                  "<tr><td>PSRAM free / largest</td><td class=v>%u / %u KB</td></tr>"
@@ -904,7 +919,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  (unsigned)s.us.rb_full_drops, (unsigned long long)usbt.rb_full_drops,
                  dsp_cap, worker_cap,
                  lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz,
-                 gain_str, (unsigned)(dma_free / 1024), (unsigned)(dma_largest / 1024),
+                 gain_str, at_buf, (unsigned)(dma_free / 1024), (unsigned)(dma_largest / 1024),
                  (unsigned)(sram_free / 1024), (unsigned)(sram_largest / 1024),
                  (unsigned)(psram_free / 1024), (unsigned)(psram_largest / 1024),
                  (unsigned)stash_fails, sd_str);

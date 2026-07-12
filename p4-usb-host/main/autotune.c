@@ -9,6 +9,7 @@
 
 #include <stdatomic.h>
 #include "esp_log.h"
+#include "esp_timer.h" // scan-progress elapsed/ETA clock
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -100,6 +101,47 @@ static void autotune_persist(bool is_lo, int32_t val)
 
 // Body of the manual/boot/periodic gain-calibration pass. Caller must hold
 // the busy guard (autotune_try_begin() already returned true).
+// Scan-progress state for the status page: 0=idle, 1=gain cal, 2=LO rescan.
+// Lets the operator see WHY reception dips (the on_boot gain sweep) and how much
+// is left, instead of guessing. esp_timer µs clock; relaxed atomics (one writer
+// = the autotune task, cross-task reads from the http task are torn-read-benign).
+static _Atomic int     s_scan_type     = 0;
+static _Atomic int64_t s_scan_start_us = 0;
+static _Atomic int64_t s_scan_est_end  = 0;
+
+static void scan_begin(int type, int64_t est_dur_us)
+{
+    int64_t now = esp_timer_get_time();
+    atomic_store_explicit(&s_scan_start_us, now, memory_order_relaxed);
+    atomic_store_explicit(&s_scan_est_end, now + est_dur_us, memory_order_relaxed);
+    atomic_store_explicit(&s_scan_type, type, memory_order_relaxed);
+}
+
+static void scan_end(void)
+{
+    atomic_store_explicit(&s_scan_type, 0, memory_order_relaxed);
+}
+
+int autotune_scan_status(int *elapsed_s, int *remaining_s)
+{
+    int t = atomic_load_explicit(&s_scan_type, memory_order_relaxed);
+    if (t == 0) {
+        if (elapsed_s) *elapsed_s = 0;
+        if (remaining_s) *remaining_s = 0;
+        return 0;
+    }
+    int64_t now = esp_timer_get_time();
+    if (elapsed_s) {
+        int64_t e  = (now - atomic_load_explicit(&s_scan_start_us, memory_order_relaxed)) / 1000000;
+        *elapsed_s = e < 0 ? 0 : (int)e;
+    }
+    if (remaining_s) {
+        int64_t r    = (atomic_load_explicit(&s_scan_est_end, memory_order_relaxed) - now) / 1000000;
+        *remaining_s = r < 0 ? 0 : (int)r;
+    }
+    return t;
+}
+
 static void autotune_run_manual_locked(void)
 {
     app_config_t cfg;
@@ -133,6 +175,8 @@ static void autotune_run_manual_locked(void)
     }
 
     uint32_t dwell_ms = cfg.autotune_gain_dwell_s * 1000u;
+    // Publish scan progress: ng gains × (prime + dwell) per step.
+    scan_begin(1, (int64_t)ng * (int64_t)(AUTOTUNE_PRIME_MS + dwell_ms) * 1000);
     ESP_LOGI(TAG,
              "=== autotune manual pass: IRA LO=%lu Hz, %d gains, %lu s dwell each ===",
              (unsigned long)cfg.autotune_ira_lo_hz, ng,
@@ -206,6 +250,7 @@ static void autotune_run_manual_locked(void)
     }
 
     (void)unknown; // logged per-gain above; secondary signal only
+    scan_end();
 }
 
 void autotune_run_manual(void)
@@ -251,6 +296,9 @@ void autotune_run_lo_rescan(void)
     ESP_LOGI(TAG, "=== autotune LO rescan: sweeping %lu-%lu Hz step %lu Hz ===",
              (unsigned long)SCAN_START_HZ, (unsigned long)SCAN_STOP_HZ,
              (unsigned long)SCAN_STEP_HZ);
+    // Publish scan progress: one dwell per hop across the band.
+    int lo_hops = (int)((SCAN_STOP_HZ - SCAN_START_HZ) / SCAN_STEP_HZ) + 1;
+    scan_begin(2, (int64_t)lo_hops * (int64_t)SCAN_DWELL_MS * 1000);
     scanner_scan(SCAN_START_HZ, SCAN_STOP_HZ, SCAN_STEP_HZ, SCAN_DWELL_MS);
 
     // scanner_scan() parks live (persist=false) on the hottest center but
@@ -267,5 +315,6 @@ void autotune_run_lo_rescan(void)
         ESP_LOGW(TAG, "=== autotune LO rescan done: no hot center found; LO unchanged ===");
     }
 
+    scan_end();
     autotune_end();
 }

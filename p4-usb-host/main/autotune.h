@@ -38,3 +38,8 @@ void autotune_run_manual(void);
 // disables this path if it proves unsafe. Requires device-smoke validation
 // before merge.
 void autotune_run_lo_rescan(void);
+
+// Scan-progress for the status page. Returns 0=idle, 1=gain cal, 2=LO rescan,
+// and fills elapsed_s / remaining_s (estimated) when a scan is active (both 0
+// when idle). Either pointer may be NULL. Cross-task safe (relaxed atomics).
+int autotune_scan_status(int *elapsed_s, int *remaining_s);
