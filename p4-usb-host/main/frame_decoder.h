@@ -88,9 +88,11 @@ typedef struct {
     // Chain salvage (§9): partials reaped from timed-out IDA chains.
     uint32_t salvage_ok;       // reaped partial that classifies as an SBD type
     uint32_t salvage_rejected; // reaped partial that is non-SBD (control traffic)
-    uint32_t dirty_cont;       // clean continuation frame dropped ONLY for crc=BAD
-                               // (upstream ida.py would still chain it) — sizes
-                               // the dirty-continuation-admission lever (Task C)
+    uint32_t dirty_cont;       // clean-demod continuation that failed ONLY its own
+                               // crc — the Task C population (counted whether or
+                               // not best_effort_decode admitted it)
+    uint32_t dirty_emitted;    // Task C: dirty-but-complete chains that classified
+                               // SBD and were emitted PARTIAL (best_effort ON)
     uint64_t acars_partial;    // Task B4: salvage.ok chains actually EMITTED as a
                                // PARTIAL /messages row (best_effort_decode gate ON).
                                // Never counted in acars_decoded — display-only,

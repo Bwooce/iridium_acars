@@ -89,7 +89,8 @@ static _Atomic uint64_t  s_class_lw_da_valid = 0; // LW.DA frames that passed th
 // s_ida_reasm.cnt_* counters).
 static uint32_t s_salvage_ok       = 0; // reaped partial that classifies as SBD
 static uint32_t s_salvage_rejected = 0; // reaped partial that is non-SBD control
-static uint32_t s_dirty_cont       = 0; // clean continuation dropped only on crc=BAD
+static uint32_t s_dirty_cont       = 0; // clean-demod continuation that failed ONLY its own CRC (Task C population)
+static uint32_t s_dirty_emitted    = 0; // Task C: dirty-but-complete chains that classified SBD + emitted PARTIAL
 
 // B4: best-effort PARTIAL rows actually pushed to /messages (gated by
 // app_config.best_effort_decode; see ida_salvage_drain). Separate from
@@ -110,62 +111,78 @@ static _Atomic uint64_t s_acars_partial = 0;
 // surfaces as salvage. Provenance is already guaranteed: only frames that
 // passed ida.ok && header_ok && crc_ok ever entered the IDA table, so a
 // reaped chain's bytes are trustworthy, only truncated.
+// Classify one set of best-effort (untrusted) merged IDA bytes and, if
+// best_effort_decode is on, push a display-only PARTIAL row. Shared by two
+// callers: ida_salvage_drain() (a chain that timed out truncated) and Task C's
+// dirty-but-complete chains (a chain that completed but carried a CRC-failed
+// continuation). Returns 1 if the bytes classified as an SBD envelope, 0 if
+// rejected as non-SBD control traffic. `dirty` only selects the log/row tag --
+// every partial is already hard-tagged crc_ok=false and goes to the msg_ring
+// ONLY (never acars_push_emit / sd_log_emit / the trusted s_acars_decoded).
+static int salvage_emit(const uint8_t *payload, int payload_len, bool uplink,
+                        unsigned frags, bool dirty)
+{
+    sbd_salvage_info_t info;
+    if (sbd_salvage_parse(payload, payload_len, uplink, &info) != 1) {
+        return 0; // non-SBD chain (control traffic)
+    }
+    const char *tag = dirty ? "DIRTY" : "SALVAGE";
+    ESP_LOGI(TAG, "%s: type=%s %s frags=%u len=%d body=%d msg=%d/%d%s", tag,
+             sbd_type_wire_name(info.type), uplink ? "UL" : "DL", frags,
+             payload_len, info.body_len, info.msg_no, info.msg_cnt,
+             info.truncated ? " TRUNC" : "");
+    iot_log(IOT_LOG_INFO, "%s type=%s %s frags=%u len=%d body=%d msg=%d/%d%s", tag,
+            sbd_type_wire_name(info.type), uplink ? "UL" : "DL", frags,
+            payload_len, info.body_len, info.msg_no, info.msg_cnt,
+            info.truncated ? " TRUNC" : "");
+
+    // Snapshot app_config only on this (rare) classified path, not on every
+    // reap/frame -- real reassembly completes via the trusted path; only
+    // truncated or dirty chains reach here at all.
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    if (cfg.best_effort_decode) {
+        static const char hex_tab[] = "0123456789abcdef";
+        char              hex[2 * 24 + 1];
+        int               hexlen = info.body_len;
+        if (hexlen > 24) hexlen = 24;
+        if (hexlen < 0) hexlen = 0;
+        for (int i = 0; i < hexlen; i++) {
+            uint8_t b      = info.body[i];
+            hex[i * 2]     = hex_tab[(b >> 4) & 0xf];
+            hex[i * 2 + 1] = hex_tab[b & 0xf];
+        }
+        hex[hexlen * 2] = '\0';
+
+        acars_msg_t out  = {0};
+        out.partial      = true;
+        out.crc_ok       = false;
+        out.uplink       = uplink;
+        out.timestamp_us = (uint64_t)esp_timer_get_time();
+        out.peak_bin     = 0;
+        out.snr_db       = 0;
+        char txt[128]; // hex-capped at 24 B (48 hex chars) -- well under MSG_RING_TXT_MAX
+        snprintf(txt, sizeof(txt), "PARTIAL%s %s %s f%u msg%d/%d%s %dB: %s",
+                 dirty ? " DIRTY" : "", sbd_type_wire_name(info.type),
+                 uplink ? "UL" : "DL", frags, info.msg_no, info.msg_cnt,
+                 info.truncated ? " trunc" : "", info.body_len, hex);
+        strlcpy(out.txt, txt, sizeof(out.txt));
+
+        msg_ring_push(&out); // display-only -- NEVER acars_push_emit / sd_log_emit
+        atomic_fetch_add_explicit(&s_acars_partial, 1, memory_order_relaxed);
+    }
+    return 1;
+}
+
 static void ida_salvage_drain(uint64_t now_us)
 {
     ida_salvage_t sv;
     while (ida_reassembler_reap(&s_ida_reasm, now_us, &sv)) {
-        sbd_salvage_info_t info;
-        if (sbd_salvage_parse(sv.payload, sv.payload_len, sv.uplink, &info) != 1) {
-            s_salvage_rejected++; // non-SBD chain (control traffic)
-            continue;
-        }
-        s_salvage_ok++;
-        ESP_LOGI(TAG, "SALVAGE: type=%s %s frags=%u len=%d body=%d msg=%d/%d%s",
-                 sbd_type_wire_name(info.type), sv.uplink ? "UL" : "DL",
-                 (unsigned)sv.frags, sv.payload_len, info.body_len, info.msg_no,
-                 info.msg_cnt, info.truncated ? " TRUNC" : "");
-        iot_log(IOT_LOG_INFO, "SALVAGE type=%s %s frags=%u len=%d body=%d msg=%d/%d%s",
-                sbd_type_wire_name(info.type), sv.uplink ? "UL" : "DL",
-                (unsigned)sv.frags, sv.payload_len, info.body_len, info.msg_no,
-                info.msg_cnt, info.truncated ? " TRUNC" : "");
-
-        // B4: only snapshot app_config on the (rare) salvage_ok path, not
-        // every reap -- cheap because this branch is already the uncommon
-        // one (real reassembly chains complete via the normal path; only
-        // stalled/truncated ones reach here at all).
-        app_config_t cfg;
-        app_config_snapshot(&cfg);
-        if (cfg.best_effort_decode) {
-            static const char hex_tab[] = "0123456789abcdef";
-            char              hex[2 * 24 + 1];
-            int               hexlen = info.body_len;
-            if (hexlen > 24) hexlen = 24;
-            if (hexlen < 0) hexlen = 0;
-            for (int i = 0; i < hexlen; i++) {
-                uint8_t b      = info.body[i];
-                hex[i * 2]     = hex_tab[(b >> 4) & 0xf];
-                hex[i * 2 + 1] = hex_tab[b & 0xf];
-            }
-            hex[hexlen * 2] = '\0';
-
-            acars_msg_t out  = {0};
-            out.partial      = true;
-            out.crc_ok       = false;
-            out.uplink       = sv.uplink;
-            out.timestamp_us = (uint64_t)esp_timer_get_time();
-            out.peak_bin     = 0;
-            out.snr_db       = 0;
-            char txt[128]; // hex-capped at 24 B (48 hex chars) -- well under MSG_RING_TXT_MAX
-            snprintf(txt, sizeof(txt),
-                     "PARTIAL %s %s f%u msg%d/%d%s %dB: %s",
-                     sbd_type_wire_name(info.type), sv.uplink ? "UL" : "DL",
-                     (unsigned)sv.frags, info.msg_no, info.msg_cnt,
-                     info.truncated ? " trunc" : "", info.body_len, hex);
-            strlcpy(out.txt, txt, sizeof(out.txt));
-
-            msg_ring_push(&out); // display-only -- NEVER acars_push_emit / sd_log_emit
-            atomic_fetch_add_explicit(&s_acars_partial, 1, memory_order_relaxed);
-        }
+        if (salvage_emit(sv.payload, sv.payload_len, sv.uplink, sv.frags,
+                         sv.dirty) == 1)
+            s_salvage_ok++;
+        else
+            s_salvage_rejected++;
     }
 }
 
@@ -475,8 +492,28 @@ static void process_one(const frame_queue_item_t *it)
                      ida.ok, ida.blocks_ok, ida.n_blocks, ida.total_errors,
                      ida.header_ok, ida.da_ctr, (unsigned)ida.payload_len,
                      ida.crc_ok ? "OK" : "BAD");
-            if (rc_ida == 0 && ida.ok && ida.header_ok && ida.crc_ok) {
-                atomic_fetch_add_explicit(&s_class_lw_da_valid, 1, memory_order_relaxed);
+            bool ida_ok_hdr = (rc_ida == 0 && ida.ok && ida.header_ok);
+            bool clean      = ida_ok_hdr && ida.crc_ok;
+            bool dirty_cont = ida_ok_hdr && !ida.crc_ok && ida.da_ctr > 0;
+            if (dirty_cont) s_dirty_cont++; // sizing counter: every dirty continuation SEEN
+
+            // Task C: a continuation (ctr>0) that demodulated cleanly (all BCH +
+            // header OK) but failed ONLY its own CRC is admitted as a dirty
+            // continuation when best_effort_decode is on -- upstream ida.py
+            // chains on cont/ctr regardless of any single fragment's CRC, so this
+            // can COMPLETE chains we would otherwise drop. Openers/standalone
+            // stay strict (clean only). Snapshot app_config only on the rare
+            // dirty_cont frame to keep the per-frame cost unchanged.
+            bool allow_dirty = false;
+            if (dirty_cont) {
+                app_config_t dcfg;
+                app_config_snapshot(&dcfg);
+                allow_dirty = dcfg.best_effort_decode;
+            }
+            if (clean || (dirty_cont && allow_dirty)) {
+                if (clean)
+                    atomic_fetch_add_explicit(&s_class_lw_da_valid, 1,
+                                              memory_order_relaxed); // trusted only
                 // Reap-before-feed: salvage any chain that timed out (and free
                 // its table slot) before this fragment might need one. Uses the
                 // frame's own timestamp clock, same as feed() below.
@@ -487,12 +524,24 @@ static void process_one(const frame_queue_item_t *it)
                 // real SBD/ACARS envelopes routinely need more than
                 // that (see ida_reassembler.h).
                 uint8_t merged[IDA_REASM_MAX_BYTES];
-                int     merged_len = 0;
-                int     rc_reasm   = ida_reassembler_feed(
-                    &s_ida_reasm, &ida, it->direction == 1,
+                int     merged_len  = 0;
+                bool    chain_dirty = false;
+                int     rc_reasm    = ida_reassembler_feed_ex(
+                    &s_ida_reasm, &ida, ida.crc_ok, it->direction == 1,
                     (uint32_t)it->freq_hz, it->timestamp_us, merged,
-                    (int)sizeof(merged), &merged_len);
-                if (rc_reasm == 1) {
+                    (int)sizeof(merged), &merged_len, &chain_dirty);
+                if (rc_reasm == 1 && chain_dirty) {
+                    // Task C: dirty-but-complete chain -- carried a CRC-failed
+                    // fragment, so it is NEVER trusted. Route to the same
+                    // display-only PARTIAL emit as a timed-out salvage; keep it
+                    // out of the trusted sbd_reassembler_feed/try_acars path so
+                    // dirty bytes never reach acars_push_emit / sd_log / the
+                    // trusted counter. frags=0: the completion path does not
+                    // track the fragment count.
+                    if (salvage_emit(merged, merged_len, it->direction == 1,
+                                     /*frags=*/0, /*dirty=*/true) == 1)
+                        s_dirty_emitted++;
+                } else if (rc_reasm == 1) {
                     // Stage 2: SBD envelope-level (msgno/msgcnt) reassembly.
                     sbd_message_t sbd;
                     int           rc_sbd = sbd_reassembler_feed(&s_sbd, merged,
@@ -510,15 +559,6 @@ static void process_one(const frame_queue_item_t *it)
                         try_acars(&sbd, it->peak_bin, it->snr_db);
                     }
                 }
-            } else if (rc_ida == 0 && ida.ok && ida.header_ok && !ida.crc_ok &&
-                       ida.da_ctr > 0) {
-                // Task C sizing: a continuation frame (ctr>0) that demodulated
-                // cleanly (all BCH + header OK) but failed ONLY its own CRC.
-                // Upstream ida.py chains on cont/ctr regardless of any single
-                // fragment's CRC, so admitting these as continuations could
-                // COMPLETE chains we currently drop. Count how often it happens
-                // to size that lever before building it.
-                s_dirty_cont++;
             }
         } else {
             atomic_fetch_add_explicit(&s_class_lw_other, 1, memory_order_relaxed);
@@ -775,5 +815,6 @@ void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out)
     out->salvage_ok       = s_salvage_ok;
     out->salvage_rejected = s_salvage_rejected;
     out->dirty_cont       = s_dirty_cont;
+    out->dirty_emitted    = s_dirty_emitted;
     out->acars_partial    = atomic_load_explicit(&s_acars_partial, memory_order_relaxed);
 }

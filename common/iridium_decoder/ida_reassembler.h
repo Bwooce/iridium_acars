@@ -64,6 +64,10 @@ typedef struct {
     uint64_t last_time_us;
     uint8_t  payload[IDA_REASM_MAX_BYTES];
     int      payload_len;
+    bool     dirty; // Task C: a merged continuation failed its OWN CRC. Openers
+                    // are always clean (caller gate), so this only gets set by a
+                    // best-effort dirty continuation; it rides through completion
+                    // so a dirty-but-complete chain is emitted PARTIAL, never trusted.
 } ida_reasm_session_t;
 
 typedef struct {
@@ -105,6 +109,27 @@ int ida_reassembler_feed(ida_reassembler_t *ctx, const ida_decoded_t *ida,
                          bool uplink, uint32_t freq_hz, uint64_t now_us,
                          uint8_t *out_payload, int out_cap, int *out_len);
 
+// Task C extension: same as ida_reassembler_feed() but the caller states whether
+// THIS fragment passed its own CRC (frag_crc_ok) and receives whether the
+// completed chain was dirty (*out_dirty, set only on return==1).
+//
+// Contract: openers and standalone frames (da_ctr==0) MUST still be crc_ok — the
+// caller gates them, and this function assumes it (frag_crc_ok is only consulted
+// on the continuation-merge path). A continuation (da_ctr>0) with frag_crc_ok==
+// false is admitted (appended) exactly like a clean one but marks its chain
+// dirty; iridium-toolkit's ida.py chains purely on cont/ctr regardless of any
+// single fragment's CRC (see the note on ida_reassembler_feed above). On
+// completion, *out_dirty reflects whether ANY fragment in the chain was dirty, so
+// the caller can route a dirty-but-complete payload to a PARTIAL (never trusted)
+// emit. *out_dirty is set to false for a standalone frame and on every non-1
+// return. out_dirty may be NULL.
+//
+// ida_reassembler_feed() is a thin wrapper: frag_crc_ok=true, out_dirty ignored.
+int ida_reassembler_feed_ex(ida_reassembler_t *ctx, const ida_decoded_t *ida,
+                            bool frag_crc_ok, bool uplink, uint32_t freq_hz,
+                            uint64_t now_us, uint8_t *out_payload, int out_cap,
+                            int *out_len, bool *out_dirty);
+
 // A timed-out (incomplete) chain, handed to the driver for best-effort
 // PARTIAL salvage instead of being silently discarded. frags = fragments that
 // were received before the chain stalled (1 = opener only).
@@ -115,6 +140,7 @@ typedef struct {
     uint32_t freq_hz;
     uint64_t last_time_us;
     uint8_t  frags;
+    bool     dirty; // Task C: chain contained a CRC-failed continuation.
 } ida_salvage_t;
 
 // Reap ONE chain that has been idle longer than IDA_REASM_SESSION_TIMEOUT_US:

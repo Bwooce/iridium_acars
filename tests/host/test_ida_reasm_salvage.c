@@ -191,6 +191,160 @@ static void test_stale_no_capture(void)
     CHECK(ctx.cnt_merged == 0, "nothing should have merged, cnt_merged=%u", ctx.cnt_merged);
 }
 
+// --- Task C: dirty-continuation admission via ida_reassembler_feed_ex().
+// A continuation whose OWN CRC failed (frag_crc_ok=false) is still appended, but
+// marks the chain dirty so a completed chain is emitted PARTIAL, never trusted.
+
+// 6. Clean opener + a dirty terminal continuation completes and reports dirty.
+static void test_dirty_terminal_completes_dirty(void)
+{
+    printf("Test: clean opener + dirty terminal -> completes, out_dirty=true\n");
+    ida_reassembler_t ctx;
+    ida_reassembler_init(&ctx);
+    uint8_t       o[] = {0x76, 0x08, 0xAA, 0xBB};
+    uint8_t       c[] = {0xCC, 0xDD};
+    ida_decoded_t f;
+    uint8_t       out[IDA_REASM_MAX_BYTES];
+    int           outlen = 0;
+    bool          dirty  = true; // must be cleared by the opener return
+
+    make_frag(&f, 0, 1, o, sizeof(o));
+    int rc = ida_reassembler_feed_ex(&ctx, &f, true, false, FREQ, 1 * SEC, out,
+                                     sizeof(out), &outlen, &dirty);
+    CHECK(rc == 0, "clean opener should open (0), got %d", rc);
+    CHECK(dirty == false, "opener return should clear out_dirty");
+
+    make_frag(&f, 1, 0, c, sizeof(c)); // terminal, but its own CRC failed
+    rc = ida_reassembler_feed_ex(&ctx, &f, false, false, FREQ, 1 * SEC + 100000,
+                                 out, sizeof(out), &outlen, &dirty);
+    CHECK(rc == 1, "dirty terminal should complete (1), got %d", rc);
+    CHECK(dirty == true, "completed chain with a dirty fragment must report dirty");
+    CHECK(outlen == 6, "merged len should be 6, got %d", outlen);
+    CHECK(memcmp(out, "\x76\x08\xAA\xBB\xCC\xDD", 6) == 0, "merged bytes mismatch");
+    CHECK(ctx.cnt_completed == 1, "cnt_completed should be 1, got %u", ctx.cnt_completed);
+}
+
+// 7. A fully clean chain reports out_dirty=false (regression on the flag).
+static void test_clean_chain_not_dirty(void)
+{
+    printf("Test: fully clean chain -> out_dirty=false\n");
+    ida_reassembler_t ctx;
+    ida_reassembler_init(&ctx);
+    uint8_t       o[] = {0x76, 0x08, 0x01};
+    uint8_t       c[] = {0x02};
+    ida_decoded_t f;
+    uint8_t       out[IDA_REASM_MAX_BYTES];
+    int           outlen = 0;
+    bool          dirty  = true;
+
+    make_frag(&f, 0, 1, o, sizeof(o));
+    ida_reassembler_feed_ex(&ctx, &f, true, false, FREQ, 1 * SEC, out, sizeof(out),
+                            &outlen, &dirty);
+    make_frag(&f, 1, 0, c, sizeof(c));
+    int rc = ida_reassembler_feed_ex(&ctx, &f, true, false, FREQ, 1 * SEC + 100000,
+                                     out, sizeof(out), &outlen, &dirty);
+    CHECK(rc == 1, "clean terminal should complete (1), got %d", rc);
+    CHECK(dirty == false, "fully clean chain must report out_dirty=false");
+}
+
+// 8. A dirty middle fragment rides through to a CLEAN terminal (dirty is sticky).
+static void test_dirty_rides_through_clean_terminal(void)
+{
+    printf("Test: dirty middle + clean terminal -> out_dirty=true (sticky)\n");
+    ida_reassembler_t ctx;
+    ida_reassembler_init(&ctx);
+    uint8_t       o[]  = {0x76, 0x08, 0x41};
+    uint8_t       c1[] = {0x42, 0x43}; // dirty continuation, more to come
+    uint8_t       c2[] = {0x44};       // clean terminal
+    ida_decoded_t f;
+    uint8_t       out[IDA_REASM_MAX_BYTES];
+    int           outlen = 0;
+    bool          dirty  = false;
+
+    make_frag(&f, 0, 1, o, sizeof(o));
+    ida_reassembler_feed_ex(&ctx, &f, true, false, FREQ, 1 * SEC, out, sizeof(out),
+                            &outlen, &dirty);
+    make_frag(&f, 1, 1, c1, sizeof(c1));
+    int rc = ida_reassembler_feed_ex(&ctx, &f, false, false, FREQ, 1 * SEC + 100000,
+                                     out, sizeof(out), &outlen, &dirty);
+    CHECK(rc == 0, "dirty middle should stay open (0), got %d", rc);
+    CHECK(dirty == false, "non-completing return should report out_dirty=false");
+    make_frag(&f, 2, 0, c2, sizeof(c2));
+    rc = ida_reassembler_feed_ex(&ctx, &f, true, false, FREQ, 1 * SEC + 200000, out,
+                                 sizeof(out), &outlen, &dirty);
+    CHECK(rc == 1, "clean terminal should complete (1), got %d", rc);
+    CHECK(dirty == true, "dirty must ride through even when the terminal is clean");
+    CHECK(outlen == 6, "merged len should be 6, got %d", outlen);
+    CHECK(memcmp(out, "\x76\x08\x41\x42\x43\x44", 6) == 0, "merged bytes mismatch");
+}
+
+// 9. A dirty incomplete chain is reaped with its dirty flag set.
+static void test_dirty_reap_flag(void)
+{
+    printf("Test: dirty incomplete chain -> reap carries dirty=true\n");
+    ida_reassembler_t ctx;
+    ida_reassembler_init(&ctx);
+    uint8_t       o[]  = {0x76, 0x08, 0x55};
+    uint8_t       c1[] = {0x66}; // dirty continuation, still more expected
+    ida_decoded_t f;
+    uint8_t       out[IDA_REASM_MAX_BYTES];
+    int           outlen = 0;
+    bool          dirty  = false;
+
+    make_frag(&f, 0, 1, o, sizeof(o));
+    ida_reassembler_feed_ex(&ctx, &f, true, false, FREQ, 5 * SEC, out, sizeof(out),
+                            &outlen, &dirty);
+    make_frag(&f, 1, 1, c1, sizeof(c1));
+    ida_reassembler_feed_ex(&ctx, &f, false, false, FREQ, 5 * SEC + 100000, out,
+                            sizeof(out), &outlen, &dirty);
+
+    ida_salvage_t s;
+    CHECK(ida_reassembler_reap(&ctx, 5 * SEC + 100000 + IDA_REASM_SESSION_TIMEOUT_US + 1, &s) == 1,
+          "reap after timeout should return 1");
+    CHECK(s.dirty == true, "reaped chain that had a dirty fragment must set s.dirty");
+    CHECK(s.payload_len == 4, "merged salvage len should be 4, got %d", s.payload_len);
+}
+
+// 10. Standalone frame via _ex reports out_dirty=false.
+static void test_standalone_not_dirty(void)
+{
+    printf("Test: standalone frame -> out_dirty=false\n");
+    ida_reassembler_t ctx;
+    ida_reassembler_init(&ctx);
+    uint8_t       o[] = {0x76, 0x08, 0x99};
+    ida_decoded_t f;
+    uint8_t       out[IDA_REASM_MAX_BYTES];
+    int           outlen = 0;
+    bool          dirty  = true;
+
+    make_frag(&f, 0, 0, o, sizeof(o)); // ctr=0, cont=0 -> standalone
+    int rc = ida_reassembler_feed_ex(&ctx, &f, true, false, FREQ, 1 * SEC, out,
+                                     sizeof(out), &outlen, &dirty);
+    CHECK(rc == 1, "standalone should return 1, got %d", rc);
+    CHECK(dirty == false, "standalone must report out_dirty=false");
+    CHECK(ctx.cnt_standalone == 1, "cnt_standalone should be 1, got %u", ctx.cnt_standalone);
+}
+
+// 11. A dirty continuation with no open chain is a plain orphan (openers strict).
+static void test_dirty_orphan(void)
+{
+    printf("Test: dirty continuation with no opener -> orphan (-1)\n");
+    ida_reassembler_t ctx;
+    ida_reassembler_init(&ctx);
+    uint8_t       c1[] = {0x66};
+    ida_decoded_t f;
+    uint8_t       out[IDA_REASM_MAX_BYTES];
+    int           outlen = 0;
+    bool          dirty  = true;
+
+    make_frag(&f, 1, 0, c1, sizeof(c1)); // continuation, ctr=1, no chain open
+    int rc = ida_reassembler_feed_ex(&ctx, &f, false, false, FREQ, 1 * SEC, out,
+                                     sizeof(out), &outlen, &dirty);
+    CHECK(rc == -1, "orphan dirty continuation should return -1, got %d", rc);
+    CHECK(dirty == false, "orphan return should report out_dirty=false");
+    CHECK(ctx.cnt_orphan == 1, "cnt_orphan should be 1, got %u", ctx.cnt_orphan);
+}
+
 int main(void)
 {
     test_normal_completion();
@@ -198,6 +352,12 @@ int main(void)
     test_salvage_two_fragments();
     test_reap_frees_slots();
     test_stale_no_capture();
+    test_dirty_terminal_completes_dirty();
+    test_clean_chain_not_dirty();
+    test_dirty_rides_through_clean_terminal();
+    test_dirty_reap_flag();
+    test_standalone_not_dirty();
+    test_dirty_orphan();
     printf("\n%d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;
 }

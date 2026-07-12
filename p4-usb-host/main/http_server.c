@@ -2619,7 +2619,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
          "\"orphan\":%u,\"overflow\":%u,\"expired\":%u},"
          "\"sbd\":{\"short\":%u,\"single\":%u,\"assembled\":%u,\"multi\":%u,"
          "\"broken\":%u,\"filtered\":%u},"
-         "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u,\"acars_partial\":%llu},"
+         "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u,\"dirty_emit\":%u,\"acars_partial\":%llu},"
          "\"burst_drops\":{\"snr_buckets\":\"<8,8-12,12-16,16-20,20-24,>=24\","
          "\"stale\":[%u,%u,%u,%u,%u,%u],\"pri\":[%u,%u,%u,%u,%u,%u]},"
          "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
@@ -2631,6 +2631,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)r.sbd_short, (unsigned)r.sbd_single, (unsigned)r.sbd_assembled,
         (unsigned)r.sbd_multi, (unsigned)r.sbd_broken, (unsigned)r.sbd_filtered,
         (unsigned)r.salvage_ok, (unsigned)r.salvage_rejected, (unsigned)r.dirty_cont,
+        (unsigned)r.dirty_emitted,
         (unsigned long long)r.acars_partial,
         (unsigned)dstale[0], (unsigned)dstale[1], (unsigned)dstale[2],
         (unsigned)dstale[3], (unsigned)dstale[4], (unsigned)dstale[5],

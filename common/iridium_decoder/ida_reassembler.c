@@ -56,6 +56,7 @@ int ida_reassembler_reap(ida_reassembler_t *ctx, uint64_t now_us,
             out->uplink       = s->uplink;
             out->freq_hz      = s->freq_hz;
             out->last_time_us = s->last_time_us;
+            out->dirty        = s->dirty;
             // next_ctr is the expected ctr of the NEXT fragment, i.e. the count
             // of fragments received so far (opener sets it to 1).
             out->frags = s->next_ctr;
@@ -71,6 +72,19 @@ int ida_reassembler_feed(ida_reassembler_t *ctx, const ida_decoded_t *ida,
                          bool uplink, uint32_t freq_hz, uint64_t now_us,
                          uint8_t *out_payload, int out_cap, int *out_len)
 {
+    // Clean-path wrapper: the fragment is asserted crc_ok and the caller does
+    // not care about the dirty flag.
+    return ida_reassembler_feed_ex(ctx, ida, /*frag_crc_ok=*/true, uplink,
+                                   freq_hz, now_us, out_payload, out_cap,
+                                   out_len, /*out_dirty=*/NULL);
+}
+
+int ida_reassembler_feed_ex(ida_reassembler_t *ctx, const ida_decoded_t *ida,
+                            bool frag_crc_ok, bool uplink, uint32_t freq_hz,
+                            uint64_t now_us, uint8_t *out_payload, int out_cap,
+                            int *out_len, bool *out_dirty)
+{
+    if (out_dirty) *out_dirty = false;
     if (!ctx || !ida || !out_payload || !out_len) return -1;
     *out_len = 0;
     // NB: expiry is NOT done here anymore — the driver calls
@@ -135,6 +149,7 @@ int ida_reassembler_feed(ida_reassembler_t *ctx, const ida_decoded_t *ida,
     memcpy(s->payload + s->payload_len, ida->payload, ida->payload_len);
     s->payload_len += ida->payload_len;
     s->last_time_us = now_us;
+    if (!frag_crc_ok) s->dirty = true; // Task C: chain is now best-effort only
     ctx->cnt_merged++;
 
     if (ida->da_cont == 0) {
@@ -142,7 +157,8 @@ int ida_reassembler_feed(ida_reassembler_t *ctx, const ida_decoded_t *ida,
         int n = s->payload_len;
         if (n > out_cap) n = out_cap;
         memcpy(out_payload, s->payload, (size_t)n);
-        *out_len  = n;
+        *out_len = n;
+        if (out_dirty) *out_dirty = s->dirty;
         s->active = false;
         ctx->cnt_completed++;
         return 1;
