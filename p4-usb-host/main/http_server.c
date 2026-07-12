@@ -614,7 +614,10 @@ static void send_page_head(httpd_req_t *req, const char *title, int refresh_s)
                      "button{margin-top:1.5em;padding:.7em 1.5em;border:0;background:#1976d2;color:#fff;border-radius:4px;font-size:1em}"
                      "small{color:#888}table{border-collapse:collapse;width:100%%}"
                      "td,th{text-align:left;padding:.25em .5em;border-bottom:1px solid #eee;font-size:.9em}"
-                     "td.v{font-family:ui-monospace,monospace;text-align:right}"
+                     // Value cells: monospace, LEFT-aligned so they line up
+                     // under the left-aligned <th> headers. (Right-align made
+                     // every value column look offset from its title.)
+                     "td.v{font-family:ui-monospace,monospace;text-align:left}"
                      "</style></head><body>"
                      "<nav><a href=\"/\">Config</a><a href=\"/status\">Status</a>"
                      "<a href=\"/messages\">Messages</a><a href=\"/tasks\">Tasks</a>"
