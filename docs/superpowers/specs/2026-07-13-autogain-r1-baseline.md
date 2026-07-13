@@ -63,8 +63,17 @@ STATUS field semantics (verified from the raw stream, mixed and easy to get wron
   is reachable in ~1 pass; on `lwda` it needs many passes (1.26/min).
 
 ## Caveats / next
-- **One LO only (1626, IRA region), one gain, ~1 h, 7 passes.** Not the ACARS-dense
-  LO (~1620.6) — the `lwda` rate there is unmeasured and likely higher. Re-run the
-  same soak at 1620.6 for the ACARS-transport comparison when the device is back.
+- **One LO only (1626), one gain, ~1 h, 7 passes.** 1626 is the IRA ring-alert
+  cluster — the *only* fixed/dense allocation in the band, hence lots of IRA/control
+  frames (`bch_dec` healthy) but low `lwda`.
+- **There is NO durable "ACARS-dense LO" to compare against.** Per
+  `reference_freq_coverage_analysis` (CRITICAL 2026-07-09), the once-quoted 1620.6
+  was a single-day IDA snapshot, explicitly retracted: on-device scans show the
+  hottest center jumping across the whole band sweep-to-sweep (density 0.5→295 on
+  the same center within ~1 min, satellite-driven, mean-reverting, no stable point).
+  So "re-soak at the ACARS LO" is not a valid step — and since completed ACARS ≈ 0
+  at any LO, and IDA ≠ completed ACARS, LO choice doesn't change the mission signal.
+  If a cross-band `lwda` picture is wanted, it must come from the periodic autotune
+  LO **scan**, not a fixed retune.
 - The soak ended because the device was **powered off for a cable** (intentional,
   not a crash). Method + listener are proven and reusable.
