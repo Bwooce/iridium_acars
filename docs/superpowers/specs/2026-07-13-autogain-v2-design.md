@@ -14,6 +14,12 @@
 > exposure-stopped full-range coarse curve → gain = measured-knee + fixed-dB margin)
 > before building the 4-arm machinery — it's immune to the all-arms-deaf trap and
 > likely dominant at the measured rates. See the review for R1–R5 + all findings.
+>
+> **R1 DONE (`2026-07-13-autogain-r1-baseline.md`):** the 20× rate contradiction was
+> apples-vs-oranges (frame rate ≠ completed ACARS) — resolved. Key results now baked
+> into this design: completed ACARS ≈ 0 → objective/acceptance use `bch_dec`/`lwda`
+> **frame** yield, NOT ACARS (B4 below); garbage ratio Ḡ ≈ 0.52 (< 0.85 ceiling →
+> Part A trigger has headroom); pass-to-pass CV = 0.72 → **paired** A/B acceptance.
 
 ## Why v1 died (one paragraph)
 The v1 5-arm ±1-step knee-finder was killed by host gate-1: at the real pass rate
@@ -114,12 +120,16 @@ clamped to `MAX_STEPS_PER_RUN` table steps/run (walk, don't jump). Persist via t
 internal-stack `autotune_persist` task only when changed (PSRAM-stack rule; the
 ~24.7-min crash-loop fix already in place, commit 1479bd6).
 
-### B4 — acceptance = ACARS-YIELD PRESERVATION (not ±1-step stability)
+### B4 — acceptance = FRAME-YIELD PRESERVATION, PAIRED (R1-revised)
 The v1 acceptance ("5 sweeps within ±1 step") is invalid — the degenerate
-always-step-down passes it. Replace: **after convergence, the chosen gain must not
-lose real ACARS decode yield over several passes at the operating LO versus the
-manually-found good gain** (43.4/40.2 today). Precision is worthless if the point
-is wrong.
+always-step-down passes it. **And "ACARS-yield preservation" (earlier v2) is also
+invalid**: R1 (`2026-07-13-autogain-r1-baseline.md`) measured **0 completed ACARS**
+— there is no ACARS yield to preserve. Replace with a **measurable frame proxy**:
+after convergence, the chosen gain must not lose **`bch_dec` frame-yield (+ `lwda`
+IDA-frame yield)** at the operating LO versus the reference good gain.
+**Must be PAIRED** — R1 measured pass-to-pass `CV = 0.72`, so an unpaired A/B at
+n=5 passes/arm has 1σ ≈ 45% of the mean (can't see a 20–40% erosion). Alternate
+chosen vs reference gain *within the same passes* (Fable R5).
 
 ---
 
