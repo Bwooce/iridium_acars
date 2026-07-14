@@ -190,10 +190,10 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
     //   (cont=1) into a standalone frame and orphaned its continuation —
     //   breaking all cross-burst SBD reassembly. See tests/host/test_phaseb_cut.c.
     //   NB: bit 4 is NOT the "always ~0 spacer" it was once assumed to be —
-    //   empirically it is set on ~13% of frames (2026-07-15 HydraSDR corpus),
-    //   strongly correlated with SBD type 0x7605 (da_len=11). Captured below as
-    //   da_flag1b for study; its meaning is undecoded (no public spec) and it is
-    //   NOT used for reassembly (which keys only on da_cont).
+    //   set on ~13% of frames (2026-07-15 corpus), almost exclusively single-burst
+    //   0x7605 SBD Ring-Alert/paging messages. It is an L2 fast-path control flag;
+    //   captured below as da_flag1b, unused for reassembly (which keys only on
+    //   da_cont). See ida_decode.h + docs/superpowers/specs/2026-07-15-ida-bit4-*.
     out->da_flags1 = (uint8_t)PACKBITS_N(0, 3);
     out->da_cont   = (uint8_t)PACKBITS_N(3, 1);
     out->da_flag1b = (uint8_t)PACKBITS_N(4, 1);

@@ -63,11 +63,14 @@ typedef struct {
     //   bits[17..19]  zero1 (sanity-check, must be 0)
     uint8_t da_flags1; // 3 bits (bits 0..2)
     uint8_t da_cont;   // 1 bit (bit 3) — continuation flag; governs reassembly
-    uint8_t da_flag1b; // 1 bit (bit 4) — NOT a spacer: empirically set on ~13% of frames,
-                       // strongly correlated with SBD type 0x7605 (da_len=11). Meaning
-                       // undecoded (no public spec; iridium-toolkit / gr-iridium /
-                       // iridium-sniffer all discard it). Captured for study; unused for
-                       // reassembly (reassembly keys only on da_cont, bit 3).
+    uint8_t da_flag1b; // 1 bit (bit 4) — NOT a spacer. Set on ~13% of frames, almost
+                       // exclusively single-burst 0x7605 SBD Ring-Alert/paging messages.
+                       // 0x7605 is GSM-04.08-derived L3 (0x76 = RRM protocol discriminator,
+                       // 0x05 = paging); payload = 76 05 00 4b | TMSI(4B) | 50 | trailer(2B),
+                       // corroborated across 755 corpus frames (TMSI field ~55% unique).
+                       // bit 4 is an L2 fast-path/control flag ("immediate signaling — skip
+                       // the SBD reassembler"). Safe to ignore for reassembly (keys only on
+                       // da_cont); captured for a possible future Ring-Alert / TMSI tracker.
     uint8_t da_ctr;    // 3 bits
     uint8_t da_flags2; // 3 bits
     uint8_t da_len;    // 5 bits — number of valid payload bytes

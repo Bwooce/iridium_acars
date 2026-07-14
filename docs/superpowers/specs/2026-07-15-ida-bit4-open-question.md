@@ -1,7 +1,32 @@
-# Open question: Iridium IDA header bit 4 (`flag1b`) — what does it mean?
+# RESOLVED: Iridium IDA header bit 4 (`flag1b`) — an L2 fast-path flag on 0x7605 Ring Alerts
 
-Self-contained brief for handing to another agent / expert. Goal: identify the meaning
-of an undecoded flag bit in the Iridium **IDA (LW.DA / data) frame header**.
+Self-contained brief for the Iridium **IDA (LW.DA / data) frame header** bit 4. Original
+question below; answered 2026-07-15 by an external agent + **corroborated on the corpus**.
+
+## RESOLUTION (2026-07-15)
+- **`0x7605` = an SBD Ring Alert / paging message.** Iridium L3 is GSM-04.08/04.06-derived
+  (LAPDm). First byte `0x76` = GSM Protocol Discriminator `0x06` (Radio Resource Management)
+  with skip-indicator `0x07`; `0x05` = the Iridium paging/ring-alert message type. When an
+  MT-SBD is queued at the gateway, the network blasts this short ring alert on the L-band
+  downlink to wake a specific modem, which then does a mailbox check → the actual data comes
+  down as the multi-frame `0x7608` messages. (Ref: CCC / Harald Welte OsmoDevCall 2022 —
+  "LAPDm messages, type 0x06 and 0x76".) No official spec exists; lineage is GSM.
+- **Structure, CORROBORATED on 755 corpus frames** (`76 05 00 4b | TMSI(4B) | 50 | trailer(2B)`):
+  bytes 0–1 `76 05` const; bytes 2–3 `00 4b` near-const (routing/beam); bytes 4–7 a 4-byte
+  **TMSI** (temporary subscriber id) — **418 distinct values / 755 frames (~55% unique)**,
+  exactly identifier-like (mostly different modems, some re-paged); byte 8 `50` const marker;
+  bytes 9–10 high-variance trailer (channel assignment / backoff for the mailbox-check reply).
+- **`flag1b` (bit 4) = an L2 fast-path / control flag** — "immediate signaling, do NOT route
+  to the SBD reassembler." Explains why it's set almost only on single-burst `0x7605` and
+  never on multi-fragment `0x7608` data.
+- **Ignoring it loses no content** — these frames are single-burst (`cont=0`) and already pass
+  our pipeline correctly; bit 4 is only a metadata label. Recommendation (adopted): keep
+  `da_flag1b` captured but passive; usable later as a filter for a Ring-Alert/TMSI tracker.
+
+---
+
+## Original brief (for reference)
+Goal: identify the meaning of an undecoded flag bit in the Iridium IDA frame header.
 
 ## Background / layer
 Iridium L-band downlink, 1616–1626.5 MHz. "IDA" (a.k.a. LW.DA) frames carry Short Burst
