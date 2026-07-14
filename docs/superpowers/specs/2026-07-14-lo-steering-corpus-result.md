@@ -27,10 +27,17 @@ Files: `scratchpad/corpus.bits` (17 MB), `corpus.parsed`.
   scheme can achieve is to *average back into the fixed park*; it cannot beat it.
 - The oracle's +25.9% is a **mirage** — it needs foreknowledge no predictor has (Fable
   F4). At a realistic 15-min cadence even the oracle is only +8.5% (below worth-it).
-- **1620.60 MHz recurs** as the best fixed center (same as the 2026-07-08 reading), so
-  it's durable enough to park on. The "no stable point" note (2026-07-09) is true at the
-  *instantaneous* level (density swings 0.5→295 in 1 min) but the *time-averaged* best
-  fixed LO is stable and strictly superior to chasing.
+- **What the specific center 1620.60 does NOT prove:** 45 min ≈ 4–5 passes of a ~100-min
+  orbital cycle — too short to call any center *durable*. Two agreeing time-averaged
+  estimates (2026-07-08 and today) are suggestive, not conclusive. The *time-averaged*
+  best center is plausibly more stable than the *instantaneous* hotspot (which swings
+  0.5→295 in 1 min, 2026-07-09), but that needs a multi-hour/multi-day duration-weighted
+  corpus to establish — NOT claimed here.
+- **What survives regardless of the center — the structural result:** a causal steerer
+  underperforms a static window because the hotspot is *anti-predictive* bin-to-bin
+  (mean-reversion, corroborated by the 2026-07-09 swings). "Chasing loses to sitting
+  still" doesn't depend on which center → **"don't steer" holds; "park exactly at
+  1620.6" is only a 45-min point estimate.**
 
 ## Actionable win for the deployed P4
 The hourly LO-rescan (`autotune_run_lo_rescan`) does the harmful causal-chase — worse,
