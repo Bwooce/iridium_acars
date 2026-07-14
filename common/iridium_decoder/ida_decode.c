@@ -184,14 +184,19 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
     _v;                                       \
 })
     // Header bit layout matches iridium-toolkit bitsparser.py:1385-1391:
-    //   bits[0:3] flags, bit[3]=cont, bit[4]=spacer, bits[5:8]=ctr,
+    //   bits[0:3] flags, bit[3]=cont, bit[4]=flag1b, bits[5:8]=ctr,
     //   bits[8:11] flags, bits[11:16]=len. da_cont was previously read
-    //   from bit 4 (the spacer, always ~0), which silently collapsed
-    //   every multi-fragment opener (cont=1) into a standalone frame
-    //   and orphaned its continuation — breaking all cross-burst SBD
-    //   reassembly. See tests/host/test_phaseb_cut.c.
+    //   from bit 4, which silently collapsed every multi-fragment opener
+    //   (cont=1) into a standalone frame and orphaned its continuation —
+    //   breaking all cross-burst SBD reassembly. See tests/host/test_phaseb_cut.c.
+    //   NB: bit 4 is NOT the "always ~0 spacer" it was once assumed to be —
+    //   empirically it is set on ~13% of frames (2026-07-15 HydraSDR corpus),
+    //   strongly correlated with SBD type 0x7605 (da_len=11). Captured below as
+    //   da_flag1b for study; its meaning is undecoded (no public spec) and it is
+    //   NOT used for reassembly (which keys only on da_cont).
     out->da_flags1 = (uint8_t)PACKBITS_N(0, 3);
     out->da_cont   = (uint8_t)PACKBITS_N(3, 1);
+    out->da_flag1b = (uint8_t)PACKBITS_N(4, 1);
     out->da_ctr    = (uint8_t)PACKBITS_N(5, 3);
     out->da_flags2 = (uint8_t)PACKBITS_N(8, 3);
     out->da_len    = (uint8_t)PACKBITS_N(11, 5);

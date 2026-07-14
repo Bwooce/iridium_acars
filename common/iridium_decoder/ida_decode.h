@@ -55,14 +55,19 @@ typedef struct {
     // iridium-toolkit/bitsparser.py:IridiumDAMessage):
     //   bits[ 0.. 2]  flags1
     //   bits[ 3]      cont (continuation flag — bitsparser.py:1388)
-    //   bits[ 4]      spacer (unlabeled/unused — bitsparser.py:1389)
+    //   bits[ 4]      flag1b — NOT a spacer (see da_flag1b below)
     //   bits[ 5.. 7]  da_ctr (3-bit message counter)
     //   bits[ 8..10]  flags2
     //   bits[11..15]  da_len (5-bit payload byte count, 0..24)
     //   bits[16]      flags3
     //   bits[17..19]  zero1 (sanity-check, must be 0)
-    uint8_t da_flags1; // 3 bits (bits 0..2; bit 4 is an unused spacer)
-    uint8_t da_cont;   // 1 bit (bit 3)
+    uint8_t da_flags1; // 3 bits (bits 0..2)
+    uint8_t da_cont;   // 1 bit (bit 3) — continuation flag; governs reassembly
+    uint8_t da_flag1b; // 1 bit (bit 4) — NOT a spacer: empirically set on ~13% of frames,
+                       // strongly correlated with SBD type 0x7605 (da_len=11). Meaning
+                       // undecoded (no public spec; iridium-toolkit / gr-iridium /
+                       // iridium-sniffer all discard it). Captured for study; unused for
+                       // reassembly (reassembly keys only on da_cont, bit 3).
     uint8_t da_ctr;    // 3 bits
     uint8_t da_flags2; // 3 bits
     uint8_t da_len;    // 5 bits — number of valid payload bytes
