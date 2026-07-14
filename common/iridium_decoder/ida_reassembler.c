@@ -62,6 +62,9 @@ int ida_reassembler_reap(ida_reassembler_t *ctx, uint64_t now_us,
             out->frags = s->next_ctr;
             s->active  = false;
             ctx->cnt_expired++;
+            // Bin the failed chain by how many fragments it had gathered.
+            { unsigned b = s->next_ctr; if (b >= IDA_PARTS_BINS) b = IDA_PARTS_BINS - 1;
+              ctx->parts_expired[b]++; }
             return 1;
         }
     }
@@ -161,6 +164,9 @@ int ida_reassembler_feed_ex(ida_reassembler_t *ctx, const ida_decoded_t *ida,
         if (out_dirty) *out_dirty = s->dirty;
         s->active = false;
         ctx->cnt_completed++;
+        // Bin the completed chain by fragment count (final frag's ctr + 1).
+        { unsigned b = (unsigned)ida->da_ctr + 1u; if (b >= IDA_PARTS_BINS) b = IDA_PARTS_BINS - 1;
+          ctx->parts_completed[b]++; }
         return 1;
     }
     s->next_ctr = (uint8_t)((ida->da_ctr + 1) % 8);

@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "qpsk_demod.h" // ir_direction_t
+#include "ida_reassembler.h" // IDA_PARTS_BINS (parts-per-chain histogram size)
 
 #ifdef __cplusplus
 extern "C" {
@@ -83,6 +84,10 @@ typedef struct {
     // Stage 1 — ida_reassembler (cross-burst da_cont/da_ctr chaining)
     uint32_t ida_standalone, ida_opened, ida_merged, ida_completed;
     uint32_t ida_orphan, ida_overflow, ida_expired;
+    // Parts-per-chain histograms (index = fragment count, clamped to IDA_PARTS_BINS-1):
+    // shows whether longer multi-fragment messages complete or fail to reassemble.
+    uint32_t ida_parts_completed[IDA_PARTS_BINS];
+    uint32_t ida_parts_expired[IDA_PARTS_BINS];
     // Stage 2 — sbd_reassembler (SBD envelope, msgno/msgcnt)
     uint32_t sbd_short, sbd_single, sbd_assembled, sbd_multi, sbd_broken, sbd_filtered;
     // Chain salvage (§9): partials reaped from timed-out IDA chains.

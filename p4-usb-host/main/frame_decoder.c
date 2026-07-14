@@ -806,6 +806,10 @@ void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out)
     out->ida_orphan       = s_ida_reasm.cnt_orphan;
     out->ida_overflow     = s_ida_reasm.cnt_overflow;
     out->ida_expired      = s_ida_reasm.cnt_expired;
+    memcpy(out->ida_parts_completed, s_ida_reasm.parts_completed,
+           sizeof(out->ida_parts_completed));
+    memcpy(out->ida_parts_expired, s_ida_reasm.parts_expired,
+           sizeof(out->ida_parts_expired));
     out->sbd_short        = s_sbd.cnt_short;
     out->sbd_single       = s_sbd.cnt_single;
     out->sbd_assembled    = s_sbd.cnt_assembled;

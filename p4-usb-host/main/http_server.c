@@ -2634,12 +2634,15 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
     // <8,8-12,12-16,16-20,20-24,>=24 dB. See worker_core1.c.
     uint32_t dstale[WORKER_DROP_SNR_NBUCKET], dpri[WORKER_DROP_SNR_NBUCKET];
     worker_core1_get_drop_snr(dstale, dpri);
-    char body[1024];
+    char body[1400];
     int  n = snprintf(
         body, sizeof(body),
         "{\"lw_da\":%llu,\"lw_da_valid\":%llu,\"lw_da_gate_rejected\":%llu,"
          "\"ida\":{\"standalone\":%u,\"opened\":%u,\"merged\":%u,\"completed\":%u,"
          "\"orphan\":%u,\"overflow\":%u,\"expired\":%u},"
+         "\"parts\":{\"index\":\"fragment count 0..7 (clamped)\","
+         "\"completed\":[%u,%u,%u,%u,%u,%u,%u,%u],"
+         "\"expired\":[%u,%u,%u,%u,%u,%u,%u,%u]},"
          "\"sbd\":{\"short\":%u,\"single\":%u,\"assembled\":%u,\"multi\":%u,"
          "\"broken\":%u,\"filtered\":%u},"
          "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u,\"dirty_emit\":%u,\"acars_partial\":%llu},"
@@ -2651,6 +2654,14 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)r.ida_standalone, (unsigned)r.ida_opened, (unsigned)r.ida_merged,
         (unsigned)r.ida_completed, (unsigned)r.ida_orphan, (unsigned)r.ida_overflow,
         (unsigned)r.ida_expired,
+        (unsigned)r.ida_parts_completed[0], (unsigned)r.ida_parts_completed[1],
+        (unsigned)r.ida_parts_completed[2], (unsigned)r.ida_parts_completed[3],
+        (unsigned)r.ida_parts_completed[4], (unsigned)r.ida_parts_completed[5],
+        (unsigned)r.ida_parts_completed[6], (unsigned)r.ida_parts_completed[7],
+        (unsigned)r.ida_parts_expired[0], (unsigned)r.ida_parts_expired[1],
+        (unsigned)r.ida_parts_expired[2], (unsigned)r.ida_parts_expired[3],
+        (unsigned)r.ida_parts_expired[4], (unsigned)r.ida_parts_expired[5],
+        (unsigned)r.ida_parts_expired[6], (unsigned)r.ida_parts_expired[7],
         (unsigned)r.sbd_short, (unsigned)r.sbd_single, (unsigned)r.sbd_assembled,
         (unsigned)r.sbd_multi, (unsigned)r.sbd_broken, (unsigned)r.sbd_filtered,
         (unsigned)r.salvage_ok, (unsigned)r.salvage_rejected, (unsigned)r.dirty_cont,

@@ -56,6 +56,11 @@ extern "C" {
 #define IDA_REASM_FRAG_GAP_US (280ULL * 1000ULL)         // max gap between consecutive fragments
 #define IDA_REASM_SESSION_TIMEOUT_US (1000ULL * 1000ULL) // max age since last fragment
 
+// Parts-per-chain histogram size: index = fragment count of a chain, clamped to
+// IDA_PARTS_BINS-1. A multi-burst chain is 2..8 fragments; standalone (1 burst) is
+// counted separately in cnt_standalone.
+#define IDA_PARTS_BINS 8
+
 typedef struct {
     bool     active;
     bool     uplink;
@@ -80,6 +85,10 @@ typedef struct {
     uint32_t cnt_orphan;     // continuation fragment with no matching chain
     uint32_t cnt_overflow;   // chain would exceed IDA_REASM_MAX_BYTES, or table full
     uint32_t cnt_expired;    // chains dropped for inactivity
+    // Parts-per-chain histograms (index = fragment count, clamped to IDA_PARTS_BINS-1).
+    // Reveals whether longer multi-fragment messages complete or fail to reassemble.
+    uint32_t parts_completed[IDA_PARTS_BINS];
+    uint32_t parts_expired[IDA_PARTS_BINS];
 } ida_reassembler_t;
 
 void ida_reassembler_init(ida_reassembler_t *ctx);
