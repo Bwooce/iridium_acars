@@ -28,13 +28,18 @@ mkdir -p "$OUTDIR"
 
 log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*"; }
 
-declare -A SYM=(
-    [corpus]=CONFIG_SMOKE_TEST_CORPUS
-    [frame]=CONFIG_SMOKE_TEST_FRAME_DECODER
-    [raw]=CONFIG_SMOKE_TEST_RAW_IRIDIUM
-    [real]=CONFIG_SMOKE_TEST_REAL_IRIDIUM
-    [pieplace]=CONFIG_SMOKE_TEST_PIE_PLACEMENT
-)
+# Variant -> Kconfig symbol. A plain case (not `declare -A`) so this runs
+# under macOS's stock bash 3.2 as well as bash 4+.
+sym_for() {
+    case "$1" in
+        corpus)   echo CONFIG_SMOKE_TEST_CORPUS ;;
+        frame)    echo CONFIG_SMOKE_TEST_FRAME_DECODER ;;
+        raw)      echo CONFIG_SMOKE_TEST_RAW_IRIDIUM ;;
+        real)     echo CONFIG_SMOKE_TEST_REAL_IRIDIUM ;;
+        pieplace) echo CONFIG_SMOKE_TEST_PIE_PLACEMENT ;;
+        *)        echo "" ;;
+    esac
+}
 
 # Snapshot the production sdkconfig ONCE (only if it isn't already a
 # smoke config — refuse to back up a smoke-tainted config).
@@ -161,7 +166,7 @@ fi
 
 snapshot_prod || exit 1
 for v in "$@"; do
-    sym="${SYM[$v]:-}"
+    sym="$(sym_for "$v")"
     if [ -z "$sym" ]; then log "unknown variant '$v' (want corpus|frame|raw|real)"; continue; fi
     log "=== SMOKE variant: $v ($sym) ==="
     set_config "$sym"

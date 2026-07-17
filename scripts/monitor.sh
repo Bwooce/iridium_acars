@@ -32,23 +32,28 @@ if [ ! -e "${PORT}" ]; then
 fi
 
 # Use python+pyserial for non-interactive reading. pyserial ships with the
-# project's IDF venv. Source the env only if pyserial isn't already importable.
-if ! python3 -c "import serial" 2>/dev/null; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-    IDF_EXPORT="${IDF_EXPORT:-${REPO_DIR}/esp-idf/export.sh}"
-    if [ ! -f "${IDF_EXPORT}" ]; then
-        echo "error: pyserial unavailable and IDF export.sh not found" >&2
+# project's IDF venv. The stock python3 may lack it (e.g. macOS Homebrew
+# python), and `source export.sh` does not reliably put the venv python ahead
+# on PATH — so pick an interpreter that actually has pyserial, preferring the
+# vendored IDF venv python.
+PYSERIAL_PY="python3"
+if ! "${PYSERIAL_PY}" -c "import serial" 2>/dev/null; then
+    PYSERIAL_PY=""
+    for _cand in "${IDF_PYTHON_ENV_PATH:-}/bin/python" \
+                 "${HOME}"/.espressif/python_env/*/bin/python; do
+        [ -x "${_cand}" ] || continue
+        if "${_cand}" -c "import serial" 2>/dev/null; then PYSERIAL_PY="${_cand}"; break; fi
+    done
+    if [ -z "${PYSERIAL_PY}" ]; then
+        echo "error: no python with pyserial found (checked python3 + IDF venv)" >&2
         exit 1
     fi
-    # shellcheck disable=SC1090
-    source "${IDF_EXPORT}" > /dev/null
 fi
 
 # Run a small inline python — pyserial reads up to <duration> seconds, prints
 # every byte as it arrives, then exits cleanly. RESET (any non-empty value)
 # pulses RTS first to force a clean boot capture.
-exec python3 - "${PORT}" "${BAUD}" "${DURATION}" "${RESET}" <<'PYEOF'
+exec "${PYSERIAL_PY}" - "${PORT}" "${BAUD}" "${DURATION}" "${RESET}" <<'PYEOF'
 import serial, sys, time
 port, baud, duration, reset = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
 s = serial.Serial(port, baud, timeout=0.5)

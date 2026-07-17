@@ -31,24 +31,58 @@ PORT="${1:-${ESP_PORT:-}}"
 BAUD="${2:-460800}"
 SERIAL_LOGGER="${SCRIPT_DIR}/serial_logger.sh"
 
+# macOS has no udevadm, so id_of() maps a /dev/cu.usbmodem* device to its
+# vid:pid via pyserial's list_ports. The stock python3 may lack pyserial, so
+# pick an interpreter that has it — preferring the vendored IDF venv python.
+# (Linux uses the udevadm branch below and ignores PYSERIAL_PY.)
+PYSERIAL_PY="python3"
+if ! command -v udevadm >/dev/null 2>&1; then
+    if ! "${PYSERIAL_PY}" -c "import serial.tools.list_ports" 2>/dev/null; then
+        for _cand in "${IDF_PYTHON_ENV_PATH:-}/bin/python" \
+                     "${HOME}"/.espressif/python_env/*/bin/python; do
+            [ -x "${_cand}" ] || continue
+            if "${_cand}" -c "import serial.tools.list_ports" 2>/dev/null; then
+                PYSERIAL_PY="${_cand}"; break
+            fi
+        done
+    fi
+fi
+
 # vendor:model pairs we recognise on the P4-NANO. The first match wins
 # during auto-detect; both are accepted (with a warning for the 2nd) when
 # an explicit port is given.
 P4_FLASH_ID="1a86:55d3"      # WCH CH343 USB-UART -> P4 UART0 + EN + GPIO0
 P4_DEBUG_ID="303a:1001"      # Espressif USB JTAG/serial -> P4 native USB OTG
 
-# Print "vendor:model" for a tty device (empty if udevadm can't tell).
+# Print "vendor:model" for a serial device (empty if it can't be told).
+# Linux: udevadm. macOS (no udevadm): pyserial's list_ports vid/pid.
 id_of() {
     local d="$1"
     [ -e "$d" ] || { echo ""; return; }
-    local v m
-    v="$(udevadm info "$d" 2>/dev/null | awk -F= '/^E: ID_VENDOR_ID=/{print $2; exit}')"
-    m="$(udevadm info "$d" 2>/dev/null | awk -F= '/^E: ID_MODEL_ID=/{print $2; exit}')"
-    if [ -n "$v" ] && [ -n "$m" ]; then
-        echo "${v}:${m}"
-    else
-        echo ""
+    if command -v udevadm >/dev/null 2>&1; then
+        local v m
+        v="$(udevadm info "$d" 2>/dev/null | awk -F= '/^E: ID_VENDOR_ID=/{print $2; exit}')"
+        m="$(udevadm info "$d" 2>/dev/null | awk -F= '/^E: ID_MODEL_ID=/{print $2; exit}')"
+        if [ -n "$v" ] && [ -n "$m" ]; then
+            echo "${v}:${m}"
+        else
+            echo ""
+        fi
+        return
     fi
+    # macOS / no udevadm: map the callout device -> vid:pid via pyserial.
+    "${PYSERIAL_PY}" - "$d" <<'PY' 2>/dev/null
+import sys
+try:
+    from serial.tools import list_ports
+except Exception:
+    sys.exit(0)
+dev = sys.argv[1]
+for p in list_ports.comports():
+    if p.device == dev and p.vid is not None and p.pid is not None:
+        print("%04x:%04x" % (p.vid, p.pid))
+        break
+PY
 }
 
 if [ -z "${PORT}" ]; then
@@ -142,14 +176,22 @@ fi
 
 # If the port is still held (e.g. orphaned cat from a SIGKILL'd logger),
 # kill the specific holder(s). We only target ${PORT} — not any other ACM port.
-if fuser "${PORT}" &>/dev/null 2>&1; then
-    echo "[flash.sh] ${PORT} still held after logger stop; killing holders ..."
-    # shellcheck disable=SC2046
-    kill -9 $(fuser "${PORT}" 2>/dev/null) 2>/dev/null || true
+# Use lsof -t (portable): it prints the holder PIDs and nothing when free.
+# NOT fuser — macOS/BSD fuser exits 0 even when the file is unheld, which
+# would make this guard a permanent false-positive and abort every flash.
+# `|| true` because lsof -t exits 1 when the port is free, which would trip
+# `set -e` in the `holders=$(...)` assignments below.
+port_holders() { lsof -t "${PORT}" 2>/dev/null || true; }
+holders="$(port_holders)"
+if [ -n "${holders}" ]; then
+    echo "[flash.sh] ${PORT} still held after logger stop (pids: ${holders}); killing ..."
+    # shellcheck disable=SC2086
+    kill -9 ${holders} 2>/dev/null || true
     sleep 0.3
 fi
-if fuser "${PORT}" &>/dev/null 2>&1; then
-    echo "error: ${PORT} is still held; aborting flash" >&2
+holders="$(port_holders)"
+if [ -n "${holders}" ]; then
+    echo "error: ${PORT} is still held (pids: ${holders}); aborting flash" >&2
     exit 1
 fi
 
