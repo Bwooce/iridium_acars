@@ -214,3 +214,11 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # retransmits -> reliable downloads. MUST match the C6 slave's CONFIG_ESP_SDIO_CHECKSUM.
 # Cost is network-frame-only (the RTL-SDR stream is USB, not SDIO) - negligible.
 CONFIG_ESP_HOSTED_SDIO_CHECKSUM=y
+
+# SD subsystem (#63): message log (NDJSON) + on-demand raw-IQ capture/trace.
+# Kept in defaults (not just local menuconfig) so a `rm sdkconfig; reconfigure`
+# doesn't silently reset it to the Kconfig default (n) and lose SD persistence.
+# COST: links SDMMC+FATFS -> ~50 KB internal DMA-SRAM reserved at link time,
+# which competes with the USB transfer pool + fft_burst_tagger's 65 KB alloc.
+# Watch tagger alloc + rate>0 after enabling (see 6bd218b rationale).
+CONFIG_ENABLE_SD_LOG=y
