@@ -55,6 +55,17 @@ typedef struct {
     // key "best_eff".
     bool best_effort_decode;
 
+    // Chase-2 soft-decision BCH fallback on hard-BCH-failed LW.DA
+    // frames (task #16, common/iridium_decoder/ida_chase.c). Default
+    // OFF: with the toggle off the decode path is bit-identical to the
+    // shipped hard-decision decoder (the fallback is never invoked).
+    // ON = A/B measurement mode: expected ~+2% additional CRC-valid
+    // LW.DA frames at the validated L=5/cap-256 operating point (host
+    // ground-truth run 2026-07-17: +11 on 514 baseline, 0 false
+    // accepts). NVS key "chase2"; toggle via POST /chase2?on=0|1
+    // (applies live — frame_decoder re-snapshots per hard-fail frame).
+    bool chase2_decode;
+
     // Console UART log output (NVS "uart_log", default ON). The console
     // TX path is a VFS busy-spin (topology review 2026-07-17 §F1):
     // every ESP_LOGx char spins the calling task until FIFO space, and
@@ -146,6 +157,7 @@ esp_err_t app_config_set_gain_mode(gain_mode_t mode);
 esp_err_t app_config_set_gain_db_x10(int16_t v);
 esp_err_t app_config_set_bias_tee(bool on);
 esp_err_t app_config_set_best_effort_decode(bool on);
+esp_err_t app_config_set_chase2_decode(bool on);
 esp_err_t app_config_set_uart_log(bool on);
 
 // The uart_log null-sink vprintf hook, and a live apply helper (installs the

@@ -43,6 +43,7 @@
 #include <string.h>
 
 #include "burst_pipeline.h"
+#include "ida_chase.h"
 #include "ida_decode.h"
 #include "iridium_frame.h"
 #include "qpsk_demod.h"
@@ -126,6 +127,11 @@ static void on_frame(burst_pipeline_result_t *res, void *ctx_)
         if (f.type == IR_FRAME_LW && f.lw_subtype == IR_LW_DA) {
             ida_decoded_t ida = {0};
             if (ida_decode(&f, &ida) == 0) {
+                // --chase: Chase-2 soft fallback on hard-BCH fails (no-op
+                // when the toggle is off — returns 0, ida untouched).
+                if (!ida.ok && res->frame.soft_bits)
+                    ida_chase_decode(&f, res->frame.soft_bits,
+                                     (size_t)res->frame.n_bits, &ida);
                 int r = ida_rank(&ida);
                 if (r > ctx->best_rank) {
                     ctx->best_rank = r;
@@ -215,6 +221,12 @@ int main(int argc, char **argv)
             ida_only = true;
         } else if (strcmp(argv[a], "--no-harder") == 0) {
             iridium_frame_classify_set_harder(false);
+        } else if (strcmp(argv[a], "--chase") == 0) {
+            // Chase-2 soft BCH fallback at the validated L=5/cap-256
+            // operating point (task #16; measures the DA_OK uplift and
+            // the safety table must stay 0).
+            ida_chase_set_params(5, 256);
+            ida_chase_set_enabled(true);
         } else if (strcmp(argv[a], "--dumpbits") == 0 && a + 1 < argc) {
             dump_fh = fopen(argv[++a], "w");
             if (!dump_fh) {

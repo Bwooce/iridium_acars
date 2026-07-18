@@ -1001,6 +1001,8 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
     }
 #else // STANDALONE (and AGGREGATOR, which never reaches here)
     frame_decoder_push(frame.bits, frame.n_bits,
+                       frame.soft_bits,
+                       frame.soft_bits ? (size_t)frame.n_bits : 0,
                        frame.direction, 0u,
                        wctx->burst->peak_bin, wctx->burst->peak_snr_db,
                        cap_us);
