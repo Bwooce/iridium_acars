@@ -99,12 +99,19 @@ bool panic_capture_report(char *out, size_t out_len)
     }
     s_cap.magic = 0; // consume: emit the record once, not every window
 
+    // Registers FIRST, the long (truncatable) abort string LAST: the iot_log
+    // emission clips the line at a fixed length, and the coproc trap-storm
+    // abort message is long enough to eat mepc/mtval off the end. Ordering the
+    // hex registers up front guarantees they survive the clip (they're the
+    // datum that discriminates the FPU-vs-PIE EXT_ILL misdispatch — mepc =
+    // faulting instruction, mtval = its raw encoding).
     snprintf(out, out_len,
-             "PANIC-BT core=%ld task=%s %s=\"%s\" mepc=0x%08lx ra=0x%08lx "
-             "sp=0x%08lx mcause=%lu mtval=0x%08lx addr=0x%08lx",
-             (long)s_cap.core, s_cap.task, s_cap.is_abort ? "abort" : "reason",
-             s_cap.desc, (unsigned long)s_cap.mepc, (unsigned long)s_cap.ra,
+             "PANIC-BT core=%ld task=%s mepc=0x%08lx ra=0x%08lx sp=0x%08lx "
+             "mcause=%lu mtval=0x%08lx addr=0x%08lx %s=\"%s\"",
+             (long)s_cap.core, s_cap.task,
+             (unsigned long)s_cap.mepc, (unsigned long)s_cap.ra,
              (unsigned long)s_cap.sp, (unsigned long)s_cap.mcause,
-             (unsigned long)s_cap.mtval, (unsigned long)s_cap.addr);
+             (unsigned long)s_cap.mtval, (unsigned long)s_cap.addr,
+             s_cap.is_abort ? "abort" : "reason", s_cap.desc);
     return true;
 }
