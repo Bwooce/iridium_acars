@@ -17,6 +17,7 @@
 #include "frame_queue.h"
 #include "iridium_frame.h"
 #include "ida_decode.h"
+#include "ida_chase.h" // Chase-2 soft BCH fallback (task #16, NVS chase2_decode)
 #include "ida_reassembler.h"
 #include "dsp_processor.h" // FS_DETECT_HZ / FFT_SIZE for the peak_bin→Hz reassembler key
 #include "worker_core1.h"  // A6: hot-bin publish/clear on open-chain state
@@ -515,13 +516,35 @@ static void process_one(const frame_queue_item_t *it)
             // in the stream (CRC pass/fail, payload length, flags).
             ida_decoded_t ida    = {0};
             int           rc_ida = ida_decode(&classified, &ida);
+            // Chase-2 soft-decision BCH fallback (task #16): only on a
+            // hard BCH failure, only when the worker shipped soft
+            // metrics, and only when the NVS toggle (chase2_decode,
+            // default OFF) is on. Recovery rewrites `ida` to exactly
+            // what a clean hard decode would have produced (CRC-16
+            // arbitrated), so everything downstream is unchanged.
+            // Config snapshot only on this rare path (mirrors the
+            // dirty_cont pattern below) to keep per-frame cost flat.
+            if (rc_ida == 0 && !ida.ok && it->n_soft > 0) {
+                app_config_t ccfg;
+                app_config_snapshot(&ccfg);
+                ida_chase_set_enabled(ccfg.chase2_decode);
+                if (ccfg.chase2_decode &&
+                    ida_chase_decode(&classified, it->soft, it->n_soft,
+                                     &ida) == 1) {
+                    ESP_LOGI(TAG, "CHASE2: recovered LW.DA after hard BCH "
+                                  "fail (checks=%u) bin=%ld snr=%.1f",
+                             (unsigned)ida.chase_checks,
+                             (long)it->peak_bin, (double)it->snr_db);
+                }
+            }
             ESP_LOGI(TAG, "FRAME: LW.DA bin=%ld snr=%.1f "
                           "bch_ok=%d blocks=%d/%d errs=%d "
-                          "hdr_ok=%d ctr=%d len=%u crc=%s",
+                          "hdr_ok=%d ctr=%d len=%u crc=%s%s",
                      (long)it->peak_bin, (double)it->snr_db,
                      ida.ok, ida.blocks_ok, ida.n_blocks, ida.total_errors,
                      ida.header_ok, ida.da_ctr, (unsigned)ida.payload_len,
-                     ida.crc_ok ? "OK" : "BAD");
+                     ida.crc_ok ? "OK" : "BAD",
+                     ida.chase_used ? " (chase2)" : "");
             bool ida_ok_hdr = (rc_ida == 0 && ida.ok && ida.header_ok);
             bool clean      = ida_ok_hdr && ida.crc_ok;
             bool dirty_cont = ida_ok_hdr && !ida.crc_ok && ida.da_ctr > 0;
@@ -784,6 +807,7 @@ esp_err_t frame_decoder_init(void)
 }
 
 bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
+                        const int16_t *soft_bits, size_t n_soft,
                         ir_direction_t direction,
                         uint32_t freq_hz, int peak_bin, float snr_db,
                         uint64_t timestamp_us)
@@ -791,21 +815,37 @@ bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
     if (!s_initialised || !bits) return false;
     if (n_bits == 0 || n_bits > FRAME_QUEUE_MAX_BITS) return false;
 
-    frame_queue_item_t item;
+    // Fill the slot in place (frame_queue_producer_reserve) instead of
+    // staging a frame_queue_item_t on the calling task's stack: with the
+    // soft[] area (task #16) the item is ~2.8 KB, which is real stack
+    // pressure on the 16 KB worker task, and the stage-then-push path
+    // copied every byte twice.
+    frame_queue_item_t *item = frame_queue_producer_reserve(s_queue);
+    if (!item) return false; // full — drop counted by the queue
     // Capture time from the caller (burst sample position); 0 = stamp now.
-    item.timestamp_us = timestamp_us ? timestamp_us : (uint64_t)esp_timer_get_time();
-    item.freq_hz      = freq_hz;
-    item.peak_bin     = peak_bin;
-    item.snr_db       = snr_db;
-    item.n_bits       = (uint16_t)n_bits;
-    item.direction    = (uint8_t)((direction == DIR_DOWNLINK) ? 0 : 1);
-    item.pad          = 0;
+    item->timestamp_us = timestamp_us ? timestamp_us : (uint64_t)esp_timer_get_time();
+    item->freq_hz      = freq_hz;
+    item->peak_bin     = peak_bin;
+    item->snr_db       = snr_db;
+    item->n_bits       = (uint16_t)n_bits;
+    item->direction    = (uint8_t)((direction == DIR_DOWNLINK) ? 0 : 1);
+    item->pad          = 0;
+    // Per-bit soft metrics (Chase-2, task #16): optional, truncated to
+    // the queue's soft capacity (only frame bits [0, 382) are ever
+    // consumed — see ida_chase).
+    if (soft_bits && n_soft > 0) {
+        if (n_soft > FRAME_QUEUE_MAX_SOFT) n_soft = FRAME_QUEUE_MAX_SOFT;
+        item->n_soft = (uint16_t)n_soft;
+        memcpy(item->soft, soft_bits, n_soft * sizeof(int16_t));
+    } else {
+        item->n_soft = 0;
+    }
     // No tail zero-fill: every consumer (iridium_frame_classify and the
     // ida/ibc/ims/tl/ira decoders it dispatches to) bounds-checks against
-    // item.n_bits before indexing into bits[], so bits[n_bits..2047] is
-    // never read. frame_queue_push() also only copies the valid prefix.
-    memcpy(item.bits, bits, n_bits);
-    return frame_queue_push(s_queue, &item);
+    // item->n_bits/n_soft before indexing, so the tails are never read.
+    memcpy(item->bits, bits, n_bits);
+    frame_queue_producer_commit(s_queue);
+    return true;
 }
 
 uint64_t frame_decoder_pushed(void)
@@ -881,4 +921,11 @@ void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out)
     out->dirty_cont       = s_dirty_cont;
     out->dirty_emitted    = s_dirty_emitted;
     out->acars_partial    = atomic_load_explicit(&s_acars_partial, memory_order_relaxed);
+    // Chase-2 counters live in the common module (single writer = this
+    // decoder task; torn read benign for a diagnostic snapshot).
+    ida_chase_stats_t cs;
+    ida_chase_get_stats(&cs);
+    out->chase_attempts   = cs.attempts;
+    out->chase_recovered  = cs.recovered;
+    out->chase_crc_checks = cs.crc_checks;
 }

@@ -55,6 +55,8 @@ static void cmd_config(void)
     uart_puts(buf);
     snprintf(buf, sizeof(buf), "bias_tee=%d\r\n", (int)c.bias_tee);
     uart_puts(buf);
+    snprintf(buf, sizeof(buf), "chase2=%d\r\n", (int)c.chase2_decode);
+    uart_puts(buf);
     snprintf(buf, sizeof(buf), "tag_thr=%.2f\r\n", (double)c.tagger_threshold_db);
     uart_puts(buf);
     snprintf(buf, sizeof(buf), "coal_n=%u\r\n", (unsigned)c.coalesce_min_bursts);
@@ -112,6 +114,8 @@ static void cmd_get(const char *key)
         uint8_t            ulm        = c.uart_log > UART_LOG_MODE_AUTO ? UART_LOG_MODE_AUTO : c.uart_log;
         snprintf(buf, sizeof(buf), "%d (%s)\r\n", (int)c.uart_log, UL_NAMES[ulm]);
     }
+    else if (strcmp(key, "chase2") == 0)
+        snprintf(buf, sizeof(buf), "%d\r\n", (int)c.chase2_decode);
     else if (strcmp(key, "tag_thr") == 0)
         snprintf(buf, sizeof(buf), "%.2f\r\n", (double)c.tagger_threshold_db);
     else if (strcmp(key, "coal_n") == 0)
@@ -170,6 +174,10 @@ static void cmd_set(const char *key, const char *val)
         rc = app_config_set_gain_db_x10((int16_t)atoi(val));
     else if (strcmp(key, "bias_tee") == 0)
         rc = app_config_set_bias_tee(atoi(val) != 0);
+    else if (strcmp(key, "chase2") == 0)
+        // Chase-2 soft BCH A/B toggle (task #16); frame_decoder reads it
+        // live per hard-fail frame, no reboot needed.
+        rc = app_config_set_chase2_decode(atoi(val) != 0);
     else if (strcmp(key, "uart_log") == 0) {
         // Serial recovery path for the console mode: 0=off/1=on/2=auto (see
         // app_config.h 3-state model). Apply live immediately (so a wedged

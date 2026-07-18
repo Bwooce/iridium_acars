@@ -182,6 +182,38 @@ target_include_directories(test_ida_decode_corpus PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
 )
 
+# Task #16: Chase-2 soft-decision BCH fallback — self-contained
+# synthetic gate (ida_encode ground truth + controlled >t=2 error
+# bursts + soft-confidence markers). Asserts toggle-off bit-identity,
+# exact recovery, no-modify-on-fail, multi-codeword arbitration, and
+# determinism. The real-capture parity gate vs the Python reference is
+# test_chase_parity below (fixture-dependent, build-only).
+add_executable(test_ida_chase
+    test_ida_chase.c
+    ${COMMON_DIR}/ida_chase.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/ida_encode.c
+    ${COMMON_DIR}/crc16.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+)
+target_include_directories(test_ida_chase PRIVATE ${COMMON_DIR})
+
+# Task #16 parity driver: production ida_chase vs chase_crc_bch.py on
+# the SAME --dumpbits capture (see the file header for the workflow).
+# Needs runtime fixtures (the 2026-07-17 dump + the Python-emitted
+# expected CSV) => build-only, no add_test — same convention as
+# test_demod_diff_gri.
+add_executable(test_chase_parity
+    test_chase_parity.c
+    ${COMMON_DIR}/ida_chase.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/crc16.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+)
+target_include_directories(test_chase_parity PRIVATE ${COMMON_DIR})
+
 # ibc_decode: IBC (Iridium Broadcast) body parser bit-orientation
 # regression. Synthesizes a valid BC frame with a non-palindromic
 # payload and checks the header/block fields round-trip correctly.
@@ -1296,6 +1328,7 @@ add_test(NAME iridium_frame_phaseB COMMAND test_iridium_frame_phaseB)
 add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
 add_test(NAME frame_queue          COMMAND test_frame_queue)
 add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
+add_test(NAME ida_chase            COMMAND test_ida_chase)
 add_test(NAME ibc_decode           COMMAND test_ibc_decode)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME ida_reasm_salvage    COMMAND test_ida_reasm_salvage)
@@ -1397,6 +1430,7 @@ add_executable(test_demod_diff_gri
     ${COMMON_DIR}/iridium_frame.c
     ${COMMON_DIR}/iridium_bch.c
     ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/ida_chase.c
     ${COMMON_DIR}/crc16.c
 )
 target_include_directories(test_demod_diff_gri PRIVATE

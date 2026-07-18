@@ -96,6 +96,22 @@ static void tail_64_to_codewords(const uint8_t *tail, uint8_t *out_codewords)
     memcpy(out_codewords + 1 * 31, b1 + 1, 31); // b1[1:]
 }
 
+void ida_decode_build_codewords(const uint8_t *data_section,
+                                uint8_t out_codewords[IDA_DECODE_N_CW_BITS])
+{
+    // Apply pair-swap to the post-UW data section. The classifier
+    // does this in a local stack buffer; we have to redo it from
+    // frame->bits which is in qpsk_demod orientation.
+    uint8_t data[DATA_BITS_TOTAL];
+    memcpy(data, data_section, DATA_BITS_TOTAL);
+    pair_swap(data, DATA_BITS_TOTAL);
+
+    // Build all 10 31-bit codewords.
+    chunk_124_to_codewords(data + 0, out_codewords + 0 * 4 * 31);
+    chunk_124_to_codewords(data + CHUNK_124, out_codewords + 1 * 4 * 31);
+    tail_64_to_codewords(data + 2 * CHUNK_124, out_codewords + 2 * 4 * 31);
+}
+
 int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
 {
     if (!frame || !out) return -1;
@@ -106,18 +122,8 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
     memset(out, 0, sizeof(*out));
     out->n_blocks = 10;
 
-    // Apply pair-swap to the post-UW data section. The classifier
-    // does this in a local stack buffer; we have to redo it from
-    // frame->bits which is in qpsk_demod orientation.
-    uint8_t data[DATA_BITS_TOTAL];
-    memcpy(data, frame->bits + UW_BITS + LCW_BITS, DATA_BITS_TOTAL);
-    pair_swap(data, DATA_BITS_TOTAL);
-
-    // Build all 10 31-bit codewords.
-    uint8_t codewords[10 * 31];
-    chunk_124_to_codewords(data + 0, codewords + 0 * 4 * 31);
-    chunk_124_to_codewords(data + CHUNK_124, codewords + 1 * 4 * 31);
-    tail_64_to_codewords(data + 2 * CHUNK_124, codewords + 2 * 4 * 31);
+    uint8_t codewords[IDA_DECODE_N_CW_BITS];
+    ida_decode_build_codewords(frame->bits + UW_BITS + LCW_BITS, codewords);
 
     // BCH-decode each codeword using the ACCH poly with up to 2-bit ECC
     // repair (matches upstream bch_repair() / nrepair2 syndrome table
@@ -159,10 +165,17 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
     out->n_bits = (uint16_t)bit_pos;
     out->ok     = (out->blocks_ok == out->n_blocks);
 
+    ida_decode_parse_fields(out);
+    return 0;
+}
+
+void ida_decode_parse_fields(ida_decoded_t *out)
+{
+    int bit_pos = out->n_bits;
     // Parse the 20-bit header per bitsparser.py:IridiumDAMessage.
     // Need at least 196 bits (9*20+16) for header + payload + CRC.
     if (bit_pos < 196) {
-        return 0; // BCH ok but not enough decoded data — leave header fields zero
+        return; // BCH ok but not enough decoded data — leave header fields zero
     }
     const uint8_t *b = out->bits;
 // Helper: pack n bits MSB-first from b[off..off+n-1]
@@ -249,6 +262,4 @@ int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out)
         out->crc_ok          = (out->da_len > 0) && (out->da_crc_computed == 0);
     }
 #undef PACKBITS_N
-
-    return 0;
 }

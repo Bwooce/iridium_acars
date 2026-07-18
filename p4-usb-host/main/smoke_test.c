@@ -304,7 +304,7 @@ static void smoke_test_run_frame_decoder(void)
         // before giving up; far longer than realistic for this corpus.
         bool ok = false;
         for (int attempt = 0; attempt < 100; attempt++) {
-            ok = frame_decoder_push(e->bits, e->n_bits, qdir,
+            ok = frame_decoder_push(e->bits, e->n_bits, NULL, 0, qdir,
                                     e->freq_hz, 0, e->snr_db, 0u);
             if (ok) break;
             vTaskDelay(1); // one tick = drain a bit, then retry
@@ -356,7 +356,8 @@ static void smoke_test_run_frame_decoder(void)
                 // (see project_30min_live_stability memory note); the
                 // fixture doesn't carry its own SNR field, so log a
                 // representative fixed value here.
-                ok = frame_decoder_push(bits, IDA_ENCODE_FRAME_BITS, DIR_DOWNLINK,
+                ok = frame_decoder_push(bits, IDA_ENCODE_FRAME_BITS, NULL, 0,
+                                        DIR_DOWNLINK,
                                         fr->freq_hz, 0, 12.5f, fr->timestamp_us);
                 if (ok) break;
                 vTaskDelay(1);

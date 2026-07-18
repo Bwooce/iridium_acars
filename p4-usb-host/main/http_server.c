@@ -1985,6 +1985,38 @@ static esp_err_t besteffort_post(httpd_req_t *req)
 
 static const char *const UARTLOG_MODE_NAMES[] = {"off", "on", "auto"};
 
+// POST /chase2?on=0|1 — live A/B toggle for the Chase-2 soft-decision BCH
+// fallback (task #16, app_config.chase2_decode, default OFF). No reboot:
+// frame_decoder snapshots the flag on every hard-BCH-failed LW.DA frame, so
+// the new value applies to the next candidate frame. Same internal-stack
+// hand-off for the NVS commit as besteffort_cfg_task above (PSRAM-stack
+// httpd task must never nvs_commit — cache_utils.c:114 assert).
+static void chase2_cfg_task(void *arg)
+{
+    bool      on = (bool)(uintptr_t)arg;
+    esp_err_t r  = app_config_set_chase2_decode(on);
+    ESP_LOGI(TAG, "/chase2: chase2_decode=%d (%s) — applied live (no reboot)",
+             (int)on, esp_err_to_name(r));
+    vTaskDelete(NULL);
+}
+static esp_err_t chase2_post(httpd_req_t *req)
+{
+    char query[32] = {0}, s[8] = {0};
+    bool on = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "on", s, sizeof(s)) == ESP_OK) {
+        on = (s[0] == '1' || s[0] == 't' || s[0] == 'T');
+    }
+    char body[40];
+    int  n = snprintf(body, sizeof(body), "{\"chase2_decode\":%s}", on ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, n);
+    if (xTaskCreate(chase2_cfg_task, "chase2_cfg", 4096, (void *)(uintptr_t)on, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "/chase2: failed to spawn apply task");
+    }
+    return ESP_OK;
+}
+
 // POST /uartlog?on=0|1 or ?auto=1 — console ESP_LOG mode (topology review
 // 2026-07-17 §F1 + 3-state AUTO extension, app_config.h). The UART TX path
 // is a busy-spin that drains at baud rate whether or not a cable is
@@ -2714,7 +2746,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
     worker_core1_get_drop_snr(dstale, dpri);
     worker_hot_stats_t hot; // A6 continuation-priority boost
     worker_core1_get_hot_stats(&hot);
-    char body[1500];
+    char body[1600]; // +chase2 block (task #16); headroom re-checked
     int  n = snprintf(
         body, sizeof(body),
         "{\"lw_da\":%llu,\"lw_da_valid\":%llu,\"lw_da_gate_rejected\":%llu,"
@@ -2732,6 +2764,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
          "\"boost_pops\":%u,\"boost_inserts\":%u,"
          "\"pf_rej_hot\":%u,\"pf_rej_hot_width\":%u,\"pf_rej_hot_dur\":%u,\"pf_rej_hot_snr\":%u,"
          "\"pf_rej_margin\":%u,\"cont_stale\":%u,\"cont_pri\":%u},"
+         "\"chase2\":{\"attempts\":%u,\"recovered\":%u,\"crc_checks\":%u},"
          "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
         (unsigned long long)r.lw_da, (unsigned long long)r.lw_da_valid,
         (unsigned long long)gate_rej,
@@ -2761,6 +2794,8 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)hot.pf_rej_hot_dur, (unsigned)hot.pf_rej_hot_snr,
         (unsigned)hot.pf_rej_margin,
         (unsigned)hot.hot_cont_stale, (unsigned)hot.hot_cont_pri,
+        (unsigned)r.chase_attempts, (unsigned)r.chase_recovered,
+        (unsigned)r.chase_crc_checks,
         (unsigned long long)r.sbd_complete, (unsigned long long)r.acars_fragments,
         (unsigned long long)r.acars_decoded);
     if (n < 0) n = 0;
@@ -2859,6 +2894,7 @@ esp_err_t http_server_start(void)
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
         {.uri = "/besteffort", .method = HTTP_POST, .handler = besteffort_post, .user_ctx = NULL},
+        {.uri = "/chase2", .method = HTTP_POST, .handler = chase2_post, .user_ctx = NULL},
         {.uri = "/uartlog", .method = HTTP_POST, .handler = uartlog_post, .user_ctx = NULL},
         {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
         {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post, .user_ctx = NULL},
