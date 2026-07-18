@@ -18,6 +18,7 @@ git apply ../patches/0003-freertos-riscv-coproc-save-area-in-internal-ram-for-ps
 git apply ../patches/0004-freertos-riscv-pie-coproc-trap-storm-watchdog.patch   # apply AFTER 0003
 git apply ../patches/0006-freertos-riscv-pie-coproc-force-aligned-cfg-in-save-restore.patch   # apply AFTER 0004
 git apply ../patches/0007-bootloader_support-invalidate-mmap-cache-before-app-ota-verify.patch
+git apply ../patches/0008-fatfs-enable-exfat.patch
 ```
 
 **0005 and 0006 are mutually exclusive** — both edit the
@@ -385,3 +386,23 @@ byte-unchanged by this patch. A quiet `ESP_LOGD` records the invalidate
 
 Adds `#include "hal/cache_hal.h"` (the file already pulls `hal/cache_ll.h`);
 uses `SPI_FLASH_MMU_PAGE_SIZE` and `ALIGN_UP`, both already available in the file.
+
+## 0008 — fatfs: enable exFAT (`FF_FS_EXFAT`)
+
+**File:** `components/fatfs/src/ffconf.h`
+**IDF version:** v6.1 — vendored checkout tracks `release/v6.1`. Re-verify on IDF updates.
+
+FatFs ships exFAT hard-disabled (`FF_FS_EXFAT 0`) with no ESP-IDF Kconfig
+toggle, because exFAT is patent-encumbered (Microsoft) — you must opt in
+deliberately. We want it for a large (256 GB SDXC) capture/log card:
+FAT32 on 256 GB forces 32-128 KB clusters (wasteful for many small NDJSON
+logs), while exFAT uses right-sized clusters and mounts the card in its
+native shipped format (no reformat).
+
+Fix: `FF_FS_EXFAT 0 -> 1`. Prereqs already met: `FF_USE_LFN == 3`
+(`CONFIG_FATFS_LFN_HEAP=y`). Memory cost is only the LFN working-buffer
+bump (~600 B extra with exFAT) which is on the heap and lands in **PSRAM**
+(`CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y`) — **zero internal DMA-INT cost**.
+exFAT support is additive: FAT12/16/32 cards still mount. Note the ffconf
+caveat that exFAT "discards ANSI C (C89) compatibility" (needs 64-bit
+`QWORD`) — a non-issue for this C11 build.
