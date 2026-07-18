@@ -2,6 +2,7 @@
 
 #include "ida_decode.h"
 #include "iridium_bch.h"
+#include "crc16.h"
 #include <string.h>
 
 // DA frames use the ACCH BCH(31,21) polynomial (poly=3545, 12-bit
@@ -19,22 +20,11 @@
 // (NOT BCH(31,21) — that's the ringalert variant for IBC frames.)
 #define BCH_MSG_BITS 20
 
-// CRC-16/CCITT-FALSE (a.k.a. CRC-16/IBM-3740):
-//   poly = 0x1021, init = 0xFFFF, refin = false, refout = false, xorout = 0.
-// Matches `crcmod.predefined.mkPredefinedCrcFun("crc-ccitt-false")` used in
-// iridium-toolkit/bitsparser.py:IridiumDAMessage.
-static uint16_t crc16_ccitt_false(const uint8_t *data, size_t n_bytes)
-{
-    uint16_t crc = 0xFFFFu;
-    for (size_t i = 0; i < n_bytes; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int b = 0; b < 8; b++) {
-            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u)
-                                  : (uint16_t)(crc << 1);
-        }
-    }
-    return crc;
-}
+// CRC-16/CCITT-FALSE over the DA payload — matches
+// `crcmod.predefined.mkPredefinedCrcFun("crc-ccitt-false")` used in
+// iridium-toolkit/bitsparser.py:IridiumDAMessage. The shared table-based
+// implementation lives in crc16.c (see crc16.h); pinned bit-exact by
+// test_crc16_ccitt.
 
 // Pair-swap bits in-place: r[0]<->r[1], r[2]<->r[3], ...
 // Mirrors iridium-toolkit/bitsparser.py:symbol_reverse(). qpsk_demod

@@ -69,6 +69,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// Gate-2 detection threshold, in this build's baseline-scale dB. gr-iridium's
+// default is 18 dB (iridium-extractor:130); our tagger runs ~4 dB lower (memory
+// note "Tagger threshold scale: ours ≈ gri − 4 dB"), so the parity value is 14.
+// Exposed here (not just internal to the .c) so a receiver-integration layer can
+// apply its own MARGIN below this without re-testing at strict parity — the
+// prefilter's SNR estimator never cross-calibrated with the tagger, so shaving
+// exactly at parity kills marginal-but-real bursts (see worker_core1 opener rescue).
+#define PF_THRESH_DB 14.0
+
 typedef struct {
     bool  accept;         // final verdict
     int   width_bins;     // gate-0 tagger spectral width (echoed back)

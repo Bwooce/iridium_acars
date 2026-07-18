@@ -7,9 +7,12 @@
 // libacars.
 //
 // Lifecycle: frame_decoder_init() once at startup, before any worker
-// pushes. Returns ESP_OK on success. The task auto-pins to Core 1
-// at priority 4 (lower than worker_core1 at 5; lower than ingest at 8;
-// higher than status_logger at 1).
+// pushes. Returns ESP_OK on success. The task pins to CORE 0 at
+// priority 6 (same as dsp_feed; below usb_pump at 7) — moved off
+// Core 1 in #123, with a one-frame-per-wake + taskYIELD discipline
+// after the 2026-07-08 WDT incident. See DECODER_PRIO/DECODER_CORE in
+// frame_decoder.c (the authoritative values) and
+// docs/2026-07-17-core-priority-topology-review.md §1.
 
 #include "esp_err.h"
 #include <stdint.h>
@@ -84,6 +87,7 @@ typedef struct {
     // Stage 1 — ida_reassembler (cross-burst da_cont/da_ctr chaining)
     uint32_t ida_standalone, ida_opened, ida_merged, ida_completed;
     uint32_t ida_orphan, ida_overflow, ida_expired;
+    uint32_t ida_orphan_freq; // subset of ida_orphan rejected only on the freq key (Task#6)
     // Parts-per-chain histograms (index = fragment count, clamped to IDA_PARTS_BINS-1):
     // shows whether longer multi-fragment messages complete or fail to reassemble.
     uint32_t ida_parts_completed[IDA_PARTS_BINS];

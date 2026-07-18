@@ -27,6 +27,7 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define UW_LENGTH 12
@@ -2232,6 +2233,52 @@ rrc_scalar_fallback:; // empty stmt — falls through to scalar below
 #endif
 
     const int center = (RRC_NTAPS - 1) / 2;
+
+#ifndef ESP_PLATFORM
+    // Host-only ablation (2026-07-17 demod-gap phase 0): BP_FLOAT_RRC=1
+    // runs the matched filter in float64 with the UNQUANTISED tap set
+    // (s_rrc_taps), rounding to int16 only at the output — isolates the
+    // Q14 tap quantisation + >>14 truncation loss from the other
+    // stages. Diagnostic only; never compiled for target.
+    {
+        static int f_rrc = -1;
+        if (f_rrc < 0) {
+            const char *v = getenv("BP_FLOAT_RRC");
+            f_rrc         = (v && v[0] == '1') ? 1 : 0;
+        }
+        if (f_rrc) {
+            static double *tmp     = NULL;
+            static int     tmp_cap = 0;
+            if (n_complex * 2 > tmp_cap) {
+                free(tmp);
+                tmp_cap = n_complex * 2;
+                tmp     = (double *)malloc((size_t)tmp_cap * sizeof(double));
+            }
+            for (int k = 0; k < n_complex; k++) {
+                double acc_re = 0.0, acc_im = 0.0;
+                for (int t = 0; t < RRC_NTAPS; t++) {
+                    int in_idx = k + t - center;
+                    if (in_idx < 0 || in_idx >= n_complex) continue;
+                    acc_re += (double)s_rrc_taps[t] * (double)burst_in[in_idx * 2 + 0];
+                    acc_im += (double)s_rrc_taps[t] * (double)burst_in[in_idx * 2 + 1];
+                }
+                tmp[k * 2 + 0] = acc_re;
+                tmp[k * 2 + 1] = acc_im;
+            }
+            for (int k = 0; k < n_complex; k++) {
+                long re = lrint(tmp[k * 2 + 0]);
+                long im = lrint(tmp[k * 2 + 1]);
+                if (re > INT16_MAX) re = INT16_MAX;
+                if (re < INT16_MIN) re = INT16_MIN;
+                if (im > INT16_MAX) im = INT16_MAX;
+                if (im < INT16_MIN) im = INT16_MIN;
+                burst_out[k * 2 + 0] = (int16_t)re;
+                burst_out[k * 2 + 1] = (int16_t)im;
+            }
+            return;
+        }
+    }
+#endif
 
     // Linear delay line (no circular modulo in the inner loop).
     // 51 int16 × 2 channels = 204 bytes of stack — trivial. The

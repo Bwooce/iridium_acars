@@ -34,7 +34,21 @@
 
 // ---- GOLDEN BASELINE (filled from a capture run; see CAPTURE block) ----
 #define G_BURST_START 2304
-#define G_RRC_FNV 0x55bc316eu
+// The RRC-buffer FNV is the one PLATFORM-SENSITIVE golden: apply_rrc's tap
+// generation goes through libm floats, and Apple libm vs glibc round a few
+// samples ±1 LSB apart, so the int16 bit-hash diverges per platform while
+// every semantic field (burst_start/uw_offset/direction/CFO/SNR/peaks)
+// stays identical. Pin one hash per known platform — bit-exact refactor
+// protection holds on each — and warn-skip (not fail) the hash subtest on
+// platforms with no captured baseline yet (capture block prints the value
+// to pin). 2026-07-17; Linux baseline 2026-06-15 commit 8a41b4f.
+#if defined(__APPLE__)
+#define G_RRC_FNV 0xbc607bd4u // macOS arm64, Apple clang/libm
+#elif defined(__linux__)
+#define G_RRC_FNV 0x55bc316eu // Linux x86_64, gcc/glibc (original baseline)
+#else
+#define G_RRC_FNV_UNPINNED 1
+#endif
 #define G_UW_OFFSET 196
 #define G_DIRECTION UW_DIR_DOWNLINK // == 1
 #define G_CORRECTION 0.000000f
@@ -113,7 +127,13 @@ int main(void)
     printf("  #define G_PEAK_IM %.6ff\n", (double)r.peak_im);
 
     CHECK(burst_start == G_BURST_START, "burst_start %d != golden %d", burst_start, G_BURST_START);
+#ifdef G_RRC_FNV_UNPINNED
+    printf("  WARN: no RRC-FNV baseline pinned for this platform — hash "
+           "subtest skipped (pin 0x%08x in the #if ladder above)\n",
+           rrc_fnv);
+#else
     CHECK(rrc_fnv == G_RRC_FNV, "RRC fnv 0x%08x != golden 0x%08x", rrc_fnv, G_RRC_FNV);
+#endif
     CHECK(r.uw_offset == G_UW_OFFSET, "uw_offset %d != golden %d", r.uw_offset, G_UW_OFFSET);
     CHECK((int)r.direction == (int)G_DIRECTION, "direction %d != golden %d", (int)r.direction, (int)G_DIRECTION);
     CHECK(feq(r.correction, G_CORRECTION), "correction %.6f != golden %.6f", (double)r.correction, (double)G_CORRECTION);

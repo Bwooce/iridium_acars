@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"    // esp_reset_reason() — reboot-cause telemetry over iot_log
+#include "worker_core1.h"  // A6 hot-boost stats for the STATUS line
 #include "panic_capture.h" // remote crash frame (mepc/ra) recovered from RTC
 #include "status_logger.h"
 #include "esp_iot_log.h"
@@ -399,6 +400,8 @@ static void emit(const status_snapshot_t *s)
     frame_decoder_reasm_stats_t rs;
     frame_decoder_get_reasm_stats(&rs);
     uint32_t lwda_bad = (rs.lw_da >= rs.lw_da_valid) ? (uint32_t)(rs.lw_da - rs.lw_da_valid) : 0;
+    worker_hot_stats_t hot; // A6 continuation-boost activity
+    worker_core1_get_hot_stats(&hot);
 
     // Health-watchdog counters for reboot-cause tracing: gwf = consecutive
     // failed gateway pings (reboots at GW_FAIL_LIMIT), stall = consecutive
@@ -421,7 +424,7 @@ static void emit(const status_snapshot_t *s)
             "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%% "
             "bursts=%u pk_bursts=%u pk_wk=%u%% pk_acc=%u pk_qd=%u "
             "lwda=%lu lwda_bad=%lu sbd=%lu gwf=%d stall=%d "
-            "dmaf=%lu sramf=%lu psramf=%lu",
+            "dmaf=%lu sramf=%lu psramf=%lu hot=%lu/%lu",
             rate_inst,
             (unsigned long)s->ws.bursts_bch_decoded,
             (unsigned long)s->ws.bursts_bch_unknown,
@@ -432,7 +435,8 @@ static void emit(const status_snapshot_t *s)
             (unsigned)s_cap_peak_processed, (unsigned)s_cap_peak_qdrops,
             (unsigned long)rs.lw_da, (unsigned long)lwda_bad,
             (unsigned long)rs.sbd_complete, gwf, stall,
-            (unsigned long)dmaf_kb, (unsigned long)sramf_kb, (unsigned long)psramf_kb);
+            (unsigned long)dmaf_kb, (unsigned long)sramf_kb, (unsigned long)psramf_kb,
+            (unsigned long)hot.published, (unsigned long)hot.boost_pops);
 
     // Warn proactively when EITHER subsystem crosses 80 % capacity OR
     // any drop / recovery counter ticks. Field names match
@@ -528,13 +532,17 @@ esp_err_t status_logger_init(void)
     // PSRAM stack — see feedback_task_stacks_in_psram memory note.
     // 1 Hz periodic logging; PSRAM stack overhead is negligible.
     //
-    // Priority 6 = above frame_decoder (4) and worker (3) on Core 1
-    // so the logger always gets its sub-millisecond formatting slot
-    // even when the worker has a sustained backlog of bursts. This
-    // 1 Hz spike can't starve the lower-prio tasks — it's ~200 µs
-    // of CPU per second. Without this, under heavy noise (10 dB
-    // tagger threshold, ~145 bursts/sec) the worker preempted the
-    // logger indefinitely and the STATUS line disappeared.
+    // Priority 6 = above worker_core1 (4) on Core 1 (frame_decoder now
+    // lives on Core 0 at prio 6 — see frame_decoder.c DECODER_CORE) so
+    // the logger always gets its formatting slot even when the worker
+    // has a sustained backlog of bursts. Without this, under heavy
+    // noise (10 dB tagger threshold, ~145 bursts/sec) the worker
+    // preempted the logger indefinitely and the STATUS line
+    // disappeared — diagnostics vanished exactly at saturation.
+    // CAVEAT (topology review 2026-07-17 §F1): being above the worker
+    // means this task's UART output steals from the worker during
+    // passes; the console TX path is a busy-spin, so keep STATUS lines
+    // lean and keep the console baud high (921600).
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(logger_task, "status_logger",
                                                     6144, NULL, 6, NULL, 1,
                                                     MALLOC_CAP_SPIRAM);

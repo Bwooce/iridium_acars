@@ -59,6 +59,7 @@ static void dump_iq_cf32(const char *fname, const int16_t *iq, int n_complex)
 #define UW_SPS 10
 #endif
 
+
 #define POST_CORR_DECIM 5
 
 static inline int16_t q15_saturate(int32_t x)
@@ -73,6 +74,60 @@ static inline int16_t q15_from_float(float f)
     int32_t q = (int32_t)lrintf(f * 32767.0f);
     return q15_saturate(q);
 }
+
+#ifndef ESP_PLATFORM
+// ---- Host-only stage-swap ablation diagnostics (2026-07-17 demod-gap
+// phase 0). Env-gated float64 replacements for the Q15 signal-path
+// stages so the demod-diff harness can attribute the SNR-edge gap vs
+// gr-iridium to a specific stage. NEVER compiled on target.
+//   BP_FLOAT_ROT=1    float64 rotations (coarse-CFO rotate, peak-phase
+//                     pre-rotate, post-UW residual-CFO rotate)
+//   BP_FLOAT_INTERP=1 float64 sub-sample interpolation + decimation
+// (float RRC lives in uw_correlator.c: BP_FLOAT_RRC=1.)
+static int bp_env_flag(const char *name)
+{
+    const char *v = getenv(name);
+    return v && v[0] == '1';
+}
+static int bp_float_rot(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = bp_env_flag("BP_FLOAT_ROT");
+    return cached;
+}
+static int bp_float_interp(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = bp_env_flag("BP_FLOAT_INTERP");
+    return cached;
+}
+// Float64 equivalent of rotate_to_dc_q15_simd_at: multiply by
+// exp(+j*phase_step*(sample_offset+k)), round-to-nearest back to int16.
+static void bp_rotate_f64_at(int16_t *iq, int n_complex, double phase_step,
+                             int sample_offset)
+{
+    for (int k = 0; k < n_complex; k++) {
+        double ph = phase_step * (double)(sample_offset + k);
+        double cs = cos(ph), ss = sin(ph);
+        double r  = (double)iq[k * 2 + 0];
+        double v  = (double)iq[k * 2 + 1];
+        double nr = r * cs - v * ss;
+        double ni = r * ss + v * cs;
+        iq[k * 2 + 0] = q15_saturate((int32_t)lrint(nr));
+        iq[k * 2 + 1] = q15_saturate((int32_t)lrint(ni));
+    }
+}
+#define BP_ROTATE_AT(iq, n, step, off)                        \
+    do {                                                      \
+        if (bp_float_rot())                                   \
+            bp_rotate_f64_at((iq), (n), (step), (off));       \
+        else                                                  \
+            rotate_to_dc_q15_simd_at((iq), (n), (step), (off)); \
+    } while (0)
+#else
+#define BP_ROTATE_AT(iq, n, step, off) \
+    rotate_to_dc_q15_simd_at((iq), (n), (step), (off))
+#endif
 
 // (q15_freq_shift_inplace used to live here — the Q15 phase-ramp
 // helper from the channelizer era. Both its roles are now served by
@@ -260,16 +315,35 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     if (pmag > 1e-3f) {
         float   rot_re = tmp.peak_re / pmag;
         float   rot_im = tmp.peak_im / pmag;
-        int16_t pr_q   = q15_from_float(rot_re);
-        int16_t pi_q   = q15_from_float(rot_im);
-        for (int i = search_start; i < rot_end; i++) {
-            int32_t re           = adj_burst[i * 2 + 0];
-            int32_t im           = adj_burst[i * 2 + 1];
-            int32_t nr           = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
-            int32_t ni           = ((int32_t)re * pi_q + (int32_t)im * pr_q) >> 15;
-            adj_burst[i * 2 + 0] = q15_saturate(nr);
-            adj_burst[i * 2 + 1] = q15_saturate(ni);
+#ifndef ESP_PLATFORM
+        if (bp_float_rot()) {
+            // Ablation: float64 phase rotation, round-to-nearest.
+            for (int i = search_start; i < rot_end; i++) {
+                double re = adj_burst[i * 2 + 0];
+                double im = adj_burst[i * 2 + 1];
+                double nr = re * (double)rot_re - im * (double)rot_im;
+                double ni = re * (double)rot_im + im * (double)rot_re;
+                adj_burst[i * 2 + 0] = q15_saturate((int32_t)lrint(nr));
+                adj_burst[i * 2 + 1] = q15_saturate((int32_t)lrint(ni));
+            }
+            goto prerot_done;
         }
+#endif
+        {
+            int16_t pr_q = q15_from_float(rot_re);
+            int16_t pi_q = q15_from_float(rot_im);
+            for (int i = search_start; i < rot_end; i++) {
+                int32_t re           = adj_burst[i * 2 + 0];
+                int32_t im           = adj_burst[i * 2 + 1];
+                int32_t nr           = ((int32_t)re * pr_q - (int32_t)im * pi_q) >> 15;
+                int32_t ni           = ((int32_t)re * pi_q + (int32_t)im * pr_q) >> 15;
+                adj_burst[i * 2 + 0] = q15_saturate(nr);
+                adj_burst[i * 2 + 1] = q15_saturate(ni);
+            }
+        }
+#ifndef ESP_PLATFORM
+    prerot_done:;
+#endif
     }
     if (dump) {
         dump_iq_cf32("07_post_prerot_250k",
@@ -315,6 +389,19 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     // j+1 <= n_rot-4 for every kept sample, so no out-of-bounds read.
     int n_post_cplx = n_rot / POST_CORR_DECIM;
     if (n_post_cplx > TDF_POST_MAX) n_post_cplx = TDF_POST_MAX; // can't trip: n_rot <= 1910
+#ifndef ESP_PLATFORM
+    if (bp_float_interp() && interp_frac != 0.0f) {
+        // Ablation: float64 linear interpolation, round-to-nearest.
+        double a = 1.0 - (double)interp_frac, bcoef = (double)interp_frac;
+        for (int i = 0; i < n_post_cplx; i++) {
+            int    j  = i * POST_CORR_DECIM;
+            double re = a * src[j * 2 + 0] + bcoef * src[(j + 1) * 2 + 0];
+            double im = a * src[j * 2 + 1] + bcoef * src[(j + 1) * 2 + 1];
+            s_tdf_post[i * 2 + 0] = q15_saturate((int32_t)lrint(re));
+            s_tdf_post[i * 2 + 1] = q15_saturate((int32_t)lrint(im));
+        }
+    } else
+#endif
     if (interp_frac != 0.0f) {
         int16_t a_q = q15_from_float(1.0f - interp_frac);
         int16_t b_q = q15_from_float(interp_frac);
@@ -348,9 +435,8 @@ static bool try_decode_frame(int16_t *adj_burst, int adj_n,
     // src is at sps=2 after the POST_CORR_DECIM step, so phase_step =
     // omega_per_sym / 2.
     if (tmp.omega_per_sym != 0.0f) {
-        rotate_to_dc_q15_simd_at(post, n_post_cplx,
-                                 (double)tmp.omega_per_sym * 0.5,
-                                 0);
+        BP_ROTATE_AT(post, n_post_cplx,
+                     (double)tmp.omega_per_sym * 0.5, 0);
     }
     if (dump) dump_iq_cf32("08b_post_uwcfo_2sps", post, n_post_cplx);
 
@@ -540,8 +626,7 @@ static int pipeline_head(int16_t *iq250, int n_complex,
     // `feedback_q15_incremental_phasor_decays.md`.
     if (omega_coarse != 0.0f) {
         float dphi = omega_coarse / (float)UW_SPS;
-        rotate_to_dc_q15_simd_at(adj_burst, adj_n,
-                                 (double)dphi, 0);
+        BP_ROTATE_AT(adj_burst, adj_n, (double)dphi, 0);
     }
     PROFILE_LOG(PREROT);
 

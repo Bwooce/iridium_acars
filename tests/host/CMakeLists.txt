@@ -142,6 +142,17 @@ add_executable(test_iridium_bch
 )
 target_include_directories(test_iridium_bch PRIVATE ${COMMON_DIR})
 
+# Syndrome-table BCH repair vs the retained brute-force reference —
+# EXHAUSTIVE bit-exactness proof (every 0/1/2-error pattern on a set of
+# valid codewords for every (poly, n_bits) the decoders actually call,
+# plus random >=3-error patterns where identical MIScorrection is
+# asserted). Hard gate for the iridium_bch_repair1/2 table fast path.
+add_executable(test_bch_syndrome
+    test_bch_syndrome.c
+    ${COMMON_DIR}/iridium_bch.c
+)
+target_include_directories(test_bch_syndrome PRIVATE ${COMMON_DIR})
+
 # Phase B synthetic frame tests (BC + LW dispatch + LW subtypes).
 add_executable(test_iridium_frame_phaseB
     test_iridium_frame_phaseB.c
@@ -162,6 +173,7 @@ target_link_libraries(test_frame_queue PRIVATE pthread)
 add_executable(test_ida_decode_corpus
     test_ida_decode_corpus.c
     ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/crc16.c
     ${COMMON_DIR}/iridium_frame.c
     ${COMMON_DIR}/iridium_bch.c
 )
@@ -194,6 +206,13 @@ add_executable(test_ida_reasm_salvage
     ${COMMON_DIR}/ida_reassembler.c
 )
 target_include_directories(test_ida_reasm_salvage PRIVATE ${COMMON_DIR})
+
+# A6 hot-bin table (continuation-priority boost) — dependency-free module.
+add_executable(test_hot_bin_table
+    test_hot_bin_table.c
+    ${MAIN_DIR}/hot_bin_table.c
+)
+target_include_directories(test_hot_bin_table PRIVATE ${MAIN_DIR})
 
 # Chain-salvage (Task B2): sbd_salvage_parse() stateless, truncation-
 # tolerant SBD envelope extractor (mirrors sbd_reassembler_feed()'s
@@ -419,8 +438,9 @@ add_executable(test_frame_link
     test_frame_link.c
     ${MAIN_DIR}/frame_link.c
     ${MAIN_DIR}/frame_pdu.c
+    ${COMMON_DIR}/crc16.c
 )
-target_include_directories(test_frame_link PRIVATE ${MAIN_DIR})
+target_include_directories(test_frame_link PRIVATE ${MAIN_DIR} ${COMMON_DIR})
 
 # Phase 3.6.M task #58 step 1: validate rotate_to_dc_q15_inc against
 # the cosf/sinf reference (rotate_to_dc) on synthetic tones. Asserts
@@ -738,6 +758,10 @@ target_compile_options(test_libacars_link PRIVATE
     -D_POSIX_C_SOURCE=200809L
     -D_DEFAULT_SOURCE
     -D_GNU_SOURCE
+    # macOS: _XOPEN_SOURCE/_POSIX_C_SOURCE alone HIDE BSD extensions
+    # (strsep/memmem) in Apple's <string.h>; _DARWIN_C_SOURCE restores
+    # them (the Darwin analogue of _DEFAULT_SOURCE; no-op on glibc).
+    -D_DARWIN_C_SOURCE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
 )
@@ -801,6 +825,10 @@ target_compile_options(test_libacars_best_effort PRIVATE
     -D_POSIX_C_SOURCE=200809L
     -D_DEFAULT_SOURCE
     -D_GNU_SOURCE
+    # macOS: _XOPEN_SOURCE/_POSIX_C_SOURCE alone HIDE BSD extensions
+    # (strsep/memmem) in Apple's <string.h>; _DARWIN_C_SOURCE restores
+    # them (the Darwin analogue of _DEFAULT_SOURCE; no-op on glibc).
+    -D_DARWIN_C_SOURCE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
     -Wno-unused-variable
@@ -902,6 +930,7 @@ add_executable(decode_burst_capture
     ${COMMON_DIR}/iridium_frame.c
     ${COMMON_DIR}/iridium_bch.c
     ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/crc16.c
     ${COMMON_DIR}/ida_reassembler.c
     ${COMMON_DIR}/sbd_reassembler.c
     ${LIBACARS_SRC}/acars.c
@@ -929,6 +958,10 @@ target_compile_options(decode_burst_capture PRIVATE
     -D_POSIX_C_SOURCE=200809L
     -D_DEFAULT_SOURCE
     -D_GNU_SOURCE
+    # macOS: _XOPEN_SOURCE/_POSIX_C_SOURCE alone HIDE BSD extensions
+    # (strsep/memmem) in Apple's <string.h>; _DARWIN_C_SOURCE restores
+    # them (the Darwin analogue of _DEFAULT_SOURCE; no-op on glibc).
+    -D_DARWIN_C_SOURCE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
 )
@@ -957,6 +990,7 @@ add_executable(test_phaseb_cut
     ${COMMON_DIR}/iridium_frame.c
     ${COMMON_DIR}/iridium_bch.c
     ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/crc16.c
     ${COMMON_DIR}/ida_reassembler.c
     ${COMMON_DIR}/sbd_reassembler.c
     ${LIBACARS_SRC}/acars.c
@@ -985,10 +1019,75 @@ target_compile_options(test_phaseb_cut PRIVATE
     -D_POSIX_C_SOURCE=200809L
     -D_DEFAULT_SOURCE
     -D_GNU_SOURCE
+    # macOS: _XOPEN_SOURCE/_POSIX_C_SOURCE alone HIDE BSD extensions
+    # (strsep/memmem) in Apple's <string.h>; _DARWIN_C_SOURCE restores
+    # them (the Darwin analogue of _DEFAULT_SOURCE; no-op on glibc).
+    -D_DARWIN_C_SOURCE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
 )
 target_link_libraries(test_phaseb_cut PRIVATE m)
+
+# test_fullchain_slice: equal-bandwidth end-to-end comparison harness.
+# Same chain as test_phaseb_cut but for a NATIVE 2.5 MSPS ci16 slice
+# (no 2.56→2.5 ingest resample) and with the production burst_prefilter
+# gate (worker_core1.c step 3, incl. the A6 hot-bin SNR exemption) and
+# real RF-derived timestamps driving the IDA chain gap/expiry logic.
+# Answers: does the P4 FULL chain (tagger included) recover the same
+# IDA/ACARS gr-iridium does on the same file at the same bandwidth?
+# Not wired into ctest (needs a runtime slice file argument); see
+# docs/2026-07-17-p4-fullchain-2p5mhz.md for the measurement runs.
+add_executable(test_fullchain_slice
+    test_fullchain_slice.c
+    acars_tail.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/burst_prefilter.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/crc16.c
+    ${COMMON_DIR}/ida_reassembler.c
+    ${COMMON_DIR}/sbd_reassembler.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_fullchain_slice PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+    ${LIBACARS_UPSTREAM}
+    ${LIBACARS_IDF_DIR}
+)
+target_compile_options(test_fullchain_slice PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -D_DARWIN_C_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+target_link_libraries(test_fullchain_slice PRIVATE m)
 
 # Positive control for the IDA -> SBD -> ACARS tail glue (acars_tail.c),
 # the shared helper decode_burst_capture uses on LW.DA frames. Feeds a
@@ -1026,6 +1125,10 @@ target_compile_options(test_acars_tail_synthetic PRIVATE
     -D_POSIX_C_SOURCE=200809L
     -D_DEFAULT_SOURCE
     -D_GNU_SOURCE
+    # macOS: _XOPEN_SOURCE/_POSIX_C_SOURCE alone HIDE BSD extensions
+    # (strsep/memmem) in Apple's <string.h>; _DARWIN_C_SOURCE restores
+    # them (the Darwin analogue of _DEFAULT_SOURCE; no-op on glibc).
+    -D_DARWIN_C_SOURCE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
 )
@@ -1068,6 +1171,10 @@ target_compile_options(test_acars_tail_real PRIVATE
     -D_POSIX_C_SOURCE=200809L
     -D_DEFAULT_SOURCE
     -D_GNU_SOURCE
+    # macOS: _XOPEN_SOURCE/_POSIX_C_SOURCE alone HIDE BSD extensions
+    # (strsep/memmem) in Apple's <string.h>; _DARWIN_C_SOURCE restores
+    # them (the Darwin analogue of _DEFAULT_SOURCE; no-op on glibc).
+    -D_DARWIN_C_SOURCE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
 )
@@ -1085,6 +1192,7 @@ add_executable(test_ida_encode_roundtrip
     test_ida_encode_roundtrip.c
     ${COMMON_DIR}/ida_encode.c
     ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/crc16.c
     ${COMMON_DIR}/ida_reassembler.c
     ${COMMON_DIR}/sbd_reassembler.c
     ${COMMON_DIR}/iridium_frame.c
@@ -1114,6 +1222,10 @@ target_compile_options(test_ida_encode_roundtrip PRIVATE
     -D_POSIX_C_SOURCE=200809L
     -D_DEFAULT_SOURCE
     -D_GNU_SOURCE
+    # macOS: _XOPEN_SOURCE/_POSIX_C_SOURCE alone HIDE BSD extensions
+    # (strsep/memmem) in Apple's <string.h>; _DARWIN_C_SOURCE restores
+    # them (the Darwin analogue of _DEFAULT_SOURCE; no-op on glibc).
+    -D_DARWIN_C_SOURCE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
 )
@@ -1178,6 +1290,7 @@ add_test(NAME demod_corpus         COMMAND test_demod_corpus)
 add_test(NAME demod_low_snr        COMMAND test_demod_low_snr)
 add_test(NAME demod_albq           COMMAND test_demod_albq)
 add_test(NAME iridium_bch          COMMAND test_iridium_bch)
+add_test(NAME bch_syndrome         COMMAND test_bch_syndrome)
 add_test(NAME iridium_frame        COMMAND test_iridium_frame)
 add_test(NAME iridium_frame_phaseB COMMAND test_iridium_frame_phaseB)
 add_test(NAME iridium_frame_corpus COMMAND test_iridium_frame_corpus)
@@ -1186,6 +1299,7 @@ add_test(NAME ida_decode_corpus    COMMAND test_ida_decode_corpus)
 add_test(NAME ibc_decode           COMMAND test_ibc_decode)
 add_test(NAME sbd_reassembler      COMMAND test_sbd_reassembler)
 add_test(NAME ida_reasm_salvage    COMMAND test_ida_reasm_salvage)
+add_test(NAME hot_bin_table        COMMAND test_hot_bin_table)
 add_test(NAME sbd_salvage          COMMAND test_sbd_salvage)
 add_test(NAME acars_tail_synthetic COMMAND test_acars_tail_synthetic)
 add_test(NAME acars_tail_real      COMMAND test_acars_tail_real)
@@ -1248,3 +1362,55 @@ endif()
 # smoke test (56 frames classified per task #59's measurement run).
 # The unit test binary still builds (catches link breakage); update
 # it the next time someone needs targeted uw_correlator coverage.
+
+# tagger back-to-back detection (2026-07-17): does the production tagger tag a
+# continuation burst arriving 90 ms after its opener on the SAME bin? Field
+# signature: P4 loses every 0x7608 continuation while HydraSDR shows them on
+# air at equal strength (+90 ms, same freq, CRC:OK); queue and triage are
+# exonerated by counters — detection is the remaining un-instrumented stage.
+add_executable(test_tagger_back_to_back
+    test_tagger_back_to_back.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_tagger_back_to_back PRIVATE
+    ${COMMON_DIR}
+)
+target_link_libraries(test_tagger_back_to_back PRIVATE m)
+add_test(NAME tagger_back_to_back COMMAND test_tagger_back_to_back)
+
+# demod-diff harness (2026-07-17): per-burst A/B against gr-iridium on a
+# real wideband HydraSDR capture. Windows are extracted by
+# tests/scripts/demod_diff_extract.py (memmap seek into the 7.2 GB ci16,
+# rotate + gri-matched Kaiser LPF + decimate to 250 ksps); this binary
+# runs each window through the production burst_pipeline_process_burst
+# + classify + ida_decode and prints the stratified ours-vs-gri table.
+# Measurement tool, not a regression gate — no add_test.
+add_executable(test_demod_diff_gri
+    test_demod_diff_gri.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/crc16.c
+)
+target_include_directories(test_demod_diff_gri PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+)
+target_link_libraries(test_demod_diff_gri PRIVATE m)
+
+# test_crc16_ccitt (2026-07-17): pins the table-driven crc16_ccitt_false
+# (ida_decode.c) bit-exact vs a bit-serial reference + canonical vector + the
+# CCITT-FALSE residual property. Guards the 512-byte lookup table.
+add_executable(test_crc16_ccitt
+    test_crc16_ccitt.c
+    ${COMMON_DIR}/crc16.c
+)
+target_include_directories(test_crc16_ccitt PRIVATE ${COMMON_DIR})
+add_test(NAME crc16_ccitt COMMAND test_crc16_ccitt)

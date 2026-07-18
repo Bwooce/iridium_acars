@@ -145,6 +145,20 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
     //   - PLL_BETA path elided (compile-time 0).
     float complex phi_hat   = 1.0f + 0.0f * _Complex_I;
     float         omega_hat = 0.0f;
+    float         pll_alpha = PLL_ALPHA;
+#ifndef ESP_PLATFORM
+    // Host-only ablation (2026-07-17 demod-gap phase 0): PLL_ALPHA env
+    // var overrides the loop gain so the demod-diff harness can probe
+    // PLL tuning at threshold SNR. Never compiled for target.
+    {
+        static float env_alpha = -1.0f;
+        if (env_alpha < 0.0f) {
+            const char *v = getenv("PLL_ALPHA");
+            env_alpha     = (v && v[0]) ? strtof(v, NULL) : PLL_ALPHA;
+        }
+        pll_alpha = env_alpha;
+    }
+#endif
     // Power-decay truncation (task #73, gri-aligned). Track the running
     // peak magnitude across the burst; if three consecutive symbols
     // come in below peak/8, the actual signal has ended and the rest
@@ -182,7 +196,7 @@ int qpsk_demod_process(const int16_t *samples_2sps, int n_samples, decoded_frame
         float         angle = cargf(er);
 
         // First-order phase correction: phi_hat *= exp(-j·α·angle).
-        float total = PLL_ALPHA * angle;
+        float total = pll_alpha * angle;
         float c = cosf(total), s = sinf(total);
         // exp(-j·t) = cos(t) - j·sin(t). Multiply: (c - j·s) * phi_hat.
         float ph_re = crealf(phi_hat);

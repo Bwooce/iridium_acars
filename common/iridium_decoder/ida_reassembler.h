@@ -53,7 +53,20 @@ extern "C" {
 // estimate; our estimator is coarser, so we widen it while staying
 // well inside the 40 kHz channel grid (channels can't be confused).
 #define IDA_REASM_FREQ_DEADBAND_HZ 5000u
-#define IDA_REASM_FRAG_GAP_US (280ULL * 1000ULL)         // max gap between consecutive fragments
+// Max PER-HOP gap between consecutive fragments (gated on now_us - last_time_us). Was 280ms.
+// NOT changed to un-clip clean chains: measured on a 45-min HydraSDR corpus, per-hop gaps are
+// TDMA-quantised at ~90ms (p99 180ms, max 180ms), so 280ms clipped zero clean chains (78
+// assembled at 280/700/1000ms identically). The 0.36–0.45s figures are multi-hop chain SPANS,
+// which a per-hop gate never sees; and item timestamps are RF-sample-derived so worker/queue
+// latency cannot stretch observed gaps. The REAL reason for 700ms: ARQ retransmits cluster at
+// 0.36–0.54s (retrans census, all types). When the worker stale-drops a head-of-line
+// continuation ctr=k, next_ctr stays k; the network's retransmit of ctr=k then arrives ~0.45–
+// 0.54s after the last accepted fragment — orphaned at 280ms, but at 700ms it matches ctr ==
+// next_ctr and the chain completes IN STRICT ORDER with zero new code. So 700ms is the cheap,
+// safe fraction of hole-tolerance (head-of-line retransmit capture) as a constant. Invariant:
+// keep FRAG_GAP < SESSION_TIMEOUT (a fragment must not be acceptable to a reaper-dead session).
+// Full analysis: docs/2026-07-15-p4-reassembly-design-review.md.
+#define IDA_REASM_FRAG_GAP_US (700ULL * 1000ULL)         // max per-hop gap between fragments
 #define IDA_REASM_SESSION_TIMEOUT_US (1000ULL * 1000ULL) // max age since last fragment
 
 // Parts-per-chain histogram size: index = fragment count of a chain, clamped to
@@ -83,6 +96,10 @@ typedef struct {
     uint32_t cnt_merged;     // fragments appended to an open chain
     uint32_t cnt_completed;  // chains that reached da_cont==0
     uint32_t cnt_orphan;     // continuation fragment with no matching chain
+    uint32_t cnt_orphan_freq;// subset of cnt_orphan: a session matched uplink+ctr+time but was
+                             // rejected ONLY on the ±FREQ_DEADBAND freq key — i.e. the
+                             // peak_bin-derived freq (Task#6) rejected a valid continuation.
+                             // orphan-cnt_orphan_freq = genuine lost-opener (first-packet loss).
     uint32_t cnt_overflow;   // chain would exceed IDA_REASM_MAX_BYTES, or table full
     uint32_t cnt_expired;    // chains dropped for inactivity
     // Parts-per-chain histograms (index = fragment count, clamped to IDA_PARTS_BINS-1).

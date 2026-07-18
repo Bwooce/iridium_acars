@@ -49,8 +49,10 @@ static uint32_t head         = 0; // in complex samples
 // alias back to an apparently-fresh distance. This counter carries full
 // lap information so burst_valid() can compare absolute positions.
 //
-// Written only by the producer (signal_buffer_push, Core 0); read by the
-// worker (Core 1, via burst_valid). A 64-bit load is two 32-bit reads on
+// Written only by the producer (signal_buffer_push, called from the
+// ingest task on CORE 1 — not Core 0; fixed 2026-07-17, topology review
+// §1.3); read by the worker (also Core 1, via burst_valid) and by
+// Core-0 contexts via head_total. A 64-bit load is two 32-bit reads on
 // this RV32 core and could tear at the ~28-min hi-word rollover; a too-small
 // torn value would wrongly pass a stale burst. Guard with a single-writer
 // seqlock (odd seq = write in flight) — same __sync_synchronize() fence

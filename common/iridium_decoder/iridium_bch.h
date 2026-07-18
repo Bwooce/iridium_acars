@@ -28,15 +28,29 @@ uint32_t iridium_bch_ndivide(uint32_t poly, const uint8_t *bits, size_t n_bits);
 // if no single-bit flip yields a clean division.
 //
 // This is the C equivalent of iridium-toolkit/bch.py:nrepair1.
+// Implementation: O(1) syndrome-table lookup (lazy-built per (poly, n_bits),
+// ~2 KB max per combo in PSRAM on-device), proven bit-exact against the
+// brute-force reference below by tests/host/test_bch_syndrome.c.
 int iridium_bch_repair1(uint32_t poly, uint8_t *bits, size_t n_bits);
 
-// Try to correct up to two bit errors against `poly`. Brute-force version
-// of bch.py:nrepair2 — checks no-flip, all single flips, then all pairs.
-// O(n^2) in n_bits but n_bits ≤ 31 in our use, so worst case ~465 ndivide
-// calls per check. Used for polys 465 / 1207 / 1897 / 3545 where upstream
-// pre-computes 2-error syndromes; the runtime brute-force does fewer
-// redundant divisions and avoids carrying a syndrome table around.
+// Try to correct up to two bit errors against `poly` — C equivalent of
+// bch.py:nrepair2 (checks no-flip, then singles, then pairs, preferring
+// the lowest-index single and then the lexicographically first pair).
+// Implementation: same syndrome-table lookup as repair1 (one division +
+// one probe instead of the O(n^2) ≈ 465-division brute force). Used for
+// polys 465 / 1207 / 1897 / 3545. Bit-exact with the reference below —
+// including identical MIScorrections on >2-error inputs (exhaustively
+// tested; see test_bch_syndrome.c).
 int iridium_bch_repair2(uint32_t poly, uint8_t *bits, size_t n_bits);
+
+// Brute-force reference implementations (the original production code,
+// unchanged): flip each bit / each (i < j) pair and re-divide. Retained
+// as the behavioural ground truth for test_bch_syndrome's exhaustive
+// table-vs-reference diff, and as the runtime fallback for any
+// (poly, n_bits) the table registry can't host (n_bits > 31, arena/slot
+// exhaustion). Semantics identical to iridium_bch_repair1/2.
+int iridium_bch_repair1_ref(uint32_t poly, uint8_t *bits, size_t n_bits);
+int iridium_bch_repair2_ref(uint32_t poly, uint8_t *bits, size_t n_bits);
 
 #ifdef __cplusplus
 }

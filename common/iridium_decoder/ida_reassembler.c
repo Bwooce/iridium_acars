@@ -40,6 +40,25 @@ static int find_matching_session(ida_reassembler_t *ctx, bool uplink,
     return -1;
 }
 
+// Like find_matching_session but IGNORING the frequency deadband. Used only to attribute an
+// orphan: if a continuation matched uplink+ctr+time here but find_matching_session returned -1,
+// the ONLY reason was the freq key — i.e. the peak_bin-derived freq (Task#6) rejected a valid
+// continuation, as opposed to a genuine lost opener (no session at all).
+static bool session_matches_ignoring_freq(ida_reassembler_t *ctx, bool uplink,
+                                          uint8_t ctr, uint64_t now_us)
+{
+    for (int i = IDA_REASM_MAX_SESSIONS - 1; i >= 0; i--) {
+        ida_reasm_session_t *s = &ctx->sessions[i];
+        if (!s->active) continue;
+        if (s->uplink != uplink) continue;
+        if (ctr != s->next_ctr) continue;
+        if (now_us < s->last_time_us) continue;
+        if ((now_us - s->last_time_us) > IDA_REASM_FRAG_GAP_US) continue;
+        return true; // matched everything EXCEPT the frequency deadband
+    }
+    return false;
+}
+
 int ida_reassembler_reap(ida_reassembler_t *ctx, uint64_t now_us,
                          ida_salvage_t *out)
 {
@@ -138,6 +157,11 @@ int ida_reassembler_feed_ex(ida_reassembler_t *ctx, const ida_decoded_t *ida,
     int idx = find_matching_session(ctx, uplink, freq_hz, ida->da_ctr, now_us);
     if (idx < 0) {
         ctx->cnt_orphan++;
+        // Attribute: did an otherwise-matching session exist but get rejected ONLY on the freq
+        // deadband? Then the freq key (Task#6) dropped a valid continuation; the rest are
+        // genuine lost openers (first-packet loss).
+        if (session_matches_ignoring_freq(ctx, uplink, ida->da_ctr, now_us))
+            ctx->cnt_orphan_freq++;
         return -1;
     }
     ida_reasm_session_t *s     = &ctx->sessions[idx];

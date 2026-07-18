@@ -6,6 +6,7 @@
 #include "sym_timing.h"
 #include "fixture_corpus_2sps.h"
 
+#include <math.h> // sqrt — implicit-decl is a hard error on clang/macOS
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

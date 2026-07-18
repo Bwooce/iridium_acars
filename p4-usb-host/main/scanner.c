@@ -2,6 +2,7 @@
 #include "scanner_map.h"
 #include "class_driver.h"
 #include "app_config.h"
+#include "worker_core1.h" // A6: hot_clear_all on LO retune
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,6 +32,7 @@ esp_err_t scanner_hop(uint32_t hz, bool persist)
     if (s_dsp) {
         dsp_processor_reset_tagger_baseline(s_dsp);
     }
+    worker_core1_hot_clear_all(); // A6: detect bins are LO-relative — stale after a retune
     if (persist) app_config_set_lo_freq_hz(hz);
     ESP_LOGI(TAG, "hopped to %lu Hz (persist=%d) — re-priming", (unsigned long)hz, persist);
     return ESP_OK;
@@ -39,6 +41,7 @@ esp_err_t scanner_hop(uint32_t hz, bool persist)
 void scanner_reset_baseline(void)
 {
     if (s_dsp) dsp_processor_reset_tagger_baseline(s_dsp);
+    worker_core1_hot_clear_all(); // A6: bins invalidated by the LO change
 }
 
 void scanner_scan(uint32_t start_hz, uint32_t stop_hz, uint32_t step_hz, uint32_t dwell_ms)

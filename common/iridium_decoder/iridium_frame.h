@@ -73,6 +73,28 @@ int iridium_frame_classify(const uint8_t *bits, size_t n_bits,
                            ir_frame_direction_t direction,
                            iridium_frame_t     *out);
 
+// --- "harder" DA recovery (iridium-toolkit --harder equivalent) ------
+// When strict classification leaves a frame UNKNOWN, a fallback pass
+// attempts the LW.DA path with two relaxations, mirroring
+// iridium-toolkit's `--harder` ECC mode:
+//   1. The exact-24-bit-UW gate is skipped (qpsk_demod already
+//      direction-verified the UW to <=2 symbol errors before emitting
+//      any bits — the strict re-gate here was redundantly stricter).
+//   2. The three LCW sub-words are BCH-*repaired* (iridium_bch_repair1/2)
+//      instead of requiring clean divides.
+// The fallback is DA-ONLY and forwards nothing on its own authority:
+// ida_decode's downstream 10x BCH(31,20) + zero1 + CRC-16 remains the
+// sole arbiter (false-accept ~1e-12/frame), so a repaired-but-wrong LCW
+// still fails the CRC and is dropped. Runs ONLY on frames strict
+// classification already rejected — off the common hot path.
+//
+// Default ON. Toggle for A/B measurement / emergency revert (device or
+// host); the setting is process-global and not thread-safe to flip
+// concurrently with classification (single worker path — see
+// worker_core1.c). Returns the previous value.
+bool iridium_frame_classify_set_harder(bool enable);
+bool iridium_frame_classify_get_harder(void);
+
 // Convenience: human-readable type name. Returns a 2- to 3-char ASCII
 // string ("MS", "TL", "BC", "LW", "??"). Always non-NULL.
 const char *iridium_frame_type_name(ir_frame_type_t type);

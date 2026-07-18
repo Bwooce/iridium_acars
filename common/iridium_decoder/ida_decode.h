@@ -103,6 +103,9 @@ typedef struct {
 //   -1  invalid input (NULL pointers, frame type wrong, n_bits too short)
 int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out);
 
+// (crc16_ccitt_false moved to the shared crc16.h/crc16.c — single tree-wide
+// table-based implementation, still pinned by test_crc16_ccitt.)
+
 #ifdef __cplusplus
 }
 #endif

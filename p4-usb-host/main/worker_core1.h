@@ -98,6 +98,45 @@ void worker_core1_get_histograms(worker_histograms_t *out);
 // min(max, WORKER_DCFINE_BINS) entries; *total_out gets the sum (may be NULL).
 void worker_core1_get_dcfine(uint32_t *out, int max, uint32_t *total_out);
 
+// ---- A6: continuation-priority boost (hot-bin table) ----
+// The frame_decoder task (Core 0) publishes the detect-FFT bin of any OPEN IDA
+// chain into a small hot-bin table; burst_priority() boosts bursts within
+// HOT_BIN_DEADBAND of a live entry so a chain's continuation is decoded before
+// its ring samples lapse. See docs/2026-07-15-a6-continuation-priority-boost-spec.md.
+// The table is owned by worker_core1.c; these are the write/query API from the
+// decoder task (single writer). `now_us` is the caller's esp_timer_get_time()
+// (wall-clock), NOT the frame's RF timestamp (which lags under queueing).
+void worker_core1_hot_publish(int bin, uint64_t now_us); // open/refresh a chain's bin (TTL-managed)
+void worker_core1_hot_clear(int bin);                    // clear-on-complete
+void worker_core1_hot_clear_all(void);                   // LO-retune hook (bins become meaningless)
+void worker_core1_hot_set_enabled(bool on);             // runtime A/B gate (default ON)
+bool worker_core1_hot_enabled(void);
+
+typedef struct {
+    uint32_t published;     // publish/refresh calls
+    uint32_t cleared;       // clear-on-complete that found a live entry
+    uint32_t boost_pops;    // pq_extract_max winner was boosted
+    uint32_t boost_inserts; // pq_insert admitted/evicted-for a boosted newcomer
+    // Triage/prefilter rejects on a HOT (open-chain) channel — a candidate 0x7608
+    // continuation killed by the fast-pass. Per failing gate (docs/2026-07-15-triage-
+    // acars-continuation-review.md §5, measurement M-A). pf_rej_hot_snr>0 = the
+    // channel-SNR gate is eating continuations (the suspected zero-ACARS cause).
+    uint32_t pf_rej_hot;       // total prefilter rejects whose bin matched an open chain
+    uint32_t pf_rej_hot_width; //   ...of which the WIDTH gate failed
+    uint32_t pf_rej_hot_dur;   //   ...the DURATION gate failed
+    uint32_t pf_rej_hot_snr;   //   ...the channel-SNR gate failed (THE suspect)
+    // Global 2 dB SNR-margin rescues on ANY channel (opener saver): bursts that failed ONLY
+    // the SNR gate but sat within WORKER_PF_SNR_MARGIN_DB of parity, escalated anyway. Openers
+    // can't be hot-exempted (no chain open yet), so this is what saves marginal FIRST fragments.
+    uint32_t pf_rej_margin;
+    // Continuation-fate: bursts DROPPED (never decoded) on a bin that had an OPEN chain (hot).
+    // Candidate lost continuations, split by cause. Large vs ida.expired => worker saturation is
+    // eating continuations (de-saturate); ~0 while expired>0 => weak-SNR/never-detected instead.
+    uint32_t hot_cont_stale; // ring lapped before decode (saturation)
+    uint32_t hot_cont_pri;   // evicted from a full queue
+} worker_hot_stats_t;
+void worker_core1_get_hot_stats(worker_hot_stats_t *out); // plain read, no reset
+
 // Smoke-only: dumps per-burst golden-bits comparison summary at the
 // end of the smoke run. Compiled to a no-op outside the
 // CONFIG_SMOKE_TEST_RAW_IRIDIUM build.

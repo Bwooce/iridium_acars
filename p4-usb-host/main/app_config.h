@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <stdarg.h> // uart_log_null_vprintf
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
@@ -53,6 +54,20 @@ typedef struct {
     // the /messages ring (display-only — never acars_push/sd_log). NVS
     // key "best_eff".
     bool best_effort_decode;
+
+    // Console UART log output (NVS "uart_log", default ON). The console
+    // TX path is a VFS busy-spin (topology review 2026-07-17 §F1):
+    // every ESP_LOGx char spins the calling task until FIFO space, and
+    // UART TX drains at baud rate whether or not anything is attached.
+    // When the bench serial cable is unplugged (device network-only,
+    // telemetry via iot_log UDP — a SEPARATE explicit path, unaffected)
+    // that spin is pure waste, paid partly ABOVE the worker. false =
+    // install a null esp_log vprintf hook at boot: zero UART log writes,
+    // zero spin. serial_cmd RX + its uart_puts replies still work
+    // (direct UART, not ESP_LOG), and panic/ROM output is unaffected —
+    // serial recovery stays possible. Toggle via POST /uartlog?on=0|1
+    // (applies live) or serial `set uart_log 0|1` (persists).
+    bool uart_log;
 
     // P1.5 companion heuristic (NON-GRI; gr-iridium has no equivalent):
     // same-instant multi-bin gone-burst coalescing in dsp_processor.
@@ -131,6 +146,14 @@ esp_err_t app_config_set_gain_mode(gain_mode_t mode);
 esp_err_t app_config_set_gain_db_x10(int16_t v);
 esp_err_t app_config_set_bias_tee(bool on);
 esp_err_t app_config_set_best_effort_decode(bool on);
+esp_err_t app_config_set_uart_log(bool on);
+
+// The uart_log null-sink vprintf hook, and a live apply helper (installs the
+// null hook or restores the default UART vprintf; safe from any task —
+// esp_log_set_vprintf is a pointer swap). Persisting is separate
+// (app_config_set_uart_log); boot applies the persisted value in app_main.
+int  uart_log_null_vprintf(const char *fmt, va_list ap);
+void uart_log_apply(bool on);
 esp_err_t app_config_set_tagger_threshold_db(float db);
 esp_err_t app_config_set_coalesce_min_bursts(uint8_t n);
 esp_err_t app_config_set_dcmask_lo(int16_t v);

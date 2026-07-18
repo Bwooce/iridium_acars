@@ -1968,6 +1968,40 @@ static esp_err_t besteffort_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// POST /uartlog?on=0|1 — console ESP_LOG mute (topology review 2026-07-17 §F1).
+// The UART TX path is a busy-spin that drains at baud rate whether or not a
+// cable is attached; with the device network-only the spin is pure waste,
+// partly ABOVE the worker. on=0 installs a null vprintf hook (applied LIVE
+// here — a pointer swap, safe from httpd) and persists via an internal-stack
+// task (NVS write must not run on the PSRAM-stacked httpd task). iot_log UDP
+// telemetry, serial_cmd, and panic output are unaffected.
+static void uartlog_cfg_task(void *arg)
+{
+    bool      on = (bool)(uintptr_t)arg;
+    esp_err_t r  = app_config_set_uart_log(on);
+    ESP_LOGI(TAG, "/uartlog: uart_log=%d (%s) — applied live", (int)on,
+             esp_err_to_name(r));
+    vTaskDelete(NULL);
+}
+static esp_err_t uartlog_post(httpd_req_t *req)
+{
+    char query[32] = {0}, s[8] = {0};
+    bool on = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "on", s, sizeof(s)) == ESP_OK) {
+        on = (s[0] == '1' || s[0] == 't' || s[0] == 'T');
+    }
+    uart_log_apply(on); // live: mute/unmute immediately
+    char body[32];
+    int  n = snprintf(body, sizeof(body), "{\"uart_log\":%s}", on ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, n);
+    if (xTaskCreate(uartlog_cfg_task, "uartlog_cfg", 4096, (void *)(uintptr_t)on, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "/uartlog: failed to spawn persist task");
+    }
+    return ESP_OK;
+}
+
 // POST /gaincal[?dwell=<s>] — manually trigger the autotune GAIN-CAL now
 // (autotune_run_manual): hop to the IRA reference LO, sweep the R828D gain steps,
 // measure bch decodes per gain, pick the best, park back at the ACARS LO + apply.
@@ -2634,12 +2668,14 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
     // <8,8-12,12-16,16-20,20-24,>=24 dB. See worker_core1.c.
     uint32_t dstale[WORKER_DROP_SNR_NBUCKET], dpri[WORKER_DROP_SNR_NBUCKET];
     worker_core1_get_drop_snr(dstale, dpri);
-    char body[1400];
+    worker_hot_stats_t hot; // A6 continuation-priority boost
+    worker_core1_get_hot_stats(&hot);
+    char body[1500];
     int  n = snprintf(
         body, sizeof(body),
         "{\"lw_da\":%llu,\"lw_da_valid\":%llu,\"lw_da_gate_rejected\":%llu,"
          "\"ida\":{\"standalone\":%u,\"opened\":%u,\"merged\":%u,\"completed\":%u,"
-         "\"orphan\":%u,\"overflow\":%u,\"expired\":%u},"
+         "\"orphan\":%u,\"orphan_freq\":%u,\"overflow\":%u,\"expired\":%u},"
          "\"parts\":{\"index\":\"fragment count 0..7 (clamped)\","
          "\"completed\":[%u,%u,%u,%u,%u,%u,%u,%u],"
          "\"expired\":[%u,%u,%u,%u,%u,%u,%u,%u]},"
@@ -2648,12 +2684,16 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
          "\"salvage\":{\"ok\":%u,\"rejected\":%u,\"dirty_cont\":%u,\"dirty_emit\":%u,\"acars_partial\":%llu},"
          "\"burst_drops\":{\"snr_buckets\":\"<8,8-12,12-16,16-20,20-24,>=24\","
          "\"stale\":[%u,%u,%u,%u,%u,%u],\"pri\":[%u,%u,%u,%u,%u,%u]},"
+         "\"hot\":{\"enabled\":%d,\"published\":%u,\"cleared\":%u,"
+         "\"boost_pops\":%u,\"boost_inserts\":%u,"
+         "\"pf_rej_hot\":%u,\"pf_rej_hot_width\":%u,\"pf_rej_hot_dur\":%u,\"pf_rej_hot_snr\":%u,"
+         "\"pf_rej_margin\":%u,\"cont_stale\":%u,\"cont_pri\":%u},"
          "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
         (unsigned long long)r.lw_da, (unsigned long long)r.lw_da_valid,
         (unsigned long long)gate_rej,
         (unsigned)r.ida_standalone, (unsigned)r.ida_opened, (unsigned)r.ida_merged,
-        (unsigned)r.ida_completed, (unsigned)r.ida_orphan, (unsigned)r.ida_overflow,
-        (unsigned)r.ida_expired,
+        (unsigned)r.ida_completed, (unsigned)r.ida_orphan, (unsigned)r.ida_orphan_freq,
+        (unsigned)r.ida_overflow, (unsigned)r.ida_expired,
         (unsigned)r.ida_parts_completed[0], (unsigned)r.ida_parts_completed[1],
         (unsigned)r.ida_parts_completed[2], (unsigned)r.ida_parts_completed[3],
         (unsigned)r.ida_parts_completed[4], (unsigned)r.ida_parts_completed[5],
@@ -2671,6 +2711,12 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)dstale[3], (unsigned)dstale[4], (unsigned)dstale[5],
         (unsigned)dpri[0], (unsigned)dpri[1], (unsigned)dpri[2],
         (unsigned)dpri[3], (unsigned)dpri[4], (unsigned)dpri[5],
+        (int)worker_core1_hot_enabled(), (unsigned)hot.published, (unsigned)hot.cleared,
+        (unsigned)hot.boost_pops, (unsigned)hot.boost_inserts,
+        (unsigned)hot.pf_rej_hot, (unsigned)hot.pf_rej_hot_width,
+        (unsigned)hot.pf_rej_hot_dur, (unsigned)hot.pf_rej_hot_snr,
+        (unsigned)hot.pf_rej_margin,
+        (unsigned)hot.hot_cont_stale, (unsigned)hot.hot_cont_pri,
         (unsigned long long)r.sbd_complete, (unsigned long long)r.acars_fragments,
         (unsigned long long)r.acars_decoded);
     if (n < 0) n = 0;
@@ -2769,6 +2815,7 @@ esp_err_t http_server_start(void)
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
         {.uri = "/besteffort", .method = HTTP_POST, .handler = besteffort_post, .user_ctx = NULL},
+        {.uri = "/uartlog", .method = HTTP_POST, .handler = uartlog_post, .user_ctx = NULL},
         {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
         {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post, .user_ctx = NULL},
         {.uri = "/c6ota", .method = HTTP_POST, .handler = c6ota_post, .user_ctx = NULL},

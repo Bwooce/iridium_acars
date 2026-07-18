@@ -61,11 +61,8 @@
 // demotion line, so a ~1-channel real burst is never width-rejected.
 #define PF_MAX_WIDTH_BINS 100
 
-// Detection threshold. gr-iridium default = 18 dB (iridium-extractor:130);
-// in our baseline-scale domain the equivalent is 14 dB (memory note
-// "Tagger threshold scale: ours ≈ gri − 4 dB"; these host tests run the
-// tagger at 14 dB). Same threshold the tagger applied to admit the burst.
-#define PF_THRESH_DB 14.0
+// PF_THRESH_DB (gate-2 detection threshold, 14 dB) now lives in burst_prefilter.h
+// so the worker can margin against it. Same threshold the tagger used to admit.
 
 static inline int16_t pf_sat16(int32_t x)
 {

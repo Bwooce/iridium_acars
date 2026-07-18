@@ -345,9 +345,117 @@ static void test_dirty_orphan(void)
     CHECK(ctx.cnt_orphan == 1, "cnt_orphan should be 1, got %u", ctx.cnt_orphan);
 }
 
+// --- Clock-domain regression (docs/2026-07-15-multipart-reassembly-bug-review.md).
+// The frame_decoder tick reaped sessions on WALL time while sessions are stamped on the RF
+// arrival clock. Under the worker's permanent >=1s decode lag, the wall-clock reap fired
+// between opener and continuation and orphaned EVERY chain (zero ACARS). The fix drives the
+// reap on the extrapolated RF clock. This asserts the reassembler contract the fix relies on:
+// a reap at an RF-consistent time does NOT kill a still-fresh chain (it completes), while a
+// reap far ahead of RF (the bug) reaps it early and orphans the continuation.
+static void test_reap_clock_domain(void)
+{
+    printf("Test: reap between feeds — RF-clock keeps the chain; wall-ahead clock kills it\n");
+    uint8_t        o[] = {0x76, 0x08, 0xAA, 0xBB};
+    uint8_t        c[] = {0xCC, 0xDD};
+    ida_decoded_t  f;
+    uint8_t        out[IDA_REASM_MAX_BYTES];
+    int            outlen = 0;
+    ida_salvage_t  s;
+    const uint64_t t0 = 1783000000ULL * SEC; // opener RF arrival (large cap_us-like value)
+    const uint64_t t1 = t0 + 90000;          // continuation RF arrival (+90 ms)
+
+    // (A) FIXED: tick reaps with the extrapolated RF clock. A reap between the two feeds is
+    // only ~0.5 s of RF-elapsed (< SESSION_TIMEOUT), so the chain survives and completes.
+    ida_reassembler_t ctx;
+    ida_reassembler_init(&ctx);
+    make_frag(&f, 0, 1, o, sizeof(o));
+    CHECK(ida_reassembler_feed(&ctx, &f, false, FREQ, t0, out, sizeof(out), &outlen) == 0,
+          "opener opens the chain");
+    CHECK(ida_reassembler_reap(&ctx, t0 + SEC / 2, &s) == 0,
+          "RF-clock reap must NOT expire a still-fresh chain");
+    make_frag(&f, 1, 0, c, sizeof(c));
+    CHECK(ida_reassembler_feed(&ctx, &f, false, FREQ, t1, out, sizeof(out), &outlen) == 1,
+          "continuation completes when reap uses the RF clock");
+    CHECK(ctx.cnt_completed == 1, "cnt_completed should be 1, got %u", ctx.cnt_completed);
+
+    // (B) BUG: the old tick reaped with wall time far ahead of RF (decode lag) — an effective
+    // now >> t0 + SESSION_TIMEOUT — reaping the opener-only chain so the continuation orphans.
+    ida_reassembler_init(&ctx);
+    make_frag(&f, 0, 1, o, sizeof(o));
+    ida_reassembler_feed(&ctx, &f, false, FREQ, t0, out, sizeof(out), &outlen);
+    CHECK(ida_reassembler_reap(&ctx, t0 + 2 * IDA_REASM_SESSION_TIMEOUT_US, &s) == 1,
+          "wall-ahead reap expires the chain (the bug)");
+    make_frag(&f, 1, 0, c, sizeof(c));
+    CHECK(ida_reassembler_feed(&ctx, &f, false, FREQ, t1, out, sizeof(out), &outlen) == -1,
+          "continuation orphans after the early reap (demonstrates the bug)");
+    CHECK(ctx.cnt_completed == 0, "no completion after an early reap, got %u", ctx.cnt_completed);
+}
+
+// --- Overload simulation: reproduce the device's two clock domains explicitly and show the
+// bug is a consequence of DECODE LAG. Bursts arrive on the RF clock (cap_us); the compute-bound
+// worker feeds them to the reassembler LAG behind (wall clock, esp_timer), and the ~1Hz reaper
+// tick fires in the gap. This drives the reassembler under BOTH the buggy policy (reap on wall
+// now) and the fixed policy (reap on the extrapolated RF clock the decoder now tracks), asserting
+// the fix completes the chain and the bug orphans it. docs/2026-07-15-multipart-reassembly-bug-review.md
+static void test_overload_reap_policy(void)
+{
+    printf("Test: overload (>=1s decode lag) — wall-clock reap orphans; RF-clock reap completes\n");
+    uint8_t        o[] = {0x76, 0x08, 0xAA, 0xBB};
+    uint8_t        c[] = {0xCC, 0xDD};
+    ida_decoded_t  f;
+    uint8_t        out[IDA_REASM_MAX_BYTES];
+    int            outlen = 0;
+    ida_salvage_t  s;
+
+    // RF-arrival times (cap_us): the two bursts arrive 90 ms apart.
+    const uint64_t rf_open = 5 * SEC;
+    const uint64_t rf_cont = rf_open + 90000;
+    // Worker is 2s behind RF (permanent operating point). Wall-clock (esp_timer/uptime) when
+    // each fragment is actually decoded+fed; the continuation is delayed further by queue churn.
+    const uint64_t LAG     = 2 * SEC;
+    const uint64_t w_open  = rf_open + LAG;          // opener fed 2s after it arrived
+    const uint64_t w_tick  = w_open + 300000;        // ~1Hz reaper tick fires 0.3s later
+    const uint64_t w_cont  = w_open + 600000;        // continuation fed 0.6s later (still lagging)
+    (void)w_cont;
+
+    // ---- BUGGY policy: the tick reaps with WALL now. now(w_tick) - last(rf_open) = LAG+0.3s
+    //      >> SESSION_TIMEOUT, so the still-live chain is reaped BEFORE the continuation. ----
+    ida_reassembler_t ctx;
+    ida_reassembler_init(&ctx);
+    make_frag(&f, 0, 1, o, sizeof(o));
+    CHECK(ida_reassembler_feed(&ctx, &f, false, FREQ, rf_open, out, sizeof(out), &outlen) == 0,
+          "opener opens the chain");
+    CHECK(ida_reassembler_reap(&ctx, w_tick, &s) == 1,
+          "BUG: wall-clock reap expires the chain under lag (now-last = %llu us)",
+          (unsigned long long)(w_tick - rf_open));
+    make_frag(&f, 1, 0, c, sizeof(c));
+    CHECK(ida_reassembler_feed(&ctx, &f, false, FREQ, rf_cont, out, sizeof(out), &outlen) == -1,
+          "BUG: continuation orphans -> chain lost (the zero-ACARS mechanism)");
+
+    // ---- FIXED policy: decoder tracks s_rf_now (newest arrival fed) + s_wall_at_rf_now, and
+    //      the tick reaps with drain_now = s_rf_now + wall-elapsed. Only the opener has been fed,
+    //      so drain_now ~ rf_open + 0.3s -> now-last = 0.3s < SESSION_TIMEOUT -> chain survives. ----
+    ida_reassembler_init(&ctx);
+    uint64_t s_rf_now = 0, s_wall_at_rf_now = 0;
+    make_frag(&f, 0, 1, o, sizeof(o));
+    if (rf_open > s_rf_now) { s_rf_now = rf_open; s_wall_at_rf_now = w_open; } // decoder loop update
+    CHECK(ida_reassembler_feed(&ctx, &f, false, FREQ, rf_open, out, sizeof(out), &outlen) == 0,
+          "opener opens the chain (fixed run)");
+    uint64_t drain_now = s_rf_now + (w_tick - s_wall_at_rf_now); // the fix's extrapolation
+    CHECK(ida_reassembler_reap(&ctx, drain_now, &s) == 0,
+          "FIX: extrapolated-RF reap keeps the fresh chain (now-last = %llu us)",
+          (unsigned long long)(drain_now - rf_open));
+    make_frag(&f, 1, 0, c, sizeof(c));
+    CHECK(ida_reassembler_feed(&ctx, &f, false, FREQ, rf_cont, out, sizeof(out), &outlen) == 1,
+          "FIX: continuation completes the chain under the same 2s lag");
+    CHECK(ctx.cnt_completed == 1, "FIX: cnt_completed should be 1, got %u", ctx.cnt_completed);
+}
+
 int main(void)
 {
     test_normal_completion();
+    test_reap_clock_domain();
+    test_overload_reap_policy();
     test_salvage_first_fragment();
     test_salvage_two_fragments();
     test_reap_frees_slots();

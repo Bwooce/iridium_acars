@@ -5,6 +5,7 @@
 #include "app_config.h"
 #include "dsp_processor.h" // FS_IN_HZ, IRIDIUM_CENTER_FREQ_HZ defaults
 
+#include <stdio.h> // vprintf (uart_log_apply restore path)
 #include <string.h>
 #include "esp_log.h"
 #include "esp_err.h"
@@ -25,6 +26,7 @@ static const char *NVS_NS = "iridium";
 #define DEFAULT_GAIN_DB_X10 350 // 35.0 dB (rec'd for live)
 #define DEFAULT_BIAS_TEE false
 #define DEFAULT_BEST_EFFORT_DECODE false // gated OFF; salvage.ok stays count-only until enabled
+#define DEFAULT_UART_LOG true // console ESP_LOG on UART; false=null vprintf hook (see app_config.h)
 #define DEFAULT_TAGGER_THRESHOLD_DB 10.0f
 #define DEFAULT_COALESCE_MIN_BURSTS 0 // 0 = coalescer disabled (gri-parity dispatch)
 #define DEFAULT_DCMASK_LO 1           // lo>hi => disabled by default
@@ -134,6 +136,7 @@ esp_err_t app_config_init(void)
     s_cfg.gain_db_x10              = DEFAULT_GAIN_DB_X10;
     s_cfg.bias_tee                 = DEFAULT_BIAS_TEE;
     s_cfg.best_effort_decode       = DEFAULT_BEST_EFFORT_DECODE;
+    s_cfg.uart_log                 = DEFAULT_UART_LOG;
     s_cfg.tagger_threshold_db      = DEFAULT_TAGGER_THRESHOLD_DB;
     s_cfg.coalesce_min_bursts      = DEFAULT_COALESCE_MIN_BURSTS;
     s_cfg.dcmask_lo                = DEFAULT_DCMASK_LO;
@@ -182,12 +185,14 @@ esp_err_t app_config_init(void)
     uint8_t gm = (uint8_t)DEFAULT_GAIN_MODE;
     uint8_t bt = (uint8_t)DEFAULT_BIAS_TEE;
     uint8_t be = (uint8_t)DEFAULT_BEST_EFFORT_DECODE;
+    uint8_t ul = (uint8_t)DEFAULT_UART_LOG;
     nvs_get_u32_or(h, "lo_hz", &s_cfg.lo_freq_hz, DEFAULT_LO_FREQ_HZ);
     nvs_get_u32_or(h, "rate_hz", &s_cfg.sample_rate_hz, DEFAULT_SAMPLE_RATE_HZ);
     nvs_get_u8_or(h, "gain_mode", &gm, (uint8_t)DEFAULT_GAIN_MODE);
     nvs_get_i16_or(h, "gain_dbx10", &s_cfg.gain_db_x10, DEFAULT_GAIN_DB_X10);
     nvs_get_u8_or(h, "bias_tee", &bt, (uint8_t)DEFAULT_BIAS_TEE);
     nvs_get_u8_or(h, "best_eff", &be, (uint8_t)DEFAULT_BEST_EFFORT_DECODE);
+    nvs_get_u8_or(h, "uart_log", &ul, (uint8_t)DEFAULT_UART_LOG);
     nvs_get_f32_or(h, "tag_thr", &s_cfg.tagger_threshold_db, DEFAULT_TAGGER_THRESHOLD_DB);
     nvs_get_u8_or(h, "coal_n", &s_cfg.coalesce_min_bursts, DEFAULT_COALESCE_MIN_BURSTS);
     nvs_get_i16_or(h, "dcmask_lo", &s_cfg.dcmask_lo, DEFAULT_DCMASK_LO);
@@ -228,6 +233,7 @@ esp_err_t app_config_init(void)
     s_cfg.gain_mode          = (gain_mode_t)gm;
     s_cfg.bias_tee           = (bool)bt;
     s_cfg.best_effort_decode = (bool)be;
+    s_cfg.uart_log           = (bool)ul;
 
     nvs_close(h);
     return ESP_OK;
@@ -363,6 +369,29 @@ esp_err_t app_config_set_best_effort_decode(bool on)
     s_cfg.best_effort_decode = on;
     xSemaphoreGive(s_cfg_mu);
     return commit_one_u8("best_eff", (uint8_t)on);
+}
+esp_err_t app_config_set_uart_log(bool on)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.uart_log = on;
+    xSemaphoreGive(s_cfg_mu);
+    return commit_one_u8("uart_log", (uint8_t)on);
+}
+
+// uart_log support (topology review 2026-07-17 §F1). The null hook discards
+// log output BEFORE formatting — callers skip both the vsnprintf and the
+// UART FIFO busy-spin. esp_log's default hook is plain vprintf (stdout →
+// UART VFS), so restoring is just handing vprintf back.
+int uart_log_null_vprintf(const char *fmt, va_list ap)
+{
+    (void)fmt;
+    (void)ap;
+    return 0;
+}
+void uart_log_apply(bool on)
+{
+    esp_log_set_vprintf(on ? vprintf : uart_log_null_vprintf);
 }
 
 static esp_err_t set_str_field(char *dst, size_t cap, const char *k, const char *src)

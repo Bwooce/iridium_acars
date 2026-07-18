@@ -48,6 +48,12 @@ static const char *TAG = "SDCAP";
 // keep running on their own. Below ingest (8) so USB ingest itself
 // is never preempted.
 #define WRITER_STACK 6144
+// NOTE (topology review 2026-07-17 §F4): prio 5 > worker (4) is a DELIBERATE
+// fidelity-over-throughput trade — lowering it below the worker would overflow
+// the ~0.8 s stream buffer at saturation and tear the capture, and captures
+// exist to record exactly those busy windows. Consequence: soak/worker-capacity
+// numbers taken WHILE a raw-IQ capture is armed under-report the worker. Don't
+// "quick-fix" this priority; don't compare soaks across capture on/off.
 #define WRITER_PRIO 5
 
 // Per-receive scratch. Must be DMA-capable internal SRAM (SDMMC

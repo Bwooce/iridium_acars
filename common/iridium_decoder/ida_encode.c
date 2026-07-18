@@ -4,6 +4,7 @@
 
 #include "ida_encode.h"
 #include "iridium_bch.h"
+#include "crc16.h"
 #include <string.h>
 
 // Same ACCH BCH(31,20) polynomial ida_decode.c uses for the 10 DATA
@@ -154,22 +155,11 @@ static void bch_encode_block(uint32_t poly, const uint8_t *msg, int k, uint8_t *
     }
 }
 
-// CRC-16/CCITT-FALSE, matching ida_decode.c's crc16_ccitt_false()
-// exactly (same algorithm is needed on both sides of the residue
-// property: CRC(message || CRC(message)) == 0 for this variant since
-// its Residue is 0x0000 per the standard CRC catalogue).
-static uint16_t crc16_ccitt_false(const uint8_t *data, size_t n_bytes)
-{
-    uint16_t crc = 0xFFFFu;
-    for (size_t i = 0; i < n_bytes; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int b = 0; b < 8; b++) {
-            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u)
-                                  : (uint16_t)(crc << 1);
-        }
-    }
-    return crc;
-}
+// CRC-16/CCITT-FALSE comes from the shared crc16.c (same impl ida_decode.c
+// verifies against — needed on both sides of the residue property:
+// CRC(message || CRC(message)) == 0 for this variant since its Residue is
+// 0x0000 per the standard CRC catalogue). Was a local static bit-serial
+// copy; deduped to the shared table-based one (bit-exact, test_crc16_ccitt).
 
 // OR n_bits 0/1-per-byte bits[] (MSB-first) into out[], starting at bit
 // offset out_bit_offset. out[] must be pre-zeroed by the caller; this

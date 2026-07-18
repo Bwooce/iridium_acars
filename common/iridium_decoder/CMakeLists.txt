@@ -28,6 +28,9 @@ idf_component_register(
         "frame_queue.c"
         # Phase D part 4: IDA frame post-LCW decoder (de-interleave + BCH).
         "ida_decode.c"
+        # Shared CRC-16/CCITT-FALSE (table-based). Used by ida_decode.c's
+        # DA payload CRC and p4-usb-host frame_link.c's wire framing.
+        "crc16.c"
         # Phase A device-corpus: inverse of ida_decode.c's LW.DA path --
         # re-encodes a known-good da_cont/da_ctr/payload triple into a
         # content-accurate over-the-air bitstream. Lets the FRAME_DECODER

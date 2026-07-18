@@ -18,6 +18,8 @@
 #include "iridium_frame.h"
 #include "ida_decode.h"
 #include "ida_reassembler.h"
+#include "dsp_processor.h" // FS_DETECT_HZ / FFT_SIZE for the peak_bin→Hz reassembler key
+#include "worker_core1.h"  // A6: hot-bin publish/clear on open-chain state
 #include "ibc_decode.h"
 #include "ira_decode.h"
 #include "ims_decode.h"
@@ -33,6 +35,34 @@
 #include <sys/time.h>
 
 static const char *TAG = "FRMDEC";
+
+// The IDA reassembler discriminates concurrent chains by frequency (its
+// ±IDA_REASM_FREQ_DEADBAND_HZ deadband). The worker/aggregator pass freq_hz=0
+// into frame_decoder_push (peak_bin is the codebase's real per-burst frequency
+// carrier — see aggregator_ingest.c), so feeding it->freq_hz to the reassembler
+// makes the deadband abs(0-0)<DEADBAND = ALWAYS true → chains merge with NO
+// frequency discrimination (fragments of two concurrent chains on different
+// channels can cross-merge). Derive the reassembler's Hz key from the detector's
+// peak_bin instead. peak_bin is packed (bin | width<<16) → mask to the bin;
+// bin×FS_DETECT_HZ/FFT_SIZE (~1220.7 Hz/bin) yields a stable per-channel Hz so
+// the ±5 kHz deadband (~±4 bins, vs ~34-bin channel spacing) discriminates
+// channels while tolerating intra-chain bin jitter/Doppler. uint64 intermediate:
+// bin (≤2047) × 2.5e6 overflows uint32.
+static inline uint32_t reasm_freq_key_hz(int packed_peak_bin)
+{
+    uint32_t bin = (uint32_t)(packed_peak_bin & 0xFFFF);
+    return (uint32_t)(((uint64_t)bin * (uint64_t)FS_DETECT_HZ) / (uint64_t)FFT_SIZE);
+}
+
+// Reassembler-expiry clock (fix for the clock-domain bug, docs/2026-07-15-multipart-
+// reassembly-bug-review.md). Sessions are stamped with the burst's RF-arrival time
+// (it->timestamp_us = cap_us), so the reap tick MUST expire them on the same RF clock —
+// NOT wall time. The worker runs permanently >=1s behind RF (decode lag), so a wall-clock
+// reap collapses the effective window to <=0 and reaps every chain before its continuation
+// arrives (regression 46dc971). We track the newest RF time seen and extrapolate it with
+// wall-elapsed so idle stalls still expire. Owned by the single decoder task; no locking.
+static uint64_t s_rf_now         = 0; // max it->timestamp_us seen (RF arrival clock)
+static uint64_t s_wall_at_rf_now = 0; // esp_timer when s_rf_now last advanced
 
 #define FRAME_QUEUE_SLOTS 64 // 64 × ~2064 B ≈ 132 KB in PSRAM
 #define DECODER_STACK 6144
@@ -528,8 +558,25 @@ static void process_one(const frame_queue_item_t *it)
                 bool    chain_dirty = false;
                 int     rc_reasm    = ida_reassembler_feed_ex(
                     &s_ida_reasm, &ida, ida.crc_ok, it->direction == 1,
-                    (uint32_t)it->freq_hz, it->timestamp_us, merged,
+                    reasm_freq_key_hz(it->peak_bin), it->timestamp_us, merged,
                     (int)sizeof(merged), &merged_len, &chain_dirty);
+                // A6: publish/clear the hot-bin table so the worker (Core 1)
+                // priority-boosts this channel's next burst while the chain is
+                // open. now_us = wall-clock (NOT the RF-lagged it->timestamp_us),
+                // so the TTL is not under-sized under queueing (spec §5.1).
+                {
+                    const int det_bin = it->peak_bin & 0xFFFF; // BURST_PEAK_BIN space
+                    if (rc_reasm == 0) {
+                        // Opener, or continuation merged with the chain still open —
+                        // a further continuation is expected within FRAG_GAP.
+                        worker_core1_hot_publish(det_bin, (uint64_t)esp_timer_get_time());
+                    } else if (rc_reasm == 1 && !(ida.da_ctr == 0 && ida.da_cont == 0)) {
+                        // Multi-burst chain completed (exclude the standalone fast
+                        // path, which never published): stop boosting now.
+                        worker_core1_hot_clear(det_bin);
+                    }
+                    // rc_reasm == -1 (orphan/overflow): no open chain to protect.
+                }
                 if (rc_reasm == 1 && chain_dirty) {
                     // Task C: dirty-but-complete chain -- carried a CRC-failed
                     // fragment, so it is NEVER trusted. Route to the same
@@ -625,15 +672,27 @@ static void decoder_task(void *arg)
     uint64_t                  last_tick = (uint64_t)esp_timer_get_time();
     while (1) {
         bool got = frame_queue_pop(s_queue, &item);
-        // Tick the SBD reassembler periodically (~1 Hz) so stale
-        // multi-frame sessions get expired even when no frames arrive.
+        // Advance the RF clock to the newest burst arrival time seen (max, so an
+        // out-of-order older frame can't regress it).
+        if (got && item.timestamp_us > s_rf_now) {
+            s_rf_now         = item.timestamp_us;
+            s_wall_at_rf_now = (uint64_t)esp_timer_get_time();
+        }
+        // Tick the SBD/IDA reassemblers periodically (~1 Hz) so stale multi-frame
+        // sessions get expired even when no frames arrive.
         uint64_t now = (uint64_t)esp_timer_get_time();
         if (now - last_tick > 1000000ULL) {
-            sbd_reassembler_tick(&s_sbd, now);
+            // Expire on the EXTRAPOLATED RF CLOCK, not wall time: sessions are stamped
+            // with cap_us (RF arrival), and the worker lags RF by >=1s, so a wall-clock
+            // reap would collapse the window and reap every chain before its continuation.
+            // s_rf_now + wall-elapsed advances even during a full stream stall, so idle
+            // salvage still fires. See docs/2026-07-15-multipart-reassembly-bug-review.md.
+            uint64_t drain_now = s_rf_now + (now - s_wall_at_rf_now);
+            sbd_reassembler_tick(&s_sbd, drain_now);
             // Salvage IDA chains that timed out with no new frames arriving —
             // reap() no longer auto-expires inside feed(), so this tick is what
             // catches idle stalls (the common case: opener received, no more).
-            ida_salvage_drain(now);
+            ida_salvage_drain(drain_now);
             last_tick = now;
         }
         if (got) {
@@ -804,6 +863,7 @@ void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out)
     out->ida_merged       = s_ida_reasm.cnt_merged;
     out->ida_completed    = s_ida_reasm.cnt_completed;
     out->ida_orphan       = s_ida_reasm.cnt_orphan;
+    out->ida_orphan_freq  = s_ida_reasm.cnt_orphan_freq;
     out->ida_overflow     = s_ida_reasm.cnt_overflow;
     out->ida_expired      = s_ida_reasm.cnt_expired;
     memcpy(out->ida_parts_completed, s_ida_reasm.parts_completed,

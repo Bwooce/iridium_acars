@@ -17,6 +17,7 @@
 // phase coherence ≥ 0.993 on burst id=30) — commit de72f24.
 
 #include <string.h>
+#include <stdlib.h> // abs() for the A6 hot-bin deadband
 #include <math.h>
 #include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
@@ -40,6 +41,8 @@
 #include "bch_decoder.h"
 #include "frame_decoder.h"
 #include "iridium_frame.h"
+#include "ida_reassembler.h" // A6: IDA_REASM_MAX_SESSIONS / IDA_REASM_FRAG_GAP_US
+#include "hot_bin_table.h"    // A6: continuation-priority boost table
 #include "worker_dcfine.h"
 #include "sdkconfig.h"
 
@@ -108,11 +111,104 @@ static SemaphoreHandle_t s_pq_items = NULL; // counts occupied slots (worker wai
 // FBT_BURST_POST_LEN 40000) − one FFT-step (2048) threshold-jitter
 // tolerance = 55148 samples (~22.1 ms) at FS_DETECT_HZ.
 #define BURST_DURATION_CLASS_MIN_SAMPLES 55148
-static inline float burst_priority(const detected_burst_t *b)
+// ---- A6: continuation-priority boost (hot-bin table) ----
+// Table logic lives in hot_bin_table.c (dependency-free + host-tested); this file
+// owns the single instance, the worker-side boost/counters, and the public wrappers.
+// Writer = frame_decoder task (Core 0); readers = tagger callback (Core 0) + worker
+// task (Core 1). See docs/2026-07-15-a6-continuation-priority-boost-spec.md.
+_Static_assert(HOT_BIN_ENTRIES == IDA_REASM_MAX_SESSIONS,
+               "A6 hot-bin table must mirror the reassembler session capacity");
+#define HOT_BIN_TTL_MS ((uint32_t)(IDA_REASM_FRAG_GAP_US / 1000ULL)) // 700 ms — shadow of chain acceptability
+#define HOT_BOOST      100.0f  // > any SNR gap (~45 dB), < the 1000 wideband penalty
+static hot_bin_table_t  s_hot;                  // enabled=true set in worker_core1_init()
+static _Atomic uint32_t s_hot_boost_pops    = 0;
+static _Atomic uint32_t s_hot_boost_inserts = 0;
+// Triage-review M-A (docs/2026-07-15-triage-acars-continuation-review.md): prefilter rejects
+// on a HOT (open-chain) channel = candidate 0x7608 continuations killed by the fast-pass, per
+// failing gate. pf_rej_hot_snr>0 over a soak confirms the channel-SNR gate is the zero-ACARS
+// cause. Incremented at the reject branch (uses hot_bin_match); read via get_hot_stats.
+static _Atomic uint32_t s_pf_rej_hot       = 0;
+static _Atomic uint32_t s_pf_rej_hot_width = 0;
+static _Atomic uint32_t s_pf_rej_hot_dur   = 0;
+static _Atomic uint32_t s_pf_rej_hot_snr   = 0;
+
+// Global SNR margin (opener rescue): a burst that fails ONLY the channel-SNR gate but sits
+// within WORKER_PF_SNR_MARGIN_DB of PF_THRESH_DB is escalated on ANY channel — not just hot
+// (open-chain) ones. This is the ONLY thing that saves a marginal FIRST fragment (opener): an
+// opener can't be hot-exempted because its chain isn't open yet. gr-iridium has no decode-time
+// SNR gate at all, and the prefilter's 2nd SNR estimator never cross-calibrated with the tagger,
+// so re-testing at strict 14 dB parity shaves real openers. BCH/CRC still gate downstream, so
+// the worst case is a wasted decode; bounded by gain-22 worker headroom (~6/s vs ~12/s ceiling).
+// s_pf_rej_margin counts the GLOBAL-margin rescues (opener saver); watch it vs ida.orphan.
+//
+// A/B 2026-07-17: DISABLED (2.0 -> 0). A 9.5 h soak at 15.7 dB showed the margin admitted
+// ~7900 marginal bursts (mostly junk, lwda_bad-heavy) that saturated the worker (~11k stale-
+// drops, pk_wk 130%). We DO receive ACARS — 6x 0x7608 openers salvaged as f1-only partials —
+// but every continuation was lost: A6 boosts QUEUE priority while stale-drop is RING-AGE, so a
+// saturated worker laps the 3.36 s ring before the boosted continuation is reached. Killing the
+// global margin frees that capacity while KEEPING the hot-channel exemption (the continuation's
+// real rescue). 0.0f makes the escape condition (snr >= 14 - margin, on the !snr_ok branch,
+// i.e. snr < 14) unreachable, cleanly disabling it. Restore to A/B or if opener recall drops.
+#define WORKER_PF_SNR_MARGIN_DB 0.0f
+static _Atomic uint32_t s_pf_rej_margin    = 0;
+
+// Continuation-fate instrument (2026-07-17): a burst DROPPED (never decoded) while its bin has
+// an OPEN chain (hot) is a candidate LOST CONTINUATION. This splits the proven continuation-loss
+// into its cause, which decides the fix:
+//   hot_cont_stale = admitted but the 3.36 s ring lapped before decode → worker SATURATION
+//   hot_cont_pri   = evicted from a full queue for a higher-priority burst
+// If these are large vs ida.expired, saturation IS eating continuations (margin-off / gain-down
+// is the right lever). If ~0 while expired>0, continuations die to weak-SNR (BCH-fail) or are
+// never detected — saturation is the WRONG lever (gain-UP or reception). Pop-time is the reliable
+// signal (by pop the opener has decoded → bin published); the producer-side insert/pri sites can
+// undercount when the opener hasn't decoded yet, so treat them as a floor.
+static _Atomic uint32_t s_hot_cont_stale   = 0;
+static _Atomic uint32_t s_hot_cont_pri     = 0;
+
+// now_ms is snapshotted once per PQ operation and threaded in (avoids 64× timer reads).
+static inline bool hot_bin_match(uint32_t bin, uint32_t now_ms)
+{
+    return hot_bin_table_match(&s_hot, bin, now_ms);
+}
+
+static inline float burst_priority_at(const detected_burst_t *b, uint32_t now_ms)
 {
     float p = b->peak_snr_db;
     if ((int)BURST_WIDTH_BINS(b) > BURST_NARROW_MAX_BINS) p -= 1000.0f;
+    if (hot_bin_match(BURST_PEAK_BIN(b), now_ms)) p += HOT_BOOST; // A6
     return p;
+}
+
+// ---- A6 hot-bin table public API (writer = frame_decoder task, Core 0) ----
+// now_us is the caller's wall-clock esp_timer_get_time() (NOT the frame's RF
+// timestamp, which lags under queueing and would under-size the TTL).
+void worker_core1_hot_publish(int bin, uint64_t now_us)
+{
+    hot_bin_table_publish(&s_hot, (uint32_t)(bin & 0xFFFF),
+                          (uint32_t)(now_us / 1000ULL), HOT_BIN_TTL_MS);
+}
+void worker_core1_hot_clear(int bin)
+{
+    hot_bin_table_clear(&s_hot, (uint32_t)(bin & 0xFFFF),
+                        (uint32_t)(esp_timer_get_time() / 1000));
+}
+void worker_core1_hot_clear_all(void)       { hot_bin_table_clear_all(&s_hot); }
+void worker_core1_hot_set_enabled(bool on)  { hot_bin_table_set_enabled(&s_hot, on); }
+bool worker_core1_hot_enabled(void)         { return hot_bin_table_enabled(&s_hot); }
+void worker_core1_get_hot_stats(worker_hot_stats_t *out)
+{
+    if (!out) return;
+    out->published     = hot_bin_table_published(&s_hot);
+    out->cleared       = hot_bin_table_cleared(&s_hot);
+    out->boost_pops    = atomic_load_explicit(&s_hot_boost_pops, memory_order_relaxed);
+    out->boost_inserts = atomic_load_explicit(&s_hot_boost_inserts, memory_order_relaxed);
+    out->pf_rej_hot       = atomic_load_explicit(&s_pf_rej_hot, memory_order_relaxed);
+    out->pf_rej_hot_width = atomic_load_explicit(&s_pf_rej_hot_width, memory_order_relaxed);
+    out->pf_rej_hot_dur   = atomic_load_explicit(&s_pf_rej_hot_dur, memory_order_relaxed);
+    out->pf_rej_hot_snr   = atomic_load_explicit(&s_pf_rej_hot_snr, memory_order_relaxed);
+    out->pf_rej_margin    = atomic_load_explicit(&s_pf_rej_margin, memory_order_relaxed);
+    out->hot_cont_stale   = atomic_load_explicit(&s_hot_cont_stale, memory_order_relaxed);
+    out->hot_cont_pri     = atomic_load_explicit(&s_hot_cont_pri, memory_order_relaxed);
 }
 
 // Dropped/lost-burst SNR histograms — measures the raw-burst-backlog
@@ -153,8 +249,12 @@ void worker_core1_get_drop_snr(uint32_t stale[DROP_SNR_NBUCKET], uint32_t pri[DR
 
 static int pq_insert_locked(const detected_burst_t *b)
 {
+    // A6: snapshot wall-clock once; boosted newcomers survive full-queue eviction.
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    const bool     nb     = hot_bin_match(BURST_PEAK_BIN(b), now_ms);
     if (s_pq_count < BURST_PQ_CAP) {
         s_pq[s_pq_count++] = *b;
+        if (nb) atomic_fetch_add_explicit(&s_hot_boost_inserts, 1, memory_order_relaxed);
         return 1;
     }
     // Full. EVICT-STALE-FIRST: a burst admitted while fresh can go stale
@@ -175,30 +275,37 @@ static int pq_insert_locked(const detected_burst_t *b)
             // The evicted slot's burst was admitted but went stale (ring lapped
             // its samples) — a backlog could have saved it. Record its SNR.
             drop_snr_record(s_drop_stale_snr, s_pq[i].peak_snr_db);
+            if (hot_bin_match(BURST_PEAK_BIN(&s_pq[i]), now_ms))
+                atomic_fetch_add_explicit(&s_hot_cont_stale, 1, memory_order_relaxed);
             s_pq[i] = *b; // reclaim a doomed slot (occupied-slot give stands)
+            if (nb) atomic_fetch_add_explicit(&s_hot_boost_inserts, 1, memory_order_relaxed);
             return 0;
         }
     }
     // No stale slot: find the lowest-priority slot; replace only if the
-    // newcomer outranks it (narrowband-first, then SNR).
+    // newcomer outranks it (narrowband-first, then SNR, then A6 boost).
     int   min_i = 0;
-    float min_s = burst_priority(&s_pq[0]);
+    float min_s = burst_priority_at(&s_pq[0], now_ms);
     for (int i = 1; i < BURST_PQ_CAP; i++) {
-        float pi = burst_priority(&s_pq[i]);
+        float pi = burst_priority_at(&s_pq[i], now_ms);
         if (pi < min_s) {
             min_s = pi;
             min_i = i;
         }
     }
-    if (burst_priority(b) > min_s) {
+    if (burst_priority_at(b, now_ms) > min_s) {
         // Evicting the weakest queued burst for a stronger newcomer: the loser
         // is low-priority by construction — junk, not backlog-worthy.
         drop_snr_record(s_drop_pri_snr, s_pq[min_i].peak_snr_db);
+        if (hot_bin_match(BURST_PEAK_BIN(&s_pq[min_i]), now_ms))
+            atomic_fetch_add_explicit(&s_hot_cont_pri, 1, memory_order_relaxed);
         s_pq[min_i] = *b; // evict lowest-priority (its occupied-slot give stands)
+        if (nb) atomic_fetch_add_explicit(&s_hot_boost_inserts, 1, memory_order_relaxed);
         return 0;
     }
     // Newcomer is weaker than everything queued — dropped. Also low-SNR.
     drop_snr_record(s_drop_pri_snr, b->peak_snr_db);
+    if (nb) atomic_fetch_add_explicit(&s_hot_cont_pri, 1, memory_order_relaxed); // nb = newcomer on a hot bin
     return -1;
 }
 
@@ -206,15 +313,19 @@ static int pq_insert_locked(const detected_burst_t *b)
 // holds s_pq_lock and has already taken s_pq_items (so count > 0 is guaranteed).
 static void pq_extract_max_locked(detected_burst_t *out)
 {
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     int   max_i = 0;
-    float max_s = burst_priority(&s_pq[0]);
+    float max_s = burst_priority_at(&s_pq[0], now_ms);
     for (int i = 1; i < s_pq_count; i++) {
-        float pi = burst_priority(&s_pq[i]);
+        float pi = burst_priority_at(&s_pq[i], now_ms);
         if (pi > max_s) {
             max_s = pi;
             max_i = i;
         }
     }
+    // A6: count when the popped winner was boosted (once per pop, on the winner only).
+    if (hot_bin_match(BURST_PEAK_BIN(&s_pq[max_i]), now_ms))
+        atomic_fetch_add_explicit(&s_hot_boost_pops, 1, memory_order_relaxed);
     *out        = s_pq[max_i];
     s_pq[max_i] = s_pq[--s_pq_count]; // move last into the hole
 }
@@ -1009,6 +1120,12 @@ void worker_task(void *arg)
                 // the backlog-recoverable class. Record its SNR (every one; the
                 // ESP_LOGW below is throttled, the histogram is not).
                 drop_snr_record(s_drop_stale_snr, burst.peak_snr_db);
+                // Continuation-fate (reliable site): by the time the worker pops this burst and
+                // finds it stale, the opener that arrived earlier has been decoded and published
+                // its hot bin — so a hot match here is a genuine open-chain continuation the ring
+                // lapped despite A6's priority boost. THE saturation proof for continuation loss.
+                if (hot_bin_match(BURST_PEAK_BIN(&burst), (uint32_t)(esp_timer_get_time() / 1000)))
+                    atomic_fetch_add_explicit(&s_hot_cont_stale, 1, memory_order_relaxed);
                 // T59 lag instrument: how far behind the producer is this
                 // burst's start when we finally look at it? >ring-span means
                 // the detect chain is lagging live ingest; the magnitude tells
@@ -1133,10 +1250,43 @@ void worker_task(void *arg)
                                 (int)BURST_WIDTH_BINS(&burst), &pf);
             int64_t t_pf1 = esp_timer_get_time();
             if (!pf_accept) {
-                s_bursts_prefilter_rejected++;
-                s_bursts_triage_rejected++; // surfaced via /status + worker_stats
-                s_t_triage_rej_us += (uint64_t)(t_pf1 - burst_t0);
-                continue;
+                // A burst on a channel with an OPEN IDA chain is a candidate 0x7608
+                // continuation (the A6 hot table is live for exactly the ~700ms one is
+                // expected). Attribute the failing gate. FIX (triage review §6): if it failed
+                // ONLY the channel-SNR gate, ESCALATE it — the tagger already admitted it at
+                // >=14dB and the prefilter's 2nd, never-cross-calibrated SNR estimator was
+                // killing it (confirmed live: pf_rej_hot_snr climbed while completions stayed
+                // 0). Width/duration rejects still stand (junk protection); BCH/CRC still gate
+                // everything downstream, so worst case is a wasted decode. With the exemption
+                // active pf_rej_hot_snr counts the continuations we RESCUE (watch it vs
+                // parts_completed[2]). Compute bounded: <=4 hot channels x <=700ms windows.
+                bool snr_exempt = false;
+                if (hot_bin_match(BURST_PEAK_BIN(&burst), (uint32_t)(t_pf1 / 1000))) {
+                    atomic_fetch_add_explicit(&s_pf_rej_hot, 1, memory_order_relaxed);
+                    if      (!pf.width_ok) atomic_fetch_add_explicit(&s_pf_rej_hot_width, 1, memory_order_relaxed);
+                    else if (!pf.dur_ok)   atomic_fetch_add_explicit(&s_pf_rej_hot_dur,   1, memory_order_relaxed);
+                    else { // SNR-only failure on an open-chain channel → rescue it
+                        atomic_fetch_add_explicit(&s_pf_rej_hot_snr, 1, memory_order_relaxed);
+                        snr_exempt = true;
+                    }
+                }
+                // GLOBAL SNR margin (opener rescue): failed ONLY the SNR gate, on ANY channel,
+                // but within WORKER_PF_SNR_MARGIN_DB of parity → escalate. Openers can't be
+                // hot-exempted (no open chain yet), so this margin is what saves a marginal FIRST
+                // fragment. Skipped for hot-channel SNR-only bursts (already exempt above, any SNR)
+                // so no double-count. Width/duration rejects still stand (junk protection).
+                if (!snr_exempt && pf.width_ok && pf.dur_ok && !pf.snr_ok &&
+                    pf.channel_snr_db >= (float)PF_THRESH_DB - WORKER_PF_SNR_MARGIN_DB) {
+                    atomic_fetch_add_explicit(&s_pf_rej_margin, 1, memory_order_relaxed);
+                    snr_exempt = true;
+                }
+                if (!snr_exempt) {
+                    s_bursts_prefilter_rejected++;
+                    s_bursts_triage_rejected++; // surfaced via /status + worker_stats
+                    s_t_triage_rej_us += (uint64_t)(t_pf1 - burst_t0);
+                    continue;
+                }
+                // escalated: fall through to the decode pipeline below.
             }
             s_t_triage_us += (uint64_t)(t_pf1 - t_pf0);
 
@@ -1171,12 +1321,18 @@ void worker_task(void *arg)
             s_burst_total_us += (uint64_t)(esp_timer_get_time() - burst_t0);
         }
 
-        // Periodic yield so same-prio tasks (frame_decoder, both at 4)
-        // and lower-prio tasks get scheduled. One vTaskDelay(1) every
-        // 8 bursts gives ~10 ms of ceded CPU per 8 bursts. NB: the
-        // skipped/stale-burst paths `continue` above this point, so
-        // only fully processed (or demod-attempted) bursts advance the
-        // counter — skips are cheap, that's the intended behaviour.
+        // Periodic vTaskDelay(1) so LOWER-prio Core-1 tasks (agc at 3,
+        // unpinned prio-3 floaters) get a guaranteed window during
+        // sustained passes. (Stale comment fixed 2026-07-17: it used to
+        // name frame_decoder "both at 4" — frame_decoder moved to
+        // Core 0 prio 6 in #123. daemon(4) is same-prio and rotates via
+        // time-slicing anyway; a bare taskYIELD() would NOT run agc,
+        // only a real delay lets prio<4 run — topology review §F5.)
+        // One vTaskDelay(1) every 8 bursts ≈ ≤10 ms ceded per 8 bursts
+        // (<1% at saturation). NB: the skipped/stale-burst paths
+        // `continue` above this point, so only fully processed (or
+        // demod-attempted) bursts advance the counter — skips are
+        // cheap, that's the intended behaviour.
         static int yield_counter = 0;
         if (++yield_counter >= 8) {
             yield_counter = 0;
@@ -1203,6 +1359,7 @@ void worker_core1_prealloc_fir(void)
 
 esp_err_t worker_core1_init(void)
 {
+    hot_bin_table_init(&s_hot); // A6: entries empty, boost enabled (default ON)
     // Burst queue depth 1024, storage in PSRAM. Each detected_burst_t
     // is 28 bytes, so 1024 entries cost ~28 KB of PSRAM (trivial out
     // of 32 MB). At the current 103 ms/burst worker time this is

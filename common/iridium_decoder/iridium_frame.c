@@ -302,6 +302,69 @@ static const uint8_t LCW_TBL[LW_LCW_BITS] = {
     41,
 };
 
+// "harder" DA recovery toggle (see iridium_frame.h). Default ON.
+static bool s_classify_harder = true;
+
+bool iridium_frame_classify_set_harder(bool enable)
+{
+    bool prev         = s_classify_harder;
+    s_classify_harder = enable;
+    return prev;
+}
+
+bool iridium_frame_classify_get_harder(void)
+{
+    return s_classify_harder;
+}
+
+// --- LW.DA "harder" classification -----------------------------------
+// Same LCW de-interleave + slice as classify_lw(), but BCH-*repairs*
+// lcw1/lcw2/lcw3 rather than requiring clean divides, mirroring
+// iridium-toolkit/bitsparser.py:352-364 (the `--harder` ECC path).
+// DA-ONLY: returns 1 (with *subtype_out = IR_LW_DA) only when the
+// repaired lcw1 frame-type field is 2 (DA). Every other ft — including
+// legitimate VO/IP — is declined here, because only the DA path has the
+// downstream CRC-16 arbiter that keeps false-accepts at ~1e-12. So this
+// relaxation can never forward an unprotected LW subtype.
+static int classify_lw_harder(const uint8_t *p, size_t avail,
+                              ir_lw_subtype_t *subtype_out)
+{
+    if (avail < LW_LCW_BITS) return 0;
+
+    uint8_t permuted[LW_LCW_BITS];
+    for (size_t i = 0; i < LW_LCW_BITS; i++) {
+        permuted[i] = p[LCW_TBL[i]] & 1;
+    }
+    uint8_t lcw1[7];
+    uint8_t lcw3[26];
+    uint8_t lcw2_pad[14]; // 13 + trailing guess bit
+    memcpy(lcw1, permuted + 0, 7);
+    memcpy(lcw3, permuted + 20, 26);
+    memcpy(lcw2_pad, permuted + 7, 13);
+
+    // lcw1: BCH(7,3) poly=29, correct up to 1 error (its ECC capability;
+    // repair2 would over-fit a 2-bit "correction" onto a t=1 code).
+    if (iridium_bch_repair1(29u, lcw1, 7) < 0) return 0;
+    // lcw3: BCH(26,21) poly=41 — repair up to 2.
+    if (iridium_bch_repair2(41u, lcw3, 26) < 0) return 0;
+    // lcw2: unknown trailing bit — try both guesses, accept if either
+    // repairs (bitsparser tries o_lcw2+'0' then o_lcw2+'1').
+    lcw2_pad[13] = 0;
+    int e2       = iridium_bch_repair2(465u, lcw2_pad, 14);
+    if (e2 < 0) {
+        memcpy(lcw2_pad, permuted + 7, 13);
+        lcw2_pad[13] = 1;
+        e2           = iridium_bch_repair2(465u, lcw2_pad, 14);
+    }
+    if (e2 < 0) return 0;
+
+    // ft = repaired lcw1 message bits (repair is in-place).
+    uint8_t ft = (uint8_t)((lcw1[0] << 2) | (lcw1[1] << 1) | lcw1[2]);
+    if ((ir_lw_subtype_t)ft != IR_LW_DA) return 0;
+    if (subtype_out) *subtype_out = IR_LW_DA;
+    return 1;
+}
+
 static int classify_lw(const uint8_t *p, size_t avail, ir_lw_subtype_t *subtype_out)
 {
     if (avail < LW_LCW_BITS) return 0;
@@ -359,20 +422,17 @@ int iridium_frame_classify(const uint8_t *bits, size_t n_bits,
     out->n_bits      = n_bits;
     out->payload_off = UW_BITS;
 
-    // Strict UW gate. qpsk_demod accepts up to 2 symbol errors at decode
-    // time so noisy frames still get bits emitted, but a real-world
-    // parser (iridium-toolkit's iridium-parser.py in default mode) only
-    // accepts frames with an exact UW match. Mirror that strictness
-    // here — leave UNKNOWN if the UW is corrupted, regardless of
-    // whether the rest of the bits happen to satisfy MS / TL / BC / LW
-    // structure. This tightens our corpus regression to 100% agreement
-    // with the parser by rejecting frames the parser wouldn't process.
+    // UW gate. qpsk_demod accepts up to 2 symbol errors at decode time
+    // (so noisy frames still get bits emitted with a verified direction),
+    // but the STRICT dispatch below mirrors iridium-toolkit's default
+    // mode, which only accepts an exact UW match. Compute the exactness
+    // here; strict dispatch runs only when uw_ok, the harder DA fallback
+    // (below) runs on the <=2-symbol-error frames qpsk_demod already
+    // verified. The strict path's corpus behaviour is unchanged.
     const uint8_t *uw_expected = (direction == IR_FRM_DIR_UPLINK)
                                      ? UW_UL
                                      : UW_DL;
-    if (!bits_equal(bits, uw_expected, UW_BITS)) {
-        return 0; // UW corrupt — leave UNKNOWN
-    }
+    bool uw_ok = bits_equal(bits, uw_expected, UW_BITS);
 
     const uint8_t *p     = bits + UW_BITS;
     size_t         avail = n_bits - UW_BITS;
@@ -391,7 +451,9 @@ int iridium_frame_classify(const uint8_t *bits, size_t n_bits,
     //
     // We swap only the prefix actually used by the dispatch (BC needs
     // 70 bits, LW needs 46, MS needs 32, TL needs 96). 128 bytes is
-    // plenty and fits in the worker task's stack budget.
+    // plenty and fits in the worker task's stack budget. Built
+    // regardless of uw_ok — the harder DA fallback needs it too, and it
+    // is a function of the payload bits, not the UW.
     uint8_t swapped[128];
     size_t  swap_len = avail < sizeof(swapped) ? avail : sizeof(swapped);
     // Round down to even — we swap in pairs.
@@ -401,43 +463,58 @@ int iridium_frame_classify(const uint8_t *bits, size_t n_bits,
         swapped[i + 1] = p[i + 0] & 1;
     }
 
-    // Order of dispatch matches iridium-toolkit's bitsparser.py:
+    // Strict dispatch (exact-UW only) — matches iridium-toolkit's
+    // default mode. Order matches bitsparser.py:
     //   1. MS  — header_messaging at offset 0 (32 bits exact match)
     //   2. TL  — header_time_location at offset 0 ("11" + 94 zeros)
     //   3. BC  — 6-bit hdr_poly=29 CRC + double BCH(31,21) poly=1207
     //   4. LW  — 46-bit interleaved LCW with three BCH checks
-    //
+    //   5. RA  — 3 × 32-bit BCH(31,21), 3-way interleaved over 96 bits
     // We do NOT mimic upstream's frequency-class filtering — sub-
     // classification by frequency band belongs higher up.
+    if (uw_ok) {
+        if (swap_len >= sizeof(HEADER_MESSAGING) && bits_equal(swapped, HEADER_MESSAGING, sizeof(HEADER_MESSAGING))) {
+            out->type = IR_FRAME_MS;
+            return 0;
+        }
 
-    if (swap_len >= sizeof(HEADER_MESSAGING) && bits_equal(swapped, HEADER_MESSAGING, sizeof(HEADER_MESSAGING))) {
-        out->type = IR_FRAME_MS;
-        return 0;
+        if (looks_like_time_location(swapped, swap_len)) {
+            out->type = IR_FRAME_TL;
+            return 0;
+        }
+
+        if (classify_bc(swapped, swap_len)) {
+            out->type = IR_FRAME_BC;
+            return 0;
+        }
+
+        ir_lw_subtype_t lw_sub = IR_LW_NONE;
+        if (classify_lw(swapped, swap_len, &lw_sub)) {
+            out->type       = IR_FRAME_LW;
+            out->lw_subtype = lw_sub;
+            return 0;
+        }
+
+        if (classify_ra(swapped, swap_len)) {
+            out->type = IR_FRAME_RA;
+            return 0;
+        }
     }
 
-    if (looks_like_time_location(swapped, swap_len)) {
-        out->type = IR_FRAME_TL;
-        return 0;
-    }
-
-    if (classify_bc(swapped, swap_len)) {
-        out->type = IR_FRAME_BC;
-        return 0;
-    }
-
-    ir_lw_subtype_t lw_sub = IR_LW_NONE;
-    if (classify_lw(swapped, swap_len, &lw_sub)) {
-        out->type       = IR_FRAME_LW;
-        out->lw_subtype = lw_sub;
-        return 0;
-    }
-
-    // RA (Ring Alert): no header. 3 × 32-bit BCH(31,21) codewords
-    // 3-way interleaved over the first 96 bits. iridium-toolkit/
-    // bitsparser.py:317-324.
-    if (classify_ra(swapped, swap_len)) {
-        out->type = IR_FRAME_RA;
-        return 0;
+    // "harder" DA fallback (iridium-toolkit --harder equivalent). Runs
+    // only on frames strict classification already rejected — either the
+    // UW had <=2 symbol errors (uw_ok false) or the LCW didn't cleanly
+    // divide (uw_ok true but classify_lw declined). DA-only, BCH-repaired
+    // LCW; ida_decode's CRC-16 is still the sole arbiter downstream. See
+    // iridium_frame.h. Default ON; toggle via
+    // iridium_frame_classify_set_harder().
+    if (s_classify_harder) {
+        ir_lw_subtype_t hard_sub = IR_LW_NONE;
+        if (classify_lw_harder(swapped, swap_len, &hard_sub)) {
+            out->type       = IR_FRAME_LW;
+            out->lw_subtype = hard_sub; // == IR_LW_DA
+            return 0;
+        }
     }
 
     return 0;

@@ -1,4 +1,5 @@
 #include "frame_link.h"
+#include "crc16.h" // shared CRC-16/CCITT-FALSE (common/iridium_decoder) — pure, no ESP deps
 #include <string.h>
 
 #ifdef ESP_PLATFORM
@@ -12,14 +13,10 @@
 uint16_t frame_link_crc16(const uint8_t *data, size_t len)
 {
     // CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflect, no xorout.
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int b = 0; b < 8; b++) {
-            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-        }
-    }
-    return crc;
+    // Thin wrapper over the shared table-based implementation (crc16.c) —
+    // bit-exact with the bit-serial form this replaced (test_crc16_ccitt
+    // pins it). Name kept so frame_link callers/tests are untouched.
+    return crc16_ccitt_false(data, len);
 }
 
 size_t frame_link_encode(const iridium_frame_pdu_t *pdu, uint8_t *buf, size_t buflen)

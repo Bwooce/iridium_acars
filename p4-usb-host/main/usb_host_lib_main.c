@@ -256,6 +256,23 @@ void app_main(void)
     app_config_init();
     app_config_log();
 
+    // uart_log=0: mute console ESP_LOG output entirely (null vprintf hook).
+    // The console TX path is a busy-spin that drains at baud rate whether or
+    // not a cable is attached (topology review 2026-07-17 §F1) — when the
+    // device runs network-only, that spin (partly ABOVE the worker) buys
+    // nothing. iot_log UDP telemetry is a separate explicit path and keeps
+    // working; serial_cmd RX/uart_puts replies and panic/ROM output are
+    // unaffected, so serial recovery stays possible. Re-enable live via
+    // POST /uartlog?on=1 or serial `set uart_log 1` + reboot.
+    {
+        app_config_t boot_cfg;
+        app_config_snapshot(&boot_cfg);
+        if (!boot_cfg.uart_log) {
+            ESP_LOGW(TAG, "uart_log=0 — muting console ESP_LOG output (iot_log UDP unaffected)");
+            esp_log_set_vprintf(uart_log_null_vprintf);
+        }
+    }
+
     // Serial NVS command interface — always active so config can be
     // recovered even when WiFi is down or credentials are lost.
     serial_cmd_init();

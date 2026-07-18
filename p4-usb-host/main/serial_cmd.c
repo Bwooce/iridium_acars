@@ -105,6 +105,8 @@ static void cmd_get(const char *key)
         snprintf(buf, sizeof(buf), "%d\r\n", (int)c.gain_db_x10);
     else if (strcmp(key, "bias_tee") == 0)
         snprintf(buf, sizeof(buf), "%d\r\n", (int)c.bias_tee);
+    else if (strcmp(key, "uart_log") == 0)
+        snprintf(buf, sizeof(buf), "%d\r\n", (int)c.uart_log);
     else if (strcmp(key, "tag_thr") == 0)
         snprintf(buf, sizeof(buf), "%.2f\r\n", (double)c.tagger_threshold_db);
     else if (strcmp(key, "coal_n") == 0)
@@ -163,6 +165,11 @@ static void cmd_set(const char *key, const char *val)
         rc = app_config_set_gain_db_x10((int16_t)atoi(val));
     else if (strcmp(key, "bias_tee") == 0)
         rc = app_config_set_bias_tee(atoi(val) != 0);
+    else if (strcmp(key, "uart_log") == 0) {
+        // Serial recovery path for the console mute: apply live + persist.
+        uart_log_apply(atoi(val) != 0);
+        rc = app_config_set_uart_log(atoi(val) != 0);
+    }
     else if (strcmp(key, "tag_thr") == 0)
         rc = app_config_set_tagger_threshold_db((float)atof(val));
     else if (strcmp(key, "coal_n") == 0)
