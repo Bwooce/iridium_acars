@@ -31,8 +31,7 @@ typedef struct {
     uint32_t bursts_bch_unknown;         // subset that passed BCH but iridium_frame_classify returned UNKNOWN (BCH false positives)
     uint32_t bursts_bch_failed;          // subset that demod'd but BCH was uncorrectable (qpsk_demod false positives)
     uint32_t bursts_bch_chase_recovered; // subset where hard-BCH failed but Chase-2 soft decoder rescued it (#112; subset of bursts_bch_decoded + bursts_bch_unknown)
-    uint32_t bursts_triage_rejected;     // pre-correlation fast-pass rejected the burst — dropped without the full decode cost (not in bursts_processed). Now driven by burst_prefilter (P1.5b); == bursts_prefilter_rejected.
-    uint32_t bursts_prefilter_rejected;  // P1.5b burst_prefilter rejects (width/duration/channel-SNR gate), dropped before the retry pipeline
+    uint32_t bursts_triage_rejected;     // burst_prefilter (P1.5b) rejected the burst (width/duration/channel-SNR gate) — dropped without the full decode cost (not in bursts_processed)
     uint32_t queue_high_water;           // peak observed queue depth
     float    avg_burst_us;               // mean wall-clock per processed burst
     float    triage_rej_us;              // mean pop→drop wall per triage-REJECTED burst (capacity accounting; rejects aren't in avg_burst_us)
@@ -41,7 +40,6 @@ typedef struct {
     float extract_us;     // signal_buffer_extract
     float freq_center_us; // dsps_cplx_gen + complex multiply loop
     float fir_decim_us;   // Stage 1 FIR + I/Q split
-    float resample_us;    // Stage 2 polyphase resample
     float demod_us;       // qpsk_demod_process + interleave
     float bch_us;         // BCH decode + de-interleave (when run)
     float triage_us;      // P1.5a triage pass (extract+decim+verdict) of accepted bursts
@@ -74,23 +72,19 @@ void worker_core1_get_drop_snr(uint32_t stale[WORKER_DROP_SNR_NBUCKET],
 //
 // P1.5c: snr/bch/freq above are POP-side (or, for freq, all detections) —
 // snr[] specifically only sees bursts the worker actually extracted off
-// the PQ. snr_pushed[]/duration_pushed[] are recorded for EVERY burst
-// handed to worker_core1_push_burst (before the stale-reject and PQ
-// eviction), so the population the PQ sheds is visible too:
+// the PQ. snr_pushed[] is recorded for EVERY burst handed to
+// worker_core1_push_burst (before the stale-reject and PQ eviction), so
+// the population the PQ sheds is visible too:
 //   snr_pushed[32]      same bin layout as snr[], but ALL pushes
-//   duration_pushed[2]  0 = length_samples < BURST_DURATION_CLASS_MIN_SAMPLES
-//                       (impulse-length), 1 = at/above (plausible-length)
 typedef struct {
     uint32_t snr[32];
     uint32_t bch[16];
     uint32_t freq[40]; // band occupancy: ALL detections bucketed by rel_freq
     uint32_t snr_pushed[32];
-    uint32_t duration_pushed[2];
     uint32_t snr_total;
     uint32_t bch_total;
     uint32_t freq_total;
     uint32_t snr_pushed_total;
-    uint32_t duration_pushed_total;
 } worker_histograms_t;
 void worker_core1_get_histograms(worker_histograms_t *out);
 
@@ -125,10 +119,9 @@ typedef struct {
     uint32_t pf_rej_hot_width; //   ...of which the WIDTH gate failed
     uint32_t pf_rej_hot_dur;   //   ...the DURATION gate failed
     uint32_t pf_rej_hot_snr;   //   ...the channel-SNR gate failed (THE suspect)
-    // Global 2 dB SNR-margin rescues on ANY channel (opener saver): bursts that failed ONLY
-    // the SNR gate but sat within WORKER_PF_SNR_MARGIN_DB of parity, escalated anyway. Openers
-    // can't be hot-exempted (no chain open yet), so this is what saves marginal FIRST fragments.
-    uint32_t pf_rej_margin;
+    // (pf_rej_margin removed 2026-07-18: the global SNR-margin opener rescue was
+    // disabled after the 2026-07-17 A/B — see the WORKER_PF_SNR_MARGIN_DB history
+    // in git — leaving the counter permanently 0.)
     // Continuation-fate: bursts DROPPED (never decoded) on a bin that had an OPEN chain (hot).
     // Candidate lost continuations, split by cause. Large vs ida.expired => worker saturation is
     // eating continuations (de-saturate); ~0 while expired>0 => weak-SNR/never-detected instead.

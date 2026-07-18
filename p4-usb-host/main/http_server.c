@@ -389,7 +389,7 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
     uint32_t bp_first_calls = 0, bp_retry_calls = 0;
     burst_pipeline_get_stage_us(bp_stage_us, &bp_first_calls, &bp_retry_calls); // P1.5c
 
-    char body[3072]; // P1.5c: grew from 2048 to fit snr_pushed/duration_pushed/stage_us
+    char body[3072]; // P1.5c: grew from 2048 to fit snr_pushed/stage_us
     int  n = 0;
     int  m;
     m = snprintf(body + n, sizeof(body) - n,
@@ -449,16 +449,16 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
         }
     }
-    // P1.5c: push-side SNR + duration-class histograms — same bin layout
-    // as snr[] above, but recorded for EVERY burst pushed to the worker
-    // PQ (not just what got popped), so the evicted/shed population is
-    // visible. duration_pushed[0]=impulse-length, [1]=plausible-length
-    // (BURST_DURATION_CLASS_MIN_SAMPLES, worker_core1.c).
+    // P1.5c: push-side SNR histogram — same bin layout as snr[] above,
+    // but recorded for EVERY burst pushed to the worker PQ (not just
+    // what got popped), so the evicted/shed population is visible.
+    // (duration_pushed removed 2026-07-18 — the duration-class triage
+    // question it informed is closed; see worker_core1.c.)
     if (n < (int)sizeof(body) - 1) {
         m = snprintf(body + n, sizeof(body) - n,
-                     "],\"snr_pushed_total\":%u,\"duration_pushed_total\":%u,"
+                     "],\"snr_pushed_total\":%u,"
                      "\"snr_pushed\":[",
-                     (unsigned)h.snr_pushed_total, (unsigned)h.duration_pushed_total);
+                     (unsigned)h.snr_pushed_total);
         if (m > 0) {
             n += m;
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
@@ -474,10 +474,7 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
         }
     }
     if (n < (int)sizeof(body) - 1) {
-        m = snprintf(body + n, sizeof(body) - n,
-                     "],\"duration_pushed_index\":\"0=impulse-length,1=plausible-length\","
-                     "\"duration_pushed\":[%u,%u]",
-                     (unsigned)h.duration_pushed[0], (unsigned)h.duration_pushed[1]);
+        m = snprintf(body + n, sizeof(body) - n, "]");
         if (m > 0) {
             n += m;
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
@@ -2687,7 +2684,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
          "\"hot\":{\"enabled\":%d,\"published\":%u,\"cleared\":%u,"
          "\"boost_pops\":%u,\"boost_inserts\":%u,"
          "\"pf_rej_hot\":%u,\"pf_rej_hot_width\":%u,\"pf_rej_hot_dur\":%u,\"pf_rej_hot_snr\":%u,"
-         "\"pf_rej_margin\":%u,\"cont_stale\":%u,\"cont_pri\":%u},"
+         "\"cont_stale\":%u,\"cont_pri\":%u},"
          "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
         (unsigned long long)r.lw_da, (unsigned long long)r.lw_da_valid,
         (unsigned long long)gate_rej,
@@ -2715,7 +2712,6 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)hot.boost_pops, (unsigned)hot.boost_inserts,
         (unsigned)hot.pf_rej_hot, (unsigned)hot.pf_rej_hot_width,
         (unsigned)hot.pf_rej_hot_dur, (unsigned)hot.pf_rej_hot_snr,
-        (unsigned)hot.pf_rej_margin,
         (unsigned)hot.hot_cont_stale, (unsigned)hot.hot_cont_pri,
         (unsigned long long)r.sbd_complete, (unsigned long long)r.acars_fragments,
         (unsigned long long)r.acars_decoded);
