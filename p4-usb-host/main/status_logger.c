@@ -328,9 +328,9 @@ static void emit(const status_snapshot_t *s)
              s->ws.triage_rej_us, worker_pct);
 
     ESP_LOGI(TAG, "Worker-stages (us): triage=%.0f extract=%.0f freq=%.0f "
-                  "fir=%.0f resamp=%.0f demod=%.0f bch=%.0f",
+                  "fir=%.0f demod=%.0f bch=%.0f",
              s->ws.triage_us, s->ws.extract_us, s->ws.freq_center_us,
-             s->ws.fir_decim_us, s->ws.resample_us, s->ws.demod_us,
+             s->ws.fir_decim_us, s->ws.demod_us,
              s->ws.bch_us);
 #else
     // Quiet mode: one line of essential health, plus a separate WARN line
@@ -387,10 +387,12 @@ static void emit(const status_snapshot_t *s)
              lo_mhz, lo_mhz - half_mhz, lo_mhz + half_mhz);
     // One machine-parseable STATUS line carries every field that used to also
     // be emitted as ~10 separate IOT_LOG METRIC packets per second — those were
-    // redundant with this line and each cost an SDIO UDP send + CRC. pk_acc /
-    // pk_qd fold in the only two fields that weren't already here, so no
-    // telemetry is lost. (iot_log_metric() remains available in the component
-    // API; we just don't spam it every window.)
+    // redundant with this line and each cost an SDIO UDP send + CRC.
+    // (iot_log_metric() remains available in the component API; we just don't
+    // spam it every window. pk_acc/pk_qd were dropped from this line
+    // 2026-07-18: since-boot peaks resent every second, redundant with
+    // /status load{accepted_peak,queue_drops_peak} — the Option B backlog-
+    // sizing question they scoped is closed.)
     // ACARS/SBD reception telemetry (since boot): lwda = ACARS-data frames
     // seen, lwda_bad = those that failed the IDA CRC/header gate (marginal SNR,
     // NOT fed downstream), sbd = SBD envelopes completed. Surfaces reception
@@ -422,7 +424,7 @@ static void emit(const status_snapshot_t *s)
 
     iot_log(IOT_LOG_INFO,
             "STATUS rate=%.2f bch_dec=%lu bch_unk=%lu drops=%lu dsp=%u%% wk=%u%% "
-            "bursts=%u pk_bursts=%u pk_wk=%u%% pk_acc=%u pk_qd=%u "
+            "bursts=%u pk_bursts=%u pk_wk=%u%% "
             "lwda=%lu lwda_bad=%lu sbd=%lu gwf=%d stall=%d "
             "dmaf=%lu sramf=%lu psramf=%lu hot=%lu/%lu",
             rate_inst,
@@ -432,7 +434,6 @@ static void emit(const status_snapshot_t *s)
             (unsigned)dsp_pct, (unsigned)worker_pct,
             (unsigned)s->dsp.gone_bursts, (unsigned)s_cap_peak_bursts,
             (unsigned)s_cap_peak_worker,
-            (unsigned)s_cap_peak_processed, (unsigned)s_cap_peak_qdrops,
             (unsigned long)rs.lw_da, (unsigned long)lwda_bad,
             (unsigned long)rs.sbd_complete, gwf, stall,
             (unsigned long)dmaf_kb, (unsigned long)sramf_kb, (unsigned long)psramf_kb,
@@ -518,6 +519,14 @@ static void logger_task(void *arg)
             emit(&snap);
         }
         iot_log_poll();
+
+        // uart_log AUTO self-heal: re-evaluate the network-gated console mute
+        // every ~1 Hz so WiFi connecting/dropping takes effect within ~1 s
+        // with no reboot required (app_config.h 3-state model). OFF/ON modes
+        // just re-assert the same forced value each pass — a cheap pointer
+        // swap (esp_log_set_vprintf), safe at 1 Hz.
+        uart_log_apply(app_config_uart_log_effective(app_config_get_uart_log_mode(),
+                                                      wifi_link_is_connected()));
     }
 }
 

@@ -29,6 +29,16 @@ extern "C" {
 #define IDA_DECODE_MAX_BITS 200
 #define IDA_DECODE_MAX_BYTES 25
 
+// Data-section geometry shared with the Chase-2 soft fallback
+// (ida_chase.c): 10 BCH(31,20) codewords of 31 bits each, built from
+// the 312-bit post-LCW data section.
+#define IDA_DECODE_N_CW 10
+#define IDA_DECODE_CW_BITS 31
+#define IDA_DECODE_N_CW_BITS (IDA_DECODE_N_CW * IDA_DECODE_CW_BITS)
+#define IDA_DECODE_DATA_BITS 312
+// Frame-bit offset of the data section: UW(24) + LCW(46).
+#define IDA_DECODE_DATA_OFF 70
+
 typedef struct {
     bool     ok;                       // true iff all BCH blocks decoded
     int      n_blocks;                 // BCH blocks attempted (always 10 for full IDA)
@@ -90,6 +100,14 @@ typedef struct {
     // crc_computed == 0 (CCITT-FALSE residual property).
     uint16_t da_crc_computed;
     bool     crc_ok;
+
+    // Chase-2 soft-decision fallback provenance (task #16, ida_chase.c).
+    // Both stay zero on the pure hard-decision path; set only when
+    // ida_chase_decode() recovered this frame. A chase-recovered frame is
+    // still CRC-16-arbitrated (crc_ok true by construction on recovery),
+    // but carries this marker so counters/logs can A/B the two paths.
+    bool     chase_used;   // true iff this decode came from the chase fallback
+    uint16_t chase_checks; // CRC-16 arbiter checks spent (<= configured cap)
 } ida_decoded_t;
 
 // Run the IDA-specific decode chain on `frame`. Caller must have already
@@ -102,6 +120,24 @@ typedef struct {
 //                   describe how many BCH blocks survived ECC repair)
 //   -1  invalid input (NULL pointers, frame type wrong, n_bits too short)
 int ida_decode(const iridium_frame_t *frame, ida_decoded_t *out);
+
+// --- shared internals (used by ida_decode itself and ida_chase.c) ----
+
+// Build the 10 x 31-bit BCH codewords (0/1-per-byte, concatenated) from
+// the RAW 312-bit post-LCW data section (`frame->bits + 70`, qpsk_demod
+// orientation — pair-swap is applied internally). This is the exact
+// received-codeword transform ida_decode() runs before BCH repair;
+// exposed so the Chase-2 fallback enumerates flips of the SAME received
+// words the hard path saw.
+void ida_decode_build_codewords(const uint8_t *data_section,
+                                uint8_t out_codewords[IDA_DECODE_N_CW_BITS]);
+
+// Parse header/payload/CRC fields from out->bits[0..n_bits). Factored
+// out of ida_decode() (behaviour identical) so the Chase-2 fallback can
+// re-run the same field parse + CRC arbitration after it rewrites
+// out->bits with a recovered message. Requires out->n_bits already set;
+// no-op (fields left zero) when n_bits < 196.
+void ida_decode_parse_fields(ida_decoded_t *out);
 
 // (crc16_ccitt_false moved to the shared crc16.h/crc16.c — single tree-wide
 // table-based implementation, still pinned by test_crc16_ccitt.)

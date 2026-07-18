@@ -40,11 +40,17 @@ esp_err_t frame_decoder_init(void);
 //
 // Returns true on enqueue, false if dropped or if frame_decoder_init
 // hasn't been called yet.
+// soft_bits/n_soft: qpsk_demod's per-bit soft metrics for the SAME bits
+// (Chase-2 soft BCH fallback, task #16). Optional — pass NULL/0 when
+// unavailable (aggregator PDU path, smoke corpus, demod soft OOM); the
+// chase fallback is then simply skipped for that frame. Truncated to
+// FRAME_QUEUE_MAX_SOFT entries (only bits [0, 382) are consumed).
 // timestamp_us is the burst's CAPTURE time (from its sample position), not
 // decode time, so processing order doesn't reorder emitted timestamps. Pass 0
 // to fall back to esp_timer_get_time() at enqueue (callers without a capture
 // clock, e.g. the aggregator/corpus paths).
 bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
+                        const int16_t *soft_bits, size_t n_soft,
                         ir_direction_t direction,
                         uint32_t freq_hz, int peak_bin, float snr_db,
                         uint64_t timestamp_us);
@@ -106,6 +112,12 @@ typedef struct {
                                // PARTIAL /messages row (best_effort_decode gate ON).
                                // Never counted in acars_decoded — display-only,
                                // untrusted, crc_ok always false.
+    // Chase-2 soft BCH fallback (task #16; NVS chase2_decode, default OFF).
+    uint32_t chase_attempts;   // hard-BCH-failed LW.DA frames that entered the chase
+    uint32_t chase_recovered;  // ...that the CRC-16 arbiter accepted (counted in
+                               // lw_da_valid too — they are full valid decodes)
+    uint32_t chase_crc_checks; // total CRC arbiter checks spent (x 2^-16 =
+                               // expected false-accept exposure)
 } frame_decoder_reasm_stats_t;
 void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out);
 

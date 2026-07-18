@@ -123,6 +123,67 @@ static void test_invalid_create(void)
     CHECK(frame_queue_create(7) == NULL, "non-power-of-two");
 }
 
+// --- 3b. Soft-metric round-trip (Chase-2, task #16) + the zero-copy
+// reserve/commit producer path frame_decoder_push now uses.
+static void test_soft_and_reserve(void)
+{
+    printf("Test: soft[] round-trip + producer reserve/commit\n");
+    frame_queue_t *q = frame_queue_create(4);
+    CHECK(q != NULL, "create");
+
+    // Copy-push with soft metrics.
+    frame_queue_item_t it;
+    make_item(&it, 42);
+    it.n_soft = 382;
+    for (int i = 0; i < 382; i++)
+        it.soft[i] = (int16_t)(i - 191); // signs + magnitudes both exercised
+    CHECK(frame_queue_push(q, &it), "push with soft");
+
+    frame_queue_item_t out;
+    memset(&out, 0xAA, sizeof(out)); // poison: stale bytes must not matter
+    CHECK(frame_queue_pop(q, &out), "pop with soft");
+    CHECK(recover_id(&out) == 42, "id round-trip");
+    CHECK(out.n_soft == 382, "n_soft round-trip (%u)", out.n_soft);
+    int soft_ok = 1;
+    for (int i = 0; i < 382; i++)
+        if (out.soft[i] != (int16_t)(i - 191)) soft_ok = 0;
+    CHECK(soft_ok, "soft payload round-trip");
+
+    // Clamp: bogus n_soft must not read/write past the array.
+    make_item(&it, 43);
+    it.n_soft = 0xFFFF;
+    CHECK(frame_queue_push(q, &it), "push with bogus n_soft");
+    CHECK(frame_queue_pop(q, &out), "pop bogus n_soft");
+    CHECK(out.n_soft <= FRAME_QUEUE_MAX_SOFT, "n_soft clamped (%u)", out.n_soft);
+
+    // Zero-copy producer path: reserve, fill in place, commit.
+    frame_queue_item_t *slot = frame_queue_producer_reserve(q);
+    CHECK(slot != NULL, "reserve");
+    make_item(slot, 44);
+    slot->n_soft  = 4;
+    slot->soft[0] = -7;
+    slot->soft[3] = 7;
+    frame_queue_producer_commit(q);
+    CHECK(frame_queue_count(q) == 1, "count after commit");
+    CHECK(frame_queue_pop(q, &out), "pop reserved");
+    CHECK(recover_id(&out) == 44 && out.n_soft == 4 &&
+              out.soft[0] == -7 && out.soft[3] == 7,
+          "reserve/commit round-trip");
+
+    // Reserve honours full-queue (capacity 3).
+    for (int i = 0; i < 3; i++) {
+        frame_queue_item_t *s = frame_queue_producer_reserve(q);
+        CHECK(s != NULL, "fill reserve %d", i);
+        make_item(s, 50 + (uint32_t)i);
+        frame_queue_producer_commit(q);
+    }
+    uint64_t dropped_before = frame_queue_dropped(q);
+    CHECK(frame_queue_producer_reserve(q) == NULL, "reserve on full");
+    CHECK(frame_queue_dropped(q) == dropped_before + 1, "full counts a drop");
+
+    frame_queue_destroy(q);
+}
+
 // --- 4. Concurrent producer/consumer with pthread.
 //
 // Mirrors production semantics: the worker calls push() once per
@@ -217,6 +278,7 @@ int main(void)
     test_invalid_create();
     test_basic_push_pop();
     test_wraparound();
+    test_soft_and_reserve();
     test_pthread_producer_consumer();
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;

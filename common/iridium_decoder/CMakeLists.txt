@@ -31,6 +31,10 @@ idf_component_register(
         # Shared CRC-16/CCITT-FALSE (table-based). Used by ida_decode.c's
         # DA payload CRC and p4-usb-host frame_link.c's wire framing.
         "crc16.c"
+        # Task #16: Chase-2 soft-decision BCH fallback for hard-BCH-failed
+        # LW.DA frames (CRC-16-arbitrated; NVS chase2_decode, default OFF).
+        # Integer-only; reference = tests/scripts/chase_crc_bch.py.
+        "ida_chase.c"
         # Phase A device-corpus: inverse of ida_decode.c's LW.DA path --
         # re-encodes a known-good da_cont/da_ctr/payload triple into a
         # content-accurate over-the-air bitstream. Lets the FRAME_DECODER

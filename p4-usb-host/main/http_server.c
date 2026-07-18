@@ -389,7 +389,7 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
     uint32_t bp_first_calls = 0, bp_retry_calls = 0;
     burst_pipeline_get_stage_us(bp_stage_us, &bp_first_calls, &bp_retry_calls); // P1.5c
 
-    char body[3072]; // P1.5c: grew from 2048 to fit snr_pushed/duration_pushed/stage_us
+    char body[3072]; // P1.5c: grew from 2048 to fit snr_pushed/stage_us
     int  n = 0;
     int  m;
     m = snprintf(body + n, sizeof(body) - n,
@@ -449,16 +449,16 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
         }
     }
-    // P1.5c: push-side SNR + duration-class histograms — same bin layout
-    // as snr[] above, but recorded for EVERY burst pushed to the worker
-    // PQ (not just what got popped), so the evicted/shed population is
-    // visible. duration_pushed[0]=impulse-length, [1]=plausible-length
-    // (BURST_DURATION_CLASS_MIN_SAMPLES, worker_core1.c).
+    // P1.5c: push-side SNR histogram — same bin layout as snr[] above,
+    // but recorded for EVERY burst pushed to the worker PQ (not just
+    // what got popped), so the evicted/shed population is visible.
+    // (duration_pushed removed 2026-07-18 — the duration-class triage
+    // question it informed is closed; see worker_core1.c.)
     if (n < (int)sizeof(body) - 1) {
         m = snprintf(body + n, sizeof(body) - n,
-                     "],\"snr_pushed_total\":%u,\"duration_pushed_total\":%u,"
+                     "],\"snr_pushed_total\":%u,"
                      "\"snr_pushed\":[",
-                     (unsigned)h.snr_pushed_total, (unsigned)h.duration_pushed_total);
+                     (unsigned)h.snr_pushed_total);
         if (m > 0) {
             n += m;
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
@@ -474,10 +474,7 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
         }
     }
     if (n < (int)sizeof(body) - 1) {
-        m = snprintf(body + n, sizeof(body) - n,
-                     "],\"duration_pushed_index\":\"0=impulse-length,1=plausible-length\","
-                     "\"duration_pushed\":[%u,%u]",
-                     (unsigned)h.duration_pushed[0], (unsigned)h.duration_pushed[1]);
+        m = snprintf(body + n, sizeof(body) - n, "]");
         if (m > 0) {
             n += m;
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
@@ -759,7 +756,7 @@ static esp_err_t index_get(httpd_req_t *req)
     }
 
     // Part C: remainder of the SDR form + the separate manual-sweep form.
-    char sdrform_c[900];
+    char sdrform_c[1100];
     int  sc = snprintf(sdrform_c, sizeof(sdrform_c),
                        "</select>"
                         "<label>Tagger threshold (dB above noise floor)</label>"
@@ -775,6 +772,18 @@ static esp_err_t index_get(httpd_req_t *req)
                         "<option value=\"1\"%s>On</option>"
                         "<option value=\"0\"%s>Off</option>"
                         "</select>"
+                        // uart_log 3-state mode (app_config.h). Auto = network-
+                        // gated (mutes console once WiFi is up, telemetry
+                        // keeps flowing via iot_log/HTTP); Off/On force it.
+                        // Applied live within ~1 s by status_logger regardless
+                        // of the reboot below (see /uartlog for an immediate,
+                        // no-reboot toggle).
+                        "<label>Console UART log</label>"
+                        "<select name=\"uart_log\">"
+                        "<option value=\"0\"%s>Off</option>"
+                        "<option value=\"1\"%s>On</option>"
+                        "<option value=\"2\"%s>Auto (default; off when network is up)</option>"
+                        "</select>"
                         "<button type=\"submit\">Apply &amp; reboot</button>"
                         "</form>"
                        // Manual one-shot gain sweep (POST /gaincal). Separate
@@ -786,7 +795,10 @@ static esp_err_t index_get(httpd_req_t *req)
                        (unsigned)cfg.autotune_lo_interval_s,
                        (unsigned)cfg.autotune_gain_interval_s,
                       cfg.autotune_on_boot ? " selected" : "",
-                      cfg.autotune_on_boot ? "" : " selected");
+                      cfg.autotune_on_boot ? "" : " selected",
+                      cfg.uart_log == UART_LOG_MODE_OFF ? " selected" : "",
+                      cfg.uart_log == UART_LOG_MODE_ON ? " selected" : "",
+                      cfg.uart_log == UART_LOG_MODE_AUTO ? " selected" : "");
     if (sc < 0) sc = 0;
     if (sc > (int)sizeof(sdrform_c)) sc = sizeof(sdrform_c);
     httpd_resp_send_chunk(req, sdrform_c, sc);
@@ -1968,22 +1980,23 @@ static esp_err_t besteffort_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-// POST /uartlog?on=0|1 — console ESP_LOG mute (topology review 2026-07-17 §F1).
-// The UART TX path is a busy-spin that drains at baud rate whether or not a
-// cable is attached; with the device network-only the spin is pure waste,
-// partly ABOVE the worker. on=0 installs a null vprintf hook (applied LIVE
-// here — a pointer swap, safe from httpd) and persists via an internal-stack
-// task (NVS write must not run on the PSRAM-stacked httpd task). iot_log UDP
-// telemetry, serial_cmd, and panic output are unaffected.
-static void uartlog_cfg_task(void *arg)
+static const char *const UARTLOG_MODE_NAMES[] = {"off", "on", "auto"};
+
+// POST /chase2?on=0|1 — live A/B toggle for the Chase-2 soft-decision BCH
+// fallback (task #16, app_config.chase2_decode, default OFF). No reboot:
+// frame_decoder snapshots the flag on every hard-BCH-failed LW.DA frame, so
+// the new value applies to the next candidate frame. Same internal-stack
+// hand-off for the NVS commit as besteffort_cfg_task above (PSRAM-stack
+// httpd task must never nvs_commit — cache_utils.c:114 assert).
+static void chase2_cfg_task(void *arg)
 {
     bool      on = (bool)(uintptr_t)arg;
-    esp_err_t r  = app_config_set_uart_log(on);
-    ESP_LOGI(TAG, "/uartlog: uart_log=%d (%s) — applied live", (int)on,
-             esp_err_to_name(r));
+    esp_err_t r  = app_config_set_chase2_decode(on);
+    ESP_LOGI(TAG, "/chase2: chase2_decode=%d (%s) — applied live (no reboot)",
+             (int)on, esp_err_to_name(r));
     vTaskDelete(NULL);
 }
-static esp_err_t uartlog_post(httpd_req_t *req)
+static esp_err_t chase2_post(httpd_req_t *req)
 {
     char query[32] = {0}, s[8] = {0};
     bool on = false;
@@ -1991,12 +2004,64 @@ static esp_err_t uartlog_post(httpd_req_t *req)
         httpd_query_key_value(query, "on", s, sizeof(s)) == ESP_OK) {
         on = (s[0] == '1' || s[0] == 't' || s[0] == 'T');
     }
-    uart_log_apply(on); // live: mute/unmute immediately
-    char body[32];
-    int  n = snprintf(body, sizeof(body), "{\"uart_log\":%s}", on ? "true" : "false");
+    char body[40];
+    int  n = snprintf(body, sizeof(body), "{\"chase2_decode\":%s}", on ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, body, n);
-    if (xTaskCreate(uartlog_cfg_task, "uartlog_cfg", 4096, (void *)(uintptr_t)on, 5, NULL) != pdPASS) {
+    if (xTaskCreate(chase2_cfg_task, "chase2_cfg", 4096, (void *)(uintptr_t)on, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "/chase2: failed to spawn apply task");
+    }
+    return ESP_OK;
+}
+
+// POST /uartlog?on=0|1 or ?auto=1 — console ESP_LOG mode (topology review
+// 2026-07-17 §F1 + 3-state AUTO extension, app_config.h). The UART TX path
+// is a busy-spin that drains at baud rate whether or not a cable is
+// attached; on=1/on=0 force the console on/off regardless of network state,
+// while auto=1 selects the network-gated AUTO mode (mutes once the device
+// has network — telemetry keeps flowing via iot_log UDP/HTTP — and re-logs
+// locally the moment it doesn't; status_logger's 1 Hz loop keeps
+// re-evaluating this even without a request, so AUTO self-heals across
+// WiFi connect/drop with no reboot). Applied LIVE here (a vprintf pointer
+// swap, safe from httpd) and persisted via an internal-stack task (NVS
+// write must not run on the PSRAM-stacked httpd task). iot_log UDP
+// telemetry, serial_cmd, and panic output are unaffected in every mode.
+static void uartlog_cfg_task(void *arg)
+{
+    uint8_t   mode = (uint8_t)(uintptr_t)arg;
+    esp_err_t r    = app_config_set_uart_log(mode);
+    ESP_LOGI(TAG, "/uartlog: uart_log_mode=%s (%s) — persisted",
+             UARTLOG_MODE_NAMES[mode], esp_err_to_name(r));
+    vTaskDelete(NULL);
+}
+static esp_err_t uartlog_post(httpd_req_t *req)
+{
+    char    query[32] = {0}, s[8] = {0};
+    uint8_t mode      = UART_LOG_MODE_AUTO;
+    bool    have_mode = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "auto", s, sizeof(s)) == ESP_OK &&
+            (s[0] == '1' || s[0] == 't' || s[0] == 'T')) {
+            mode      = UART_LOG_MODE_AUTO;
+            have_mode = true;
+        } else if (httpd_query_key_value(query, "on", s, sizeof(s)) == ESP_OK) {
+            mode      = (s[0] == '1' || s[0] == 't' || s[0] == 'T') ? UART_LOG_MODE_ON : UART_LOG_MODE_OFF;
+            have_mode = true;
+        }
+    }
+    if (!have_mode) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "usage: POST /uartlog?on=0|1 or ?auto=1\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    bool on = app_config_uart_log_effective(mode, wifi_link_is_connected());
+    uart_log_apply(on); // live: mute/unmute immediately
+    char body[40];
+    int  n = snprintf(body, sizeof(body), "{\"uart_log_mode\":\"%s\"}", UARTLOG_MODE_NAMES[mode]);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, n);
+    if (xTaskCreate(uartlog_cfg_task, "uartlog_cfg", 4096, (void *)(uintptr_t)mode, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "/uartlog: failed to spawn persist task");
     }
     return ESP_OK;
@@ -2057,7 +2122,8 @@ typedef struct {
     uint8_t     coal_n;
     uint32_t    at_lo_s;
     uint32_t    at_gain_s;
-    int8_t      on_boot; // autotune_on_boot: 0/1, or -1 = leave unchanged
+    int8_t      on_boot;  // autotune_on_boot: 0/1, or -1 = leave unchanged
+    uint8_t     uart_log; // UART_LOG_MODE_OFF/ON/AUTO
 } sdrcfg_args_t;
 
 static void sdrcfg_apply_reboot_task(void *arg)
@@ -2071,14 +2137,17 @@ static void sdrcfg_apply_reboot_task(void *arg)
     esp_err_t      r6 = app_config_set_autotune_lo_interval_s(a->at_lo_s);
     esp_err_t      r7 = app_config_set_autotune_gain_interval_s(a->at_gain_s);
     if (a->on_boot >= 0) app_config_set_autotune_on_boot(a->on_boot != 0);
+    // Persist only — status_logger's 1 Hz loop (and the boot-time AUTO
+    // evaluation) apply it live; no separate uart_log_apply() call needed here.
+    esp_err_t r8 = app_config_set_uart_log(a->uart_log);
     ESP_LOGI(TAG,
              "/sdrcfg: lo=%u mode=%d gain_dbx10=%d tag=%.1f coal=%u at_lo=%u at_gain=%u "
-             "(%s/%s/%s/%s/%s/%s/%s) — rebooting to apply",
+             "uart_log=%u (%s/%s/%s/%s/%s/%s/%s/%s) — rebooting to apply",
              (unsigned)a->lo_hz, (int)a->gain_mode, (int)a->gain_dbx10,
              (double)a->tag_thr_db, (unsigned)a->coal_n, (unsigned)a->at_lo_s,
-             (unsigned)a->at_gain_s, esp_err_to_name(r1), esp_err_to_name(r2),
+             (unsigned)a->at_gain_s, (unsigned)a->uart_log, esp_err_to_name(r1), esp_err_to_name(r2),
              esp_err_to_name(r3), esp_err_to_name(r4), esp_err_to_name(r5),
-             esp_err_to_name(r6), esp_err_to_name(r7));
+             esp_err_to_name(r6), esp_err_to_name(r7), esp_err_to_name(r8));
     free(a);
     vTaskDelay(pdMS_TO_TICKS(500));
     class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
@@ -2109,14 +2178,15 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     // would misconfigure gain/threshold). No bias_tee here: it stays on the
     // Wi-Fi-safe /config form where it's already preserved.
     char lo_s[16] = {0}, gm_s[4] = {0}, gain_s[12] = {0}, tag_s[12] = {0},
-         coal_s[6] = {0}, atlo_s[12] = {0}, atg_s[12] = {0};
+         coal_s[6] = {0}, atlo_s[12] = {0}, atg_s[12] = {0}, ul_s[4] = {0};
     if (form_field(body, total, "lo_hz", lo_s, sizeof(lo_s)) != ESP_OK ||
         form_field(body, total, "gain_mode", gm_s, sizeof(gm_s)) != ESP_OK ||
         form_field(body, total, "gain_db", gain_s, sizeof(gain_s)) != ESP_OK ||
         form_field(body, total, "tag_thr", tag_s, sizeof(tag_s)) != ESP_OK ||
         form_field(body, total, "coal_n", coal_s, sizeof(coal_s)) != ESP_OK ||
         form_field(body, total, "at_lo_s", atlo_s, sizeof(atlo_s)) != ESP_OK ||
-        form_field(body, total, "at_gain_s", atg_s, sizeof(atg_s)) != ESP_OK) {
+        form_field(body, total, "at_gain_s", atg_s, sizeof(atg_s)) != ESP_OK ||
+        form_field(body, total, "uart_log", ul_s, sizeof(ul_s)) != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req, "all SDR fields required (submit the form intact)\n",
@@ -2141,6 +2211,8 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     float         tag_thr    = strtof(tag_s, NULL);
     unsigned long coal       = strtoul(coal_s, NULL, 10);
     if (coal > 255) coal = 255;
+    unsigned long ul = strtoul(ul_s, NULL, 10);
+    if (ul > UART_LOG_MODE_AUTO) ul = UART_LOG_MODE_AUTO; // out-of-range -> safe default
 
     sdrcfg_args_t *a = calloc(1, sizeof(*a));
     if (!a) {
@@ -2154,6 +2226,7 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     a->coal_n     = (uint8_t)coal;
     a->at_lo_s    = (uint32_t)strtoul(atlo_s, NULL, 10);
     a->at_gain_s  = (uint32_t)strtoul(atg_s, NULL, 10);
+    a->uart_log   = (uint8_t)ul;
     // on_boot is an optional field (the form's On/Off select always sends it;
     // a curl submit without it leaves autotune_on_boot unchanged, -1).
     char ob_s[8] = {0};
@@ -2670,7 +2743,7 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
     worker_core1_get_drop_snr(dstale, dpri);
     worker_hot_stats_t hot; // A6 continuation-priority boost
     worker_core1_get_hot_stats(&hot);
-    char body[1500];
+    char body[1600]; // +chase2 block (task #16); headroom re-checked
     int  n = snprintf(
         body, sizeof(body),
         "{\"lw_da\":%llu,\"lw_da_valid\":%llu,\"lw_da_gate_rejected\":%llu,"
@@ -2687,7 +2760,8 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
          "\"hot\":{\"enabled\":%d,\"published\":%u,\"cleared\":%u,"
          "\"boost_pops\":%u,\"boost_inserts\":%u,"
          "\"pf_rej_hot\":%u,\"pf_rej_hot_width\":%u,\"pf_rej_hot_dur\":%u,\"pf_rej_hot_snr\":%u,"
-         "\"pf_rej_margin\":%u,\"cont_stale\":%u,\"cont_pri\":%u},"
+         "\"cont_stale\":%u,\"cont_pri\":%u},"
+         "\"chase2\":{\"attempts\":%u,\"recovered\":%u,\"crc_checks\":%u},"
          "\"sbd_complete\":%llu,\"acars_fragments\":%llu,\"acars_decoded\":%llu}",
         (unsigned long long)r.lw_da, (unsigned long long)r.lw_da_valid,
         (unsigned long long)gate_rej,
@@ -2715,8 +2789,9 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
         (unsigned)hot.boost_pops, (unsigned)hot.boost_inserts,
         (unsigned)hot.pf_rej_hot, (unsigned)hot.pf_rej_hot_width,
         (unsigned)hot.pf_rej_hot_dur, (unsigned)hot.pf_rej_hot_snr,
-        (unsigned)hot.pf_rej_margin,
         (unsigned)hot.hot_cont_stale, (unsigned)hot.hot_cont_pri,
+        (unsigned)r.chase_attempts, (unsigned)r.chase_recovered,
+        (unsigned)r.chase_crc_checks,
         (unsigned long long)r.sbd_complete, (unsigned long long)r.acars_fragments,
         (unsigned long long)r.acars_decoded);
     if (n < 0) n = 0;
@@ -2815,6 +2890,7 @@ esp_err_t http_server_start(void)
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
         {.uri = "/besteffort", .method = HTTP_POST, .handler = besteffort_post, .user_ctx = NULL},
+        {.uri = "/chase2", .method = HTTP_POST, .handler = chase2_post, .user_ctx = NULL},
         {.uri = "/uartlog", .method = HTTP_POST, .handler = uartlog_post, .user_ctx = NULL},
         {.uri = "/gaincal", .method = HTTP_POST, .handler = gaincal_post, .user_ctx = NULL},
         {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post, .user_ctx = NULL},

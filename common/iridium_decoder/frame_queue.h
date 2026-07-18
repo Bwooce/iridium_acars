@@ -42,6 +42,13 @@ extern "C" {
 // queue is ~132 KB in PSRAM. (We have 32 MB free PSRAM; this is noise.)
 #define FRAME_QUEUE_MAX_BITS 2048
 
+// Maximum per-bit soft metrics carried alongside bits[] (Chase-2 soft
+// BCH, task #16). Sized for one standard 382-bit burst frame (the only
+// consumer, ida_chase, needs soft coverage of frame bits [0, 382) —
+// UW+LCW+data); multi-slot frames simply truncate. 384 int16 = 768 B
+// per slot; 64 slots ≈ +48 KB PSRAM (noise next to the 32 MB pool).
+#define FRAME_QUEUE_MAX_SOFT 384
+
 typedef struct {
     // Host timestamp at enqueue (esp_timer_get_time / gettimeofday).
     // Full 64-bit: a uint32_t wrapped at ~71.6 min uptime, after which
@@ -56,7 +63,14 @@ typedef struct {
     uint8_t  direction; // 0 = downlink (matches qpsk_demod's DIR_DOWNLINK),
                         // 1 = uplink   (DIR_UPLINK)
     uint8_t pad;
-    uint8_t bits[FRAME_QUEUE_MAX_BITS]; // 0/1-per-byte demod output
+    // Per-bit soft metrics for bits[0..n_soft) (sign = hard decision,
+    // magnitude = reliability; see qpsk_demod.h). n_soft == 0 when the
+    // producer had none (aggregator PDU path, demod OOM). Kept BEFORE
+    // bits[] so push/pop can keep copying only the valid bits[] prefix
+    // (bits[] must stay the last member).
+    uint16_t n_soft;
+    int16_t  soft[FRAME_QUEUE_MAX_SOFT];
+    uint8_t  bits[FRAME_QUEUE_MAX_BITS]; // 0/1-per-byte demod output
 } frame_queue_item_t;
 
 typedef struct frame_queue frame_queue_t;
@@ -73,6 +87,18 @@ void           frame_queue_destroy(frame_queue_t *q);
 // debug/stats. Producer callable from any task / ISR context that has
 // stable access to `q`.
 bool frame_queue_push(frame_queue_t *q, const frame_queue_item_t *item);
+
+// Zero-copy producer path: reserve the tail slot for in-place fill,
+// then commit to publish it. Between reserve and commit the producer
+// owns the returned slot exclusively (SPSC — the consumer never reads
+// past the released tail). Returns NULL when full (the drop counter
+// advances, mirroring frame_queue_push). The producer MUST set n_bits/
+// n_soft consistently with what it wrote before committing, and must
+// not interleave another reserve/push before the commit. Added so
+// frame_decoder_push can fill the (now ~2.8 KB) item directly in PSRAM
+// instead of staging it on the calling task's stack and copying twice.
+frame_queue_item_t *frame_queue_producer_reserve(frame_queue_t *q);
+void                frame_queue_producer_commit(frame_queue_t *q);
 
 // Non-blocking pop from consumer side. Returns true if an item was
 // dequeued into *out, false if empty.

@@ -89,28 +89,12 @@ static SemaphoreHandle_t s_pq_items = NULL; // counts occupied slots (worker wai
 // default (process, don't shed). Does not touch detection (still gri-aligned).
 #define BURST_NARROW_MAX_BINS 48 // one channel (~34) + margin
 
-// P1.5c duration class — HISTOGRAM ONLY (the priority term was removed
-// with P1.5a). Bench 2026-07-06 (see
-// docs/superpowers/ANALYSIS-2026-07-06-path-to-first-acars.md) found the PQ
-// monopolized by 19-22 dB impulsive broadband junk active for only 1-3
-// tagger FFT-steps, and a duration-class penalty was added here to rank
-// such bursts below plausible-single-frame-length ones. The overnight
-// 2026-07-06/07 soak then showed the term is DEFEATED by squelch
-// clipping: the P1 burst squelch force-closes REAL bursts short, so
-// genuine Iridium frames land under the threshold and get demoted along
-// with the junk. With the P1.5a triage fast-pass giving every popped
-// burst a real (demod-based) verdict at ~1/40th of the old junk cost,
-// length-based guessing is obsolete — triage order is now SNR-driven
-// (T60 width + SNR, below) and length-agnostic.
-//
-// The threshold constant stays for the push-side duration histogram
-// (s_hist_duration_pushed), which keeps the impulse-vs-plausible-length
-// population visible in /diag without a serial log. Derivation (all
-// gri/tagger constants): MIN_FRAME_LENGTH_NORMAL 131 sym × 100
-// samples/sym = 13100 + tagger pad (FBT_BURST_PRE_LEN 4096 +
-// FBT_BURST_POST_LEN 40000) − one FFT-step (2048) threshold-jitter
-// tolerance = 55148 samples (~22.1 ms) at FS_DETECT_HZ.
-#define BURST_DURATION_CLASS_MIN_SAMPLES 55148
+// (P1.5c duration-class histogram removed 2026-07-18. The duration
+// priority term it shadowed was removed with P1.5a — length-based
+// triage was defeated by squelch clipping and made obsolete by the
+// demod-based fast-pass — so the impulse-vs-plausible histogram only
+// informed a decision that has been closed since. See git history for
+// BURST_DURATION_CLASS_MIN_SAMPLES and its derivation.)
 // ---- A6: continuation-priority boost (hot-bin table) ----
 // Table logic lives in hot_bin_table.c (dependency-free + host-tested); this file
 // owns the single instance, the worker-side boost/counters, and the public wrappers.
@@ -132,25 +116,13 @@ static _Atomic uint32_t s_pf_rej_hot_width = 0;
 static _Atomic uint32_t s_pf_rej_hot_dur   = 0;
 static _Atomic uint32_t s_pf_rej_hot_snr   = 0;
 
-// Global SNR margin (opener rescue): a burst that fails ONLY the channel-SNR gate but sits
-// within WORKER_PF_SNR_MARGIN_DB of PF_THRESH_DB is escalated on ANY channel — not just hot
-// (open-chain) ones. This is the ONLY thing that saves a marginal FIRST fragment (opener): an
-// opener can't be hot-exempted because its chain isn't open yet. gr-iridium has no decode-time
-// SNR gate at all, and the prefilter's 2nd SNR estimator never cross-calibrated with the tagger,
-// so re-testing at strict 14 dB parity shaves real openers. BCH/CRC still gate downstream, so
-// the worst case is a wasted decode; bounded by gain-22 worker headroom (~6/s vs ~12/s ceiling).
-// s_pf_rej_margin counts the GLOBAL-margin rescues (opener saver); watch it vs ida.orphan.
-//
-// A/B 2026-07-17: DISABLED (2.0 -> 0). A 9.5 h soak at 15.7 dB showed the margin admitted
-// ~7900 marginal bursts (mostly junk, lwda_bad-heavy) that saturated the worker (~11k stale-
-// drops, pk_wk 130%). We DO receive ACARS — 6x 0x7608 openers salvaged as f1-only partials —
-// but every continuation was lost: A6 boosts QUEUE priority while stale-drop is RING-AGE, so a
-// saturated worker laps the 3.36 s ring before the boosted continuation is reached. Killing the
-// global margin frees that capacity while KEEPING the hot-channel exemption (the continuation's
-// real rescue). 0.0f makes the escape condition (snr >= 14 - margin, on the !snr_ok branch,
-// i.e. snr < 14) unreachable, cleanly disabling it. Restore to A/B or if opener recall drops.
-#define WORKER_PF_SNR_MARGIN_DB 0.0f
-static _Atomic uint32_t s_pf_rej_margin    = 0;
+// (Global SNR-margin opener rescue REMOVED 2026-07-18. The A/B of 2026-07-17
+// disabled it — a 9.5 h soak at 15.7 dB showed the 2 dB margin admitted ~7900
+// marginal bursts that saturated the worker (~11k stale-drops, pk_wk 130%)
+// and cost every continuation, while the hot-channel exemption above is the
+// continuation's real rescue. With WORKER_PF_SNR_MARGIN_DB pinned to 0 the
+// escape branch was unreachable and s_pf_rej_margin permanently 0, so both
+// were culled; restore from git history if opener recall ever drops.)
 
 // Continuation-fate instrument (2026-07-17): a burst DROPPED (never decoded) while its bin has
 // an OPEN chain (hot) is a candidate LOST CONTINUATION. This splits the proven continuation-loss
@@ -206,7 +178,6 @@ void worker_core1_get_hot_stats(worker_hot_stats_t *out)
     out->pf_rej_hot_width = atomic_load_explicit(&s_pf_rej_hot_width, memory_order_relaxed);
     out->pf_rej_hot_dur   = atomic_load_explicit(&s_pf_rej_hot_dur, memory_order_relaxed);
     out->pf_rej_hot_snr   = atomic_load_explicit(&s_pf_rej_hot_snr, memory_order_relaxed);
-    out->pf_rej_margin    = atomic_load_explicit(&s_pf_rej_margin, memory_order_relaxed);
     out->hot_cont_stale   = atomic_load_explicit(&s_hot_cont_stale, memory_order_relaxed);
     out->hot_cont_pri     = atomic_load_explicit(&s_hot_cont_pri, memory_order_relaxed);
 }
@@ -379,10 +350,9 @@ static _Atomic uint32_t s_bch_unknown_cum = 0;
 static _Atomic uint32_t s_bursts_triage_rejected = 0;
 static _Atomic uint64_t s_t_triage_rej_us        = 0; // pop→drop wall time of rejects
 static _Atomic uint64_t s_t_triage_us            = 0; // triage stage time of accepted bursts
-// P1.5b: burst_prefilter rejects (width/duration/channel-SNR). Mirrors the
-// triage-rejected count (the prefilter IS the fast-pass now) but is kept as
-// a distinct name so /status can attribute drops to the pre-filter.
-static _Atomic uint32_t s_bursts_prefilter_rejected = 0;
+// (s_bursts_prefilter_rejected removed 2026-07-18: it mirrored
+// s_bursts_triage_rejected 1:1 — the prefilter IS the fast-pass — and
+// nothing consumed the duplicate field.)
 
 // Diagnostic histograms (#116). Cumulative since boot — no decay /
 // rolling window; clients compute deltas if they want a rate.
@@ -406,11 +376,8 @@ static _Atomic uint32_t s_hist_bch[HIST_BCH_BINS];
 // invisible. Mirror the same bin layout on the push side, recorded for
 // EVERY burst handed to worker_core1_push_burst (same point as
 // hist_freq_record below — "ALL detections", before the stale-reject
-// early-return), plus a 2-bin duration-class split so the "evicted
-// because too short" story is visible without needing a live serial log.
+// early-return).
 static _Atomic uint32_t s_hist_snr_pushed[HIST_SNR_BINS];
-#define HIST_DURATION_BINS 2 // 0 = below BURST_DURATION_CLASS_MIN_SAMPLES, 1 = at/above
-static _Atomic uint32_t s_hist_duration_pushed[HIST_DURATION_BINS];
 
 static inline void hist_snr_record_into(_Atomic uint32_t *hist, float snr_db)
 {
@@ -422,10 +389,6 @@ static inline void hist_snr_record_into(_Atomic uint32_t *hist, float snr_db)
 static inline void hist_snr_record(float snr_db)
 {
     hist_snr_record_into(s_hist_snr, snr_db);
-}
-static inline void hist_duration_record_pushed(uint32_t length_samples)
-{
-    s_hist_duration_pushed[length_samples >= BURST_DURATION_CLASS_MIN_SAMPLES ? 1 : 0]++;
 }
 static inline void hist_bch_record(int e1, int e2)
 {
@@ -1001,6 +964,8 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
     }
 #else // STANDALONE (and AGGREGATOR, which never reaches here)
     frame_decoder_push(frame.bits, frame.n_bits,
+                       frame.soft_bits,
+                       frame.soft_bits ? (size_t)frame.n_bits : 0,
                        frame.direction, 0u,
                        wctx->burst->peak_bin, wctx->burst->peak_snr_db,
                        cap_us);
@@ -1270,18 +1235,10 @@ void worker_task(void *arg)
                         snr_exempt = true;
                     }
                 }
-                // GLOBAL SNR margin (opener rescue): failed ONLY the SNR gate, on ANY channel,
-                // but within WORKER_PF_SNR_MARGIN_DB of parity → escalate. Openers can't be
-                // hot-exempted (no open chain yet), so this margin is what saves a marginal FIRST
-                // fragment. Skipped for hot-channel SNR-only bursts (already exempt above, any SNR)
-                // so no double-count. Width/duration rejects still stand (junk protection).
-                if (!snr_exempt && pf.width_ok && pf.dur_ok && !pf.snr_ok &&
-                    pf.channel_snr_db >= (float)PF_THRESH_DB - WORKER_PF_SNR_MARGIN_DB) {
-                    atomic_fetch_add_explicit(&s_pf_rej_margin, 1, memory_order_relaxed);
-                    snr_exempt = true;
-                }
+                // (The GLOBAL SNR-margin opener rescue that sat here was removed
+                // 2026-07-18 — disabled since the 2026-07-17 A/B; see the note at
+                // the continuation-fate instrument above.)
                 if (!snr_exempt) {
-                    s_bursts_prefilter_rejected++;
                     s_bursts_triage_rejected++; // surfaced via /status + worker_stats
                     s_t_triage_rej_us += (uint64_t)(t_pf1 - burst_t0);
                     continue;
@@ -1476,7 +1433,6 @@ void worker_core1_push_burst(const detected_burst_t *burst)
     hist_freq_record(burst->rel_freq_hz);                        // band occupancy of ALL detections
     hist_dcfine_record(burst->rel_freq_hz);                      // fine near-DC diagnostic
     hist_snr_record_into(s_hist_snr_pushed, burst->peak_snr_db); // P1.5c: SNR of ALL detections
-    hist_duration_record_pushed(burst->length_samples);          // P1.5c: duration class of ALL detections
 
     // P1 stale-reject at PUSH: don't queue bursts that are already
     // unrecoverable — they would only be popped and dropped by the
@@ -1541,23 +1497,17 @@ void worker_core1_get_histograms(worker_histograms_t *out)
         out->freq[i] = s_hist_freq[i];
         total_freq += s_hist_freq[i];
     }
-    // P1.5c: push-side SNR + duration-class histograms (ALL detections,
-    // not just what the worker popped) — see s_hist_snr_pushed comment.
+    // P1.5c: push-side SNR histogram (ALL detections, not just what the
+    // worker popped) — see s_hist_snr_pushed comment.
     uint32_t total_snr_pushed = 0;
     for (int i = 0; i < HIST_SNR_BINS; i++) {
         out->snr_pushed[i] = s_hist_snr_pushed[i];
         total_snr_pushed += s_hist_snr_pushed[i];
     }
-    uint32_t total_duration_pushed = 0;
-    for (int i = 0; i < HIST_DURATION_BINS; i++) {
-        out->duration_pushed[i] = s_hist_duration_pushed[i];
-        total_duration_pushed += s_hist_duration_pushed[i];
-    }
-    out->snr_total             = total_snr;
-    out->bch_total             = total_bch;
-    out->freq_total            = total_freq;
-    out->snr_pushed_total      = total_snr_pushed;
-    out->duration_pushed_total = total_duration_pushed;
+    out->snr_total        = total_snr;
+    out->bch_total        = total_bch;
+    out->freq_total       = total_freq;
+    out->snr_pushed_total = total_snr_pushed;
 }
 
 void worker_core1_get_dcfine(uint32_t *out, int max, uint32_t *total_out)
@@ -1608,8 +1558,6 @@ void worker_core1_get_stats(worker_stats_t *out)
     uint32_t n_tri_rej =
         atomic_exchange_explicit(&s_bursts_triage_rejected, 0, memory_order_relaxed);
     out->bursts_triage_rejected = n_tri_rej;
-    out->bursts_prefilter_rejected =
-        atomic_exchange_explicit(&s_bursts_prefilter_rejected, 0, memory_order_relaxed);
     uint64_t t_triage =
         atomic_exchange_explicit(&s_t_triage_us, 0, memory_order_relaxed);
     uint64_t t_triage_rej =
@@ -1636,13 +1584,12 @@ void worker_core1_get_stats(worker_stats_t *out)
         out->extract_us     = (float)t_extract / fn;
         out->freq_center_us = (float)t_rotate / fn;
         out->fir_decim_us   = (float)t_decim / fn;
-        out->resample_us    = 0.0f;
         out->demod_us       = (float)t_pipeline / fn;
         out->bch_us         = (float)t_bch / fn;
         out->triage_us      = (float)t_triage / fn;
     } else {
         out->avg_burst_us = out->extract_us = out->freq_center_us =
-            out->fir_decim_us = out->resample_us = out->demod_us =
+            out->fir_decim_us = out->demod_us =
                 out->bch_us = out->triage_us = 0.0f;
     }
 }

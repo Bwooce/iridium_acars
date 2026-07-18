@@ -35,6 +35,8 @@
 #include "burst_pipeline.h"
 #include "worker_core1.h" // worker_core1_prealloc_fir (was only transitively included)
 #include "smoke_test.h"
+#include "crc16.h"       // on-silicon CRC-16 table self-test (all variants)
+#include "iridium_bch.h" // on-silicon BCH syndrome-table vs _ref self-test (all variants)
 
 #if CONFIG_SMOKE_TEST_CORPUS
 #include "fixture_corpus_uint8.h"
@@ -304,7 +306,7 @@ static void smoke_test_run_frame_decoder(void)
         // before giving up; far longer than realistic for this corpus.
         bool ok = false;
         for (int attempt = 0; attempt < 100; attempt++) {
-            ok = frame_decoder_push(e->bits, e->n_bits, qdir,
+            ok = frame_decoder_push(e->bits, e->n_bits, NULL, 0, qdir,
                                     e->freq_hz, 0, e->snr_db, 0u);
             if (ok) break;
             vTaskDelay(1); // one tick = drain a bit, then retry
@@ -356,7 +358,8 @@ static void smoke_test_run_frame_decoder(void)
                 // (see project_30min_live_stability memory note); the
                 // fixture doesn't carry its own SNR field, so log a
                 // representative fixed value here.
-                ok = frame_decoder_push(bits, IDA_ENCODE_FRAME_BITS, DIR_DOWNLINK,
+                ok = frame_decoder_push(bits, IDA_ENCODE_FRAME_BITS, NULL, 0,
+                                        DIR_DOWNLINK,
                                         fr->freq_hz, 0, 12.5f, fr->timestamp_us);
                 if (ok) break;
                 vTaskDelay(1);
@@ -576,6 +579,49 @@ void smoke_test_run(void)
     // Run the PIE FFT diff harness first so its log lines are easy to
     // find. Tiny one-shot ~10 ms of synthetic FFT comparisons; doesn't
     // affect downstream smoke results.
+    // On-silicon self-test of the table-based ECC: prove the CRC-16 table
+    // and the BCH syndrome-table match their references on the actual P4
+    // (host tests prove bit-exactness on x86; this confirms it on RISC-V).
+    // Cheap (~ms, single-error sweep). SELFTEST_FAIL -> SMOKE_FAIL so a
+    // silicon-level table regression is caught by the gate.
+    {
+        int      stfail = 0;
+        uint16_t cc     = crc16_ccitt_false((const uint8_t *)"123456789", 9);
+        if (cc != 0x29B1u) {
+            ESP_LOGE(TAG, "SELFTEST CRC: got 0x%04X want 0x29B1", cc);
+            stfail++;
+        } else {
+            ESP_LOGI(TAG, "SELFTEST CRC: canonical 0x29B1 OK");
+        }
+        const uint32_t polys[] = {3545u, 1207u, 1897u, 465u, 41u, 29u};
+        const size_t   nbits[] = {31u, 31u, 31u, 14u, 26u, 7u};
+        int            checked = 0, mism = 0;
+        for (int ci = 0; ci < 6; ci++) {
+            for (size_t e = 0; e < nbits[ci]; e++) {
+                uint8_t a[32] = {0}, b[32] = {0};
+                a[e] = 1;
+                b[e] = 1;
+                int ra = iridium_bch_repair2(polys[ci], a, nbits[ci]);
+                int rb = iridium_bch_repair2_ref(polys[ci], b, nbits[ci]);
+                checked++;
+                if (ra != rb || memcmp(a, b, nbits[ci]) != 0) mism++;
+            }
+        }
+        if (mism) {
+            ESP_LOGE(TAG, "SELFTEST BCH: %d/%d table!=ref", mism, checked);
+            stfail++;
+        } else {
+            ESP_LOGI(TAG, "SELFTEST BCH: %d single-error patterns table==ref", checked);
+        }
+        if (stfail) {
+            ESP_LOGE(TAG, "===== SELFTEST_FAIL (%d) =====", stfail);
+            ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
+            vTaskSuspend(NULL);
+            return;
+        }
+        ESP_LOGI(TAG, "===== SELFTEST_PASS (CRC+BCH tables verified on silicon) =====");
+    }
+
     pie_fft_diff_run();
 
 #if CONFIG_SMOKE_TEST_LIVE_SDR
