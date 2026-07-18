@@ -16,16 +16,17 @@ cd esp-idf
 git apply ../patches/0001-esp_dma_utils-defer-stash-alloc-until-overflow-confirmed.patch
 git apply ../patches/0003-freertos-riscv-coproc-save-area-in-internal-ram-for-psram-stacks.patch
 git apply ../patches/0004-freertos-riscv-pie-coproc-trap-storm-watchdog.patch   # apply AFTER 0003
-git apply ../patches/0006-freertos-riscv-pie-coproc-force-aligned-cfg-in-save-restore.patch   # apply AFTER 0004
 git apply ../patches/0007-bootloader_support-invalidate-mmap-cache-before-app-ota-verify.patch
 git apply ../patches/0008-fatfs-enable-exfat.patch
 git apply ../patches/0009-freertos-riscv-pie-coproc-trap-storm-recovery.patch   # apply AFTER 0004
 ```
 
-**0005 and 0006 are mutually exclusive** — both edit the
-`pie_save_regs`/`pie_restore_regs` macros. The current production gate uses
-**0006** (the CFG-alignment fix); 0005 (the fence/nop/`.balignw` screen) is the
-superseded experiment. Apply one or the other, never both.
+**0005 and 0006 were FALSIFIED and REMOVED (2026-07-19).** Both edited the
+`pie_save_regs`/`pie_restore_regs` macros as *save/restore-side* attempts to fix
+the coproc trap storm; both were bench-tested and STILL wedged (HP-WDT), so
+neither is the fix. The production PIE gate is **0002+0003+0004+0009** — 0009
+(recovery) is the real fix. The .patch files were deleted; see git history and
+project_pie_save_deadlock_smoke for the falsification record.
 
 Managed-component patches — apply from the repo root after the
 component manager has populated `managed_components/` (first
@@ -199,127 +200,16 @@ attributable `Coprocessor lazy-save trap storm` panic with the MEPC/MTVAL
 of the faulting save/restore instruction (root fault not yet cured, but no
 silent wedge).
 
-## 0005 — freertos/riscv: PIE save/restore spacing/fence/alignment screen (EXPERIMENT)
+## 0005 / 0006 — FALSIFIED save/restore-side PIE trap-storm attempts (REMOVED 2026-07-19)
 
-**File:** `components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S`
-**IDF version:** v6.1 (vendored `release/v6.1` checkout). Re-verify on IDF
-updates. **Apply AFTER 0004** (context lines are diffed against the
-0004-applied tree; 0005 touches only the `pie_save_regs`/`pie_restore_regs`
-macros, which 0004 does not).
-
-This is a **cheap, falsifiable experiment**, not a proven fix. The device-smoke
-RAW/REAL wedge hard-hangs Core 1 (HP-WDT, no coredump) inside
-`rtos_save_pie_coproc` on the back-to-back 128-bit PIE Q-register run
-(`esp.vst.128.ip`/`esp.vld.128.ip`, `.insn 0x82012{2,6,a,e}3b`). Prior work
-ruled out memory region (0003), re-entry storm (0004 watchdog saw none), and our
-own kernels (single-PIE-owner-per-core avoids it). The surviving lead is
-esp-dsp issue **#102 "Problematic HW Loops on ESP32-P4"** (DSP-158): on P4 rev-1.0
-silicon a custom-coproc op (`esp.lp.setup`) that is **not 4-byte aligned** makes
-the core "go haywire"; the fix is `.balignw 4,0x0001`. Hypothesis: the PIE
-Q-register hang is a related pipeline / memory-ordering / alignment hazard on
-back-to-back custom-coproc ops.
-
-The patch ADDS only register-safe padding — every functional PIE op is kept
-intact and in its original order — testing three hypotheses at once (a "does ANY
-spacing help" screen; if it passes, a follow-up bisects which element mattered):
-
-- **H1 alignment:** `.balignw 4,0x0001` (mirror of esp-dsp #102) before each
-  run of coproc ops (the Q-register block, the QACC/UA block, and the XACC op),
-  in both macros.
-- **H2 memory-ordering:** `fence` before the first vector access and between the
-  Q-register block and the exotic-register (QACC/UA/XACC/SAR) block.
-- **H3 pipeline hazard:** two `nop`s between each pair of consecutive
-  `esp.vst.128.ip`/`esp.vld.128.ip` and QACC/UA ops.
-
-`fence`/`nop`/`.balignw` are all register-safe (no clobber of the `a1`/`a2`
-scratch the macros already use), which matters because these macros run in the
-illegal-instruction trap handler with a tight register budget.
-
-**Build-verified** (SMOKE_TEST_RAW, 0002+0003+0004+0005 applied): compiles
-clean; disassembly of `rtos_save_pie_coproc` confirms all 16 Q-register ops
-survive with correct encodings, separated by the nops/fences.
-
-**Known caveat (important for interpreting a bench result):** in the linked
-image the coproc ops land at **2-mod-4** addresses, i.e. the `.balignw` did NOT
-achieve absolute 4-byte alignment — `rtos_save_pie_coproc` is placed at a
-2-mod-4 base and IRAM does not honor `R_RISCV_ALIGN` to 4 here, so the padding
-tracked the assembler's local frame parity only. The H2 (fence) and H3 (2-nop)
-perturbations ARE genuinely applied; H1 as-emitted is "padding present, ops
-still 2-mod-4". So a still-hangs bench result cleanly falsifies H2+H3 but only
-partially H1 — a targeted 4-byte-alignment retry (force routine/section
-alignment) would be the H1 follow-up before discarding alignment entirely.
-
-**Bench procedure (main session):** apply 0005 after 0004, set
-`CONFIG_SMOKE_TEST_MODE=y` + `CONFIG_SMOKE_TEST_RAW_IRIDIUM=y`, build, flash,
-`scripts/smoke_run.sh raw`. GOLDEN pass (`matched>=40`, no HP-WDT) ⇒ spacing/
-fence/alignment FIXED the wedge (bisect which element next). Still HP-WDT hang
-(or a 0004 attributable trap-storm panic) ⇒ falsified; proceed to PIE-ownership
-re-tiering (research plan path (b)). Restore the production sdkconfig afterward
-(smoke_run leaves `CONFIG_SMOKE_TEST_MODE=y` in the gitignored sdkconfig).
-
-## 0006 — freertos/riscv: force strict-aligned PIE CFG inside the save/restore
-
-**File:** `components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S`
-**IDF version:** v6.1 (vendored `release/v6.1` checkout). Re-verify on IDF
-updates. **Apply AFTER 0004.** 0006 touches only the
-`pie_save_regs`/`pie_restore_regs` macros, which 0004 does not.
-
-**SUPERSEDES 0005 — do NOT apply both.** 0005 (the fence/nop/`.balignw` screen)
-and 0006 both edit the same two macros and will conflict. 0006 is the
-targeted, hypothesis-driven follow-up; the production gate uses 0002+0003+0004+**0006**
-(not 0005).
-
-**Root-cause hypothesis (from the git+code archaeology, see
-`docs/superpowers/plans/2026-07-07-pie-regression-archaeology.md`):** the IDF
-FreeRTOS-P4 port does **not** context-switch the PIE **CFG** register — its
-lazy save/restore saves Q0–7, QACC, UA_STATE, XACC, SAR, SAR_BYTES, FFT_BIT_WIDTH,
-but **never CFG** (verified: no `esp.movx.*cfg` anywhere in `portasm.S`; no
-`RV_PIE_CFG` field in `rvruntime-frames.h`). Every PIE-Q kernel this firmware runs
-— ours (`resample_arp4.S:54-58`, `rotate_to_dc_arp4.S:37-39`) and esp-dsp's
-(`dsps_fird_s16_arp4.S:50-52`) — sets **CFG bit 1 (unaligned 128-bit vld)** and
-never clears it. So once any PIE kernel has run on a core, that core is left in
-unaligned-vld mode permanently, **including while `rtos_save_pie_coproc` runs its
-own `esp.vst.128`/`esp.vld.128`/`esp.st.ua.state` against the (16-byte-aligned)
-save frame**. The regression origin (`baaff6d`, 2026-05-22, PIE-ised resample →
-`ingest_core1` became a *second* PIE-Q owner on Core 1 alongside `worker_core1`)
-made the owner-swap save/restore body actually execute; the deterministic Core-1
-HP-WDT wedge lands on the 4th Q-register op (`esp.vld.128.ip q3`) in
-`pie_restore_regs`. Hypothesis: the save/restore was validated with CFG at its
-reset (strict-aligned) value, and running it in unaligned mode against a stale
-UA_STATE stalls the pipeline. This state (CFG left set during the save/restore)
-was never tested — 0005 added spacing/fences but left CFG set the whole time.
-
-**Fix:** at the top of `pie_save_regs` **and** `pie_restore_regs`, read the caller
-PIE CFG into `t3`, clear bit 1 (`andi t4, t3, ~0x2` → the routine's own vector
-loads/stores run in strict 16-byte-aligned mode, which is correct because the
-coproc save frame is 16-byte aligned via patch 0003), and restore the caller's
-CFG (`esp.movx.w.cfg t3`) at the end of each macro so application PIE code still
-gets unaligned mode. `t3`/`t4` are safe scratch here: `rtos_save_pie_coproc` has
-already clobbered all caller-saved regs via its C calls (`xPortCoprocTrapStormCheck`,
-`rtos_current_tcb`, `pxPortUpdateCoprocOwner`, `pxPortGetCoprocArea`), and the trap
-entry saves/restores the full GP register file around the handler. The
-`esp.movx.r/w.cfg` ops and the `t3..t6` encoding match the three arp4 kernels
-above (proven-valid under this toolchain).
-
-Only the CFG save/clear/restore bracket is added — every functional PIE op
-(8× Q + 4× QACC + UA_STATE + XACC + SAR/SAR_BYTES/FFT_BIT_WIDTH) is kept intact
-and in its original order.
-
-**Build-verified** (SMOKE_TEST_RAW, 0002+0003+0004+0006 applied, `scripts/build.sh`
-exit 0): disassembly of `rtos_save_pie_coproc` confirms the CFG bracket on both
-sides (`esp.movx.r.cfg t3` / `andi t4,t3,-3` / `esp.movx.w.cfg t4` … `esp.movx.w.cfg t3`,
-`-3` == `~0x2`) and all 16 Q-register ops + QACC/UA_STATE/XACC/SAR ops surviving
-with correct encodings. **NOT bench-verified** — this is a hypothesis test.
-
-**Bench procedure (main session):** apply 0006 after 0004 (do NOT apply 0005),
-`CONFIG_SMOKE_TEST_MODE=y` + `CONFIG_SMOKE_TEST_RAW_IRIDIUM=y`, build, flash,
-`scripts/smoke_run.sh raw`. GOLDEN pass (`matched>=40`, no HP-WDT) ⇒ the unaligned
-CFG mode during the save/restore was the trigger (small, upstreamable port patch +
-root-cause explanation). Still HP-WDT hang (or a 0004 attributable trap-storm
-panic) ⇒ hypothesis falsified; the last distinct software lever is exhausted and
-the remaining paths are PIE-ownership re-tiering or shipping behind a `Smoke-skip`
-(see `docs/superpowers/plans/2026-07-07-pie-wedge-research.md`). Restore the
-production sdkconfig afterward.
+0005 (fence/nop/`.balignw` spacing screen) and 0006 (force strict-aligned PIE CFG
+inside the save/restore) were two hypothesis-driven attempts to fix the coproc
+lazy-save trap storm *from the save/restore side*. BOTH were bench-tested and
+STILL produced the HP-WDT wedge (0006's "CFG-unaligned is the cause" hypothesis
+was falsified) — see project_pie_save_deadlock_smoke and git history for the full
+analysis. The real fix is **0009** (recover the storm by enabling the correct
+coprocessor for the misrouted rev<3 P4 FPU-EXT-ILL trap). The 0005/0006 .patch
+files were deleted; their diffs remain in git history if ever needed.
 
 ## libacars — fix `uper_decode()` hard-zeroing `consumed` on RC_FAIL
 
