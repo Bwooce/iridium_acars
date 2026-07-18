@@ -7,9 +7,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+// Cold working buffers -> PSRAM to reclaim internal DMA-INT SRAM (dmaf).
+// See docs/p4-bss-audit.md (DMA-INT reclaim, 2026-07-18).
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#else
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+#endif
+
 static const char      *TAG   = "SCANNER";
 static dsp_processor_t *s_dsp = NULL;
-static scanner_pos_t    s_map[SCANNER_MAX_POSITIONS];
+static EXT_RAM_BSS_ATTR scanner_pos_t    s_map[SCANNER_MAX_POSITIONS];
 static int              s_map_n       = 0;
 static uint32_t         s_last_hot_hz = 0;
 // Live LO frequency (updated on every successful hop). 32-bit aligned: atomic

@@ -18,6 +18,16 @@
 #include "iridium_frame.h"
 #include "ida_decode.h"
 #include "ida_chase.h" // Chase-2 soft BCH fallback (task #16, NVS chase2_decode)
+
+// Cold working buffers -> PSRAM to reclaim internal DMA-INT SRAM (dmaf).
+// See docs/p4-bss-audit.md (DMA-INT reclaim, 2026-07-18).
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#else
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+#endif
 #include "ida_reassembler.h"
 #include "dsp_processor.h" // FS_DETECT_HZ / FFT_SIZE for the peak_bin→Hz reassembler key
 #include "worker_core1.h"  // A6: hot-bin publish/clear on open-chain state
@@ -232,8 +242,8 @@ static la_reasm_ctx *s_reasm_ctx = NULL;
 // used to work, we no longer do" (an OTA regression / antenna change).
 #define DRATE_MIN_BUCKETS 60 // per-minute, 1 h coverage
 #define DRATE_HR_BUCKETS 24  // per-hour, 24 h coverage
-static volatile uint32_t  s_drate_min[DRATE_MIN_BUCKETS];
-static volatile uint32_t  s_drate_hr[DRATE_HR_BUCKETS];
+static EXT_RAM_BSS_ATTR volatile uint32_t  s_drate_min[DRATE_MIN_BUCKETS];
+static EXT_RAM_BSS_ATTR volatile uint32_t  s_drate_hr[DRATE_HR_BUCKETS];
 static volatile uint64_t  s_drate_classified_at_last_roll = 0; // s_class_*-sum snapshot
 static volatile uint8_t   s_drate_min_head                = 0;
 static volatile uint8_t   s_drate_hr_head                 = 0;

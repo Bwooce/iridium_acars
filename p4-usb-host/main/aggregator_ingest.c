@@ -11,6 +11,16 @@
 
 #include <stdatomic.h>
 
+// Cold working buffers -> PSRAM to reclaim internal DMA-INT SRAM (dmaf).
+// See docs/p4-bss-audit.md (DMA-INT reclaim, 2026-07-18).
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#else
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+#endif
+
 static const char *TAG = "AGG_INGEST";
 
 static TaskHandle_t     s_task     = NULL;
@@ -24,7 +34,7 @@ static uint32_t                 s_n_sources = 0;
 
 // Bits scratch: 0/1-per-byte, sized to the PDU max. Task-local (on the
 // task stack would need ~512 B; keep it static to the single consumer).
-static uint8_t s_bits01[FRAME_PDU_MAX_BITS];
+static EXT_RAM_BSS_ATTR uint8_t s_bits01[FRAME_PDU_MAX_BITS];
 
 // Record a PDU sighting from pdu->source_id. Single-writer (ingest task);
 // the spinlock only serialises against /status readers.

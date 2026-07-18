@@ -18,6 +18,16 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+
+// Cold working buffers -> PSRAM to reclaim internal DMA-INT SRAM (dmaf).
+// See docs/p4-bss-audit.md (DMA-INT reclaim, 2026-07-18).
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#else
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+#endif
 #include "esp_timer.h" // esp_timer_get_time — DNS re-resolution backoff
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -193,7 +203,7 @@ static void push_task(void *arg)
     // Wait for the queue to fill at least once before bothering to set
     // anything up — saves work if push is enabled but never used.
     acars_msg_t m;
-    static char pkt[2048]; // 2 KB max per UDP datagram; JSON usually ~400 B
+    static EXT_RAM_BSS_ATTR char pkt[2048]; // 2 KB max per UDP datagram; JSON usually ~400 B
 
     while (1) {
         if (xQueueReceive(s_q, &m, portMAX_DELAY) != pdTRUE) continue;
