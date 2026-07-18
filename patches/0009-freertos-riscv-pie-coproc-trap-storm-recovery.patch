@@ -1,0 +1,72 @@
+diff --git a/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c b/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
+--- a/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c	2026-07-19 01:49:31
++++ b/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c	2026-07-19 01:49:31
+@@ -998,6 +998,31 @@
+  * @param frame  The RvExcFrame of the illegal-instruction trap (== sp).
+  * @param coproc Coprocessor index being saved (FPU/HWLP/PIE/DSP).
+  */
++/* iridium_acars patch 0009: targeted RECOVERY for the rev<3 P4 FPU EXT_ILL bug
++ * (layers on 0004's storm detector). See patches/README.md. */
++#ifndef COPROC_TRAP_STORM_RECOVER
++#define COPROC_TRAP_STORM_RECOVER   4   /* recover once same-PC re-faulted this many; << LIMIT(16) */
++#endif
++#define PORT_MSTATUS_FS_ENABLE      (1u << 13)  /* mstatus.FS, == portasm CSR_MSTATUS_FPU_ENABLE */
++
++/* Current TCB per core (the array rtos_current_tcb returns). void* for a
++ * pointer-identity compare with port_uxCoprocOwner (StaticTask_t*, aliases TCB). */
++extern void * volatile pxCurrentTCBs[ portNUM_PROCESSORS ];
++
++/* 1 if insn (== mtval on an illegal-instruction trap) is an FPU load/store or
++ * FP-CSR access. Masks copied verbatim from the FPU_EXT_ILL fallback in
++ * components/riscv/vectors.S so decode matches the dispatcher. */
++static inline int port_coproc_insn_is_fpu(uint32_t insn)
++{
++    if ((insn & 0x5Fu)   == 0x07u)   { return 1; }   /* FLW / FSW */
++    if ((insn & 0x6001u) == 0x6000u) { return 1; }   /* C.FLW/C.FSW/C.FLWSP/C.FSWSP */
++    if ((insn & 0x7Fu)   == 0x73u) {                 /* FP CSR (fflags/frm/fcsr) */
++        uint32_t csr = insn >> 20;
++        if (csr >= 1u && csr <= 3u) { return 1; }
++    }
++    return 0;
++}
++
+ void xPortCoprocTrapStormCheck(RvExcFrame *frame, int coproc)
+ {
+     static uint32_t s_last_mepc[portNUM_PROCESSORS][SOC_CPU_COPROC_NUM];
+@@ -1029,7 +1054,36 @@
+         g_panic_abort = true;
+         g_panic_abort_details = (char *) "ERROR: Coprocessor lazy-save trap storm (retried instruction never retires)!\n";
+         xt_unhandled_exception(frame);
++    }
++
++    /* patch 0009 RECOVERY: a confirmed same-PC storm on the PIE coproc whose
++     * faulting instruction (mtval) is actually an FPU flw/fsw AND whose current
++     * task already OWNS the FPU. The rev<3 FPU EXT_ILL bug set the PIE reason
++     * bit for an FPU access -> vectors.S misrouted it to rtos_save_pie_coproc
++     * (PIE enabled, FPU left off) -> same-PC re-fault forever. current==FPU
++     * owner means pxPortUpdateCoprocOwner would return -1 (no save/restore), so
++     * the only missing step is enabling mstatus.FS; a live write survives mret
++     * (_return_from_exception does not restore mstatus) and the flw/fsw retires.
++     * Not the FPU owner -> do nothing (a real swap needs the asm save/restore),
++     * let s_count reach COPROC_TRAP_STORM_LIMIT -> the pre-existing clean reboot. */
++#if SOC_CPU_HAS_FPU && SOC_CPU_HAS_PIE && SOC_CPU_HAS_FPU_EXT_ILL_BUG && CONFIG_ESP32P4_SELECTS_REV_LESS_V3
++    if (s_count[core][coproc] >= COPROC_TRAP_STORM_RECOVER &&
++        coproc == PIE_COPROC_IDX &&
++        port_coproc_insn_is_fpu((uint32_t) frame->mtval)) {
++        void *cur = pxCurrentTCBs[core];
++        if (cur != NULL && (void *) port_uxCoprocOwner[core][FPU_COPROC_IDX] == cur) {
++            asm volatile ("csrs mstatus, %0" :: "r"(PORT_MSTATUS_FS_ENABLE));
++            static uint32_t s_last_reco_mepc[portNUM_PROCESSORS];
++            if (s_last_reco_mepc[core] != mepc) {
++                s_last_reco_mepc[core] = mepc;
++                esp_rom_printf("coproc storm RECOVERED: enabled FPU for misrouted "
++                               "flw/fsw core %d MEPC=0x%08x MTVAL=0x%08x\r\n",
++                               core, (unsigned) mepc, (unsigned) frame->mtval);
++            }
++            return;
++        }
+     }
++#endif
+ }
+ 
+ #if CONFIG_IDF_TARGET_ESP32S31

@@ -19,6 +19,7 @@ git apply ../patches/0004-freertos-riscv-pie-coproc-trap-storm-watchdog.patch   
 git apply ../patches/0006-freertos-riscv-pie-coproc-force-aligned-cfg-in-save-restore.patch   # apply AFTER 0004
 git apply ../patches/0007-bootloader_support-invalidate-mmap-cache-before-app-ota-verify.patch
 git apply ../patches/0008-fatfs-enable-exfat.patch
+git apply ../patches/0009-freertos-riscv-pie-coproc-trap-storm-recovery.patch   # apply AFTER 0004
 ```
 
 **0005 and 0006 are mutually exclusive** — both edit the
@@ -406,3 +407,29 @@ bump (~600 B extra with exFAT) which is on the heap and lands in **PSRAM**
 exFAT support is additive: FAT12/16/32 cards still mount. Note the ffconf
 caveat that exFAT "discards ANSI C (C89) compatibility" (needs 64-bit
 `QWORD`) — a non-issue for this C11 build.
+
+## 0009 — freertos/riscv: RECOVER the coproc trap storm (rev<3 P4 FPU EXT_ILL bug)
+
+**File:** `components/freertos/FreeRTOS-Kernel/portable/riscv/port.c`
+**IDF version:** v6.1. **Apply AFTER 0004** (extends its `xPortCoprocTrapStormCheck`).
+
+The rev<3 P4 `SOC_CPU_HAS_FPU_EXT_ILL_BUG`: the EXT_ILL "reason" CSR can set the
+PIE bit for an FPU `flw/fsw`, so `vectors.S` misroutes the FPU trap to
+`rtos_save_pie_coproc` (enables PIE, leaves FPU off) -> same-PC re-fault forever =
+the "Coprocessor lazy-save trap storm" on worker_core1 (the #19 live reboots;
+0004 only DETECTS it -> clean reboot). This is the residual wedge Path A (single
+PIE owner) did NOT cure because worker_core1 uses BOTH PIE and FPU.
+
+Fix: in the already-storming branch of `xPortCoprocTrapStormCheck` (count>=4, well
+below the abort LIMIT=16), if the coproc is PIE, `frame->mtval` decodes as an FPU
+load/store (masks copied verbatim from the vectors.S FPU_EXT_ILL fallback), AND
+the current task already OWNS the FPU, enable `mstatus.FS` (a live write — mstatus
+is not restored on exception return) and return -> the flw/fsw retires = RECOVERY
+instead of reboot. Not the FPU owner -> do nothing, fall through to the 0004
+abort/reboot (unchanged). Only the storming path is touched; normal
+save/restore/dispatch are untouched. Owner-gate prevents stale-FP recovery.
+
+Verify: smoke PASS (normal path intact) + streaming soak shows "coproc storm
+RECOVERED" and no reboot under load. Gated behind
+SOC_CPU_HAS_FPU && SOC_CPU_HAS_PIE && SOC_CPU_HAS_FPU_EXT_ILL_BUG &&
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3 (compiles out on unaffected silicon).
