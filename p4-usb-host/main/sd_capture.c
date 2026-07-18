@@ -405,23 +405,24 @@ esp_err_t sd_capture_init(void)
     s_stats_mu = xSemaphoreCreateMutex();
     if (!s_stats_mu) return ESP_ERR_NO_MEM;
 
-    // Eager-allocate the 8 KB DMA-INT fwrite scratch HERE, at the
-    // earliest possible moment (sd_capture_init runs in app_main
-    // before USB stack init). At this point DMA-INT has 139 KB
-    // largest contiguous; an 8 KB slice leaves 131 KB contiguous
-    // for tagger's later 66 KB allocation. Any later (after USB
-    // pool init) only ~2-3 KB largest is left — too small.
-    //
-    // SDMMC requires DMA-capable internal SRAM for the fwrite
-    // source. PSRAM source produces ENOSPC (the ALLOC_ALIGNED_BUF
-    // host flag is SDIO-only and does not help SD card writes).
-    s_writer_buf = heap_caps_aligned_alloc(64, WRITER_RECV_CHUNK,
-                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    // fwrite scratch in 64-byte-aligned PSRAM. The P4 SDMMC controller is
+    // SOC_SDMMC_PSRAM_DMA_CAPABLE: it DMAs directly from a cache-line-
+    // (64-B-) aligned PSRAM source with NO bounce buffer (sdmmc_cmd.c
+    // compiles out the `!esp_ptr_external_ram(src)` guard on this SoC).
+    // The old "PSRAM source produces ENOSPC" belief was a misdiagnosis:
+    // the ENOSPC was the UNALIGNED bounce path (allocate_dma_buf ->
+    // MALLOC_CAP_DMA internal) failing against an exhausted DMA-INT
+    // budget, not PSRAM being unusable. WRITER_RECV_CHUNK (8 KB) and the
+    // writer's 512-B fwrite rounding keep every write 64-aligned, so
+    // writes stay on the direct path. Placing this 8 KB in PSRAM instead
+    // of DMA-INT frees ~8 KB of the razor-thin internal DMA pool (USB
+    // pool + tagger leave only ~2-3 KB) AND removes the internal-DMA
+    // NO_MEM failure mode that blocked `POST /capture/start`.
+    s_writer_buf = heap_caps_aligned_alloc(64, WRITER_RECV_CHUNK, MALLOC_CAP_SPIRAM);
     if (!s_writer_buf) {
-        ESP_LOGE(TAG, "writer-buf %u-byte DMA-INT alloc failed (largest=%u)",
+        ESP_LOGE(TAG, "writer-buf %u-byte PSRAM alloc failed (largest=%u)",
                  (unsigned)WRITER_RECV_CHUNK,
-                 (unsigned)heap_caps_get_largest_free_block(
-                     MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
         return ESP_ERR_NO_MEM;
     }
 

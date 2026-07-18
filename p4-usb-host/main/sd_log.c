@@ -498,7 +498,21 @@ static esp_err_t open_log_file(void)
         ESP_LOGE(TAG, "fopen(%s) failed errno=%d", path, errno);
         return ESP_FAIL;
     }
-    setvbuf(s_log, NULL, _IOFBF, 4096); // 4 KB FILE buffer — coalesce writes
+    // 4 KB FILE buffer to coalesce writes. Pass our OWN 64-byte-aligned
+    // PSRAM buffer instead of NULL so libc doesn't allocate it in internal
+    // RAM — frees ~4 KB off the razor-thin DMA-INT budget. FATFS re-checks
+    // alignment against its own (already-PSRAM) window, and the P4 SDMMC
+    // DMAs 64-aligned PSRAM directly. Allocated once; a reopened log FILE
+    // (rotation) reuses the same buffer.
+    static char *s_log_vbuf = NULL;
+    if (!s_log_vbuf) {
+        s_log_vbuf = heap_caps_aligned_alloc(64, 4096, MALLOC_CAP_SPIRAM);
+    }
+    if (s_log_vbuf) {
+        setvbuf(s_log, s_log_vbuf, _IOFBF, 4096);
+    } else {
+        setvbuf(s_log, NULL, _IOFBF, 4096); // fallback: libc-internal buffer
+    }
     // s_stats is read concurrently (by copy) under s_stats_mu from
     // sd_log_get_stats (httpd) — take it for the write so a reader can't
     // observe a torn log_path (open_log_file runs under s_log_mu, so lock
