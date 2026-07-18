@@ -759,7 +759,7 @@ static esp_err_t index_get(httpd_req_t *req)
     }
 
     // Part C: remainder of the SDR form + the separate manual-sweep form.
-    char sdrform_c[900];
+    char sdrform_c[1100];
     int  sc = snprintf(sdrform_c, sizeof(sdrform_c),
                        "</select>"
                         "<label>Tagger threshold (dB above noise floor)</label>"
@@ -775,6 +775,18 @@ static esp_err_t index_get(httpd_req_t *req)
                         "<option value=\"1\"%s>On</option>"
                         "<option value=\"0\"%s>Off</option>"
                         "</select>"
+                        // uart_log 3-state mode (app_config.h). Auto = network-
+                        // gated (mutes console once WiFi is up, telemetry
+                        // keeps flowing via iot_log/HTTP); Off/On force it.
+                        // Applied live within ~1 s by status_logger regardless
+                        // of the reboot below (see /uartlog for an immediate,
+                        // no-reboot toggle).
+                        "<label>Console UART log</label>"
+                        "<select name=\"uart_log\">"
+                        "<option value=\"0\"%s>Off</option>"
+                        "<option value=\"1\"%s>On</option>"
+                        "<option value=\"2\"%s>Auto (default; off when network is up)</option>"
+                        "</select>"
                         "<button type=\"submit\">Apply &amp; reboot</button>"
                         "</form>"
                        // Manual one-shot gain sweep (POST /gaincal). Separate
@@ -786,7 +798,10 @@ static esp_err_t index_get(httpd_req_t *req)
                        (unsigned)cfg.autotune_lo_interval_s,
                        (unsigned)cfg.autotune_gain_interval_s,
                       cfg.autotune_on_boot ? " selected" : "",
-                      cfg.autotune_on_boot ? "" : " selected");
+                      cfg.autotune_on_boot ? "" : " selected",
+                      cfg.uart_log == UART_LOG_MODE_OFF ? " selected" : "",
+                      cfg.uart_log == UART_LOG_MODE_ON ? " selected" : "",
+                      cfg.uart_log == UART_LOG_MODE_AUTO ? " selected" : "");
     if (sc < 0) sc = 0;
     if (sc > (int)sizeof(sdrform_c)) sc = sizeof(sdrform_c);
     httpd_resp_send_chunk(req, sdrform_c, sc);
@@ -1968,35 +1983,56 @@ static esp_err_t besteffort_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-// POST /uartlog?on=0|1 — console ESP_LOG mute (topology review 2026-07-17 §F1).
-// The UART TX path is a busy-spin that drains at baud rate whether or not a
-// cable is attached; with the device network-only the spin is pure waste,
-// partly ABOVE the worker. on=0 installs a null vprintf hook (applied LIVE
-// here — a pointer swap, safe from httpd) and persists via an internal-stack
-// task (NVS write must not run on the PSRAM-stacked httpd task). iot_log UDP
-// telemetry, serial_cmd, and panic output are unaffected.
+static const char *const UARTLOG_MODE_NAMES[] = {"off", "on", "auto"};
+
+// POST /uartlog?on=0|1 or ?auto=1 — console ESP_LOG mode (topology review
+// 2026-07-17 §F1 + 3-state AUTO extension, app_config.h). The UART TX path
+// is a busy-spin that drains at baud rate whether or not a cable is
+// attached; on=1/on=0 force the console on/off regardless of network state,
+// while auto=1 selects the network-gated AUTO mode (mutes once the device
+// has network — telemetry keeps flowing via iot_log UDP/HTTP — and re-logs
+// locally the moment it doesn't; status_logger's 1 Hz loop keeps
+// re-evaluating this even without a request, so AUTO self-heals across
+// WiFi connect/drop with no reboot). Applied LIVE here (a vprintf pointer
+// swap, safe from httpd) and persisted via an internal-stack task (NVS
+// write must not run on the PSRAM-stacked httpd task). iot_log UDP
+// telemetry, serial_cmd, and panic output are unaffected in every mode.
 static void uartlog_cfg_task(void *arg)
 {
-    bool      on = (bool)(uintptr_t)arg;
-    esp_err_t r  = app_config_set_uart_log(on);
-    ESP_LOGI(TAG, "/uartlog: uart_log=%d (%s) — applied live", (int)on,
-             esp_err_to_name(r));
+    uint8_t   mode = (uint8_t)(uintptr_t)arg;
+    esp_err_t r    = app_config_set_uart_log(mode);
+    ESP_LOGI(TAG, "/uartlog: uart_log_mode=%s (%s) — persisted",
+             UARTLOG_MODE_NAMES[mode], esp_err_to_name(r));
     vTaskDelete(NULL);
 }
 static esp_err_t uartlog_post(httpd_req_t *req)
 {
-    char query[32] = {0}, s[8] = {0};
-    bool on = false;
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, "on", s, sizeof(s)) == ESP_OK) {
-        on = (s[0] == '1' || s[0] == 't' || s[0] == 'T');
+    char    query[32] = {0}, s[8] = {0};
+    uint8_t mode      = UART_LOG_MODE_AUTO;
+    bool    have_mode = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "auto", s, sizeof(s)) == ESP_OK &&
+            (s[0] == '1' || s[0] == 't' || s[0] == 'T')) {
+            mode      = UART_LOG_MODE_AUTO;
+            have_mode = true;
+        } else if (httpd_query_key_value(query, "on", s, sizeof(s)) == ESP_OK) {
+            mode      = (s[0] == '1' || s[0] == 't' || s[0] == 'T') ? UART_LOG_MODE_ON : UART_LOG_MODE_OFF;
+            have_mode = true;
+        }
     }
+    if (!have_mode) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "usage: POST /uartlog?on=0|1 or ?auto=1\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    bool on = app_config_uart_log_effective(mode, wifi_link_is_connected());
     uart_log_apply(on); // live: mute/unmute immediately
-    char body[32];
-    int  n = snprintf(body, sizeof(body), "{\"uart_log\":%s}", on ? "true" : "false");
+    char body[40];
+    int  n = snprintf(body, sizeof(body), "{\"uart_log_mode\":\"%s\"}", UARTLOG_MODE_NAMES[mode]);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, body, n);
-    if (xTaskCreate(uartlog_cfg_task, "uartlog_cfg", 4096, (void *)(uintptr_t)on, 5, NULL) != pdPASS) {
+    if (xTaskCreate(uartlog_cfg_task, "uartlog_cfg", 4096, (void *)(uintptr_t)mode, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "/uartlog: failed to spawn persist task");
     }
     return ESP_OK;
@@ -2057,7 +2093,8 @@ typedef struct {
     uint8_t     coal_n;
     uint32_t    at_lo_s;
     uint32_t    at_gain_s;
-    int8_t      on_boot; // autotune_on_boot: 0/1, or -1 = leave unchanged
+    int8_t      on_boot;  // autotune_on_boot: 0/1, or -1 = leave unchanged
+    uint8_t     uart_log; // UART_LOG_MODE_OFF/ON/AUTO
 } sdrcfg_args_t;
 
 static void sdrcfg_apply_reboot_task(void *arg)
@@ -2071,14 +2108,17 @@ static void sdrcfg_apply_reboot_task(void *arg)
     esp_err_t      r6 = app_config_set_autotune_lo_interval_s(a->at_lo_s);
     esp_err_t      r7 = app_config_set_autotune_gain_interval_s(a->at_gain_s);
     if (a->on_boot >= 0) app_config_set_autotune_on_boot(a->on_boot != 0);
+    // Persist only — status_logger's 1 Hz loop (and the boot-time AUTO
+    // evaluation) apply it live; no separate uart_log_apply() call needed here.
+    esp_err_t r8 = app_config_set_uart_log(a->uart_log);
     ESP_LOGI(TAG,
              "/sdrcfg: lo=%u mode=%d gain_dbx10=%d tag=%.1f coal=%u at_lo=%u at_gain=%u "
-             "(%s/%s/%s/%s/%s/%s/%s) — rebooting to apply",
+             "uart_log=%u (%s/%s/%s/%s/%s/%s/%s/%s) — rebooting to apply",
              (unsigned)a->lo_hz, (int)a->gain_mode, (int)a->gain_dbx10,
              (double)a->tag_thr_db, (unsigned)a->coal_n, (unsigned)a->at_lo_s,
-             (unsigned)a->at_gain_s, esp_err_to_name(r1), esp_err_to_name(r2),
+             (unsigned)a->at_gain_s, (unsigned)a->uart_log, esp_err_to_name(r1), esp_err_to_name(r2),
              esp_err_to_name(r3), esp_err_to_name(r4), esp_err_to_name(r5),
-             esp_err_to_name(r6), esp_err_to_name(r7));
+             esp_err_to_name(r6), esp_err_to_name(r7), esp_err_to_name(r8));
     free(a);
     vTaskDelay(pdMS_TO_TICKS(500));
     class_driver_prepare_for_reboot(); // park tuner so the dongle survives the reboot
@@ -2109,14 +2149,15 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     // would misconfigure gain/threshold). No bias_tee here: it stays on the
     // Wi-Fi-safe /config form where it's already preserved.
     char lo_s[16] = {0}, gm_s[4] = {0}, gain_s[12] = {0}, tag_s[12] = {0},
-         coal_s[6] = {0}, atlo_s[12] = {0}, atg_s[12] = {0};
+         coal_s[6] = {0}, atlo_s[12] = {0}, atg_s[12] = {0}, ul_s[4] = {0};
     if (form_field(body, total, "lo_hz", lo_s, sizeof(lo_s)) != ESP_OK ||
         form_field(body, total, "gain_mode", gm_s, sizeof(gm_s)) != ESP_OK ||
         form_field(body, total, "gain_db", gain_s, sizeof(gain_s)) != ESP_OK ||
         form_field(body, total, "tag_thr", tag_s, sizeof(tag_s)) != ESP_OK ||
         form_field(body, total, "coal_n", coal_s, sizeof(coal_s)) != ESP_OK ||
         form_field(body, total, "at_lo_s", atlo_s, sizeof(atlo_s)) != ESP_OK ||
-        form_field(body, total, "at_gain_s", atg_s, sizeof(atg_s)) != ESP_OK) {
+        form_field(body, total, "at_gain_s", atg_s, sizeof(atg_s)) != ESP_OK ||
+        form_field(body, total, "uart_log", ul_s, sizeof(ul_s)) != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req, "all SDR fields required (submit the form intact)\n",
@@ -2141,6 +2182,8 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     float         tag_thr    = strtof(tag_s, NULL);
     unsigned long coal       = strtoul(coal_s, NULL, 10);
     if (coal > 255) coal = 255;
+    unsigned long ul = strtoul(ul_s, NULL, 10);
+    if (ul > UART_LOG_MODE_AUTO) ul = UART_LOG_MODE_AUTO; // out-of-range -> safe default
 
     sdrcfg_args_t *a = calloc(1, sizeof(*a));
     if (!a) {
@@ -2154,6 +2197,7 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     a->coal_n     = (uint8_t)coal;
     a->at_lo_s    = (uint32_t)strtoul(atlo_s, NULL, 10);
     a->at_gain_s  = (uint32_t)strtoul(atg_s, NULL, 10);
+    a->uart_log   = (uint8_t)ul;
     // on_boot is an optional field (the form's On/Off select always sends it;
     // a curl submit without it leaves autotune_on_boot unchanged, -1).
     char ob_s[8] = {0};

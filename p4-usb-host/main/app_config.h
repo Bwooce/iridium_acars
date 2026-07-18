@@ -38,6 +38,12 @@ typedef enum {
                                 // on noise-floor / saturation signals.
 } gain_mode_t;
 
+// Console UART log mode values (NVS "uart_log", stored as u8). See the
+// uart_log field doc below for the full 3-state model.
+#define UART_LOG_MODE_OFF 0u  // force console log off, always
+#define UART_LOG_MODE_ON 1u   // force console log on, always
+#define UART_LOG_MODE_AUTO 2u // effective_on = !network_up (default)
+
 typedef struct {
     uint32_t    lo_freq_hz;     // RTL-SDR tuner LO frequency
     uint32_t    sample_rate_hz; // RTL-SDR sample rate
@@ -55,19 +61,35 @@ typedef struct {
     // key "best_eff".
     bool best_effort_decode;
 
-    // Console UART log output (NVS "uart_log", default ON). The console
-    // TX path is a VFS busy-spin (topology review 2026-07-17 §F1):
-    // every ESP_LOGx char spins the calling task until FIFO space, and
-    // UART TX drains at baud rate whether or not anything is attached.
-    // When the bench serial cable is unplugged (device network-only,
-    // telemetry via iot_log UDP — a SEPARATE explicit path, unaffected)
-    // that spin is pure waste, paid partly ABOVE the worker. false =
-    // install a null esp_log vprintf hook at boot: zero UART log writes,
-    // zero spin. serial_cmd RX + its uart_puts replies still work
-    // (direct UART, not ESP_LOG), and panic/ROM output is unaffected —
-    // serial recovery stays possible. Toggle via POST /uartlog?on=0|1
-    // (applies live) or serial `set uart_log 0|1` (persists).
-    bool uart_log;
+    // Console UART log mode (NVS "uart_log", u8; default UART_LOG_MODE_AUTO).
+    // The console TX path is a VFS busy-spin (topology review 2026-07-17
+    // §F1): every ESP_LOGx char spins the calling task until FIFO space,
+    // and UART TX drains at baud rate whether or not anything is attached.
+    // Three states (UART_LOG_MODE_* above):
+    //   OFF  — force console log off (null esp_log vprintf hook),
+    //          regardless of network state.
+    //   ON   — force console log on (normal vprintf), regardless of
+    //          network state.
+    //   AUTO — effective_on = !network_up. Telemetry already flows via
+    //          iot_log UDP / HTTP (SEPARATE explicit paths, unaffected
+    //          either way) once the device has network, so AUTO mutes
+    //          the console then to avoid paying for the busy-spin for
+    //          nothing; with no network (bench/field, serial cable the
+    //          only channel) AUTO logs locally so the console stays
+    //          useful. network_up is wifi_link_is_connected()
+    //          (wifi_link.h) — Ethernet is NOT included in this check
+    //          yet; WiFi via the C6 companion is the only active
+    //          transport as of this design, so that's fine for now.
+    // AUTO is re-evaluated continuously by status_logger's 1 Hz loop, not
+    // just at boot — a live, self-healing gate: WiFi connecting or
+    // dropping takes effect within ~1 s, no reboot required. serial_cmd
+    // RX + its uart_puts replies still work in every mode (direct UART,
+    // not ESP_LOG), and panic/ROM output is unaffected — serial recovery
+    // stays possible regardless of mode. Toggle via POST /uartlog?on=0|1
+    // or ?auto=1 (applies live) or serial `set uart_log 0|1|2` (persists
+    // + applies live). Values 0/1 are backward compatible with the old
+    // bool NVS storage; new installs default to 2 (AUTO).
+    uint8_t uart_log;
 
     // P1.5 companion heuristic (NON-GRI; gr-iridium has no equivalent):
     // same-instant multi-bin gone-burst coalescing in dsp_processor.
@@ -146,12 +168,27 @@ esp_err_t app_config_set_gain_mode(gain_mode_t mode);
 esp_err_t app_config_set_gain_db_x10(int16_t v);
 esp_err_t app_config_set_bias_tee(bool on);
 esp_err_t app_config_set_best_effort_decode(bool on);
-esp_err_t app_config_set_uart_log(bool on);
+
+// mode is UART_LOG_MODE_OFF/ON/AUTO (0/1/2); out-of-range values are
+// clamped to AUTO. Persists AND updates the in-memory struct; callers
+// that also want the change to take effect immediately should combine
+// this with uart_log_apply()/app_config_uart_log_effective() (see
+// http_server.c uartlog_post / serial_cmd.c cmd_set for the pattern).
+esp_err_t app_config_set_uart_log(uint8_t mode);
+
+// Read the persisted/live uart_log mode (0/1/2) without a full snapshot.
+uint8_t app_config_get_uart_log_mode(void);
+
+// Pure helper (no deps): map (mode, network_up) -> effective on/off.
+// mode: OFF=false always, ON=true always, else (AUTO, or any
+// out-of-range value) = !network_up.
+bool app_config_uart_log_effective(uint8_t mode, bool network_up);
 
 // The uart_log null-sink vprintf hook, and a live apply helper (installs the
 // null hook or restores the default UART vprintf; safe from any task —
 // esp_log_set_vprintf is a pointer swap). Persisting is separate
-// (app_config_set_uart_log); boot applies the persisted value in app_main.
+// (app_config_set_uart_log); boot applies the effective value in app_main,
+// and status_logger's 1 Hz loop re-applies it continuously for AUTO mode.
 int  uart_log_null_vprintf(const char *fmt, va_list ap);
 void uart_log_apply(bool on);
 esp_err_t app_config_set_tagger_threshold_db(float db);

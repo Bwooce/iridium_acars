@@ -518,6 +518,14 @@ static void logger_task(void *arg)
             emit(&snap);
         }
         iot_log_poll();
+
+        // uart_log AUTO self-heal: re-evaluate the network-gated console mute
+        // every ~1 Hz so WiFi connecting/dropping takes effect within ~1 s
+        // with no reboot required (app_config.h 3-state model). OFF/ON modes
+        // just re-assert the same forced value each pass — a cheap pointer
+        // swap (esp_log_set_vprintf), safe at 1 Hz.
+        uart_log_apply(app_config_uart_log_effective(app_config_get_uart_log_mode(),
+                                                      wifi_link_is_connected()));
     }
 }
 

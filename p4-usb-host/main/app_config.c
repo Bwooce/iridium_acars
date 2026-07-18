@@ -26,7 +26,7 @@ static const char *NVS_NS = "iridium";
 #define DEFAULT_GAIN_DB_X10 350 // 35.0 dB (rec'd for live)
 #define DEFAULT_BIAS_TEE false
 #define DEFAULT_BEST_EFFORT_DECODE false // gated OFF; salvage.ok stays count-only until enabled
-#define DEFAULT_UART_LOG true // console ESP_LOG on UART; false=null vprintf hook (see app_config.h)
+#define DEFAULT_UART_LOG_MODE UART_LOG_MODE_AUTO // console ESP_LOG mode; see app_config.h 3-state model
 #define DEFAULT_TAGGER_THRESHOLD_DB 10.0f
 #define DEFAULT_COALESCE_MIN_BURSTS 0 // 0 = coalescer disabled (gri-parity dispatch)
 #define DEFAULT_DCMASK_LO 1           // lo>hi => disabled by default
@@ -136,7 +136,7 @@ esp_err_t app_config_init(void)
     s_cfg.gain_db_x10              = DEFAULT_GAIN_DB_X10;
     s_cfg.bias_tee                 = DEFAULT_BIAS_TEE;
     s_cfg.best_effort_decode       = DEFAULT_BEST_EFFORT_DECODE;
-    s_cfg.uart_log                 = DEFAULT_UART_LOG;
+    s_cfg.uart_log                 = DEFAULT_UART_LOG_MODE;
     s_cfg.tagger_threshold_db      = DEFAULT_TAGGER_THRESHOLD_DB;
     s_cfg.coalesce_min_bursts      = DEFAULT_COALESCE_MIN_BURSTS;
     s_cfg.dcmask_lo                = DEFAULT_DCMASK_LO;
@@ -185,14 +185,14 @@ esp_err_t app_config_init(void)
     uint8_t gm = (uint8_t)DEFAULT_GAIN_MODE;
     uint8_t bt = (uint8_t)DEFAULT_BIAS_TEE;
     uint8_t be = (uint8_t)DEFAULT_BEST_EFFORT_DECODE;
-    uint8_t ul = (uint8_t)DEFAULT_UART_LOG;
+    uint8_t ul = (uint8_t)DEFAULT_UART_LOG_MODE;
     nvs_get_u32_or(h, "lo_hz", &s_cfg.lo_freq_hz, DEFAULT_LO_FREQ_HZ);
     nvs_get_u32_or(h, "rate_hz", &s_cfg.sample_rate_hz, DEFAULT_SAMPLE_RATE_HZ);
     nvs_get_u8_or(h, "gain_mode", &gm, (uint8_t)DEFAULT_GAIN_MODE);
     nvs_get_i16_or(h, "gain_dbx10", &s_cfg.gain_db_x10, DEFAULT_GAIN_DB_X10);
     nvs_get_u8_or(h, "bias_tee", &bt, (uint8_t)DEFAULT_BIAS_TEE);
     nvs_get_u8_or(h, "best_eff", &be, (uint8_t)DEFAULT_BEST_EFFORT_DECODE);
-    nvs_get_u8_or(h, "uart_log", &ul, (uint8_t)DEFAULT_UART_LOG);
+    nvs_get_u8_or(h, "uart_log", &ul, (uint8_t)DEFAULT_UART_LOG_MODE);
     nvs_get_f32_or(h, "tag_thr", &s_cfg.tagger_threshold_db, DEFAULT_TAGGER_THRESHOLD_DB);
     nvs_get_u8_or(h, "coal_n", &s_cfg.coalesce_min_bursts, DEFAULT_COALESCE_MIN_BURSTS);
     nvs_get_i16_or(h, "dcmask_lo", &s_cfg.dcmask_lo, DEFAULT_DCMASK_LO);
@@ -230,10 +230,18 @@ esp_err_t app_config_init(void)
         ESP_LOGW(TAG, "NVS gain_mode=%u out of range; using default", gm);
         gm = (uint8_t)DEFAULT_GAIN_MODE;
     }
+    // Same guard as gain_mode: a stale/corrupt/foreign NVS byte must not
+    // become an out-of-range mode. Clamp to AUTO rather than reject —
+    // AUTO is the safe default (logs when there's no network, mutes once
+    // there is).
+    if (ul > UART_LOG_MODE_AUTO) {
+        ESP_LOGW(TAG, "NVS uart_log=%u out of range; using AUTO", ul);
+        ul = UART_LOG_MODE_AUTO;
+    }
     s_cfg.gain_mode          = (gain_mode_t)gm;
     s_cfg.bias_tee           = (bool)bt;
     s_cfg.best_effort_decode = (bool)be;
-    s_cfg.uart_log           = (bool)ul;
+    s_cfg.uart_log           = ul;
 
     nvs_close(h);
     return ESP_OK;
@@ -370,13 +378,34 @@ esp_err_t app_config_set_best_effort_decode(bool on)
     xSemaphoreGive(s_cfg_mu);
     return commit_one_u8("best_eff", (uint8_t)on);
 }
-esp_err_t app_config_set_uart_log(bool on)
+esp_err_t app_config_set_uart_log(uint8_t mode)
 {
     if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    if (mode > UART_LOG_MODE_AUTO) mode = UART_LOG_MODE_AUTO; // reject out-of-range, same as init()
     xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
-    s_cfg.uart_log = on;
+    s_cfg.uart_log = mode;
     xSemaphoreGive(s_cfg_mu);
-    return commit_one_u8("uart_log", (uint8_t)on);
+    return commit_one_u8("uart_log", mode);
+}
+
+uint8_t app_config_get_uart_log_mode(void)
+{
+    if (!s_cfg_mu) return (uint8_t)UART_LOG_MODE_AUTO;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    uint8_t mode = s_cfg.uart_log;
+    xSemaphoreGive(s_cfg_mu);
+    return mode;
+}
+
+// Pure — no app_config/NVS/task deps — so it's trivially unit-testable and
+// safe to call from any context (boot, httpd, serial_cmd, status_logger).
+bool app_config_uart_log_effective(uint8_t mode, bool network_up)
+{
+    switch (mode) {
+    case UART_LOG_MODE_OFF: return false;
+    case UART_LOG_MODE_ON: return true;
+    default: return !network_up; // AUTO (also any out-of-range byte)
+    }
 }
 
 // uart_log support (topology review 2026-07-17 §F1). The null hook discards
@@ -455,6 +484,11 @@ void app_config_log(void)
              MODES[mi], c.gain_db_x10 / 10.0f, c.bias_tee);
     ESP_LOGI(TAG, "tagger threshold=%.1f dB  station_id='%s'",
              (double)c.tagger_threshold_db, c.station_id);
+    {
+        static const char *UL_MODES[] = {"OFF", "ON", "AUTO"};
+        uint8_t            ulm        = c.uart_log > UART_LOG_MODE_AUTO ? UART_LOG_MODE_AUTO : c.uart_log;
+        ESP_LOGI(TAG, "uart_log mode=%s (network-gated when AUTO)", UL_MODES[ulm]);
+    }
     ESP_LOGI(TAG, "gone-burst coalescer: %s (coal_n=%u)",
              c.coalesce_min_bursts >= 2 ? "ENABLED (non-gri heuristic)" : "disabled",
              (unsigned)c.coalesce_min_bursts);
