@@ -44,13 +44,16 @@ CONFIG_SPIRAM_MEMTEST=y
 #    (2 × 16 KB raw + 2 × 32 KB conv = 96 KB).
 #  - 118784 (116 KB) added headroom for fft_sc16_2048's twiddle +
 #    dsp_processor's s_accum + uw_correlator scratch.
-#  - 180224 (176 KB) needed once esp_libusb's 4 × 8 KB = 32 KB async
-#    bulk-IN transfer pool is also DMA-capable internal allocated
-#    (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n per the errata
-#    hardening means usb_host_transfer_alloc cannot land buffers in
-#    PSRAM). Without this bump, transfer_alloc returns
-#    ESP_ERR_NO_MEM at start-stream because internal DMA heap is
-#    exhausted by the wideband front-end's static allocations.
+#  - 180224 (176 KB) was TRIED but FAILS: with CACHE_L2_CACHE_256KB
+#    eating 128 KB of internal SRAM, 176 KB can't be reserved
+#    ("Could not reserve internal/DMA pool 0x101" -> abort() boot
+#    loop, 2026-07-19). ~144 KB is the internal ceiling.
+#  - 147456 (144 KB) is the working value. To fit the USB transfer
+#    pool within it (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n
+#    means transfer bufs MUST be internal DMA), ASYNC_TRANSFER_COUNT
+#    was cut 6->4 (48->32 KB) and dsp_processor's handle (accum[])
+#    moved to PSRAM (+~8 KB internal). Pre-stream free ~40 KB >= the
+#    4x8 KB=32 KB pool -> transfer_alloc succeeds, rate=4.77 MB/s.
 #
 # ingest_core1's resample output (s_resamp) stays in PSRAM — AXI-
 # GDMA reads PSRAM sources fine and the resample's CPU touch is one
@@ -222,3 +225,9 @@ CONFIG_ESP_HOSTED_SDIO_CHECKSUM=y
 # which competes with the USB transfer pool + fft_burst_tagger's 65 KB alloc.
 # Watch tagger alloc + rate>0 after enabling (see 6bd218b rationale).
 CONFIG_ENABLE_SD_LOG=y
+
+# exFAT (patches/0008 sets FF_FS_EXFAT=1) references FF_USE_LABEL in its C
+# paths, and ESP-IDF's ffconf.h does `#define FF_USE_LABEL CONFIG_FATFS_USE_LABEL`
+# UNGUARDED — undefined when the option is off → "undeclared identifier" build
+# error. Enable it: the volume-label API is native to exFAT anyway (tiny code).
+CONFIG_FATFS_USE_LABEL=y

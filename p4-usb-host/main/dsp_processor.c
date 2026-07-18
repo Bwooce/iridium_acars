@@ -308,10 +308,12 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
         return NULL;
     }
 
-    // Internal SRAM for the handle so the hot-path accum[] stays fast
-    // (it was file-scope .bss / internal before). The struct holds no
-    // PIE buffers, so its placement is perf-only, not correctness.
-    dsp_processor_t *p = heap_caps_calloc(1, sizeof(*p), MALLOC_CAP_INTERNAL);
+    // Handle (incl. accum[]) in PSRAM: reclaims ~8 KB DMA-INT so the USB
+    // transfer pool can allocate. The 256 KB L2 cache caps the internal DMA
+    // reserve at ~144 KB, which tagger(66KB)+init+pool overran (rate=0).
+    // Placement is perf-only, not correctness — holds no PIE buffers; accum[]
+    // is CPU-touched then memcpy'd, not PIE-read (~125 chunks/s). 2026-07-19.
+    dsp_processor_t *p = heap_caps_calloc(1, sizeof(*p), MALLOC_CAP_SPIRAM);
     if (!p) {
         ESP_LOGE(TAG, "dsp_processor handle alloc (%zu bytes internal) failed",
                  sizeof(*p));

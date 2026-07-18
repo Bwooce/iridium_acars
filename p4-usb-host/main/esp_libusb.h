@@ -62,7 +62,8 @@ typedef struct
 //    rb_full_drops under consumer lag — the per-hop DMAINT instrumentation
 //    + STATUS rb_full watch confirm whether this trades cleanly. Revert to
 //    8 if it throttles.
-#define ASYNC_TRANSFER_COUNT 6
+#define ASYNC_TRANSFER_COUNT 4  // 6 overran the ~144KB internal DMA reserve
+                               // (256KB L2 cache caps it); 4x8KB=32KB fits. 2026-07-19
 #define ASYNC_TRANSFER_SIZE (8 * 1024)
 
 // PSRAM stream ring size. Single source of truth for both the
