@@ -19,6 +19,17 @@
 #include "iridium_bch.h"
 #include <string.h>
 
+#ifdef ESP_PLATFORM
+// EXT_RAM_BSS_ATTR: keep the chase scratch (s_map + per-call cand/rcw, ~3.2 KB
+// .bss) in PSRAM, not internal RAM — internal .bss starves the DMA-INT/USB
+// budget and (as the RAW smoke caught 2026-07-18) fragments it below the
+// fft_burst_tagger's 65 KB alloc. Chase is a rare Core-0 fail-path, so PSRAM
+// latency is fine. See feedback_dma_int_budget_audit.
+#include "esp_attr.h"
+#else
+#define EXT_RAM_BSS_ATTR
+#endif
+
 #define ACCH_BCH_POLY 3545u
 #define FRAME_BITS_NEEDED (IDA_DECODE_DATA_OFF + IDA_DECODE_DATA_BITS) // 382
 
@@ -34,7 +45,7 @@ static ida_chase_stats_t s_stats;
 // lands at bit k of codeword cw. Built once by probing the production
 // transform with one-hot inputs, so it can never drift from
 // ida_decode_build_codewords().
-static uint16_t s_map[IDA_DECODE_N_CW][IDA_DECODE_CW_BITS];
+static EXT_RAM_BSS_ATTR uint16_t s_map[IDA_DECODE_N_CW][IDA_DECODE_CW_BITS];
 static bool     s_map_built = false;
 
 static void build_index_map(void)
@@ -146,7 +157,7 @@ int ida_chase_decode(const iridium_frame_t *frame,
     const int n_trial = 1 << L;
 
     // Received codewords — the exact words the hard path saw.
-    static uint8_t rcw[IDA_DECODE_N_CW_BITS];
+    static EXT_RAM_BSS_ATTR uint8_t rcw[IDA_DECODE_N_CW_BITS];
     ida_decode_build_codewords(frame->bits + IDA_DECODE_DATA_OFF, rcw);
 
     // Hard-decode pass: identical outcome to ida_decode()'s loop
@@ -167,7 +178,7 @@ int ida_chase_decode(const iridium_frame_t *frame,
 
     // Candidate 20-bit messages per failed codeword (distinct, sorted
     // ascending). Static scratch: 10 * 64 * 4 B = 2.5 KB.
-    static uint32_t cand[IDA_DECODE_N_CW][1 << IDA_CHASE_MAX_L];
+    static EXT_RAM_BSS_ATTR uint32_t cand[IDA_DECODE_N_CW][1 << IDA_CHASE_MAX_L];
     int             n_cand[IDA_DECODE_N_CW];
 
     for (int f = 0; f < n_failed; f++) {

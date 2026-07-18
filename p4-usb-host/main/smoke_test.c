@@ -35,6 +35,8 @@
 #include "burst_pipeline.h"
 #include "worker_core1.h" // worker_core1_prealloc_fir (was only transitively included)
 #include "smoke_test.h"
+#include "crc16.h"       // on-silicon CRC-16 table self-test (all variants)
+#include "iridium_bch.h" // on-silicon BCH syndrome-table vs _ref self-test (all variants)
 
 #if CONFIG_SMOKE_TEST_CORPUS
 #include "fixture_corpus_uint8.h"
@@ -71,8 +73,6 @@
 // this re-encoding is necessary (no surviving raw pre-BCH bits for
 // these specific captured bursts).
 #include "fixture_acars_frames.h"
-#include "crc16.h"       // on-silicon CRC-16 table self-test
-#include "iridium_bch.h" // on-silicon BCH syndrome-table vs _ref self-test
 #include "ida_encode.h"
 #endif
 
