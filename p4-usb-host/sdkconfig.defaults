@@ -231,3 +231,10 @@ CONFIG_ENABLE_SD_LOG=y
 # UNGUARDED — undefined when the option is off → "undeclared identifier" build
 # error. Enable it: the volume-label API is native to exFAT anyway (tiny code).
 CONFIG_FATFS_USE_LABEL=y
+
+# Console 921600 (rec #1): cut UART-TX busy-spin cost on Core 0 during
+# passes (frame_decoder log spin). 2026-07-19.
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
