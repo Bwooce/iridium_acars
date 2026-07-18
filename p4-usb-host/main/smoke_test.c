@@ -71,6 +71,8 @@
 // this re-encoding is necessary (no surviving raw pre-BCH bits for
 // these specific captured bursts).
 #include "fixture_acars_frames.h"
+#include "crc16.h"       // on-silicon CRC-16 table self-test
+#include "iridium_bch.h" // on-silicon BCH syndrome-table vs _ref self-test
 #include "ida_encode.h"
 #endif
 
@@ -577,6 +579,49 @@ void smoke_test_run(void)
     // Run the PIE FFT diff harness first so its log lines are easy to
     // find. Tiny one-shot ~10 ms of synthetic FFT comparisons; doesn't
     // affect downstream smoke results.
+    // On-silicon self-test of the table-based ECC: prove the CRC-16 table
+    // and the BCH syndrome-table match their references on the actual P4
+    // (host tests prove bit-exactness on x86; this confirms it on RISC-V).
+    // Cheap (~ms, single-error sweep). SELFTEST_FAIL -> SMOKE_FAIL so a
+    // silicon-level table regression is caught by the gate.
+    {
+        int      stfail = 0;
+        uint16_t cc     = crc16_ccitt_false((const uint8_t *)"123456789", 9);
+        if (cc != 0x29B1u) {
+            ESP_LOGE(TAG, "SELFTEST CRC: got 0x%04X want 0x29B1", cc);
+            stfail++;
+        } else {
+            ESP_LOGI(TAG, "SELFTEST CRC: canonical 0x29B1 OK");
+        }
+        const uint32_t polys[] = {3545u, 1207u, 1897u, 465u, 41u, 29u};
+        const size_t   nbits[] = {31u, 31u, 31u, 14u, 26u, 7u};
+        int            checked = 0, mism = 0;
+        for (int ci = 0; ci < 6; ci++) {
+            for (size_t e = 0; e < nbits[ci]; e++) {
+                uint8_t a[32] = {0}, b[32] = {0};
+                a[e] = 1;
+                b[e] = 1;
+                int ra = iridium_bch_repair2(polys[ci], a, nbits[ci]);
+                int rb = iridium_bch_repair2_ref(polys[ci], b, nbits[ci]);
+                checked++;
+                if (ra != rb || memcmp(a, b, nbits[ci]) != 0) mism++;
+            }
+        }
+        if (mism) {
+            ESP_LOGE(TAG, "SELFTEST BCH: %d/%d table!=ref", mism, checked);
+            stfail++;
+        } else {
+            ESP_LOGI(TAG, "SELFTEST BCH: %d single-error patterns table==ref", checked);
+        }
+        if (stfail) {
+            ESP_LOGE(TAG, "===== SELFTEST_FAIL (%d) =====", stfail);
+            ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
+            vTaskSuspend(NULL);
+            return;
+        }
+        ESP_LOGI(TAG, "===== SELFTEST_PASS (CRC+BCH tables verified on silicon) =====");
+    }
+
     pie_fft_diff_run();
 
 #if CONFIG_SMOKE_TEST_LIVE_SDR
