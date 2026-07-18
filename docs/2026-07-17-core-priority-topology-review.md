@@ -115,8 +115,28 @@ Tasks that actually execute PIE vector code today:
    wedge class. They also burn 2×4 KB PSRAM and clutter `/tasks`.
    Recommendation: delete the two spawns (and the split branch, or
    compile-time-gate it) at the next ingest_core1.c touch.
-2. Smoke build only: the smoke task (Core 0, prio 5) drives DSP directly —
-   the known smoke-only `rtos_save_pie_coproc` hang. Unchanged, production-clean.
+   **[UPDATE 2026-07-18]** Deleting the spawns was tried (2026-07-17) and
+   REVERTED — it shifts internal-SRAM layout and stalls the DSP pipeline
+   on-device (heap-position PIE sensitivity). The landmine is instead
+   DISARMED layout-preservingly: `resample_worker_task` no longer contains
+   the PIE resample call at all (loud ESP_LOGE + zero output if ever
+   notified) — see ingest_core1.c resample_worker_task. F2 is thereby
+   resolved without touching task/stack layout.
+2. Smoke build only: the smoke task (Core 0, prio 5) drives DSP directly.
+   **[CORRECTED 2026-07-18]** The original text here repeated the folklore
+   that the smoke-only `rtos_save_pie_coproc` hang is still live. It is not:
+   the wedge required a second PIE owner (the PIE resample MAC in the ingest
+   path), and Path A (2052d93, 2026-07-08) removed it. The RAW/GOLDEN smoke
+   has run wedge-free since — evidence: c8fb095 ("Device-validated (Path A
+   RAW smoke) … 0 wedge"), f0c76f5 ("RAW GOLDEN matched=61, SMOKE_PASS"),
+   5d8581d/cf3d0a0/b366bb3/0196084/428c2c1 (RAW=PASS matched=58), 9d23374
+   2026-07-11 ("raw SMOKE_PASS matched=58/65"). In the smoke build the smoke
+   task is the sole Core-0 PIE owner (dsp_feed is not running in RAW mode)
+   and worker_core1 the sole Core-1 owner, so the one-owner rule holds there
+   too. d89779d's "Smoke-skip: blocked by known PIE-coproc-save wedge"
+   trailer was an assumption from the stale 2026-07-07 memory ("golden-smoke
+   NOT run"), not an observed failure — its DSP-path changes (BCH syndrome
+   table, --harder, hot-bin) still need a golden smoke run.
 
 Any proposal below that moves work between cores was checked against this
 rule; none moves PIE code.

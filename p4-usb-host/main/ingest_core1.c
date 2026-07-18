@@ -164,25 +164,34 @@ static void resample_worker_task(void *arg)
     resample_worker_t *w = (resample_worker_t *)arg;
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-#if WORKER_OUT_TO_INTERNAL_SCRATCH
-        int16_t *out_target     = s_worker_out_scratch;
-        int      max_out_target = WORKER_OUT_SCRATCH_INT16 / 2;
-#else
-        int16_t *out_target     = w->out_iq;
-        int      max_out_target = w->max_out;
-#endif
-        // Workers run on PSRAM-backed stacks, so a stack-local
-        // batch scratch would live in PSRAM and the memcpy from
-        // PSRAM→PSRAM would be net negative vs direct writes.
-        // Pass NULL to keep direct PSRAM writes for the worker path.
-        w->n_out = resample_256_to_250_process_explicit(
-            w->delay_i, w->delay_q, &w->wpos, &w->start_pos,
-            w->in_iq, w->n_in_complex,
-            out_target, max_out_target,
-            /*batch_scratch=*/NULL);
-        // Ensure output buffer writes are globally visible before
-        // the coord (possibly on another core) reads them / kicks
-        // signal_buffer_push (AXI-GDMA reading from PSRAM).
+        // ONE-PIE-OWNER-PER-CORE HARD GUARD (2026-07-18).
+        //
+        // This task used to run resample_256_to_250_process_explicit()
+        // (the PIE resample MAC, resample_arp4.S) here. That made it a
+        // SECOND PIE coprocessor owner on its pinned core (rs_worker_a
+        // vs dsp_feed on Core 0; rs_worker_b vs worker_core1 on
+        // Core 1), and two PIE owners on one P4 core deadlock the
+        // FreeRTOS lazy coprocessor owner-swap (rtos_save_pie_coproc
+        // hangs on an esp.vst.128 Q-register store -> HP-WDT). See
+        // project_p4_one_pie_owner_per_core /
+        // docs/2026-07-17-core-priority-topology-review.md §2.
+        //
+        // The split path that notifies these tasks is dead (s_split_pct
+        // hardwired 0, no setter), and Path A removed the resample from
+        // the live ingest path entirely — but the SPAWNS must stay: an
+        // attempted removal on 2026-07-17 shifted internal-SRAM layout
+        // and stalled the DSP pipeline on-device (heap-position PIE
+        // sensitivity). So the tasks remain, layout-identical, but the
+        // PIE call is disarmed: anyone reviving the split path gets a
+        // loud error + zero output instead of a silent core wedge, and
+        // must first re-tier PIE ownership per the rule above.
+        ESP_LOGE(TAG, "rs_worker woken — split path is retired and its PIE "
+                      "resample is DISARMED (one-PIE-owner-per-core rule); "
+                      "dropping %d complex samples",
+                 w->n_in_complex);
+        w->n_out = 0;
+        // Ensure the (empty) result is globally visible before the
+        // coord (possibly on another core) reads it.
         __sync_synchronize();
         xTaskNotifyGive(w->coord_task);
     }
@@ -635,9 +644,11 @@ esp_err_t ingest_core1_init(void)
 
     s_next_acquire_slot = 0;
 
-    // Spawn at higher priority than worker_core1 (5) so a busy worker
-    // doesn't stall USB ingest. Watch for inversion if both cores hit
-    // PSRAM hard.
+    // Spawn at prio 8, above worker_core1 (4), so a busy worker doesn't
+    // stall USB ingest: the elastic buffer upstream of ingest is the
+    // ~0.8 s usbring, not the 3.36 s signal ring — deprioritising
+    // ingest trades bounded stale-drops for total sample loss. See
+    // docs/2026-07-17-core-priority-topology-review.md §5.
     BaseType_t ok = xTaskCreatePinnedToCore(ingest_task, "ingest_core1",
                                             8192, NULL, 8, NULL, 1);
     if (ok != pdPASS) {
@@ -645,12 +656,13 @@ esp_err_t ingest_core1_init(void)
         return ESP_FAIL;
     }
 
-    // Diagnostic: spawn 2 trivial DUMMY tasks (not resample workers).
-    // If decode regresses, the bug is purely about adding tasks to
-    // the system. If decode preserves, the bug is specifically in
-    // the resample_worker_task code.
-    extern void dummy_idle_task(void *arg);
-    // Spawn the two resample workers with PSRAM-allocated stacks.
+    // Spawn the two (retired, PIE-disarmed — see resample_worker_task)
+    // resample workers with PSRAM-allocated stacks. DO NOT DELETE THESE
+    // SPAWNS: they are load-bearing for internal-SRAM heap layout — a
+    // removal attempt on 2026-07-17 stalled the DSP pipeline on-device
+    // (dsp_cap=0, usbring overflow) until reverted; see
+    // project_core1_cpu_budget_scheduling. Any future removal needs a
+    // full device smoke, not just a host build.
     //
     // ROOT CAUSE: default xTaskCreate puts stacks in MALLOC_CAP_INTERNAL
     // (internal SRAM). Adding 8 KB of internal-SRAM stacks fragments

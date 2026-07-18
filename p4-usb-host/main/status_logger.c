@@ -1,9 +1,11 @@
 // Status-logger task. See status_logger.h for the why.
 //
 // The implementation is straightforward: one queue (depth 2), one task
-// pinned to Core 1 at priority 1 (lower than ingest at 8 and worker at
-// 5, so it never preempts the hot paths). The task blocks on
-// xQueueReceive forever; class_driver posts a snapshot once per second.
+// pinned to Core 1 at priority 6 — deliberately ABOVE worker_core1 (4)
+// so the STATUS line survives worker saturation; see the rationale at
+// the spawn site (status_logger_init) and the CAVEAT about its UART
+// cost. The task blocks on xQueueReceive (1100 ms timeout);
+// class_driver posts a snapshot once per second.
 
 #include <stdio.h>
 #include "sdkconfig.h"
