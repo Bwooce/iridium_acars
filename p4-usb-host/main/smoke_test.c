@@ -26,6 +26,7 @@
 #include "esp_attr.h"
 #include "resample_256_to_250.h"
 #include "fft_sc16_2048.h"
+#include "fft_burst_tagger.h" // fft_burst_tagger_prealloc_screen (PIE detect-scan flags)
 #include "uw_correlator.h"
 #include "esp_chip_info.h"
 #include "sdkconfig.h"
@@ -566,6 +567,7 @@ static void smoke_test_run_live_sdr(void)
 // self-contained and only called from this one place.
 extern void pie_fft_diff_run(void);
 extern void pie_fft_placement_run(void); // #120 prep: PIE heap-placement sweep
+extern void fbt_detect_screen_diff_run(void); // detect-scan pre-screen: silicon-vs-model bit-exact diff
 
 void smoke_test_run(void)
 {
@@ -623,6 +625,7 @@ void smoke_test_run(void)
     }
 
     pie_fft_diff_run();
+    fbt_detect_screen_diff_run(); // detect-scan pre-screen bit-exact silicon check
 
 #if CONFIG_SMOKE_TEST_LIVE_SDR
     smoke_test_run_live_sdr();
@@ -702,6 +705,7 @@ void smoke_test_run(void)
     //      dsps_fird_s16_arp4's memalign'd delay line.
     resample_256_to_250_alloc_coeffs();
     fft_sc16_2048_init();
+    fft_burst_tagger_prealloc_screen(); // PIE detect-scan flags (2 KB, DRAM-pinned)
     uw_correlator_prealloc_pie_fft();
     ingest_core1_prealloc_tile();
     uw_correlator_prealloc_fir();

@@ -37,6 +37,7 @@
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"   // esp_ptr_in_dram() — detect-screen DRAM guard
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
@@ -88,9 +89,48 @@ extern void fbt_ema_step_arp4(int32_t *bsum, int32_t *slot,
 // Priming EMA: bsum[k] += min(mag[k],clamp); slot[k]=min(...); no old read.
 extern void fbt_ema_step_prime_arp4(int32_t *bsum, int32_t *slot,
                                     const int32_t *mag, int n, int32_t clamp);
+// Detect-scan conservative pre-screen (fbt_detect_screen_arp4). Per 16-bin
+// group, flags[4g..4g+3] OR to nonzero iff any of those 16 bins passes
+// mag > (base>>s). s = 24 - floor(log2(threshold_q15)) makes the screen a
+// PROVEN strict SUPERSET of above_threshold() -> the exact int64 test still
+// runs on every survivor -> peaks[] byte-identical to the scalar scan.
+extern void fbt_detect_screen_arp4(const int32_t *mag, const int32_t *base,
+                                   int32_t *flags, int n, int shift);
+static int32_t *s_screen_flags = NULL; // [N/4] int32, INTERNAL + DRAM-guarded
+static int      s_screen_shift = -1;   // <0 => screen disabled (scalar path)
 #else
 #define FBT_USE_PIE_KERNELS 0
 #endif
+
+// Early-boot allocation of the detect-screen flags buffer (N/4 int32 = 2 KB).
+// MUST be called from the early PIE pin block (before the USB stack fragments
+// internal SRAM): this buffer is PIE-WRITTEN (esp.vst), so it inherits the P4
+// heap-position bug — a non-DRAM placement silently garbles the flags (missed
+// bursts). Mirrors fft_sc16_2048_init's DRAM guard. On any failure it leaves
+// s_screen_flags = NULL, so create_new_bursts_internal falls back to the
+// (correct, slower) scalar detect scan. No-op on host / non-PIE builds.
+void fft_burst_tagger_prealloc_screen(void)
+{
+#if FBT_USE_PIE_KERNELS
+    if (s_screen_flags) return;
+    s_screen_flags = (int32_t *)heap_caps_aligned_alloc(
+        16, (size_t)(N / 4) * sizeof(int32_t), MALLOC_CAP_INTERNAL);
+    if (!s_screen_flags) {
+        ESP_LOGE("FBT_INIT", "detect-screen flags alloc failed (%d B) -> detect "
+                             "scan stays scalar", (int)((N / 4) * sizeof(int32_t)));
+        return;
+    }
+    if (!esp_ptr_in_dram(s_screen_flags)) {
+        ESP_LOGE("FBT_INIT", "detect-screen flags=%p landed OUTSIDE DRAM -> PIE "
+                             "screen would MIS-DETECT; call prealloc earlier in boot",
+                 s_screen_flags);
+        heap_caps_free(s_screen_flags);
+        s_screen_flags = NULL;
+        return;
+    }
+    ESP_LOGI("FBT_INIT", "detect-screen flags=%p [early]", s_screen_flags);
+#endif
+}
 
 // Per-stage timer accumulators (single-tagger process — fine for our
 // usage). Order matches fft_burst_tagger_get_stage_us() docs.
@@ -432,6 +472,25 @@ fft_burst_tagger_t *fft_burst_tagger_init(int      burst_pre_len,
     // the detector logic.
     double t_lin     = pow(10.0, (double)threshold_mult_db / 10.0);
     t->threshold_q15 = (int32_t)(t_lin * 32768.0 + 0.5);
+
+#if FBT_USE_PIE_KERNELS
+    // Screen shift for the PIE detect pre-screen: s = 24 - floor(log2(thr_q15)),
+    // clamped [0,24]. Derivation (HISTORY_SIZE = 512 = 2^9, exact test
+    // mag*512 > (base*thr_q15)>>15): 2^a <= thr_q15 (a = floor(log2)), so
+    // exact-true => mag*2^9 > base*2^a/2^15 => mag*2^(24-a) > base
+    // <=> mag > (base >> (24-a)). So mag > (base>>s) with s=24-a is a strict
+    // UNDER-estimate (superset) of above_threshold -> bit-exact peaks[].
+    // thr_q15 <= 0 (absurd negative-dB config) disables the screen.
+    if (t->threshold_q15 > 0) {
+        int a = 31 - __builtin_clz((uint32_t)t->threshold_q15);
+        int s = 24 - a;
+        if (s < 0)  s = 0;
+        if (s > 24) s = 24;
+        s_screen_shift = s;
+    } else {
+        s_screen_shift = -1;
+    }
+#endif
 
     t->baseline_history = baseline_history_ext;
     memset(t->baseline_history, 0,
@@ -776,26 +835,65 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
 {
     int n_peaks = 0;
 
-    int margin = t->burst_width / 2;
-    for (int bin = margin; bin < N - margin; bin++) {
-        if (!t->burst_mask[bin] || bin_in_dc_mask(bin)) continue;
-        int32_t mag2 = t->magnitude_shifted[bin];
-        int32_t base = t->baseline_sum[bin];
-        if (above_threshold(mag2, base, t->threshold_q15)) {
-            // Carrier-absorption fix: a bin whose entire baseline
-            // history is pinned at the EMA slot clamp is owned by a
-            // carrier too strong for int32 to retire — treat it as
-            // absorbed (gri's converged-float-baseline behavior)
-            // instead of re-triggering forever. Checked only after the
-            // raw compare so unclamped bins pay nothing.
-            if (bin_carrier_saturated(bin)) continue;
-            t->peaks[n_peaks].bin = bin;
-            // Sort key = relative_magnitude × (HISTORY_SIZE × 32768)
-            // to keep an int64 representation that's stable for
-            // ordering. Same ordering as the float ratio mag²/baseline.
-            t->peaks[n_peaks].sort_key =
-                ((int64_t)mag2 * (int64_t)FBT_HISTORY_SIZE) / ((int64_t)base + 1);
-            n_peaks++;
+    int  margin   = t->burst_width / 2;
+    bool screened = false;
+#if FBT_USE_PIE_KERNELS
+    if (s_screen_flags && s_screen_shift >= 0) {
+        // PIE conservative pre-screen: fbt_detect_screen_arp4 marks, per 16-bin
+        // group, whether ANY bin passed mag > (base>>s). The screen is a proven
+        // SUPERSET of above_threshold (see s_screen_shift derivation), so
+        // running the EXACT int64 test only on bins of flagged groups yields a
+        // byte-identical peaks[] to the scalar scan below — same bins, same
+        // ascending order (groups ascend, bins within a group ascend; skipped
+        // groups contain only bins that fail above_threshold). The margin/mask/
+        // dc-mask/carrier checks are re-applied identically in the body.
+        // dsp_feed is Core-0's sole PIE owner.
+        screened = true;
+        fbt_detect_screen_arp4(t->magnitude_shifted, t->baseline_sum,
+                               s_screen_flags, N, s_screen_shift);
+        for (int g = 0; g < N / 16; g++) {
+            const int32_t *f = &s_screen_flags[4 * g];
+            if ((f[0] | f[1] | f[2] | f[3]) == 0) continue; // no bin in group passed
+            int lo = g * 16;
+            int hi = lo + 16;
+            if (lo < margin)     lo = margin;
+            if (hi > N - margin) hi = N - margin;
+            for (int bin = lo; bin < hi; bin++) {
+                if (!t->burst_mask[bin] || bin_in_dc_mask(bin)) continue;
+                int32_t mag2 = t->magnitude_shifted[bin];
+                int32_t base = t->baseline_sum[bin];
+                if (above_threshold(mag2, base, t->threshold_q15)) {
+                    if (bin_carrier_saturated(bin)) continue;
+                    t->peaks[n_peaks].bin = bin;
+                    t->peaks[n_peaks].sort_key =
+                        ((int64_t)mag2 * (int64_t)FBT_HISTORY_SIZE) / ((int64_t)base + 1);
+                    n_peaks++;
+                }
+            }
+        }
+    }
+#endif
+    if (!screened) {
+        for (int bin = margin; bin < N - margin; bin++) {
+            if (!t->burst_mask[bin] || bin_in_dc_mask(bin)) continue;
+            int32_t mag2 = t->magnitude_shifted[bin];
+            int32_t base = t->baseline_sum[bin];
+            if (above_threshold(mag2, base, t->threshold_q15)) {
+                // Carrier-absorption fix: a bin whose entire baseline
+                // history is pinned at the EMA slot clamp is owned by a
+                // carrier too strong for int32 to retire — treat it as
+                // absorbed (gri's converged-float-baseline behavior)
+                // instead of re-triggering forever. Checked only after the
+                // raw compare so unclamped bins pay nothing.
+                if (bin_carrier_saturated(bin)) continue;
+                t->peaks[n_peaks].bin = bin;
+                // Sort key = relative_magnitude × (HISTORY_SIZE × 32768)
+                // to keep an int64 representation that's stable for
+                // ordering. Same ordering as the float ratio mag²/baseline.
+                t->peaks[n_peaks].sort_key =
+                    ((int64_t)mag2 * (int64_t)FBT_HISTORY_SIZE) / ((int64_t)base + 1);
+                n_peaks++;
+            }
         }
     }
 

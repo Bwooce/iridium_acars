@@ -24,7 +24,15 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"   // esp_ptr_in_dram (detect-screen diff)
 #include "dsps_fft2r.h"
+#include "fft_burst_tagger.h"   // FBT_FFT_SIZE (detect-screen diff)
+
+// Detect-scan PIE pre-screen kernel (common/iridium_decoder/fft_burst_tagger_
+// arp4.S). Signature must match the .S: per 16-bin group it stores a 4-lane
+// (128-bit) OR-mask; lane l aggregates bins {g*16 + q*4 + l : q=0..3}.
+extern void fbt_detect_screen_arp4(const int32_t *mag, const int32_t *base,
+                                   int32_t *flags, int n, int shift);
 
 #define FFTN 2048
 #define LOG2_FFTN 11
@@ -471,5 +479,195 @@ void pie_fft_placement_run(void)
     heap_caps_free(in_im);
     heap_caps_free(gold_re);
     heap_caps_free(gold_im);
+}
+
+// ===================================================================
+// Detect-scan PIE pre-screen: on-device scalar-vs-PIE bit-exact diff.
+//
+// The host golden test (tests/host/test_tagger_detect_screen_golden.c) proves
+// the ALGEBRA — that the C screen model is a strict superset of the exact
+// threshold test, and that a screened scan yields byte-identical peaks. It
+// cannot run the arp4 instructions. THIS harness runs the REAL silicon kernel
+// (fbt_detect_screen_arp4) against the same C model on synthetic vectors at
+// boot, and asserts:
+//   (1) BIT-EXACT — every lane of the kernel's flag output equals the model's
+//       (per-lane nonzero-equality is the hard gate; if the raw mask encoding
+//        differs — all-ones vs 1 — we WARN but do not fail, since only the
+//        nonzero-ness feeds the group skip in fft_burst_tagger.c).
+//   (2) SUPERSET — for every bin that passes the exact int64 test, the kernel's
+//       group flag is nonzero (a real burst can never be screened out).
+// It also logs the flags-buffer address + esp_ptr_in_dram verdict — the
+// prescreen buffer is PIE-written, so a non-DRAM placement would silently
+// corrupt exactly like the FFT scratch (project_heap_position_decode_bug).
+//
+// Gated under CONFIG_SMOKE_TEST_MODE — diagnostic/smoke path only, never the
+// production hot path.
+
+#define DS_N        FBT_FFT_SIZE        // bins per scan (== tagger FFT size)
+#define DS_HIST     512                 // FBT_HISTORY_SIZE (2^9); mag2*HIST in exact test
+#define DS_MAG_MAX  2147352578          // 32767^2 * 2
+
+// Exact int64 threshold test — byte-for-byte fft_burst_tagger.c:above_threshold.
+static int ds_exact_above(int32_t mag2, int32_t base, int32_t thr_q15)
+{
+    int64_t lhs = (int64_t)mag2 * (int64_t)DS_HIST;
+    int64_t rhs = ((int64_t)base * (int64_t)thr_q15) >> 15;
+    return lhs > rhs;
+}
+
+// Shift derivation — byte-for-byte fft_burst_tagger.c init.
+static int ds_screen_shift_for(int32_t thr_q15)
+{
+    if (thr_q15 <= 0) return -1;
+    int a = 31 - __builtin_clz((uint32_t)thr_q15);
+    int s = 24 - a;
+    if (s < 0)  s = 0;
+    if (s > 24) s = 24;
+    return s;
+}
+
+// C model of fbt_detect_screen_arp4, at the exact lane layout the .S produces:
+// per 16-bin group, 4 lanes; lane l = OR over bins {g*16 + q*4 + l : q=0..3};
+// a bin's lane bit is set iff mag > (base >> shift). Emits all-ones for a set
+// lane (matching esp.vcmp.gt.s32 mask semantics); the kernel-vs-model compare
+// tolerates a differing encoding via nonzero-equality.
+static void ds_screen_model(const int32_t *mag, const int32_t *base,
+                            int32_t *flags, int n, int shift)
+{
+    int ng = n / 16;
+    for (int g = 0; g < ng; g++) {
+        int32_t lane[4] = {0, 0, 0, 0};
+        for (int q = 0; q < 4; q++)
+            for (int l = 0; l < 4; l++) {
+                int bin = g * 16 + q * 4 + l;
+                if (mag[bin] > (base[bin] >> shift)) lane[l] = (int32_t)0xFFFFFFFF;
+            }
+        for (int l = 0; l < 4; l++) flags[g * 4 + l] = lane[l];
+    }
+}
+
+// group g flagged iff any of its 4 lanes nonzero (mirrors the scan skip test).
+static inline int ds_group_flagged(const int32_t *flags, int g)
+{
+    return (flags[g*4+0] | flags[g*4+1] | flags[g*4+2] | flags[g*4+3]) != 0;
+}
+
+void fbt_detect_screen_diff_run(void)
+{
+    ESP_LOGW(TAG, "=== detect-scan PIE pre-screen diff (N=%d) ===", DS_N);
+
+    const size_t bins_bytes  = (size_t)DS_N * sizeof(int32_t);
+    const size_t flags_bytes = (size_t)(DS_N / 4) * sizeof(int32_t); // 4 lanes / 16 bins
+    int32_t *mag  = heap_caps_aligned_alloc(16, bins_bytes,  MALLOC_CAP_INTERNAL);
+    int32_t *base = heap_caps_aligned_alloc(16, bins_bytes,  MALLOC_CAP_INTERNAL);
+    int32_t *fk   = heap_caps_aligned_alloc(16, flags_bytes, MALLOC_CAP_INTERNAL); // kernel
+    int32_t *fm   = heap_caps_aligned_alloc(16, flags_bytes, MALLOC_CAP_INTERNAL); // model
+    if (!mag || !base || !fk || !fm) {
+        ESP_LOGE(TAG, "detect-screen diff alloc failed");
+        heap_caps_free(mag); heap_caps_free(base);
+        heap_caps_free(fk);  heap_caps_free(fm);
+        return;
+    }
+    // PIE writes fk — placement must be main DRAM or the vector store corrupts.
+    ESP_LOGW(TAG, "flags kernel buf @ %p  esp_ptr_in_dram=%d", fk, esp_ptr_in_dram(fk));
+    if (!esp_ptr_in_dram(fk))
+        ESP_LOGE(TAG, "  flags buf NOT in DRAM — PIE store will corrupt (see heap-position bug)");
+
+    // Test-vector generators; each fills mag[] and base[] for the whole scan.
+    // Explicit thr_q15 points (avoid libm pow at boot) chosen to span the shift
+    // range: 32768 = 0 dB (s=9), ~85800 ≈ 14 dB default (s=8), and 20000000 >
+    // 2^24 which hits the a>24 shift-clamp (s=0). thr and shift stay
+    // self-consistent (shift derived from thr), so the exact test — which uses
+    // thr directly — and the screen stay coupled exactly as in production.
+    const int32_t thrs[] = {32768, 85800, 20000000};
+    uint32_t st = 0x1234abcdu;
+
+    int total_lane_mismatch = 0;   // hard: kernel lane nonzero != model lane nonzero
+    int total_raw_mismatch  = 0;   // soft: encoding differs but nonzero-ness agrees
+    int total_superset_fail = 0;   // hard: exact-true bin whose group flag is 0
+    int cases = 0;
+
+    for (unsigned di = 0; di < sizeof(thrs)/sizeof(thrs[0]); di++) {
+        int32_t thr = thrs[di];
+        int shift = ds_screen_shift_for(thr);
+        if (shift < 0) continue;
+
+        for (int mode = 0; mode < 4; mode++) {
+            for (int i = 0; i < DS_N; i++) {
+                st = st * 1103515245u + 12345u;
+                switch (mode) {
+                case 0: // ramps
+                    base[i] = (int32_t)((i * 293127) & 0x1FFFFFFF);
+                    mag[i]  = (int32_t)((i * 811 + 5) & 0x3FFFFFFF);
+                    break;
+                case 1: // random broadband
+                    base[i] = (int32_t)((st >> 3) % 600000000u);
+                    st = st * 1103515245u + 12345u;
+                    mag[i]  = (int32_t)((st >> 3) % (uint32_t)DS_MAG_MAX);
+                    break;
+                case 2: // sparse strong peaks over a noisy floor
+                    base[i] = (int32_t)((st >> 8) % 20000000u);
+                    mag[i]  = (int32_t)((st >> 5) % 100000u);
+                    if (((st >> 20) & 0x3f) == 0) mag[i] += (int32_t)((st >> 4) % 5000000u);
+                    break;
+                default: // boundaries: base at extremes, mag straddling exact rhs
+                    base[i] = (i & 1) ? INT32_MAX : ((i & 2) ? 0 : 512);
+                    { int64_t rhs = ((int64_t)base[i] * (int64_t)thr) >> 15;
+                      int64_t m = rhs / DS_HIST + ((i & 4) ? 1 : 0);
+                      if (m > DS_MAG_MAX) { m = DS_MAG_MAX; }
+                      if (m < 0) { m = 0; }
+                      mag[i] = (int32_t)m; }
+                    break;
+                }
+            }
+
+            // model then real kernel (both into fresh buffers).
+            ds_screen_model(mag, base, fm, DS_N, shift);
+            memset(fk, 0xAA, flags_bytes); // poison so a no-write is caught
+            fbt_detect_screen_arp4(mag, base, fk, DS_N, shift);
+
+            int lane_mm = 0, raw_mm = 0, sup_fail = 0;
+            int nlanes = DS_N / 4;
+            for (int l = 0; l < nlanes; l++) {
+                int kn = (fk[l] != 0), mn = (fm[l] != 0);
+                if (kn != mn) lane_mm++;
+                else if (fk[l] != fm[l]) raw_mm++;
+            }
+            // superset: every exact-true bin must land in a flagged group.
+            int ng = DS_N / 16;
+            for (int g = 0; g < ng; g++) {
+                if (ds_group_flagged(fk, g)) continue;
+                for (int j = 0; j < 16; j++) {
+                    int bin = g*16 + j;
+                    if (ds_exact_above(mag[bin], base[bin], thr)) { sup_fail++; break; }
+                }
+            }
+
+            if (lane_mm || sup_fail)
+                ESP_LOGE(TAG, "  thr=%d mode=%d shift=%d: lane_mm=%d superset_fail=%d raw_mm=%d",
+                         (int)thr, mode, shift, lane_mm, sup_fail, raw_mm);
+            else if (raw_mm)
+                ESP_LOGW(TAG, "  thr=%d mode=%d shift=%d: OK (nonzero-equal); raw encoding differs on %d lanes",
+                         (int)thr, mode, shift, raw_mm);
+            else
+                ESP_LOGI(TAG, "  thr=%d mode=%d shift=%d: bit-exact + superset OK",
+                         (int)thr, mode, shift);
+
+            total_lane_mismatch += lane_mm;
+            total_raw_mismatch  += raw_mm;
+            total_superset_fail += sup_fail;
+            cases++;
+        }
+    }
+
+    heap_caps_free(mag); heap_caps_free(base);
+    heap_caps_free(fk);  heap_caps_free(fm);
+
+    bool pass = (total_lane_mismatch == 0) && (total_superset_fail == 0);
+    ESP_LOGW(TAG, "detect-screen diff: %d cases, lane_mm=%d superset_fail=%d raw_mm=%d",
+             cases, total_lane_mismatch, total_superset_fail, total_raw_mismatch);
+    ESP_LOGW(TAG, pass
+                      ? "===== DETECT_SCREEN_DIFF_PASS ====="
+                      : "===== DETECT_SCREEN_DIFF_FAIL (see lane/superset mismatches above) =====");
 }
 #endif // CONFIG_SMOKE_TEST_MODE

@@ -181,6 +181,15 @@ void fft_burst_tagger_flush(fft_burst_tagger_t *t,
 // sample-position and burst-id continuity are unbroken.
 void fft_burst_tagger_reset_baseline(fft_burst_tagger_t *t);
 
+// Early-boot allocation of the PIE detect-scan pre-screen flags buffer
+// (N/4 int32 = 2 KB). Call from the early PIE pin block, BEFORE the USB stack
+// fragments internal SRAM — the buffer is PIE-written and inherits the P4
+// heap-position sensitivity (a non-DRAM placement silently mis-detects). It is
+// DRAM-guarded; on failure the detect scan falls back to the scalar path. No-op
+// on host / non-PIE builds. Independent of fft_burst_tagger_init (process-wide,
+// like fft_sc16_2048_init).
+void fft_burst_tagger_prealloc_screen(void);
+
 // Diagnostic — read accumulated per-stage wall-times (µs) since the
 // last call, plus the number of steps that contributed. Order:
 //   out[0] = window_multiply

@@ -26,6 +26,7 @@
 #include "resample_256_to_250.h"
 #include "scanner.h"
 #include "fft_sc16_2048.h"
+#include "fft_burst_tagger.h" // fft_burst_tagger_prealloc_screen (PIE detect-scan flags)
 #include "uw_correlator.h"
 #include "app_config.h"
 #include "sd_capture.h"
@@ -398,6 +399,10 @@ static void action_start_stream(class_driver_t *driver_obj)
     // See project_heap_position_decode_bug.md.
     resample_256_to_250_alloc_coeffs();
     fft_sc16_2048_init();
+    // Tagger detect-scan PIE pre-screen flags (2 KB): PIE-written, so pin it
+    // here in DRAM with the other position-sensitive buffers. On failure the
+    // detect scan stays scalar (correct, slower).
+    fft_burst_tagger_prealloc_screen();
     // uw_correlator's PIE float-FFT scratch (16 KB) must be pinned in DRAM
     // here too: left to the worker's lazy first call it spills to RTCRAM
     // under DRAM pressure and silently mis-decodes (the ~95%->~6% cliff).

@@ -50,9 +50,11 @@
     .global fbt_mag_sq_pass_arp4
     .global fbt_ema_step_arp4
     .global fbt_ema_step_prime_arp4
+    .global fbt_detect_screen_arp4
     .type   fbt_mag_sq_pass_arp4,     @function
     .type   fbt_ema_step_arp4,        @function
     .type   fbt_ema_step_prime_arp4,  @function
+    .type   fbt_detect_screen_arp4,   @function
 
 // void fbt_mag_sq_pass_arp4(const int16_t *src_iq, int32_t *dst, int n)
 //   a0 = src_iq (interleaved complex int16, 2*n int16 total)
@@ -142,6 +144,53 @@ fbt_ema_step_prime_arp4:
     bnez            t0, .Lprime_loop
 .Lprime_done:
     addi            sp, sp, 16
+    ret
+
+// void fbt_detect_screen_arp4(const int32_t *mag, const int32_t *base,
+//                             int32_t *flags, int n, int shift)
+//   a0 = mag   (int32[n], internal-SRAM, already PIE-load-proven)
+//   a1 = base  (int32[n], ditto; base >= 0 so arith >> == logical >>)
+//   a2 = flags (int32[n/4] out; 4 mask words per 16-bin group; internal
+//               SRAM, DRAM-guarded by fft_burst_tagger_prealloc_screen)
+//   a3 = n     (multiple of 16; N=2048 -> 128 groups)
+//   a4 = shift (screen shift s in 0..24)
+//
+// Conservative pre-screen for create_new_bursts_internal's 2048-bin scan.
+// Per lane: mag > (base >> s). s = 24 - floor(log2(threshold_q15)) makes
+// this a PROVEN strict UNDER-estimate of above_threshold() (mag*512 >
+// (base*thr)>>15), so every real peak survives; the exact int64 test then
+// runs only on survivors -> byte-identical peaks[]. Per 16-bin group the 4
+// quad-masks are OR-folded into one q6 (4 words); the C side only tests
+// (f0|f1|f2|f3)!=0, so the exact lane truth-value is not load-bearing (the
+// device diff harness pins it).
+//
+// dsp_feed is Core-0's SOLE PIE owner, so this runs beside the mag2/EMA
+// kernels with no second owner (cannot reopen the coproc trap storm). If the
+// Core-1 pipe helper is ever re-enabled, this kernel MUST migrate to the
+// helper task together with fbt_mag_sq_pass_arp4 / fbt_ema_step_arp4 so there
+// is still exactly one PIE owner per core.
+fbt_detect_screen_arp4:
+    esp.movx.r.cfg  t6
+    ori             t6, t6, 2          // unaligned-vld cfg bit (house style)
+    esp.movx.w.cfg  t6
+    esp.movx.w.sar  a4                 // SAR = shift (a4 is a valid SAR-write reg)
+    srli            t0, a3, 4          // t0 = n / 16 groups
+    beqz            t0, .Lscr_done
+.Lscr_group:
+    esp.vsub.s32    q6, q6, q6         // q6 = 0 (group fold accumulator)
+    li              t1, 4              // 4 quads = 16 bins per group
+.Lscr_quad:
+    esp.vld.128.ip  q0, a0, 16         // q0 = mag [k..k+3], advance mag
+    esp.vld.128.ip  q1, a1, 16         // q1 = base[k..k+3], advance base
+    esp.vsr.s32     q2, q1             // q2 = base >> SAR (base>=0: arith==logical)
+    esp.vcmp.gt.s32 q3, q0, q2         // q3 = (mag > base>>s) lane mask
+    esp.orq         q6, q6, q3         // fold quad mask into group accumulator
+    addi            t1, t1, -1
+    bnez            t1, .Lscr_quad
+    esp.vst.128.ip  q6, a2, 16         // flags[4g..4g+3], advance flags
+    addi            t0, t0, -1
+    bnez            t0, .Lscr_group
+.Lscr_done:
     ret
 
 #endif /* __riscv && SOC_CPU_HAS_PIE */

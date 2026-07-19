@@ -366,6 +366,15 @@ add_executable(test_tagger_mag_ema_golden
 target_include_directories(test_tagger_mag_ema_golden PRIVATE ${COMMON_DIR})
 target_link_libraries(test_tagger_mag_ema_golden PRIVATE m)
 
+# Detect-scan PIE pre-screen: superset (exact-true => screen-true) + byte-
+# identical scan (scalar vs screened peaks). Host models the screen; the real
+# arp4 kernel still needs the on-device diff + RAW GOLDEN equality check.
+add_executable(test_tagger_detect_screen_golden
+    test_tagger_detect_screen_golden.c
+)
+target_include_directories(test_tagger_detect_screen_golden PRIVATE ${COMMON_DIR})
+target_link_libraries(test_tagger_detect_screen_golden PRIVATE m)
+
 # Fine near-DC diagnostic bucket-index math (worker_dcfine.h), used to pin
 # the tuner-internal DC/LO artifact ahead of the near-DC tagger mask.
 add_executable(test_dcfine_index test_dcfine_index.c)
@@ -1349,6 +1358,7 @@ add_test(NAME tagger_carrier_absorption COMMAND test_tagger_carrier_absorption)
 add_test(NAME tagger_live_conditions COMMAND test_tagger_live_conditions)
 add_test(NAME window_multiply_golden COMMAND test_window_multiply_golden)
 add_test(NAME tagger_mag_ema_golden COMMAND test_tagger_mag_ema_golden)
+add_test(NAME tagger_detect_screen_golden COMMAND test_tagger_detect_screen_golden)
 # direct_if_decim intentionally NOT auto-registered: needs
 # tests/scripts/direct_if_dump.py to have run first.
 add_test(NAME rotate_to_dc          COMMAND test_rotate_to_dc)
