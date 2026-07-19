@@ -1008,6 +1008,64 @@ target_compile_options(decode_burst_capture PRIVATE
 )
 target_link_libraries(decode_burst_capture PRIVATE m)
 
+# decode_continuous_capture: like decode_burst_capture, but reads the
+# CONTINUOUS raw-uint8 IQ stream (RTL-SDR raw USB, sd_capture.h continuous
+# mode) instead of the device BURST-record format. Runs the wideband
+# fft_burst_tagger front end (same as test_pipeline_wideband_*) + the
+# IDA->SBD->ACARS tail (same as decode_burst_capture / test_phaseb_cut),
+# so an arbitrary 2.5 MSPS uint8 capture goes IQ-file -> ACARS-text
+# through the exact device chain. Build-only (needs a runtime IQ file).
+add_executable(decode_continuous_capture
+    decode_continuous_capture.c
+    acars_tail.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+    ${COMMON_DIR}/iridium_frame.c
+    ${COMMON_DIR}/iridium_bch.c
+    ${COMMON_DIR}/ida_decode.c
+    ${COMMON_DIR}/crc16.c
+    ${COMMON_DIR}/ida_reassembler.c
+    ${COMMON_DIR}/sbd_reassembler.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(decode_continuous_capture PRIVATE
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}    # esp_log.h stub
+    ${LIBACARS_UPSTREAM}           # for <libacars/...> includes
+    ${LIBACARS_IDF_DIR}            # for "config.h"
+)
+target_compile_options(decode_continuous_capture PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -D_DARWIN_C_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+target_link_libraries(decode_continuous_capture PRIVATE m)
+
 # test_phaseb_cut: validate the full device decode DSP chain against a
 # known-good real IQ slice (phaseb_cuts). Splices the tagger+ingest
 # harness of test_pipeline_wideband_resampled onto decode_burst_capture's
