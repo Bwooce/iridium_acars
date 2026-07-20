@@ -167,12 +167,18 @@ int main(void)
     if (n25 <= 0) return 2;
 
     // 3) Run our tagger using gri-aligned settings (gone-trigger,
-    //    threshold = 10 dB to maximise recall, end-of-stream flush).
+    //    end-of-stream flush). Threshold defaults to the PRODUCTION tag_thr
+    //    (14 dB); the old hardcoded 10 dB did not reflect prod recall (task
+    //    #27). Override via TAG_THR_DB env for A/B sweeps — e.g. 15.63 =
+    //    gri-parity (our eff-18 dB after the ENBW offset).
+    float thr_db = 14.0f;
+    { const char *e = getenv("TAG_THR_DB"); if (e && *e) thr_db = strtof(e, NULL); }
+    printf("tagger threshold = %.2f dB\n", (double)thr_db);
     fft_burst_tagger_t *t = fft_burst_tagger_init(
         /*burst_pre_len =*/2 * FBT_FFT_SIZE,
         /*burst_post_len=*/(int)(INPUT_FS_HZ * 16e-3),
         /*burst_width   =*/32,
-        /*threshold_db  =*/10.0f,
+        /*threshold_db  =*/thr_db,
         s_baseline_history);
     if (!t) {
         fprintf(stderr, "tagger init\n");

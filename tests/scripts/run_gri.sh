@@ -48,10 +48,21 @@ for f in "$@"; do
   "$PY" "$EXTRACT" -c "$CENTER" -r "$FS" -f cu8 -o "$f" \
       2>"$OUTDIR/$b.stderr" | grep '^RAW:' > "$OUTDIR/$b.bits" || true
   bursts=$(wc -l < "$OUTDIR/$b.bits" | tr -d ' ')
-  "$PY" "$PARSE" -p --uw-ec "$OUTDIR/$b.bits" 2>/dev/null > "$OUTDIR/$b.parsed" || true
-  frames=$(wc -l < "$OUTDIR/$b.parsed" | tr -d ' ')
+  # NOTE: the installed iridium-extractor emits "RAW:" bits in the *non-swapped*
+  # symbol order, but this iridium-toolkit parser treats "RAW:" as needing a
+  # per-symbol swap (swapped = tag != "RWA") and applies symbol_reverse(), which
+  # corrupts every payload -> 0 frames. (The 24-sym UW is swap-invariant, so it
+  # still matched and hid the bug.) Relabel RAW->RWA so the parser leaves the
+  # bits as-is. Also force "-o line": with stdout redirected (not a tty) the
+  # parser defaults to output=file and hijacks stdout into its own <base>.parsed,
+  # so the shell redirect below would otherwise capture nothing. Drop "-p"
+  # (--perfect): it contradicts --uw-ec and discards error-corrected frames.
+  sed 's/^RAW:/RWA:/' "$OUTDIR/$b.bits" \
+      | "$PY" "$PARSE" -o line --uw-ec /dev/stdin 2>/dev/null > "$OUTDIR/$b.parsed" || true
+  # frames = successfully decoded (typed) lines; failed bursts print "... ERR:".
+  frames=$(grep -cv ' ERR:' "$OUTDIR/$b.parsed" || true)
   printf '%-24s %10s %10s\n' "$b" "$bursts" "$frames"
   if [ "$frames" -gt 0 ]; then
-    awk '{print $1}' "$OUTDIR/$b.parsed" | sort | uniq -c | sort -rn | sed 's/^/    /'
+    grep -v ' ERR:' "$OUTDIR/$b.parsed" | awk '{print $1}' | sort | uniq -c | sort -rn | sed 's/^/    /'
   fi
 done
