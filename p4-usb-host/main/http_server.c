@@ -204,6 +204,11 @@ static esp_err_t status_get(httpd_req_t *req)
     wifi_link_wdt_status(&wdt_gw, &wdt_armed, &wdt_fails,
                          &wdt_stream_live, &wdt_stream_stalls);
 
+    /* patch 0009 coproc-trap-storm recovery counter (riscv port.c). The 0010
+     * PIE-recovery counter was removed — the 0011 eager-enable prevents the PIE
+     * trap upstream, so there is no PIE-recovery path to count. */
+    extern volatile uint32_t g_coproc_fpu_recoveries;
+
     // Load telemetry (peak vs mean burst/capacity since boot) for remote
     // monitoring of a headless deployment.
     status_capacity_t cap;
@@ -227,7 +232,13 @@ static esp_err_t status_get(httpd_req_t *req)
     json_escape(mnt_err_esc, sizeof(mnt_err_esc), sd.mount_error);
     json_escape(station_id_esc, sizeof(station_id_esc), cfg.station_id);
 
-    char body[1600];
+    // Cumulative-since-boot BCH funnel (non-resetting reads; won't race the
+    // status_logger drain). Exposes raw pre-mask BER + worker Chase-2 (#112)
+    // rescue rate over HTTP for the gain-knee sweep + Chase-2 evaluation.
+    uint32_t bch_dec = 0, bch_unk = 0, bch_fail = 0, bch_chase = 0;
+    worker_core1_get_bch_cumulative(&bch_dec, &bch_unk, &bch_fail, &bch_chase);
+
+    char body[1700];
     int  n = snprintf(body, sizeof(body),
                       "{"
                        "\"build\":\"%s\","
@@ -260,13 +271,17 @@ static esp_err_t status_get(httpd_req_t *req)
                        "}"
                        "},"
                        "\"health_wdt\":{\"gw\":\"%u.%u.%u.%u\",\"gw_armed\":%s,\"gw_fails\":%d,"
-                       "\"stream_live\":%s,\"stream_stalls\":%d},"
+                       "\"stream_live\":%s,\"stream_stalls\":%d,"
+                       "\"fpu_recover\":%u},"
                        "\"load\":{"
                        "\"bursts_win_mean\":%.0f,\"bursts_win_peak\":%u,"
                        "\"worker_cap_peak\":%.0f,\"worker_ge90_pct\":%.0f,"
                        "\"dsp_cap_peak\":%.0f,"
                        "\"accepted_peak\":%u,\"queue_drops_peak\":%u,"
                        "\"prefilter_accept_pct\":%.0f},"
+                       "\"bch\":{"
+                       "\"decoded\":%u,\"unknown\":%u,\"failed\":%u,"
+                       "\"chase_recovered\":%u},"
                        "\"sd\":{"
                        "\"mounted\":%s,\"log_open\":%s,"
                        "\"messages_written\":%u,\"bytes_written\":%llu,"
@@ -306,10 +321,13 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned)((wdt_gw >> 16) & 0xff), (unsigned)((wdt_gw >> 24) & 0xff),
                      wdt_armed ? "true" : "false", wdt_fails,
                      wdt_stream_live ? "true" : "false", wdt_stream_stalls,
+                      (unsigned)g_coproc_fpu_recoveries,
                       cap.mean_bursts, (unsigned)cap.peak_bursts,
                       cap.peak_worker_cap, cap.worker_ge90_pct, cap.peak_dsp_cap,
                       (unsigned)cap.peak_processed, (unsigned)cap.peak_queue_drops,
                       cap.prefilter_accept_pct,
+                      (unsigned)bch_dec, (unsigned)bch_unk,
+                      (unsigned)bch_fail, (unsigned)bch_chase,
                      sd.mounted ? "true" : "false",
                      sd.log_open ? "true" : "false",
                       (unsigned)sd.messages_written,
@@ -389,7 +407,7 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
     uint32_t bp_first_calls = 0, bp_retry_calls = 0;
     burst_pipeline_get_stage_us(bp_stage_us, &bp_first_calls, &bp_retry_calls); // P1.5c
 
-    char body[3072]; // P1.5c: grew from 2048 to fit snr_pushed/stage_us
+    char body[3328]; // P1.5c: grew from 2048 to fit snr_pushed/stage_us; +snr_bchok (task #26)
     int  n = 0;
     int  m;
     m = snprintf(body + n, sizeof(body) - n,
@@ -479,6 +497,24 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
             n += m;
             if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
         }
+    }
+    // task #26: tagger-SNR of frames that DECODED (BCH-ok + classified known).
+    // Same 32-bin floor(SNR_dB) layout as snr[]; compare against snr[]/snr_pushed[]
+    // to see whether any burst below gri's ~18 dB floor ever yields a real frame.
+    if (n < (int)sizeof(body) - 1) {
+        m = snprintf(body + n, sizeof(body) - n,
+                     ",\"snr_bchok_total\":%u,\"snr_bchok\":[",
+                     (unsigned)h.snr_bchok_total);
+        if (m > 0) { n += m; if (n >= (int)sizeof(body)) n = sizeof(body) - 1; }
+    }
+    for (int i = 0; i < 32; i++) {
+        if (n >= (int)sizeof(body) - 1) break;
+        m = snprintf(body + n, sizeof(body) - n, "%s%u", i ? "," : "", (unsigned)h.snr_bchok[i]);
+        if (m > 0) { n += m; if (n >= (int)sizeof(body)) n = sizeof(body) - 1; }
+    }
+    if (n < (int)sizeof(body) - 1) {
+        m = snprintf(body + n, sizeof(body) - n, "]");
+        if (m > 0) { n += m; if (n >= (int)sizeof(body)) n = sizeof(body) - 1; }
     }
     // P1.5c: burst_pipeline per-stage wall-time accumulators (read-and-
     // reset; caller computes rates from repeated polls). Order matches
@@ -2004,12 +2040,20 @@ static esp_err_t chase2_post(httpd_req_t *req)
         httpd_query_key_value(query, "on", s, sizeof(s)) == ESP_OK) {
         on = (s[0] == '1' || s[0] == 't' || s[0] == 'T');
     }
+    // Apply the LIVE flag synchronously (instant, flash-free) BEFORE replying,
+    // so the response reflects the true applied state — not an optimistic echo
+    // that could lie if the persist task fails to spawn. Only the NVS commit is
+    // deferred to the internal-stack task (the PSRAM-stacked httpd task must
+    // never nvs_commit — cache_utils.c:114).
+    app_config_set_chase2_decode_ram(on);
     char body[40];
     int  n = snprintf(body, sizeof(body), "{\"chase2_decode\":%s}", on ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, body, n);
     if (xTaskCreate(chase2_cfg_task, "chase2_cfg", 4096, (void *)(uintptr_t)on, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "/chase2: failed to spawn apply task");
+        // Live flag is already set; only persistence is lost.
+        ESP_LOGE(TAG, "/chase2: NVS persist task spawn failed — live flag set, "
+                      "value will NOT survive reboot");
     }
     return ESP_OK;
 }
@@ -2800,6 +2844,131 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// --- Dark continuous-capture coordinator (project_continuous_sd_capture_chokes) ---
+// A raw 5 MB/s continuous SD capture starves the shared SDMMC controller (SD slot 0
+// + C6 SDIO slot 1), killing HTTP + the USB stream. This runs a BOUNDED continuous
+// slice with WiFi quiesced so the SD writer owns the controller: pause health-wdt →
+// stop WiFi → continuous capture → (time AND byte cap, vTaskDelay-fed) → stop →
+// restart WiFi (auto-reconnect via STA_START) → re-arm wdt. Network is DARK for the
+// window, so progress is logged to the UART console (uart_log ON) not HTTP.
+static volatile uint32_t s_slice_ms     = 0;
+static volatile uint64_t s_slice_target = 0;
+
+static void capture_slice_task(void *arg)
+{
+    (void) arg;
+    const uint32_t ms     = s_slice_ms;
+    const uint64_t target = s_slice_target;
+    ESP_LOGW(TAG, "SLICE: begin — pausing health-wdt, quiescing WiFi; continuous capture "
+                  "%lu ms target=%llu B (network goes DARK; watch UART console)",
+             (unsigned long) ms, (unsigned long long) target);
+    wifi_link_wdt_pause(true);
+    wifi_link_quiesce();
+    vTaskDelay(pdMS_TO_TICKS(400)); // let the SDIO/WiFi settle before the SD onslaught
+
+    esp_err_t sr = sd_capture_start(target); // continuous (no burst mode)
+    if (sr != ESP_OK) {
+        ESP_LOGE(TAG, "SLICE: sd_capture_start failed: %s", esp_err_to_name(sr));
+    } else {
+        const int64_t t0 = esp_timer_get_time();
+        int64_t last_log = -2000000;
+        for (;;) {
+            int64_t el = esp_timer_get_time() - t0;
+            if (el >= (int64_t) ms * 1000) break;
+            sd_capture_stats_t st;
+            sd_capture_get_stats(&st);
+            if (!st.active) break;
+            if (target && st.bytes_captured >= target) break;
+            if (el - last_log >= 2000000) { // ~2 s console progress
+                last_log       = el;
+                double secs    = (double) el / 1e6;
+                double mbps    = secs > 0 ? st.bytes_captured / secs / 1e6 : 0;
+                ESP_LOGW(TAG, "SLICE: %.1fs captured=%llu B dropped=%u we=%u (~%.2f MB/s)",
+                         secs, (unsigned long long) st.bytes_captured,
+                         (unsigned) st.bytes_dropped, (unsigned) st.write_errors, mbps);
+            }
+            vTaskDelay(pdMS_TO_TICKS(150)); // feeds task WDT
+        }
+        sd_capture_stop();
+        for (int i = 0; i < 40; i++) { // wait for writer flush+close before spinning WiFi up
+            sd_capture_stats_t st;
+            sd_capture_get_stats(&st);
+            if (!st.active) {
+                ESP_LOGW(TAG, "SLICE: capture closed — captured=%llu B dropped=%u we=%u",
+                         (unsigned long long) st.bytes_captured, (unsigned) st.bytes_dropped,
+                         (unsigned) st.write_errors);
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+    }
+
+    ESP_LOGW(TAG, "SLICE: resuming WiFi");
+    esp_err_t rr = wifi_link_resume();
+    if (rr != ESP_OK) {
+        ESP_LOGE(TAG, "SLICE: wifi_link_resume failed: %s", esp_err_to_name(rr));
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    wifi_link_wdt_pause(false); // re-arm; if WiFi never returns the gw-wdt reboots in ~3 min (recovery)
+    ESP_LOGW(TAG, "SLICE: done — WiFi resumed, health-wdt re-armed");
+    s_slice_ms = 0;
+    vTaskDelete(NULL);
+}
+
+// POST /capture/slice — body JSON {"ms":N,"target_bytes":M}. Spawns the dark-slice
+// coordinator and returns immediately; network goes dark ~ms then reconnects. Poll
+// /sd/list + /capture/status AFTER it comes back (watch the UART console during).
+static esp_err_t capture_slice_post(httpd_req_t *req)
+{
+    char body[128] = {0};
+    int  len       = req->content_len;
+    if (len > 0 && len < (int) sizeof(body)) {
+        int got = httpd_req_recv(req, body, len);
+        if (got > 0) body[got] = '\0';
+    }
+    uint32_t ms     = 15000;
+    uint64_t target = 0;
+    const char *p   = strstr(body, "ms");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            unsigned long v = strtoul(p + 1, NULL, 10);
+            if (v) ms = (uint32_t) v;
+        }
+    }
+    const char *q = strstr(body, "target_bytes");
+    if (q) {
+        q = strchr(q, ':');
+        if (q) target = strtoull(q + 1, NULL, 10);
+    }
+    if (ms < 1000) ms = 1000;
+    if (ms > 60000) ms = 60000; // hard cap: bounded dark window, well under the gw-wdt ~3 min
+
+    sd_capture_stats_t cs;
+    sd_capture_get_stats(&cs);
+    if (cs.active || s_slice_ms) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_send(req, "capture already active\n", HTTPD_RESP_USE_STRLEN);
+    }
+    s_slice_ms     = ms;
+    s_slice_target = target;
+    BaseType_t ok  = xTaskCreatePinnedToCore(capture_slice_task, "cap_slice", 4096, NULL,
+                                             6, NULL, tskNO_AFFINITY);
+    if (ok != pdPASS) {
+        s_slice_ms = 0;
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "spawn failed\n", HTTPD_RESP_USE_STRLEN);
+    }
+    char resp[256];
+    int  n = snprintf(resp, sizeof(resp),
+                      "{\"result\":\"started\",\"ms\":%lu,\"target_bytes\":%llu,"
+                      "\"note\":\"WiFi DARK ~%lu ms then reconnects; watch UART console; "
+                      "poll /sd/list + /capture/status after\"}",
+                      (unsigned long) ms, (unsigned long long) target, (unsigned long) ms);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp, n);
+}
+
 esp_err_t http_server_start(void)
 {
     if (s_server) return ESP_OK;
@@ -2885,6 +3054,7 @@ esp_err_t http_server_start(void)
         {.uri = "/tasks", .method = HTTP_GET, .handler = tasks_get, .user_ctx = NULL},
         {.uri = "/capture/start", .method = HTTP_POST, .handler = capture_start_post, .user_ctx = NULL},
         {.uri = "/capture/stop", .method = HTTP_POST, .handler = capture_stop_post, .user_ctx = NULL},
+        {.uri = "/capture/slice", .method = HTTP_POST, .handler = capture_slice_post, .user_ctx = NULL},
         {.uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get, .user_ctx = NULL},
         {.uri = "/capture/file", .method = HTTP_GET, .handler = capture_file_get, .user_ctx = NULL},
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},

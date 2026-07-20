@@ -1008,7 +1008,15 @@ static void dsp_feed_task(void *arg)
                 int64_t t_pre_feed = esp_timer_get_time();
 
                 feed_stage(CS_FEED_DSP_FEED);
-                dsp_processor_feed(s_dsp, converted, n_int16 / 2);
+                // Shed the decode pipeline during a CONTINUOUS raw capture: the
+                // 5 MB/s stream + SD writer already saturate Core 0 / the SDMMC
+                // controller, so running the tagger on top starves the USB
+                // consumer and the stream dies. take_converted/release still run
+                // (slot bookkeeping intact); only the tagger is skipped. Burst
+                // mode keeps decoding (it needs the tagger to find the bursts).
+                if (!sd_capture_continuous_active()) {
+                    dsp_processor_feed(s_dsp, converted, n_int16 / 2);
+                }
                 int64_t t_post_feed = esp_timer_get_time();
                 atomic_fetch_add_explicit(&s_feed_dsp_total_time_us,
                                           (uint64_t)(t_post_feed - t_pre_feed), memory_order_relaxed);
@@ -1039,7 +1047,9 @@ static void dsp_feed_task(void *arg)
                 feed_stage(CS_FEED_TAKE_CONVERTED);
                 int16_t *converted = ingest_core1_take_converted(prev_dsp_slot, &n_int16);
                 feed_stage(CS_FEED_DSP_FEED);
-                dsp_processor_feed(s_dsp, converted, n_int16 / 2);
+                if (!sd_capture_continuous_active()) {  // shed decode during raw capture
+                    dsp_processor_feed(s_dsp, converted, n_int16 / 2);
+                }
                 feed_stage(CS_FEED_RELEASE);
                 ingest_core1_release(prev_dsp_slot);
                 prev_dsp_slot = -1;

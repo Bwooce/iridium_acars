@@ -66,6 +66,11 @@ esp_err_t sd_log_force_format(void);
 
 void sd_log_get_stats(sd_log_stats_t *out);
 
+// Auto-fallback: drop the SD bus clock to 20 MHz for the next mount (after
+// sustained write failure at 40 MHz HS, or a mount failure). In-RAM; resets to
+// 40 MHz on reboot. Called by the capture writer's circuit-breaker.
+void sd_log_downclock(void);
+
 #else /* !CONFIG_ENABLE_SD_LOG — provide inline no-op stubs. */
 
 static inline esp_err_t sd_log_init(void)
@@ -83,6 +88,9 @@ static inline esp_err_t sd_log_force_mount(void)
 static inline esp_err_t sd_log_force_format(void)
 {
     return ESP_ERR_NOT_SUPPORTED;
+}
+static inline void sd_log_downclock(void)
+{
 }
 static inline void sd_log_get_stats(sd_log_stats_t *out)
 {

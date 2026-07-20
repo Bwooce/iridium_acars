@@ -196,6 +196,11 @@ uint8_t app_config_get_uart_log_mode(void);
 bool app_config_uart_log_effective(uint8_t mode, bool network_up);
 
 esp_err_t app_config_set_chase2_decode(bool on);
+// RAM-only apply of the live chase2 flag: instant, flash-free, safe from ANY
+// task (incl. the PSRAM-stack httpd task, which must never nvs_commit). Lets a
+// handler apply + honestly report the live state, then hand the NVS persist to
+// an internal-stack task. Does NOT persist across reboot on its own.
+void app_config_set_chase2_decode_ram(bool on);
 
 // The uart_log null-sink vprintf hook, and a live apply helper (installs the
 // null hook or restores the default UART vprintf; safe from any task —

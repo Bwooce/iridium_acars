@@ -48,6 +48,14 @@ static volatile int      s_wdt_fails          = 0; // consecutive failed gw-ping
 static volatile bool s_stream_live   = false; // usb.completed advanced at least once
 static volatile int  s_stream_stalls = 0;     // consecutive frozen cycles
 
+// Set by wifi_link_wdt_pause() during a dark continuous SD capture: WiFi is
+// DELIBERATELY stopped (gateway unreachable) and the USB stream is diverted to
+// SD, so both the gateway (#104) and stream (#105) checks would false-reboot.
+// While paused the health-wdt resets its counters each cycle (stays "fed") and
+// skips the reboot. Bounded by the coordinator (short slice) so a stuck pause
+// can't hide a real fault for long.
+static volatile bool s_wdt_paused = false;
+
 // Non-blocking STA reconnect (#T13): STA_DISCONNECTED used to vTaskDelay(5s)
 // right in the event handler, stalling the shared default event-loop task
 // (blocks IP events and every other subsystem on WiFi flaps). Instead arm a
@@ -208,6 +216,16 @@ static void health_wdt_task(void *arg)
             continue;
         }
 
+        // Dark continuous SD capture in progress: WiFi is deliberately stopped
+        // and the stream is diverted to SD. Keep both counters fed and skip the
+        // reboot, else the gateway (#104) / stream (#105) checks would abort the
+        // capture. The coordinator bounds this (short slice + always unpauses).
+        if (s_wdt_paused) {
+            s_wdt_fails     = 0;
+            s_stream_stalls = 0;
+            continue;
+        }
+
         // --- USB stream liveness (#105) ---------------------------------
         // usb.completed advancing = the RTL-SDR stream is feeding the
         // pipeline. If it freezes, the stream wedged (dongle silent halt
@@ -331,6 +349,28 @@ static void start_ap(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
     s_mode = LINK_AP;
     ESP_LOGI(TAG, "AP configured: SSID='%s' open, channel 6", s_ssid);
+}
+
+// Dark-capture support (see project_continuous_sd_capture_chokes): quiesce/resume
+// WiFi so a continuous SD capture gets the shared SDMMC controller (SD slot 0 +
+// C6 SDIO slot 1) uncontended. quiesce = esp_wifi_stop (C6 WiFi MAC off → the
+// SDIO transport goes mostly idle). resume = esp_wifi_start; the STA_START event
+// handler then auto-fires esp_wifi_connect() to re-associate (no extra call).
+esp_err_t wifi_link_quiesce(void)
+{
+    return esp_wifi_stop();
+}
+
+esp_err_t wifi_link_resume(void)
+{
+    return esp_wifi_start();
+}
+
+// Suspend/resume the health watchdog (gateway #104 + stream #105) across a dark
+// capture, so the deliberately-down WiFi + SD-diverted stream don't false-reboot.
+void wifi_link_wdt_pause(bool paused)
+{
+    s_wdt_paused = paused;
 }
 
 esp_err_t wifi_link_start(void)

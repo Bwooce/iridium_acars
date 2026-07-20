@@ -80,6 +80,12 @@ static QueueHandle_t     s_q      = NULL;
 static void             *s_sdmmc_stash     = NULL;
 static SemaphoreHandle_t s_stats_mu        = NULL;
 static sd_log_stats_t    s_stats           = {0};
+
+// SD bus clock, with auto-fallback. Default 40 MHz (HS); sd_log_downclock()
+// drops it to 20 MHz on sustained write failure or a mount failure, so the next
+// mount re-inits at the safe speed. In-RAM (resets to 40 MHz on reboot, so a
+// transient glitch doesn't permanently penalize a HS-capable card).
+static volatile uint32_t s_sd_max_khz = SDMMC_FREQ_HIGHSPEED;
 static volatile bool     s_mount_attempted = false; // lazy-mount flag
 
 static void update_stats_ok(size_t bytes_added)
@@ -336,6 +342,19 @@ static esp_err_t sdmmc_deinit_noop(void)
     return ESP_OK;
 }
 
+// Auto-fallback: drop the SD bus clock to the safe 20 MHz for the next mount.
+// Called from the capture writer's circuit-breaker on sustained write failure
+// (the 40 MHz-HS instability signature) and from the mount-failure path below.
+// Idempotent; safe from any task (plain word write, no flash/NVS).
+void sd_log_downclock(void)
+{
+    if (s_sd_max_khz != SDMMC_FREQ_DEFAULT) {
+        s_sd_max_khz = SDMMC_FREQ_DEFAULT;
+        ESP_LOGW(TAG, "SD auto-fallback: bus clock -> 20 MHz for next mount "
+                      "(40 MHz HS instability)");
+    }
+}
+
 static esp_err_t mount_sd(bool allow_format)
 {
     enable_card_power();
@@ -365,7 +384,11 @@ static esp_err_t mount_sd(bool allow_format)
     // at 64 consecutive failures. Symptom matches an overclocked card
     // wedging under sustained load. 20 MHz halves theoretical
     // throughput but burst-mode peak (~0.8 MB/s) is well within reach.
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    // Clock is a variable (default 40 MHz HS) with AUTO-FALLBACK to 20 MHz:
+    // sd_log_downclock() drops s_sd_max_khz on sustained write failure (the
+    // 40 MHz-HS instability signature — the writer's circuit-breaker calls it) or
+    // on a mount failure below, so the next mount re-inits at the safe 20 MHz.
+    host.max_freq_khz = s_sd_max_khz;
     // Slot 0 (P4-NANO's SD slot per schematic, distinct from slot 1
     // which is C6 esp_hosted).
     host.slot            = SDMMC_HOST_SLOT_0;
@@ -403,7 +426,13 @@ static esp_err_t mount_sd(bool allow_format)
         // must never silently reformat a card full of captures.
         .format_if_mount_failed = allow_format,
         .max_files              = 4,
-        .allocation_unit_size   = 16 * 1024,
+        // 64 KB clusters (was 16 KB) — FATFS clips every disk_write at the
+        // cluster boundary (ff.c), so the 256 KB writer chunk needs big clusters
+        // or it's re-chopped into small per-cluster CMD25s and the throughput
+        // win is lost. 64 KB is the FAT32 max; exFAT (256 GB card) can be larger.
+        // Only applied on FORMAT (POST /sd/format); an existing card keeps its
+        // current cluster size.
+        .allocation_unit_size   = 64 * 1024,
     };
 
     // Mount may trigger a synchronous f_mkfs (format, allow_format
@@ -446,6 +475,10 @@ static esp_err_t mount_sd(bool allow_format)
         s_card = NULL;
         (void)sdmmc_host_deinit_slot(SDMMC_HOST_SLOT_0);
         if (ldo_handle) (void)sd_pwr_ctrl_del_on_chip_ldo(ldo_handle);
+        // A mount failure at HS may be 40 MHz init incompatibility — drop to
+        // 20 MHz so the next mount attempt (/sd/mount, /capture/start) is safe.
+        // Harmless if the real cause was no-card/LDO (20 MHz mounts fine too).
+        sd_log_downclock();
         return r;
     }
 

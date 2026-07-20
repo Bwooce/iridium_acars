@@ -77,6 +77,12 @@ void sd_capture_write(const uint8_t *data, size_t n);
 
 void sd_capture_get_stats(sd_capture_stats_t *out);
 
+// True while a CONTINUOUS (raw uint8) capture is active. The class_driver feed
+// loop uses this to shed the decode pipeline (tagger) during a raw capture so
+// the 5 MB/s stream + SD writer don't starve the USB consumer. False for burst
+// mode and when idle. See sd_capture.c.
+bool sd_capture_continuous_active(void);
+
 // Open a previously-captured file under /sdcard/acars/ for reading.
 // `name` is the bare filename (no path). Returns a FILE* the caller
 // must fclose, or NULL on error. Used by the HTTP /capture/file

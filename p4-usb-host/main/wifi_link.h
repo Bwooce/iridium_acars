@@ -16,6 +16,14 @@
 // at start; restart the firmware after writing NVS to flip modes.
 esp_err_t wifi_link_start(void);
 
+// Dark-capture support: stop/restart WiFi so a continuous SD capture gets the
+// shared SDMMC controller uncontended, and pause the health watchdog across it
+// (deliberately-down WiFi must not trigger the gateway/stream reboot). resume
+// auto-reconnects via the STA_START event handler. See wifi_link.c.
+esp_err_t wifi_link_quiesce(void);
+esp_err_t wifi_link_resume(void);
+void      wifi_link_wdt_pause(bool paused);
+
 // True once an IP address is reachable on the active interface:
 //   STA mode: IP_EVENT_STA_GOT_IP fired.
 //   AP mode:  AP_START fired (AP IP is 192.168.4.1 always).

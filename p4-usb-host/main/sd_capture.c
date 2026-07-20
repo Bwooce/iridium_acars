@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h> // mkdir — create /sdcard/acars on a fresh card
 #include <stdatomic.h>
 
 #include "esp_log.h"
@@ -34,10 +35,12 @@ static const char *TAG = "SDCAP";
 // worker_dropped tail noise in early capture runs.
 #define STREAM_BUFFER_BYTES (4 * 1024 * 1024)
 
-// Trigger size on the stream buffer — the writer task wakes when at
-// least this many bytes are available. 4 KB = 8 SDMMC sectors,
-// matches typical FAT optimal write granularity.
-#define STREAM_BUFFER_TRIG 4096
+// Trigger size on the stream buffer — the writer task wakes when at least this
+// many bytes are available. 128 KB (was 4 KB): must be near WRITER_RECV_CHUNK
+// (256 KB) or the writer wakes on tiny 4 KB reads and the big-chunk fwrite
+// amortization is defeated. 128 KB fills in ~26 ms at 5 MB/s (well under the
+// 100 ms receive timeout that still flushes partial reads).
+#define STREAM_BUFFER_TRIG (128 * 1024)
 
 // Writer task params. Pinned to Core 1. Priority 5 = above
 // worker_core1 (4 — deliberate placement, see the priority history
@@ -68,7 +71,14 @@ static const char *TAG = "SDCAP";
 // the limit but workable. If the producer outruns the writer,
 // stream-buffer back-pressure drops bytes (bytes_dropped ticks
 // up) rather than losing whole bursts.
-#define WRITER_RECV_CHUNK (8 * 1024)
+// 256 KB (was 8 KB): each fwrite pays a ~1.3 ms fixed FATFS/VFS/SDMMC
+// per-transaction cost, so at 8 KB the writer capped ~4 MB/s regardless of card
+// or clock (measured: 256 GB == 32 GB; 20→40 MHz only +11%). A 256 KB chunk
+// amortizes that tax 32× → ~9-12 MB/s (needs ≥64 KB clusters so FATFS doesn't
+// re-chop it at the cluster boundary — see sd_log.c allocation_unit_size). The
+// buffer is aligned PSRAM and the P4 SDMMC DMAs directly from PSRAM, so the old
+// "must be small DMA-INT SRAM" reason is gone.
+#define WRITER_RECV_CHUNK (256 * 1024)
 
 // FATFS FILE buffer size: 64 KB. Each fwrite to a buffered FILE
 // just memcpy's into here; the actual SDMMC write happens when
@@ -116,6 +126,18 @@ static volatile uint32_t s_burst_seq  = 0;
 // burst at a time -- see sd_capture.h), so no locking needed; each
 // _begin() call overwrites this before any _chunk() can read it.
 static volatile bool s_burst_skip = false;
+
+// True while a CONTINUOUS (raw uint8, non-burst) capture is running. The
+// class_driver feed loop consults this to SHED the decode pipeline (tagger /
+// dsp_processor_feed) during a raw capture: continuous is the full 5 MB/s
+// stream and the SD writer + capture-feed already saturate the SDMMC
+// controller (shared with C6) + Core 0, so running the tagger on top starves
+// the USB consumer and the stream dies (observed 2026-07-19). Burst mode is
+// low-rate and does NOT shed (we still want decode to find the bursts).
+bool sd_capture_continuous_active(void)
+{
+    return s_state == CAP_STATE_ACTIVE && !s_burst_mode;
+}
 
 static void update_bytes_written(size_t n)
 {
@@ -285,9 +307,16 @@ static void writer_task(void *arg)
                 consec_fail++;
                 if (consec_fail >= CONSEC_FAIL_LIMIT) {
                     ESP_LOGE(TAG, "fwrite failed %u consecutive times — "
-                                  "SDMMC controller likely wedged. Aborting "
-                                  "capture; POST /sd/format and try again.",
+                                  "SDMMC likely wedged (possible 40 MHz HS "
+                                  "instability). Auto-downclocking SD to 20 MHz "
+                                  "for the next mount; aborting this capture.",
                              (unsigned)consec_fail);
+                    // Auto-fallback: sustained write failure is the 40 MHz-HS
+                    // failure signature (old card EIO'd this way). Drop the SD
+                    // clock so the NEXT mount re-inits at the safe 20 MHz. In-RAM
+                    // (self-heals per session); safe to call from this PSRAM-stack
+                    // task (no flash write).
+                    sd_log_downclock();
                     s_state     = CAP_STATE_STOPPING;
                     consec_fail = 0;
                 }
@@ -318,7 +347,13 @@ static void writer_task(void *arg)
         // same ~1 s cadence as the old (ineffective) fflush, since
         // fsync is expensive on SDMMC and must not run per-chunk.
         int64_t now = esp_timer_get_time();
-        if (s_fp && (now - last_sync_us) >= 1000000) {
+        // fsync is a small, misaligned, full-tax transaction (FAT + dir) plus a
+        // possible multi-10-ms card metadata flush. At the continuous 5 MB/s rate
+        // a 1 s cadence steals throughput and adds stall spikes, so relax it to
+        // 10 s there (≤10 s crash-loss on a bulk IQ file is fine); keep 1 s for
+        // low-rate burst mode.
+        int64_t sync_interval = s_burst_mode ? 1000000 : 10000000;
+        if (s_fp && (now - last_sync_us) >= sync_interval) {
             if (fsync(fileno(s_fp)) != 0) {
                 ESP_LOGW(TAG, "periodic fsync failed errno=%d", errno);
                 update_write_error();
@@ -495,6 +530,12 @@ esp_err_t sd_capture_start(uint64_t target_bytes)
     char    path[64];
     int64_t t0 = esp_timer_get_time();
     snprintf(path, sizeof(path), "/sdcard/acars/iq-%lld.u8", (long long)t0);
+
+    // A freshly-formatted card has no /sdcard/acars dir, so fopen below would
+    // fail ENOENT. mkdir is idempotent — ignore EEXIST, warn on anything else.
+    if (mkdir("/sdcard/acars", 0777) != 0 && errno != EEXIST) {
+        ESP_LOGW(TAG, "mkdir(/sdcard/acars) errno=%d (continuing to fopen)", errno);
+    }
 
     FILE *fp = fopen(path, "wb");
     if (!fp) {

@@ -340,6 +340,12 @@ static _Atomic uint32_t s_bursts_bch_chase_recovered = 0; // Chase-2 soft decode
 // cumulative pattern as worker_core1_get_histograms().
 static _Atomic uint32_t s_bch_decoded_cum = 0;
 static _Atomic uint32_t s_bch_unknown_cum = 0;
+// Parallel cumulative counters for the rest of the BCH funnel, so /status can
+// show the raw pre-mask BER (failed) and the worker-side Chase-2 rescue rate
+// (chase_recovered, #112) over HTTP — previously visible only on the UDP
+// status_logger stream. NEVER reset (same read-delta pattern as the two above).
+static _Atomic uint32_t s_bch_failed_cum          = 0;
+static _Atomic uint32_t s_bch_chase_recovered_cum = 0;
 // P1.5a triage counters. rejected = the fast-pass verdict found no
 // frame at the single-attempt criterion, so the burst was dropped
 // WITHOUT paying the full retry-loop/multi-frame cost. Rejected
@@ -378,6 +384,11 @@ static _Atomic uint32_t s_hist_bch[HIST_BCH_BINS];
 // hist_freq_record below — "ALL detections", before the stale-reject
 // early-return).
 static _Atomic uint32_t s_hist_snr_pushed[HIST_SNR_BINS];
+// task #26: tagger-SNR histogram of frames that actually DECODED (BCH-ok AND
+// classified to a known type). Compared against s_hist_snr (all popped bursts),
+// this shows the SNR distribution of PRODUCTIVE bursts — i.e. whether any burst
+// below gri's ~18 dB floor ever yields a real frame (the tag_thr question).
+static _Atomic uint32_t s_hist_snr_bchok[HIST_SNR_BINS];
 
 static inline void hist_snr_record_into(_Atomic uint32_t *hist, float snr_db)
 {
@@ -898,7 +909,10 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
         }
 
         if (e1_bch >= 0 && e2_bch >= 0) {
-            if (chase_used) s_bursts_bch_chase_recovered++;
+            if (chase_used) {
+                s_bursts_bch_chase_recovered++;
+                s_bch_chase_recovered_cum++;
+            }
             // BCH passed — but at marginal SNR (~12-13 dB) BCH(31,21)
             // can correct random noise into a "valid" 31-bit codeword
             // that has no Iridium frame structure. Classify before
@@ -919,6 +933,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
                          iridium_frame_type_name(classified.type));
                 s_bursts_bch_decoded++;
                 s_bch_decoded_cum++;
+                hist_snr_record_into(s_hist_snr_bchok, wctx->burst->peak_snr_db); // task #26: tagger-SNR of a real decode
                 real_known = true;
             } else {
                 ESP_LOGD(TAG, "BCH PASS but UNKNOWN: errors=%d/%d "
@@ -933,6 +948,7 @@ static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
                           "qpsk_demod success — bits unusable)",
                      e1_bch, e2_bch);
             s_bursts_bch_failed++;
+            s_bch_failed_cum++;
         }
     }
 #if CONFIG_SMOKE_TEST_RAW_IRIDIUM
@@ -1504,10 +1520,16 @@ void worker_core1_get_histograms(worker_histograms_t *out)
         out->snr_pushed[i] = s_hist_snr_pushed[i];
         total_snr_pushed += s_hist_snr_pushed[i];
     }
+    uint32_t total_snr_bchok = 0;
+    for (int i = 0; i < HIST_SNR_BINS; i++) {
+        out->snr_bchok[i] = s_hist_snr_bchok[i];
+        total_snr_bchok += s_hist_snr_bchok[i];
+    }
     out->snr_total        = total_snr;
     out->bch_total        = total_bch;
     out->freq_total       = total_freq;
     out->snr_pushed_total = total_snr_pushed;
+    out->snr_bchok_total  = total_snr_bchok;
 }
 
 void worker_core1_get_dcfine(uint32_t *out, int max, uint32_t *total_out)
@@ -1529,6 +1551,19 @@ void worker_core1_get_decode_counts(uint32_t *decoded, uint32_t *unknown)
     // worker_core1_get_stats() drain that status_logger runs.
     if (decoded) *decoded = atomic_load_explicit(&s_bch_decoded_cum, memory_order_relaxed);
     if (unknown) *unknown = atomic_load_explicit(&s_bch_unknown_cum, memory_order_relaxed);
+}
+
+void worker_core1_get_bch_cumulative(uint32_t *decoded, uint32_t *unknown,
+                                     uint32_t *failed, uint32_t *chase_recovered)
+{
+    // Full non-resetting BCH funnel for /status (same rationale as
+    // worker_core1_get_decode_counts): raw pre-mask failure count + worker
+    // Chase-2 (#112) rescue count, without racing the periodic get_stats drain.
+    if (decoded) *decoded = atomic_load_explicit(&s_bch_decoded_cum, memory_order_relaxed);
+    if (unknown) *unknown = atomic_load_explicit(&s_bch_unknown_cum, memory_order_relaxed);
+    if (failed)  *failed  = atomic_load_explicit(&s_bch_failed_cum, memory_order_relaxed);
+    if (chase_recovered)
+        *chase_recovered = atomic_load_explicit(&s_bch_chase_recovered_cum, memory_order_relaxed);
 }
 
 void worker_core1_get_stats(worker_stats_t *out)

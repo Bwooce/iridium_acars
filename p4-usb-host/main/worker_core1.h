@@ -54,6 +54,15 @@ void worker_core1_get_stats(worker_stats_t *out);
 // and end of each dwell window and uses the delta. Either pointer may be NULL.
 void worker_core1_get_decode_counts(uint32_t *decoded, uint32_t *unknown);
 
+// Full cumulative-since-boot BCH funnel: decoded / unknown / failed /
+// chase_recovered (worker-side Chase-2, #112). Non-resetting reads (same
+// no-race rationale as worker_core1_get_decode_counts) so /status can show the
+// raw pre-mask BER and Chase-2 rescue rate that were previously visible only on
+// the UDP status_logger stream. Each pointer may be NULL. Note: chase_recovered
+// is a subset of decoded+unknown (a rescued block makes BCH "pass").
+void worker_core1_get_bch_cumulative(uint32_t *decoded, uint32_t *unknown,
+                                     uint32_t *failed, uint32_t *chase_recovered);
+
 // Dropped/lost-burst SNR histograms (see worker_core1.c). stale[] = bursts lost
 // to a ring-lap before demod (recoverable by a sample backlog / an owned-sample
 // queue); pri[] = dropped by SNR-priority (the weakest — junk). 6 buckets of
@@ -81,10 +90,12 @@ typedef struct {
     uint32_t bch[16];
     uint32_t freq[40]; // band occupancy: ALL detections bucketed by rel_freq
     uint32_t snr_pushed[32];
+    uint32_t snr_bchok[32]; // tagger-SNR of frames that DECODED (BCH-ok + classified known) — task #26
     uint32_t snr_total;
     uint32_t bch_total;
     uint32_t freq_total;
     uint32_t snr_pushed_total;
+    uint32_t snr_bchok_total;
 } worker_histograms_t;
 void worker_core1_get_histograms(worker_histograms_t *out);
 

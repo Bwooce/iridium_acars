@@ -391,6 +391,17 @@ esp_err_t app_config_set_chase2_decode(bool on)
     xSemaphoreGive(s_cfg_mu);
     return commit_one_u8("chase2", (uint8_t)on);
 }
+void app_config_set_chase2_decode_ram(bool on)
+{
+    // Live RAM apply only — no NVS commit, so this is safe to call from the
+    // PSRAM-stacked httpd task (unlike the full setter above). Caller hands the
+    // persist to an internal-stack task. frame_decoder picks the flag up on its
+    // next app_config_snapshot(), so the effect is immediate.
+    if (!s_cfg_mu) return;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.chase2_decode = on;
+    xSemaphoreGive(s_cfg_mu);
+}
 esp_err_t app_config_set_uart_log(uint8_t mode)
 {
     if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
