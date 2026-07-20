@@ -1,0 +1,91 @@
+diff --git a/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c b/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
+index 8d3efcf..1bb17e0 100644
+--- a/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
++++ b/components/freertos/FreeRTOS-Kernel/portable/riscv/port.c
+@@ -1009,6 +1009,13 @@ void vPortCoprocUsedInISR(void* frame)
+  * pointer-identity compare with port_uxCoprocOwner (StaticTask_t*, aliases TCB). */
+ extern void * volatile pxCurrentTCBs[ portNUM_PROCESSORS ];
+ 
++/* patch 0009: count of coproc-trap-storm recoveries (FPU EXT_ILL misroute),
++ * exposed via /status so a live soak can PROVE the storm is being self-healed
++ * (vs "no storm occurred"). Written only from the trap handler (single writer).
++ * (The symmetric 0010 PIE-recovery path was removed: superseded by the 0011
++ * eager-enable, which PREVENTS the PIE trap rather than recovering after it.) */
++volatile uint32_t g_coproc_fpu_recoveries = 0;  /* 0009: misrouted flw/fsw */
++
+ /* 1 if insn (== mtval on an illegal-instruction trap) is an FPU load/store or
+  * FP-CSR access. Masks copied verbatim from the FPU_EXT_ILL fallback in
+  * components/riscv/vectors.S so decode matches the dispatcher. */
+@@ -1073,6 +1080,7 @@ void xPortCoprocTrapStormCheck(RvExcFrame *frame, int coproc)
+         void *cur = pxCurrentTCBs[core];
+         if (cur != NULL && (void *) port_uxCoprocOwner[core][FPU_COPROC_IDX] == cur) {
+             asm volatile ("csrs mstatus, %0" :: "r"(PORT_MSTATUS_FS_ENABLE));
++            g_coproc_fpu_recoveries++;
+             static uint32_t s_last_reco_mepc[portNUM_PROCESSORS];
+             if (s_last_reco_mepc[core] != mepc) {
+                 s_last_reco_mepc[core] = mepc;
+@@ -1086,6 +1094,36 @@ void xPortCoprocTrapStormCheck(RvExcFrame *frame, int coproc)
+ #endif
+ }
+ 
++/* patch 0011 v2: EAGER coproc enable on context-switch-in for a task that ALREADY
++ * OWNS the coproc — the real fix for the rev<3 worker_core1 PIE trap storm.
++ * context_switch_requested leaves the incoming task's coprocs DISABLED (lazy), so
++ * its first PIE/FPU op traps; on rev<3 that lazy re-enable storms (coproc==PIE,
++ * never retires; 0009/0010 recoveries can't cure it). If the incoming task already
++ * owns the coproc, its regs are intact (pxPortUpdateCoprocOwner would return -1),
++ * so just ENABLING it here means no trap ever fires. PIE enable (csrw 0x7F2) is a
++ * live CSR surviving the return; FPU is mstatus.FS which int-exit restores from its
++ * returned value, so we return 1 and let portasm OR FS into that mstatus. Owner
++ * check = fail-safe (non-owner -> unchanged lazy path). Uses pxCurrentTCBs, NOT a0,
++ * so portasm must call it AFTER hwlp_restore_if_used (which consumes a0=TCB). */
++int vPortEagerEnableOwnedCoprocs(void);
++int vPortEagerEnableOwnedCoprocs(void)
++{
++#if SOC_CPU_HAS_FPU && SOC_CPU_HAS_PIE && SOC_CPU_HAS_FPU_EXT_ILL_BUG && CONFIG_ESP32P4_SELECTS_REV_LESS_V3
++    const int core = esp_cpu_get_core_id();
++    void *cur = pxCurrentTCBs[core];
++    if (cur == NULL) {
++        return 0;
++    }
++    if ((void *) port_uxCoprocOwner[core][PIE_COPROC_IDX] == cur) {
++        asm volatile ("csrw 0x7f2, %0" :: "r"(1u));  /* CSR_PIE_STATE_REG = 1 (enable) */
++    }
++    if ((void *) port_uxCoprocOwner[core][FPU_COPROC_IDX] == cur) {
++        return 1;  /* tell portasm to set mstatus.FS in the restored mstatus */
++    }
++#endif
++    return 0;
++}
++
+ #if CONFIG_IDF_TARGET_ESP32S31
+ /* On the ESP32-S31, the PIE is only available on core 1, so we need to perform a few checks when core 0 uses a PIE instruction.
+  * the functions here will help us with that. */
+diff --git a/components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S b/components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S
+index 5b21b07..82fe6cc 100644
+--- a/components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S
++++ b/components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S
+@@ -847,6 +847,23 @@ context_switch_requested:
+     call    hwlp_restore_if_used
+ #endif /* SOC_CPU_HAS_HWLOOP */
+ 
++    /* iridium_acars patch 0011 v2: EAGER-enable the coprocs the incoming (different)
++     * task ALREADY OWNS — the real fix for the rev<3 worker_core1 PIE lazy-re-enable
++     * trap storm. Placed AFTER hwlp_restore_if_used (which consumes a0=TCB): a0 is
++     * scratch here and is reloaded at restore_stack_pointer. The helper enables PIE
++     * via its live CSR and returns 1 iff mstatus.FS should be set for the FPU (int-
++     * exit returns mstatus from s11, so OR FS in here). ra is preserved in s10; s11
++     * is callee-saved across the call. Only the different-task path reaches here
++     * (no_context_switch jumps straight to restore_stack_pointer). Non-owner ->
++     * returns 0, coprocs untouched -> unchanged lazy path. */
++#if ( SOC_CPU_COPROC_NUM > 0 )
++    call    vPortEagerEnableOwnedCoprocs
++    beqz    a0, 1f
++    li      a1, 1 << 13                     /* mstatus.FS (== CSR_MSTATUS_FPU_ENABLE) */
++    or      s11, s11, a1                    /* enable FPU in the mstatus rtos_int_exit returns */
++1:
++#endif /* ( SOC_CPU_COPROC_NUM > 0 ) */
++
+ restore_stack_pointer:
+ 
+ #if CONFIG_ESP_SYSTEM_HW_STACK_GUARD

@@ -19,6 +19,7 @@ git apply ../patches/0004-freertos-riscv-pie-coproc-trap-storm-watchdog.patch   
 git apply ../patches/0007-bootloader_support-invalidate-mmap-cache-before-app-ota-verify.patch
 git apply ../patches/0008-fatfs-enable-exfat.patch
 git apply ../patches/0009-freertos-riscv-pie-coproc-trap-storm-recovery.patch   # apply AFTER 0004
+git apply ../patches/0011-freertos-riscv-eager-coproc-enable-plus-recovery-counters.patch   # apply AFTER 0009
 ```
 
 **0005 and 0006 were FALSIFIED and REMOVED (2026-07-19).** Both edited the
@@ -323,3 +324,37 @@ Verify: smoke PASS (normal path intact) + streaming soak shows "coproc storm
 RECOVERED" and no reboot under load. Gated behind
 SOC_CPU_HAS_FPU && SOC_CPU_HAS_PIE && SOC_CPU_HAS_FPU_EXT_ILL_BUG &&
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3 (compiles out on unaffected silicon).
+
+## 0011 — freertos/riscv: EAGER coproc enable (the #20 fix) + recovery counters
+
+**Files:** `components/freertos/FreeRTOS-Kernel/portable/riscv/port.c`,
+`components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S`
+**IDF version:** v6.1. **Apply AFTER 0009** (diffed against the 0009-applied tree).
+
+Two parts, both on top of 0009's FPU-EXT-ILL recovery:
+
+1. **Eager coproc enable — the real #20 fix.** `context_switch_requested` leaves the
+   incoming task's coprocessors DISABLED (lazy), so its first PIE/FPU op traps; on
+   rev<3 P4 that lazy PIE re-enable STORMS (coproc==PIE, retried instruction never
+   retires — 0004 only detects it, 0009's FPU recovery can't cure it, and a symmetric
+   PIE-recovery attempt was falsified, see NOTE). Fix: `vPortEagerEnableOwnedCoprocs()`
+   (port.c), called from portasm.S `rtos_int_exit` AFTER `hwlp_restore_if_used` (which
+   consumes a0=TCB, so this uses pxCurrentTCBs not a0): if the incoming task ALREADY
+   owns PIE, enable it now (`csrw 0x7f2` — a live CSR surviving mret) so no trap ever
+   fires; if it owns FPU, return 1 so portasm ORs mstatus.FS into the restored mstatus.
+   Owner-gated (non-owner → unchanged lazy path). PROVEN: worker_core1 soaked 6h then
+   11h+ across reboots with ZERO coproc recoveries and no reboot, where the storm
+   previously reboot-looped at the 2nd burst callback.
+2. **Recovery counters + logging.** 0009's FPU recovery is counted
+   (`g_coproc_fpu_recoveries`) + one-shot-logged, exposed via /status `fpu_recover`
+   as live soak evidence.
+
+NOTE — a symmetric PIE-recovery attempt (informally "0010", NEVER a committed .patch)
+was FALSIFIED and removed: enabling PIE state post-fault (the same `csrw 0x7f2`) does
+NOT cure a PIE re-fault, and 0011's eager-enable PREVENTS the trap upstream, superseding
+it. Its counter (`g_coproc_pie_recoveries`) and the /status `pie_recover` field were
+removed with it.
+
+DEVICE: golden RAW smoke NOT run for this patch; validated instead by ~11h+ live OTA
+soak (no reboot, decoding real IDA, P4≈gr-iridium) per explicit user authorization —
+see the main-repo commit that ships the matching app-side observability.
