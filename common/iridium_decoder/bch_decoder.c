@@ -137,8 +137,11 @@ int bch_decode_block(const uint8_t *block31, uint8_t *out_data)
 //
 // With K=3, the extra coverage handles up to 3 bit errors at the
 // cost of 8 hard-decodes. K=4 → 16 trials → up to 4 errors. The
-// marginal SNR gain falls off sharply past K=4; gr-iridium uses
-// K=3-4 in their experimental soft path.
+// marginal SNR gain falls off sharply past K=4. (NB: gr-iridium /
+// iridium-toolkit have NO soft-decision path at all — hard syndrome
+// decode + a hard `--harder` retry only; this Chase-2 is P4-original,
+// verified against upstream 2026-07-21. Earlier comment claiming a gri
+// "experimental soft path K=3-4" was wrong.)
 //
 // Soft distance metric: for each bit i, if the decoded codeword
 // bit differs from sign(soft_in[i]), add |soft_in[i]| to distance.
