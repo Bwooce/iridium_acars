@@ -142,6 +142,35 @@ order:
 
 ---
 
+## (c0) VERIFY + LIKELY CODE CHANGE — worker burst-window cap vs long VDL2 frames
+
+This is not a passive risk; it is an **action item that will probably require a code
+change at V4** — do not let it get lost in the risk table below.
+
+**What:** the worker's per-burst sample window (`WB_MAX_BURST_SAMPLES` in the
+worker/ingest path — the ~250 ms cap sized for Iridium's short bursts) is *upstream*
+of the demod and is **NOT** the same thing as `FRAME_QUEUE_MAX_BITS` (which was already
+grown to hold a decoded VDL2 frame's bits). VDL2's **maximum I-frame is ~0.54 s** — more
+than 2× that window. A long VDL2 transmission's IQ can therefore be **truncated before
+the demod ever sees the whole frame**, so the demod decodes a partial frame and it fails
+downstream (PHY/RS/AVLC), silently, for long frames only.
+
+**Why it wasn't fixed now:** the golden capture's frames may not have exercised the long
+tail, and sizing the window correctly needs the **real VDL2 frame-length distribution** —
+which needs a live wideband capture. Guessing the window size blind risks over-allocating
+the (shared, per-burst) sample buffer for both bands.
+
+**Verify at V4:** measure the live frame-length distribution (dumpvdl2 prints frame
+sizes; on our side, watch whether `phy_ok`/`avlc_ok` systematically drop for the longest
+transmissions while short frames decode fine). If a meaningful fraction of real frames
+exceed the ~250 ms window → confirmed.
+
+**Likely fix:** make the burst-sample window **band-dependent** — grow it for `band=vdl2`
+to hold ~0.54 s at the VDL2 detect sample rate (and check the RAM cost of the larger
+per-burst extract buffer, which is the reason it isn't just globally enlarged). Possibly
+multi-window frame assembly if a single grow is too costly. This is real code, not a
+`#define` tune — scope it once the distribution is measured.
+
 ## (c) Risk list
 
 | Risk | Symptom | Mitigation |
