@@ -89,6 +89,12 @@ idf_component_register(
         # pipeline; replaces the P1.5a UW/CFO fast-pass. Depends on
         # fft_sc16_2048 (one 2048-pt FFT for the channel-SNR gate).
         "burst_prefilter.c"
+        # VHF/VDL2 foundation: Iridium's implementation of the generic
+        # band_pipeline_t interface (common/band_pipeline/). Thin
+        # type-mapping adapter over burst_prefilter + burst_pipeline;
+        # bit-identity vs the direct calls pinned by
+        # tests/host/test_band_pipeline_iridium.c.
+        "iridium_band_pipeline.c"
         # Phase 3.6.M wideband-tagger path. All portable C — same
         # source compiles for host unit tests and P4 firmware.
         # fft_sc16_2048 internals are scalar Q15; esp-dsp's
@@ -129,7 +135,10 @@ idf_component_register(
     # here (rather than directly by p4-usb-host/main) so that any board
     # depending on iridium_decoder transitively gets the upstream ACARS
     # decoder for free.
-    REQUIRES libacars_idf
+    # band_pipeline: the generic per-band demod interface that
+    # iridium_band_pipeline.c implements (dependency points from the
+    # concrete band to the generic layer, never the reverse).
+    REQUIRES libacars_idf band_pipeline
     # frame_queue uses heap_caps_calloc with MALLOC_CAP_SPIRAM.
     # direct_if_decim on target uses dsps_fird_s16_arp4.
     PRIV_REQUIRES esp_mm espressif__esp-dsp

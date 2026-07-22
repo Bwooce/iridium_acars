@@ -4,6 +4,7 @@
 
 #include "app_config.h"
 #include "dsp_processor.h" // FS_IN_HZ, IRIDIUM_CENTER_FREQ_HZ defaults
+#include "band_profile.h"  // per-band default LO (VHF/VDL2 foundation)
 
 #include <stdio.h> // vprintf (uart_log_apply restore path)
 #include <string.h>
@@ -20,7 +21,12 @@ static const char *NVS_NS = "iridium";
 // Default values. Conservative for development (TUNER_AGC, no
 // bias-tee). Production deployments override via the C6 web UI
 // (D17) once that lands.
+#define DEFAULT_BAND ((uint8_t)BAND_IRIDIUM) // band soft-switch: iridium unless NVS says otherwise
 #define DEFAULT_LO_FREQ_HZ IRIDIUM_CENTER_FREQ_HZ
+// The Iridium band profile's default LO must equal the historical
+// compile-time default — proof that band=iridium changes nothing.
+_Static_assert(BAND_IRIDIUM_LO_HZ == IRIDIUM_CENTER_FREQ_HZ,
+               "iridium band profile LO must match IRIDIUM_CENTER_FREQ_HZ");
 #define DEFAULT_SAMPLE_RATE_HZ FS_IN_HZ
 #define DEFAULT_GAIN_MODE GAIN_MODE_TUNER_AGC
 #define DEFAULT_GAIN_DB_X10 350 // 35.0 dB (rec'd for live)
@@ -132,6 +138,7 @@ esp_err_t app_config_init(void)
 
     // Apply defaults FIRST so the struct is well-defined even if
     // NVS init fails completely.
+    s_cfg.band                     = DEFAULT_BAND;
     s_cfg.lo_freq_hz               = DEFAULT_LO_FREQ_HZ;
     s_cfg.sample_rate_hz           = DEFAULT_SAMPLE_RATE_HZ;
     s_cfg.gain_mode                = DEFAULT_GAIN_MODE;
@@ -191,7 +198,18 @@ esp_err_t app_config_init(void)
     uint8_t be = (uint8_t)DEFAULT_BEST_EFFORT_DECODE;
     uint8_t ul = (uint8_t)DEFAULT_UART_LOG_MODE;
     uint8_t c2 = (uint8_t)DEFAULT_CHASE2_DECODE;
-    nvs_get_u32_or(h, "lo_hz", &s_cfg.lo_freq_hz, DEFAULT_LO_FREQ_HZ);
+    // Band first: when lo_hz was never explicitly set, its default comes
+    // from the selected band's profile (iridium's profile default ==
+    // DEFAULT_LO_FREQ_HZ, statically asserted above, so band=iridium is
+    // byte-identical to the pre-band behaviour). An NVS-stored lo_hz
+    // always wins — switching band does not clobber an operator's park.
+    nvs_get_u8_or(h, "band", &s_cfg.band, DEFAULT_BAND);
+    if (s_cfg.band >= (uint8_t)BAND_COUNT) {
+        ESP_LOGW(TAG, "NVS band=%u out of range; using iridium", s_cfg.band);
+        s_cfg.band = (uint8_t)BAND_IRIDIUM;
+    }
+    nvs_get_u32_or(h, "lo_hz", &s_cfg.lo_freq_hz,
+                   band_profile_get((band_id_t)s_cfg.band)->default_lo_hz);
     nvs_get_u32_or(h, "rate_hz", &s_cfg.sample_rate_hz, DEFAULT_SAMPLE_RATE_HZ);
     nvs_get_u8_or(h, "gain_mode", &gm, (uint8_t)DEFAULT_GAIN_MODE);
     nvs_get_i16_or(h, "gain_dbx10", &s_cfg.gain_db_x10, DEFAULT_GAIN_DB_X10);
@@ -341,6 +359,16 @@ static esp_err_t commit_one_str(const char *k, const char *v)
     }
 
 SET_FIELD_NUM(app_config_set_lo_freq_hz, lo_freq_hz, uint32_t, "lo_hz", commit_one_u32)
+
+esp_err_t app_config_set_band(uint8_t v)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    if (v >= (uint8_t)BAND_COUNT) v = (uint8_t)BAND_IRIDIUM; // same clamp as init()
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.band = v;
+    xSemaphoreGive(s_cfg_mu);
+    return commit_one_u8("band", v);
+}
 SET_FIELD_NUM(app_config_set_sample_rate_hz, sample_rate_hz, uint32_t, "rate_hz", commit_one_u32)
 SET_FIELD_NUM(app_config_set_gain_db_x10, gain_db_x10, int16_t, "gain_dbx10", commit_one_i16)
 SET_FIELD_NUM(app_config_set_tagger_threshold_db, tagger_threshold_db, float, "tag_thr", commit_one_f32)
@@ -517,7 +545,9 @@ void app_config_log(void)
     static const char *MODES[] = {"TUNER_AGC", "MANUAL", "SOFTWARE_AGC"};
     int                mi      = (int)c.gain_mode;
     if (mi < 0 || mi > 2) mi = 0;
-    ESP_LOGI(TAG, "lo=%u Hz  rate=%u Hz", (unsigned)c.lo_freq_hz, (unsigned)c.sample_rate_hz);
+    ESP_LOGI(TAG, "band=%s (%u)  lo=%u Hz  rate=%u Hz",
+             band_profile_get((band_id_t)c.band)->name, (unsigned)c.band,
+             (unsigned)c.lo_freq_hz, (unsigned)c.sample_rate_hz);
     ESP_LOGI(TAG, "gain mode=%s  manual=%.1f dB  bias_tee=%d",
              MODES[mi], c.gain_db_x10 / 10.0f, c.bias_tee);
     ESP_LOGI(TAG, "tagger threshold=%.1f dB  station_id='%s'",

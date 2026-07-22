@@ -9,11 +9,16 @@ set(_app_srcs
     "frame_pdu.c" "aggregator_ingest.c" "frame_link.c"
     "scanner.c" "scanner_map.c" "autotune.c" "autotune_sched.c"
     "band_health.c" "panic_capture.c" "decode_survey.c"
+    # VHF/VDL2 foundation: NVS band id -> concrete band_pipeline_t.
+    "band_select.c"
 )
 set(_app_reqs
     usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash
     esp_wifi esp_netif esp_event esp_http_server esp_app_format
     esp_https_ota app_update lwip iridium_decoder
+    # VHF/VDL2 foundation: generic band interface + the VDL2 stub
+    # pipeline (band_select.c references both concrete bands).
+    band_pipeline vdl2_decoder
     # SDMMC + FATFS always declared so idf_component_register sees them
     # on first-pass CMake evaluation (CONFIG_* isn't readable until pass
     # two, but PRIV_REQUIRES is consumed on pass one). The runtime cost

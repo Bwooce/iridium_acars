@@ -616,6 +616,65 @@ target_include_directories(test_burst_prefilter PRIVATE
 target_link_libraries(test_burst_prefilter PRIVATE m)
 add_test(NAME burst_prefilter COMMAND test_burst_prefilter)
 
+# VHF/VDL2 foundation: band-profile table (common/band_pipeline/).
+# Pure scaffolding — pinned hard: the iridium profile must equal the
+# historical dsp_processor constants (bit-identity of the band=iridium
+# default), plus from_str parsing and VDL2 window-placement sanity.
+# -Werror per the scaffolding test policy (scoped to the new pure code
+# so it can't trip pre-existing warnings elsewhere in the suite).
+set(BAND_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/band_pipeline)
+set(VDL2_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/vdl2_decoder)
+add_executable(test_band_profile
+    test_band_profile.c
+    ${BAND_DIR}/band_profile.c
+)
+target_include_directories(test_band_profile PRIVATE ${BAND_DIR})
+target_compile_options(test_band_profile PRIVATE -Werror)
+add_test(NAME band_profile COMMAND test_band_profile)
+
+# VHF/VDL2 foundation: bit-identity gate for the band_pipeline
+# abstraction. Runs the ALBQ fixture through BOTH the legacy direct
+# calls (burst_prefilter + burst_pipeline_process_burst) and the
+# iridium_band_pipeline adapter the worker now dispatches through, and
+# asserts identical verdicts/frames byte-for-byte. THE regression gate
+# for the worker_core1 band dispatch change.
+add_executable(test_band_pipeline_iridium
+    test_band_pipeline_iridium.c
+    ${BAND_DIR}/band_profile.c
+    ${COMMON_DIR}/iridium_band_pipeline.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/resample_256_to_250.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${COMMON_DIR}/burst_pipeline.c
+    ${COMMON_DIR}/burst_prefilter.c
+    ${COMMON_DIR}/uw_correlator.c
+    ${COMMON_DIR}/uw_correlator_tables.c
+    ${COMMON_DIR}/qpsk_demod.c
+    ${COMMON_DIR}/sym_timing.c
+)
+target_include_directories(test_band_pipeline_iridium PRIVATE
+    ${BAND_DIR}
+    ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}                   # esp_log.h stub
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures
+)
+target_link_libraries(test_band_pipeline_iridium PRIVATE m)
+add_test(NAME band_pipeline_iridium COMMAND test_band_pipeline_iridium)
+
+# VDL2 stub pipeline: interface-conformance smoke (accept-all prefilter,
+# zero frames, burst counter). Keeps the stub honest until the real
+# demod lands. Same -Werror policy as test_band_profile (all-new code).
+add_executable(test_vdl2_pipeline_stub
+    test_vdl2_pipeline_stub.c
+    ${VDL2_DIR}/vdl2_pipeline.c
+)
+target_include_directories(test_vdl2_pipeline_stub PRIVATE ${BAND_DIR} ${VDL2_DIR})
+target_compile_options(test_vdl2_pipeline_stub PRIVATE -Werror)
+add_test(NAME vdl2_pipeline_stub COMMAND test_vdl2_pipeline_stub)
+
 # Drift + AWGN parameter-sweep regression (#121). Same wideband pipeline
 # as test_pipeline_wideband_resampled, but each cell applies a synthetic
 # LO drift (±5/10/15 kHz) and added AWGN (sigma 0..400 int16 LSB), then
@@ -1534,3 +1593,18 @@ add_executable(test_crc16_ccitt
 )
 target_include_directories(test_crc16_ccitt PRIVATE ${COMMON_DIR})
 add_test(NAME crc16_ccitt COMMAND test_crc16_ccitt)
+
+# test_rs_vdl2 (2026-07-22): VDL Mode 2 RS(255,249) codec (common/vdl2/).
+# Encode/decode round trips at 0..3 errors, >t detection behaviour, shortened-
+# block erasure decode, and cross-validation fixtures from an independent
+# GF(2^8)/0x187/fcr=120 reference (params confirmed against dumpvdl2's
+# init_rs_char call). Pure C, no IDF deps — built with -Werror.
+add_executable(test_rs_vdl2
+    test_rs_vdl2.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/vdl2/rs_vdl2.c
+)
+target_include_directories(test_rs_vdl2 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/vdl2
+)
+target_compile_options(test_rs_vdl2 PRIVATE -Werror)
+add_test(NAME rs_vdl2 COMMAND test_rs_vdl2)

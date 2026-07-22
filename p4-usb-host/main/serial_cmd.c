@@ -1,5 +1,6 @@
 #include "serial_cmd.h"
 #include "app_config.h"
+#include "band_profile.h" // band soft-switch name<->id mapping
 #include "dsp_processor.h"
 #include "scanner.h"
 #include "decode_survey.h" // `dsurvey` — decode-based band-finder
@@ -45,6 +46,9 @@ static void cmd_config(void)
     snprintf(buf, sizeof(buf), "iot_log_host=%s\r\n", c.iot_log_host);
     uart_puts(buf);
     snprintf(buf, sizeof(buf), "station_id=%s\r\n", c.station_id);
+    uart_puts(buf);
+    snprintf(buf, sizeof(buf), "band=%s (%u)\r\n",
+             band_profile_get((band_id_t)c.band)->name, (unsigned)c.band);
     uart_puts(buf);
     snprintf(buf, sizeof(buf), "lo_hz=%lu\r\n", (unsigned long)c.lo_freq_hz);
     uart_puts(buf);
@@ -100,6 +104,9 @@ static void cmd_get(const char *key)
         snprintf(buf, sizeof(buf), "%s\r\n", c.iot_log_host);
     else if (strcmp(key, "station_id") == 0)
         snprintf(buf, sizeof(buf), "%s\r\n", c.station_id);
+    else if (strcmp(key, "band") == 0)
+        snprintf(buf, sizeof(buf), "%s (%u)\r\n",
+                 band_profile_get((band_id_t)c.band)->name, (unsigned)c.band);
     else if (strcmp(key, "lo_hz") == 0)
         snprintf(buf, sizeof(buf), "%lu\r\n", (unsigned long)c.lo_freq_hz);
     else if (strcmp(key, "rate_hz") == 0)
@@ -169,6 +176,11 @@ static void cmd_set(const char *key, const char *val)
         rc = app_config_set_iot_log_host(val);
     else if (strcmp(key, "station_id") == 0)
         rc = app_config_set_station_id(val);
+    else if (strcmp(key, "band") == 0)
+        // Accepts the profile name ("iridium"/"vdl2"); unknown tokens map
+        // to iridium (band_profile_from_str). Reboot to apply — the band
+        // profile + pipeline are resolved once at init.
+        rc = app_config_set_band((uint8_t)band_profile_from_str(val));
     else if (strcmp(key, "lo_hz") == 0)
         rc = app_config_set_lo_freq_hz((uint32_t)atol(val));
     else if (strcmp(key, "rate_hz") == 0)

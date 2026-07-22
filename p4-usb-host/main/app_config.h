@@ -45,6 +45,16 @@ typedef enum {
 #define UART_LOG_MODE_AUTO 2u // effective_on = !network_up (default)
 
 typedef struct {
+    // Receive-band soft-switch (VHF/VDL2 foundation). Value is a
+    // band_id_t (common/band_pipeline/band_profile.h): 0 = iridium
+    // (default), 1 = vdl2. Kept as u8 here so this header stays
+    // decoupled from the band component; out-of-range NVS bytes are
+    // clamped to iridium at load. Selects the band profile (tagger
+    // window/threshold defaults, default LO when lo_hz is unset) and
+    // the worker's band_pipeline at boot — reboot to apply. An
+    // explicitly-set lo_hz always wins over the band's default LO.
+    // NVS key "band".
+    uint8_t     band;
     uint32_t    lo_freq_hz;     // RTL-SDR tuner LO frequency
     uint32_t    sample_rate_hz; // RTL-SDR sample rate
     gain_mode_t gain_mode;
@@ -179,6 +189,11 @@ void                app_config_unlock(void);
 // Returns ESP_OK on NVS success; the in-memory struct is updated
 // regardless so subsequent reads see the new value even if NVS
 // commit fails.
+// v is a band_id_t value; out-of-range clamps to 0 (iridium), same as
+// the load-time guard. Takes effect on next boot (profile + pipeline
+// are resolved once at create/init time).
+esp_err_t app_config_set_band(uint8_t v);
+
 esp_err_t app_config_set_lo_freq_hz(uint32_t hz);
 esp_err_t app_config_set_sample_rate_hz(uint32_t hz);
 esp_err_t app_config_set_gain_mode(gain_mode_t mode);

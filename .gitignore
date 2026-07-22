@@ -34,3 +34,4 @@ tests/host/build_*/
 tests/scripts/__pycache__/
 build_host/
 tests/host/build-mac/
+tests/host/build-dbg/

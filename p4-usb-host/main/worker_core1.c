@@ -34,8 +34,10 @@
 #include "qpsk_demod.h"
 #include "uw_correlator.h"
 #include "sd_capture.h"
-#include "burst_pipeline.h"
-#include "burst_prefilter.h"
+#include "band_pipeline.h" // per-band demod dispatch (VHF/VDL2 foundation)
+#include "band_select.h"
+#include "app_config.h"    // NVS band -> pipeline resolution at init
+#include "burst_pipeline.h" // TRIAGE_EXT_RAW derivation (BURST_PIPELINE_TRIAGE_LEN_250K)
 #include "direct_if_decim.h"
 #include "rotate_to_dc.h"
 #include "bch_decoder.h"
@@ -51,6 +53,14 @@
 #endif
 
 static const char *TAG = "WORKER1";
+
+// Per-band burst pipeline (VHF/VDL2 foundation). Resolved ONCE in
+// worker_core1_init from the NVS band soft-switch; band=iridium (the
+// default) selects iridium_band_pipeline, a zero-processing adapter
+// over the exact burst_prefilter + burst_pipeline_process_burst calls
+// this file used to make directly (bit-identity pinned by
+// tests/host/test_band_pipeline_iridium.c). Never NULL after init.
+static const band_pipeline_t *s_band_pipeline = NULL;
 
 // SNR priority queue (T59). The worker can only fully-decode ~13 bursts/s
 // (~76 ms each, dominated by the demod pipeline); the tagger, at the
@@ -837,34 +847,37 @@ typedef struct {
     uint64_t                t_bch_accum; // accumulated BCH+log+queue time
 } wb_worker_ctx_t;
 
-static void worker_emit_frame(burst_pipeline_result_t *bres, void *ctx)
+// This is the IRIDIUM frame sink: BCH + classify + frame_decoder/PDU
+// hand-off — Iridium's L2 front porch. It now receives the generic
+// band_frame_t (the per-frame D13/UW diagnostic LOGD moved into
+// iridium_band_pipeline.c's shim, next to the Iridium result type).
+// The VDL2 stub pipeline emits no frames, so this sink is Iridium-only
+// today; the VDL2 build adds its own emit path per the implementation
+// plan (frames arrive there already RS-corrected + AVLC-validated).
+static void worker_emit_frame(band_frame_t *bframe, void *ctx)
 {
     wb_worker_ctx_t *wctx   = (wb_worker_ctx_t *)ctx;
     int64_t          t_bch0 = esp_timer_get_time();
 
-    // Verbose D13/UW info -- one line per FRAME now (with multi-frame
-    // this fires multiple times per burst). Demoted to ESP_LOGD; the
-    // BCH outcome below stays at ESP_LOGI as the per-frame outcome
-    // marker.
-    ESP_LOGD(TAG, "D13 start=%d  UW dir=%s off=%d corr=%.3f SNR=%.1f omega=%.3f",
-             bres->burst_start,
-             bres->uw_res.direction == UW_DIR_DOWNLINK ? "DL" : bres->uw_res.direction == UW_DIR_UPLINK ? "UL"
-                                                                                                        : "??",
-             bres->uw_res.uw_offset,
-             (double)bres->uw_res.correction,
-             (double)bres->uw_res.snr_estimate_db,
-             (double)bres->uw_res.omega_per_sym);
-
-    if (!bres->demod_ok) {
+    if (!bframe->demod_ok) {
         // Failed sub-frames still fire the callback for diagnostic
         // logging; just free the bits and return.
-        free(bres->frame.bits);
-        free(bres->frame.soft_bits); // #112
+        free(bframe->bits);
+        free(bframe->soft_bits); // #112
         wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);
         return;
     }
 
-    decoded_frame_t frame = bres->frame;
+    // Same field set the old burst_pipeline_result_t.frame carried;
+    // the adapter guarantees identical values/ownership.
+    decoded_frame_t frame = {
+        .bits      = bframe->bits,
+        .soft_bits = bframe->soft_bits,
+        .n_bits    = bframe->n_bits,
+        .direction = (ir_direction_t)bframe->direction,
+        .snr_db    = bframe->snr_db,
+        .timestamp = 0,
+    };
     ESP_LOGI(TAG, "DEMOD SUCCESS: %s frame (%d bits) snr=%.1f dB width=%u bins",
              frame.direction == DIR_DOWNLINK ? "DL" : "UL",
              frame.n_bits, (double)wctx->burst->peak_snr_db,
@@ -1224,11 +1237,20 @@ void worker_task(void *arg)
             //    the pipeline below still sees the raw decimated window.
             //    Rejection wall time flows through the existing triage
             //    capacity counters (s_bursts_triage_rejected / s_t_triage_*).
+            //    Dispatched via the band pipeline (VHF/VDL2 foundation):
+            //    for band=iridium this is exactly burst_prefilter()
+            //    (iridium_band_pipeline.c is a type-mapping shim only).
             int64_t                  t_pf0 = esp_timer_get_time();
-            burst_prefilter_result_t pf;
-            bool                     pf_accept =
-                burst_prefilter(s_decim_buf, n_250k,
-                                (int)BURST_WIDTH_BINS(&burst), &pf);
+            band_prefilter_verdict_t pf;
+            bool                     pf_accept;
+            if (s_band_pipeline->prefilter) {
+                pf_accept = s_band_pipeline->prefilter(s_decim_buf, n_250k,
+                                                       (int)BURST_WIDTH_BINS(&burst), &pf);
+            } else {
+                pf = (band_prefilter_verdict_t){
+                    .accept = true, .width_ok = true, .dur_ok = true, .snr_ok = true};
+                pf_accept = true;
+            }
             int64_t t_pf1 = esp_timer_get_time();
             if (!pf_accept) {
                 // A burst on a channel with an OPEN IDA chain is a candidate 0x7608
@@ -1279,7 +1301,7 @@ void worker_task(void *arg)
                 .burst       = &burst,
                 .t_bch_accum = 0,
             };
-            int n_frames = burst_pipeline_process_burst(
+            int n_frames = s_band_pipeline->process_burst(
                 s_decim_buf, n_250k,
                 worker_emit_frame, &worker_ctx);
             int64_t t_pipe1 = esp_timer_get_time();
@@ -1332,6 +1354,16 @@ void worker_core1_prealloc_fir(void)
 
 esp_err_t worker_core1_init(void)
 {
+    // Resolve the per-band pipeline from the NVS band soft-switch
+    // (VHF/VDL2 foundation). app_config_init has already run (app_main
+    // order); a zeroed snapshot still yields band=0 = iridium, and
+    // band_select_pipeline clamps out-of-range ids, so this can never
+    // leave s_band_pipeline NULL.
+    app_config_t cfg = {0}; // {0}: snapshot is a no-op pre-app_config_init; band 0 = iridium
+    app_config_snapshot(&cfg);
+    s_band_pipeline = band_select_pipeline((band_id_t)cfg.band);
+    ESP_LOGI(TAG, "band pipeline: %s", s_band_pipeline->name);
+
     hot_bin_table_init(&s_hot); // A6: entries empty, boost enabled (default ON)
     // Burst queue depth 1024, storage in PSRAM. Each detected_burst_t
     // is 28 bytes, so 1024 entries cost ~28 KB of PSRAM (trivial out

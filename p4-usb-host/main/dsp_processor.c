@@ -27,6 +27,7 @@
 #include "fft_burst_tagger.h"
 #include "worker_core1.h"
 #include "app_config.h"
+#include "band_profile.h" // per-band tagger parameters (VHF/VDL2 foundation)
 
 static const char *TAG = "DSP_PROC";
 
@@ -65,11 +66,35 @@ static const char *TAG = "DSP_PROC";
 #define FBT_NEW_BUF_SIZE 16
 #define FBT_GONE_BUF_SIZE 16
 
+// VHF/VDL2 foundation: the constants above are now the IRIDIUM band
+// profile's values (band_profile.c); dsp_processor_create pulls them
+// from the profile selected by the NVS band switch. These asserts are
+// the compile-time proof that band=iridium (the default) configures the
+// tagger bit-identically to the historical hard-coded path.
+_Static_assert(BAND_IRIDIUM_FBT_PRE_LEN == FBT_BURST_PRE_LEN,
+               "iridium band profile pre-pad must match FBT_BURST_PRE_LEN");
+_Static_assert(BAND_IRIDIUM_FBT_POST_LEN == FBT_BURST_POST_LEN,
+               "iridium band profile post-pad must match FBT_BURST_POST_LEN");
+_Static_assert(BAND_IRIDIUM_FBT_WIDTH_BINS == FBT_BURST_WIDTH,
+               "iridium band profile burst width must match FBT_BURST_WIDTH");
+_Static_assert(BAND_IRIDIUM_FS_HZ == FS_DETECT_HZ,
+               "iridium band profile fs must match FS_DETECT_HZ");
+// (The float FBT_THRESHOLD_DB == BAND_IRIDIUM_TAG_THR_DB identity can't
+// be a _Static_assert — not an integer constant expression; it is pinned
+// by tests/host/test_band_profile.c instead.)
+
 // Detector instance. Formerly a bag of file-scope statics (#120).
 struct dsp_processor {
     fft_burst_tagger_t *tagger;
     int32_t            *baseline_history; // PSRAM, 4 MB
     burst_detected_cb_t user_cb;
+
+    // Detect-path sample rate from the selected band profile. Both
+    // current bands run 2.5 MSPS (== FS_DETECT_HZ, statically asserted
+    // for iridium above), so today this only feeds the bin→Hz mapping
+    // and the create log; a future band at a different rate changes it
+    // here without touching the callers.
+    uint32_t fs_hz;
 
     // Accumulator for chunks smaller than FBT_FFT_SIZE complex samples.
     // dsp_processor_feed receives variable-length buffers from class_driver
@@ -138,7 +163,7 @@ static void dispatch_gone_burst(dsp_processor_t *p, const fbt_burst_t *b)
     if (!p->user_cb) return;
 
     int   signed_bin  = b->center_bin - FBT_FFT_SIZE / 2;
-    float rel_freq_hz = (float)signed_bin * (float)FS_DETECT_HZ / (float)FBT_FFT_SIZE;
+    float rel_freq_hz = (float)signed_bin * (float)p->fs_hz / (float)FBT_FFT_SIZE;
 
     // length = stop - start, variable per burst. Clamp at uint32 max
     // to be safe; the worker further clamps to WB_EXTRACT_MAX.
@@ -278,11 +303,16 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     // compile-time default if app_config wasn't initialised.
     app_config_t cfg;
     app_config_snapshot(&cfg);
-    float thr = cfg.tagger_threshold_db;
-    if (thr <= 0.0f || thr > 30.0f) thr = FBT_THRESHOLD_DB; // sanity
+    // Band profile (VHF/VDL2 foundation): tagger window/threshold
+    // parameters come from the selected band. For band=iridium (the
+    // default) every value equals the historical constants (see the
+    // _Static_asserts above) — bit-identical behaviour.
+    const band_profile_t *bp  = band_profile_get((band_id_t)cfg.band);
+    float                 thr = cfg.tagger_threshold_db;
+    if (thr <= 0.0f || thr > 30.0f) thr = bp->tagger_threshold_db; // sanity
     ESP_LOGI(TAG,
-             "Creating wideband fft_burst_tagger (N=%d, fs=%u Hz, thr=%.1f dB, coal_n=%u)",
-             FBT_FFT_SIZE, (unsigned)FS_DETECT_HZ, (double)thr,
+             "Creating wideband fft_burst_tagger (band=%s, N=%d, fs=%u Hz, thr=%.1f dB, coal_n=%u)",
+             bp->name, FBT_FFT_SIZE, (unsigned)bp->detect_fs_hz, (double)thr,
              (unsigned)cfg.coalesce_min_bursts);
 
     // 4 MB baseline_history in PSRAM. Internal SRAM doesn't have room
@@ -299,8 +329,8 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     // tagger's size when the budget is tight (seen in the smoke build:
     // largest 73728 -> 65536 < 66672 -> create failed). Biggest-first
     // avoids the fragmentation; the handle fits any smaller fragment.
-    fft_burst_tagger_t *tagger = fft_burst_tagger_init(FBT_BURST_PRE_LEN, FBT_BURST_POST_LEN,
-                                                       FBT_BURST_WIDTH, thr,
+    fft_burst_tagger_t *tagger = fft_burst_tagger_init(bp->fbt_pre_len, bp->fbt_post_len,
+                                                       bp->fbt_width_bins, thr,
                                                        baseline_history);
     if (!tagger) {
         ESP_LOGE(TAG, "fft_burst_tagger_init failed");
@@ -324,6 +354,7 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     p->user_cb          = cb;
     p->baseline_history = baseline_history;
     p->tagger           = tagger;
+    p->fs_hz            = bp->detect_fs_hz;
     p->coalesce_min     = cfg.coalesce_min_bursts; // 0/1 = off (default)
 
     fft_burst_tagger_set_start(p->tagger, 0);
