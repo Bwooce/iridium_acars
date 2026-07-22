@@ -16,9 +16,15 @@ any cheap VHF airband whip). Two protocols share that antenna:
 - **VHF POA** ("Plain Old ACARS", ~129–137 MHz, AM-MSK 2400 bps) — **lowest effort
   of any band** (no FEC), moderate/declining value, but 131.550 is worldwide.
 
-Recommended order: **POA first** (cheap, forces the multi-band architecture into
-existence), **then VDL2** on the abstractions POA created (they share antenna,
-band-profile mechanism, and tagger parameterisation, so POA is a down-payment).
+**Recommended order (revised 2026-07-22 for a SYDNEY deployment): VDL2 first; skip
+POA.** The original "POA-first as a cheap architecture-forcing step" was reversed on
+Sydney-specific grounds (see the Sydney section below): POA carries only a *trickle*
+here (one live channel, 131.550, minority link behind VDL2), a working MSK demod
+de-risks *none* of VDL2's hard parts, and the shared scaffolding (antenna, band
+profile, tagger parameterisation) is paid either way — so POA-first would build a
+throwaway demod to defer the band that actually carries Sydney's traffic. Build
+**VDL2 (136.975 MHz, D8PSK)** directly; keep POA as a cheap optional bolt-on
+(a 131.55 MSK profile) once the scaffolding exists, off the critical path.
 
 ## Why this is easy on this hardware
 
@@ -144,13 +150,44 @@ Certus cryptographically closed; VDL 3/4 and LDACS dead/not-deployed; Inmarsat
 C-band feeder is out of tuner range (>1766 MHz). VHF POA + VDL2 + Iridium (have) +
 Inmarsat Aero (optional) are the live, receivable set on this hardware.
 
+## Sydney deployment — why VDL2 first, skip POA (revised 2026-07-22)
+
+This receiver is in suburban Sydney (near YSSY). The Australian VHF datalink reality
+changes the ordering:
+
+- **POA is a trickle here.** The one live POA channel over Australia is **131.550 MHz**
+  (SITA Asia/Pacific primary — the US 130.x and Japan's 131.45 aren't used regionally),
+  so Sydney offers ~one POA channel, not the 4–5-channel spread of North America. And
+  Sydney's fleets (Qantas/Jetstar/Virgin 737/A320/A330/787) are VDL2-default, using POA
+  only as opportunistic fallback; the POA-leaning airframes (older/regional/GA) are a
+  small slice over a major hub. Expect real but minority POA on 131.55 — **order-of-
+  magnitude fewer frames than VDL2** on 136.975. (Directional estimate from allocations
+  + fleet equipage, not measured live counts, but VDL2 ≫ POA here is not close.)
+- **VDL2 is where Sydney's traffic is** — 136.975 (worldwide VDL2 Common Signalling
+  Channel) is active, SITA/ARINC run mature VDL2 ground infrastructure at the AU capitals,
+  and Airservices' continental CPDLC runs over ATN/VDL2.
+- **POA-first buys almost nothing here.** The shared scaffolding (antenna, band-profile
+  config, tagger parameterisation) is paid either way; the *uniquely* POA code (MSK demod
+  + character framing) de-risks *none* of VDL2's hard parts (D8PSK carrier/timing recovery,
+  training-sequence sync, RS(255,249), AVLC/HDLC bit-stuffing). And the end-to-end
+  plumbing smoke (tagger→demod→libacars→push) comes for free inside a stage-wise VDL2
+  build cross-validated against dumpvdl2 — no throwaway protocol needed.
+
 ## Recommendation
 
-Do **POA → VDL2** on the same firmware via an NVS band profile. POA is the cheap
-architecture-forcing exercise; VDL2 is the traffic payoff and reuses POA's antenna
-+ band-profile + tagger parameterisation. Reassess Inmarsat Aero (see its doc) once
-VHF ships and an L-band patch + 1542 MHz SAW are in the BOM. Leave HFDL until the
-dongle changes.
+**Build VDL2 (136.975 MHz, D8PSK) directly on the same firmware via an NVS band profile;
+skip POA on the critical path.** Keep POA as a cheap optional bolt-on later (a 131.55 MHz
+MSK profile) once the antenna + band-profile scaffolding exist — it's a small self-
+contained add if the last slice of older-airframe traffic is ever wanted. Cross-validate
+every VDL2 DSP stage against dumpvdl2 (same author as the already-vendored libacars),
+matching the repo's gr-iridium-style discipline. Reassess Inmarsat Aero (see its doc) once
+VHF ships and an L-band patch + 1542 MHz SAW are in the BOM. Leave HFDL until the dongle
+changes.
+
+(Historical note: the TL;DR/§ earlier in the *first* draft of this doc recommended
+"POA first as a cheap architecture-forcing step" — that generic ordering was reversed
+for Sydney per the section above; POA-first only makes sense at a POA-heavy /
+VDL2-under-served site, which Sydney is not.)
 
 ## References
 
