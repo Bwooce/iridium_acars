@@ -42,17 +42,29 @@ static inline float scanner_pos_ranked_rate(const scanner_pos_t *p)
     return r;
 }
 
-int scanner_rank_hottest(const scanner_pos_t *pos, int n)
+static int rank_by(const scanner_pos_t *pos, int n, bool ira_penalty)
 {
     if (!pos || n <= 0) return -1;
     int   best      = 0;
-    float best_rate = scanner_pos_ranked_rate(&pos[0]);
+    float best_rate = ira_penalty ? scanner_pos_ranked_rate(&pos[0])
+                                   : scanner_pos_narrowband_rate(&pos[0]);
     for (int i = 1; i < n; i++) {
-        float r = scanner_pos_ranked_rate(&pos[i]);
+        float r = ira_penalty ? scanner_pos_ranked_rate(&pos[i])
+                              : scanner_pos_narrowband_rate(&pos[i]);
         if (r > best_rate) {
             best_rate = r;
             best      = i;
         }
     }
     return best;
+}
+
+int scanner_rank_hottest(const scanner_pos_t *pos, int n)
+{
+    return rank_by(pos, n, /*ira_penalty=*/true);
+}
+
+int scanner_rank_hottest_raw(const scanner_pos_t *pos, int n)
+{
+    return rank_by(pos, n, /*ira_penalty=*/false);
 }

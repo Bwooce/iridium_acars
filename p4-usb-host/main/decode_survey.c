@@ -159,14 +159,19 @@ static int survey_build_shortlist(int k)
         return 0;
     }
 
-    // Top-K by ranked density: reuse scanner_rank_hottest (IRA-weighted), then
-    // zero the winner so the next call returns the runner-up.
+    // Top-K by RAW density (scanner_rank_hottest_raw — NOT the IRA-penalised
+    // ranker): decode arbitrates downstream, so we must not let a frequency
+    // heuristic permanently exclude an upper-IDA-tail center before Phase B
+    // measures it. An IRA-dense center that lands here costs one recoverable
+    // ~5 min visit (lw_da≈0 → eliminated). Zero the winner so the next call
+    // returns the runner-up. (The IRA penalty still guards the density-only
+    // park inside scanner_survey above — see scanner_rank_hottest_raw docs.)
     scanner_pos_t work[SCANNER_MAX_POSITIONS];
     memcpy(work, map, (size_t)nmap * sizeof(scanner_pos_t));
     uint32_t shortlist[DS_MAX_CENTERS];
     int      ns = 0;
     for (int i = 0; i < k && ns < DS_MAX_CENTERS; i++) {
-        int idx = scanner_rank_hottest(work, nmap);
+        int idx = scanner_rank_hottest_raw(work, nmap);
         if (idx < 0 || work[idx].dwell_ms == 0) break;
         shortlist[ns++]              = work[idx].center_hz;
         work[idx].narrowband_bursts  = 0;
@@ -175,7 +180,7 @@ static int survey_build_shortlist(int k)
 
     // Union in the density peak's grid neighbours (±1 step) so a real IDA
     // center adjacent to the peak isn't excluded by an unlucky pre-pass.
-    int peak = scanner_rank_hottest(map, nmap);
+    int peak = scanner_rank_hottest_raw(map, nmap);
     if (peak >= 0) {
         uint32_t pc       = map[peak].center_hz;
         uint32_t neigh[2] = {pc - SCAN_STEP_HZ, pc + SCAN_STEP_HZ};

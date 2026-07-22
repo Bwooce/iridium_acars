@@ -38,6 +38,22 @@ int main(void)
     };
     assert(scanner_rank_hottest(tie, 2) == 0);
 
+    // IRA-region penalty scoping: a dense center in the ring-alert simplex
+    // sub-band (>= SCANNER_IRA_REGION_LO_HZ) vs a less-dense IDA-band center.
+    // The PENALISED ranker (density-only paths) must prefer the IDA-band center
+    // (the IRA flood is de-prioritised so the park can't wander to 1626 MHz).
+    // The RAW ranker (decode-survey shortlist) must prefer the truly densest —
+    // decode arbitrates, so a legitimate upper-IDA-tail center must not be
+    // heuristically excluded before it is measured.
+    scanner_pos_t ira[2] = {
+        {1620500000u, 6, 10, 12.0f, 2000},           // IDA band, 3.0 nb/s
+        {SCANNER_IRA_REGION_LO_HZ, 16, 40, 8.0f, 2000}, // IRA region, 8.0 nb/s raw
+    };
+    // Penalised: 8.0 * 0.25 = 2.0 < 3.0 -> IDA-band center (index 0) wins.
+    assert(scanner_rank_hottest(ira, 2) == 0);
+    // Raw: 8.0 > 3.0 -> densest (index 1) wins, unpenalised.
+    assert(scanner_rank_hottest_raw(ira, 2) == 1);
+
     // Edge case: scanner_enumerate_centers must clamp output to max when natural count exceeds it.
     uint32_t clamp[3];
     assert(scanner_enumerate_centers(0u, 100u, 10u, clamp, 3) == 3); // natural count 11, clamped to 3

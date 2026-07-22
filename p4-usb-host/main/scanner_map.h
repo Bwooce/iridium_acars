@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 
 #define SCANNER_MAX_POSITIONS 16
 
@@ -28,6 +29,17 @@ int   scanner_enumerate_centers(uint32_t start_hz, uint32_t stop_hz,
                                 uint32_t step_hz, uint32_t *out, int max);
 float scanner_pos_narrowband_rate(const scanner_pos_t *p);
 int   scanner_rank_hottest(const scanner_pos_t *pos, int n);
+
+// Same ranking WITHOUT the IRA-region penalty (raw narrowband rate). Use this
+// only when a DECODE stage arbitrates downstream — the decode-based band survey
+// (decode_survey.c) shortlist. An IRA-dense center that lands on the shortlist
+// costs one recoverable ~5 min decode visit (it scores lw_da≈0 and is
+// eliminated), whereas the penalised ranker would risk PERMANENTLY excluding a
+// legitimate upper-IDA-tail center (~28% of IDA is 1622-1626 MHz) before decode
+// ever sees it. The penalised scanner_rank_hottest stays for density-only
+// decisions (POST /scan, band_health auto survey) where nothing arbitrates and
+// the IRA-wander (park drifts to the IDA-barren 1626 MHz simplex) is real.
+int   scanner_rank_hottest_raw(const scanner_pos_t *pos, int n);
 
 // Fold one sweep's measurement at a center into a running accumulator for the
 // same center: burst counts and dwell_ms sum, so scanner_pos_narrowband_rate()
