@@ -62,7 +62,14 @@ static double gauss(uint32_t *s)
 }
 
 // Raised-cosine pulse, x in symbol periods. g(0)=1, g(k)=0 for integer
-// k != 0 (ISI-free at strobes).
+// k != 0 (ISI-free at strobes). The FULL raised cosine, deliberately:
+// ICAO Annex 10 Vol III puts the whole alpha=0.6 RC at the TRANSMITTER
+// (the pulse is Nyquist on its own), so the matching receiver is a
+// flat-passband channel filter, which is exactly what the production
+// demod runs. A root/root split (RRC here + RRC in the demod) was
+// tried at V4 and REJECTED: it round-trips beautifully in synthetic
+// tests but regressed the real golden capture (RS-clean 46 -> 21) —
+// see the resampler note in vdl2_demod.c.
 static double rc_pulse(double x, double alpha)
 {
     double ax = fabs(x);

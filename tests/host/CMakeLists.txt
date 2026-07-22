@@ -1716,10 +1716,13 @@ add_test(NAME avlc COMMAND test_avlc)
 # on the real sigidwiki capture — production vdl2_demod_burst ->
 # vdl2_l2_feed (RS de-interleave/correct + AVLC) -> vendored libacars
 # (la_acars_parse_and_reassemble, the same minimum source set the IDF
-# component / test_libacars_link builds). Asserts >= 7 of the 9 dumpvdl2
+# component / test_libacars_link builds). Asserts ALL 9 dumpvdl2
 # golden ACARS messages are reproduced (reg + mode, expectations from
-# fixture_vdl2_avlc_golden.h) and >= 32 FCS-valid AVLC frames (golden
-# 40). SKIPs (exit 0) when the capture file is absent. -Werror is scoped
+# fixture_vdl2_avlc_golden.h) and >= 40 FCS-valid AVLC frames — since
+# V4 (sharp 144-tap channel filter + fractional symbol timing) the
+# chain reproduces 9/9 golden ACARS and 43 FCS-valid frames, exceeding
+# the dumpvdl2 golden's 40, so the floors sit at the full golden set.
+# SKIPs (exit 0) when the capture file is absent. -Werror is scoped
 # to the NEW sources (test + vdl2 chain) — the vendored libacars files
 # keep the same warning-silencing flags as test_libacars_link.
 add_executable(test_vdl2_e2e_acars

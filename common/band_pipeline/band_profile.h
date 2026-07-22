@@ -36,11 +36,16 @@ typedef enum {
 #define BAND_IRIDIUM_FBT_WIDTH_BINS 32         // FBT_BURST_WIDTH ≈ half a 41.667 kHz channel
 #define BAND_IRIDIUM_TAG_THR_DB 14.0f          // FBT_THRESHOLD_DB (gri-18dB parity on our scale)
 
-// --- VDL2 profile constants (PROVISIONAL) ---------------------------------
-// The VDL2 demod does not exist yet; these numbers position the shared
-// front end (tagger window + LO park) and will be validated against
-// dumpvdl2 on shared IQ captures before the demod lands (implementation
-// plan docs/2026-07-22-vdl2-implementation-plan.md §cross-validation).
+// --- VDL2 profile constants (PRINCIPLED, UNCALIBRATED) ---------------------
+// Derived from the VDL2 physical layer (ICAO Annex 10 Vol III / DO-224:
+// 25 kHz channels, D8PSK 10.5 kBd, raised-cosine α=0.6) and dumpvdl2's
+// demodulator behaviour — NOT from measurement. No wideband VHF capture
+// exists yet: the golden fixture is a single 25 kHz baseband channel,
+// not a 2.5 MSPS wideband stream, so the tagger has never actually seen
+// a VDL2 burst. Every tagger value below is a derivation awaiting live
+// calibration at V4 bring-up (docs/2026-07-22-vdl2-device-bringup.md
+// §tagger-calibration). If band=vdl2 shows 0 bursts on-device, suspect
+// THESE numbers before the demod.
 //
 // LO: all VDL2 channels sit on the 25 kHz grid in 136.650–136.975 MHz
 // (≈350 kHz span, fits ONE 2.5 MHz window). Park half-a-channel off the
@@ -55,22 +60,52 @@ typedef enum {
 // vdl2_pipeline decimates further per burst. This is what makes the
 // band switch software-only.
 #define BAND_VDL2_FS_HZ 2500000u
-// Tagger pads: pre = 2×FFT (same rationale as gri — enough lookback for
-// the training sequence + ramp-up); post = 16 ms of input samples. A
-// VDL2 burst can be much longer than an Iridium frame (up to ~hundreds
-// of ms of AVLC frames per CSMA transmission); the tagger's gone-event
-// already handles long bursts via last_active tracking, the post pad
-// only sets the trailing slack. PROVISIONAL until validated vs dumpvdl2.
-#define BAND_VDL2_FBT_PRE_LEN 4096
-#define BAND_VDL2_FBT_POST_LEN 40000
-// Burst width: gri semantics = the bin span integrated when scoring a
-// candidate channel. D8PSK 10.5 kBd with RRC α=0.6 occupies ≈16.8 kHz
-// in a 25 kHz channel; at 2.5 MSPS / 2048-pt FFT (1220.7 Hz/bin) that
-// is ≈14 bins. 16 bins ≈ 19.5 kHz covers the occupied bandwidth without
-// bleeding into the adjacent 25 kHz channel. PROVISIONAL.
-#define BAND_VDL2_FBT_WIDTH_BINS 16
-// Detection threshold: start at the Iridium-parity value; VDL2 SNR
-// statistics on the bench will move this. PROVISIONAL.
+// Pre pad (input samples before the detecting FFT step, i.e. how far
+// the recorded burst start reaches back): 3 FFT steps = 6144 samples =
+// 2.46 ms, one full VDL2 TX preamble — ramp-up (DO-224 caps transmitter
+// power stabilisation at ~1 ms) + the 16-symbol sync sequence
+// (16 / 10500 Bd = 1.52 ms). Iridium uses 2 steps (gri default) on the
+// assumption that the hard QPSK burst edge crosses threshold within
+// ≤2 FFT steps; VDL2's ramp is slow, so on a weak burst the threshold
+// crossing can land a step later — the extra step guarantees the whole
+// preamble (which vdl2_demod's sync search needs) is still inside the
+// window. Cost is 2048 extra samples per extracted burst: negligible.
+// UNCALIBRATED — verify at V4 that live bursts sync near the window
+// start, not at its edge.
+#define BAND_VDL2_FBT_PRE_LEN 6144
+// Post pad (hangover: a burst closes when no bin exceeds threshold for
+// post_len samples; the gone window ends at last_active + post_len):
+// 10000 samples = 4.0 ms ≈ 42 symbols ≈ 4.9 FFT steps. A VDL2
+// transmission is continuous D8PSK — unlike Iridium there is no
+// intra-burst frame gap to bridge, so the post pad only needs to (a)
+// ride through per-FFT-step threshold flicker on marginal bursts and
+// (b) cover the last-active quantisation at the frame tail. Iridium's
+// 16 ms (gri default) exists to hold multi-frame Iridium sequences in
+// one window; for VDL2 that would instead merge back-to-back CSMA
+// transmissions from different stations into one window and spend the
+// tagger's 90 ms force-close budget (FBT_MAX_BURST_LEN, compile-time)
+// on dead air. 4 ms closes each transmission promptly while tolerating
+// ~5 consecutive below-threshold FFT steps mid-burst. UNCALIBRATED —
+// if live bursts split mid-frame (sync count >> phy_ok with truncated
+// frames), raise this first.
+#define BAND_VDL2_FBT_POST_LEN 10000
+// Burst width: gri semantics = the occupied bandwidth of one channel,
+// in FFT bins — the span integrated by the detection statistic
+// (Iridium: 40 kHz / 1220.7 Hz = 32 bins). VDL2 D8PSK occupies
+// (1 + α) × 10.5 kBd = 1.6 × 10.5 = 16.8 kHz of its 25 kHz channel;
+// at 2.5 MSPS / 2048-pt FFT (1220.7 Hz/bin) that is 13.8 → 14 bins
+// (17.1 kHz). Wider (the previous 16-bin guess) integrates noise-only
+// bins into the detection statistic and edges toward the adjacent
+// 25 kHz channel for no signal gain. UNCALIBRATED.
+#define BAND_VDL2_FBT_WIDTH_BINS 14
+// Detection threshold: keep the Iridium operating point. The threshold
+// is relative to the per-bin EMA noise floor, so its meaning is
+// band-independent, and 14 dB (our ENBW scale ≈ gri 16.4 dB) is the
+// proven-permissive value on this hardware — live Iridium data showed
+// marginal sub-threshold-margin decodes are productive, and dumpvdl2
+// itself has NO energy gate at all (it demods its channel
+// continuously), so err low. Only live VDL2 SNR statistics can justify
+// moving this. UNCALIBRATED.
 #define BAND_VDL2_TAG_THR_DB 14.0f
 
 // Per-band front-end profile. All fields are consumed at boot/create

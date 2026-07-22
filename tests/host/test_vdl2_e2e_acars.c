@@ -21,21 +21,22 @@
 // with the direction derived from the AVLC source address type exactly
 // as the firmware's vdl2_avlc_cb does (dumpvdl2 src/acars.c:100-108).
 //
-// Floors: >= 7 of the 9 golden ACARS messages matched by
-// (registration, mode), and >= 24 FCS-valid AVLC frames.
+// Floors: ALL 9 golden ACARS messages matched by (registration,
+// mode), and >= 40 FCS-valid AVLC frames (= dumpvdl2's own count).
 //
 // Measured at V3 integration (2026-07-22): 8/9 ACARS matched (missed:
-// the LN-RPA label-SA Media Advisory), 26 FCS-valid AVLC frames of the
-// golden 40, from 46 demod-complete transmissions with 9 RS-block
-// failures. The frame gap vs dumpvdl2 is DEMOD-quality-bound, not an
-// L2 defect: the RS pass/fail split here is identical to the
-// demod-layer test_vdl2_real_capture (37 RS-clean / 8 fail + 1
-// multi-block skip), and the marginal bursts sit at EVM 0.15-0.2 rad
-// where short 2-parity shortened blocks alias and the AVLC FCS (10
-// bad-FCS frames) arbitrates them out — exactly dumpvdl2's own
-// safety model. Improving the demod's BER on weak bursts is V4+
-// calibration work; floors are set with small slack under the
-// measured values to catch chain regressions, not to flatter them.
+// the LN-RPA label-SA Media Advisory), 26 FCS-valid AVLC frames —
+// demod-quality-bound, marginal bursts at EVM 0.15-0.2 rad aliased
+// the short 2-parity RS blocks and FCS arbitrated them out.
+// Measured at V4 (2026-07-22, sharp 144-tap channel filter +
+// fractional symbol timing — demod EVM median 0.182 -> 0.128 rad):
+// 9/9 golden ACARS matched INCLUDING the Media Advisory, 43 FCS-valid
+// AVLC frames (three MORE than the dumpvdl2 golden's 40), 10 ACARS
+// parsed (the extra: an HB-IJW label-A9 uplink dumpvdl2 did not
+// decode), 0 L2 failures, 2 bad-FCS frames. The 9/9 floor is exact —
+// reproducing the full golden set IS the acceptance criterion; the
+// FCS floor sits at the oracle's 40 with the 3-frame surplus as
+// slack.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -263,12 +264,12 @@ int main(void)
 
     // The golden decode carries exactly 9 ACARS in 40 AVLC frames.
     CHECK(n_golden == 9, "golden fixture ACARS count %d != 9", n_golden);
-    CHECK(s_avlc_ok >= 24, "FCS-valid AVLC frames %d < 24 (golden 40, "
-                           "measured 26 at V3 — see header)",
+    CHECK(s_avlc_ok >= 40, "FCS-valid AVLC frames %d < 40 (= the dumpvdl2 "
+                           "golden count; measured 43 at V4 — see header)",
           s_avlc_ok);
-    // THE acceptance floor: >= 7 of the 9 golden ACARS messages
-    // reproduced end-to-end (registration + mode matched).
-    CHECK(n_matched >= 7, "golden ACARS matched %d < 7 (of %d)", n_matched,
+    // THE acceptance floor: every golden ACARS message reproduced
+    // end-to-end (registration + mode matched).
+    CHECK(n_matched >= 9, "golden ACARS matched %d < 9 (of %d)", n_matched,
           n_golden);
 
     if (g_fails) {

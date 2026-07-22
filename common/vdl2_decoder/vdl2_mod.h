@@ -19,9 +19,12 @@
 //    idx * pi/4]
 //   [pad_post noise-only samples]
 //
-// Pulse shaping: raised-cosine, rolloff alpha = 0.6 (ICAO Annex 10
-// Vol III; dumpvdl2 has no matched filter so its receive path cannot
-// confirm this — flagged as a real-capture confirmation item). The
+// Pulse shaping: FULL raised-cosine, rolloff alpha = 0.6 (ICAO Annex
+// 10 Vol III puts the whole RC at the transmitter — Nyquist on its
+// own, so the receiver's flat-passband channel filter preserves
+// zero-ISI strobes). A root/root split was tried and empirically
+// rejected against the real golden capture (see rc_pulse in
+// vdl2_mod.c and the resampler note in vdl2_demod.c). The
 // waveform is synthesised at an arbitrary output rate by direct
 // pulse-superposition at fractional symbol positions, so timing offset
 // is continuous-valued, then rotated by a carrier offset and dressed

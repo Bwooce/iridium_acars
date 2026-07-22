@@ -17,6 +17,7 @@
 #include "msg_ring.h"
 #include "frame_decoder.h"
 #include "vdl2_pipeline.h" // vdl2 demod counters for /status "decode.vdl2" (V3)
+#include "band_profile.h"  // BAND_VDL2 — gates the dashboard's VDL2 section
 #include "ota_runner.h"
 #include "class_driver.h"     // class_driver_prepare_for_reboot()
 #include "scanner.h"          // scanner_survey() — /scan sweep/survey endpoint
@@ -1148,6 +1149,37 @@ static esp_err_t status_html_get(httpd_req_t *req)
     if (n < 0) n = 0;
     if (n > (int)sizeof(body)) n = sizeof(body);
     httpd_resp_send_chunk(req, body, n);
+
+    // band=vdl2 decode funnel (V4 bring-up): bursts → demod sync → PHY
+    // frames → RS → AVLC → ACARS, same counters as JSON "decode.vdl2".
+    // Gated on the active band so the iridium dashboard stays
+    // byte-identical (band=iridium emits nothing here). Separate chunk,
+    // same truncation guard as the tables above.
+    if ((band_id_t)cfg.band == BAND_VDL2) {
+        frame_decoder_vdl2_stats_t vd = {0};
+        frame_decoder_get_vdl2_stats(&vd);
+        n = snprintf(body, sizeof(body),
+                     "<h2>VDL2 decode (band=vdl2)</h2>"
+                     "<table><tr><th>Metric</th><th>Value</th></tr>"
+                     "<tr><td>Bursts &rarr; demod sync</td><td class=v>%u / %u</td></tr>"
+                     "<tr><td>PHY frames / L2 fail</td><td class=v>%llu / %llu</td></tr>"
+                     "<tr><td>RS blocks ok / fail / octets fixed</td><td class=v>%u / %u / %u</td></tr>"
+                     "<tr><td>AVLC FCS-valid / bad FCS / too short</td><td class=v>%llu / %llu / %llu</td></tr>"
+                     "<tr><td>ACARS / X.25 / S / U frames</td><td class=v>%llu / %llu / %llu / %llu</td></tr>"
+                     "</table>",
+                     (unsigned)vdl2_pipeline_bursts_seen(),
+                     (unsigned)vdl2_pipeline_sync_count(),
+                     (unsigned long long)vd.phy_frames, (unsigned long long)vd.l2_fail,
+                     (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_blocks_fail,
+                     (unsigned)vd.rs_octets_fixed,
+                     (unsigned long long)vd.avlc_ok, (unsigned long long)vd.bad_fcs,
+                     (unsigned long long)vd.too_short,
+                     (unsigned long long)vd.acars, (unsigned long long)vd.x25,
+                     (unsigned long long)vd.supervisory, (unsigned long long)vd.unnumbered);
+        if (n < 0) n = 0;
+        if (n > (int)sizeof(body)) n = sizeof(body);
+        httpd_resp_send_chunk(req, body, n);
+    }
 
     // Load telemetry (peak vs mean since boot) — the "transient vs sustained"
     // gauge for remotely watching a headless deployment. Separate chunk so the

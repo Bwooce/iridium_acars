@@ -270,15 +270,99 @@ bool vdl2_lpf_design_q15(int16_t *coeffs, int delay_size, int interp,
     return true;
 }
 
+// Root-raised-cosine prototype tap, x in symbol periods, standard RRC
+// impulse response (peak h(0) = 1 - alpha + 4 alpha / pi; the two
+// removable singularities handled explicitly). Absolute scale is
+// irrelevant here — the per-phase DC normalisation below sets the
+// gain.
+static double rrc_tap(double x, double alpha)
+{
+    double ax = fabs(x);
+    const double pi = 3.14159265358979323846;
+    if (ax < 1e-9) return 1.0 - alpha + 4.0 * alpha / pi;
+    double q = 4.0 * alpha * ax;
+    if (fabs(q - 1.0) < 1e-6) {
+        // |x| = 1/(4 alpha) limit.
+        double s = sin(pi / (4.0 * alpha));
+        double c = cos(pi / (4.0 * alpha));
+        return (alpha / sqrt(2.0)) *
+               ((1.0 + 2.0 / pi) * s + (1.0 - 2.0 / pi) * c);
+    }
+    return (sin(pi * ax * (1.0 - alpha)) +
+            4.0 * alpha * ax * cos(pi * ax * (1.0 + alpha))) /
+           (pi * ax * (1.0 - q * q));
+}
+
+bool vdl2_rrc_design_q15(int16_t *coeffs, int delay_size, int interp,
+                         double vsamples_per_symbol, double alpha)
+{
+    const int nproto = delay_size * interp;
+    const int center = nproto / 2;
+
+    double *w         = (double *)malloc(sizeof(double) * (size_t)nproto);
+    double *sum_phase = (double *)malloc(sizeof(double) * (size_t)interp);
+    if (!w || !sum_phase) {
+        free(w);
+        free(sum_phase);
+        memset(coeffs, 0, sizeof(int16_t) * (size_t)nproto);
+        return false;
+    }
+    for (int p = 0; p < interp; p++)
+        sum_phase[p] = 0.0;
+    for (int k = 0; k < nproto; k++) {
+        w[k] = rrc_tap((double)(k - center) / vsamples_per_symbol, alpha);
+        sum_phase[k % interp] += w[k];
+    }
+    // Per-phase DC gain 1.0 — identical convention to
+    // vdl2_lpf_design_q15 (firmr_s16 shift=0 divides by 2^15).
+    for (int p = 0; p < interp; p++) {
+        if (sum_phase[p] == 0.0) continue;
+        double scale = 1.0 / sum_phase[p];
+        for (int t = 0; t < delay_size; t++)
+            w[t * interp + p] *= scale;
+    }
+    for (int k = 0; k < nproto; k++) {
+        double v = w[k] * 32767.0;
+        if (v > 32767.0) v = 32767.0;
+        if (v < -32767.0) v = -32767.0;
+        coeffs[k] = (int16_t)lrint(v);
+    }
+    free(w);
+    free(sum_phase);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // 250 ksps -> 105 ksps front-end resampler (channel filter + rate
 // change in one polyphase). fc = 9 kHz at the 250 k input rate —
 // passband covers the D8PSK occupied bandwidth (1+alpha)*Rs/2 =
 // 8.4 kHz at alpha 0.6; role-equivalent to dumpvdl2's 8 kHz input LPF
 // (demod.c:45 INP_LPF_CUTOFF_FREQ).
+//
+// Why a FLAT-passband LPF and not an RRC matched filter (V4 A/B,
+// 2026-07-22): the transmitted VDL2 pulse is the FULL raised cosine,
+// alpha 0.6 (ICAO Annex 10 Vol III) — Nyquist on its own — so the
+// zero-ISI receive filter is anything flat across the signal band;
+// root-shaping at the receiver creates ISI instead of removing noise.
+// Measured on the sigidwiki golden capture (test_vdl2_real_capture,
+// fractional timing in all rows):
+//     RX filter                      RS-clean frames
+//     Kaiser 9 kHz, 144 taps/phase   46 of 47   <- production
+//     Kaiser 9 kHz,  48 taps/phase   38         (V2 prototype length)
+//     RRC alpha 0.6 matched          21         (regression)
+//     RC  alpha 0.6 matched          18         (regression)
+// The real V2 demod-side EVM cost was the SHORT (48 taps/phase)
+// prototype — its slow transition/stopband leaked noise and images —
+// not the absence of a matched shape. dumpvdl2 (2-pole Chebyshev, no
+// matched filter) is consistent with this: flat-ish passband receivers
+// are the correct structure for a full-RC transmitter.
 // ---------------------------------------------------------------------------
 
-#define VDL2_RS_DSIZE 48 // taps/phase; prototype spans 48 input samples (192 us)
+// Taps/phase; prototype spans 144 input samples = 576 us. 3024 Q15
+// taps = 6 KB .bss (V2: 2 KB); ~288 MACs per output sample across I+Q
+// = 30.2 MMAC per second of scanned window (~8 MMAC for a full 260 ms
+// tagger window) — VDL2-only, scalar, no PIE.
+#define VDL2_RS_DSIZE 144
 
 static int16_t s_rs_coeffs[VDL2_RS_DSIZE * VDL2_RESAMP_INTERP];
 static int     s_init_done = 0;
@@ -288,7 +372,8 @@ static void vdl2_demod_init_once(void)
     if (s_init_done) return;
     // 9 kHz cutoff in cycles per virtual (interp x fs_in) sample.
     (void)vdl2_lpf_design_q15(s_rs_coeffs, VDL2_RS_DSIZE, VDL2_RESAMP_INTERP,
-                              9000.0 / ((double)VDL2_FS_IN_HZ * VDL2_RESAMP_INTERP),
+                              9000.0 /
+                                  ((double)VDL2_FS_IN_HZ * VDL2_RESAMP_INTERP),
                               8.0);
     s_init_done = 1;
 }
@@ -344,8 +429,11 @@ typedef struct {
     float pherr[3];               // squared sync error at t, t-3, t-6
     float prev_dphi;              // freq estimate from the previous attempt
     // Outputs on accept:
-    float dphi;       // rad/symbol carrier offset
-    int   vertex_off; // samples back from the current sample to the vertex
+    float dphi;        // rad/symbol carrier offset
+    int   vertex_off;  // samples back from the current sample to the vertex
+    float vertex_frac; // sub-sample residual: true vertex = current
+                       // sample - vertex_off - vertex_frac, in
+                       // [-0.5, 0.5] samples
 } vdl2_sync_t;
 
 // Linear-regression constants over the 16 preamble symbols
@@ -426,13 +514,18 @@ static bool sync_attempt(vdl2_sync_t *s)
         // Passed the error minimum below threshold: sync. Parabolic
         // vertex over the last three attempts locates the symbol-clock
         // origin (demod.c:173-192). x = 0 is the current attempt.
+        // dumpvdl2 rounds the vertex to the nearest whole sample (up to
+        // T/20 timing error); we keep the fractional part and strobe at
+        // the true instant via interpolation (symrd below).
         float vertex_x = calc_para_vertex(0.f, VDL2_SYNC_SKIP, s->pherr[2],
                                           s->pherr[1], s->pherr[0]);
-        int off = (int)lroundf(-vertex_x);
-        if (off < 0) off = 0;
-        if (off > 2 * VDL2_SYNC_SKIP) off = 2 * VDL2_SYNC_SKIP;
-        s->vertex_off = off;
-        s->dphi       = s->prev_dphi;
+        float off_f = -vertex_x;
+        if (off_f < 0.f) off_f = 0.f;
+        if (off_f > 2.f * VDL2_SYNC_SKIP) off_f = 2.f * VDL2_SYNC_SKIP;
+        int off = (int)lroundf(off_f);
+        s->vertex_off  = off;
+        s->vertex_frac = off_f - (float)off;
+        s->dphi        = s->prev_dphi;
         s->pherr[1] = s->pherr[2] = VDL2_PHERR_MAX;
         return true;
     }
@@ -445,13 +538,42 @@ static bool sync_attempt(vdl2_sync_t *s)
 // ---------------------------------------------------------------------------
 // Symbol reader — dumpvdl2 demod.c DM_SYNC state (demod.c:251-284):
 // strobe every SPS samples, differential phase minus the preamble's
-// frequency estimate, round to the nearest pi/4 grid point.
+// frequency estimate, round to the nearest pi/4 grid point. Departure
+// from the reference: dumpvdl2 strobes at whole samples (T/10 grid);
+// we strobe at the FRACTIONAL symbol instant from the sync parabola,
+// interpolating the matched-filter output with a 4-point (cubic
+// Lagrange) kernel — at 10 samples/symbol its passband error over the
+// 8.4 kHz signal is negligible.
 // ---------------------------------------------------------------------------
+
+// Interpolate one complex sample at fractional index pos (values
+// outside [1, n-3) fall back to edge-clamped neighbours; callers stop
+// strobing before pos leaves the window).
+static void interp_iq_cubic(const int16_t *iq, int n, float pos,
+                            float *re, float *im)
+{
+    int   n0 = (int)floorf(pos);
+    float mu = pos - (float)n0;
+    int   im1 = n0 - 1, ip1 = n0 + 1, ip2 = n0 + 2;
+    if (im1 < 0) im1 = 0;
+    if (n0 < 0) n0 = 0;
+    if (n0 > n - 1) n0 = n - 1;
+    if (ip1 > n - 1) ip1 = n - 1;
+    if (ip2 > n - 1) ip2 = n - 1;
+    float c_m1 = -mu * (mu - 1.f) * (mu - 2.f) * (1.f / 6.f);
+    float c_0  = (mu + 1.f) * (mu - 1.f) * (mu - 2.f) * 0.5f;
+    float c_p1 = -(mu + 1.f) * mu * (mu - 2.f) * 0.5f;
+    float c_p2 = (mu + 1.f) * mu * (mu - 1.f) * (1.f / 6.f);
+    *re = c_m1 * (float)iq[2 * im1 + 0] + c_0 * (float)iq[2 * n0 + 0] +
+          c_p1 * (float)iq[2 * ip1 + 0] + c_p2 * (float)iq[2 * ip2 + 0];
+    *im = c_m1 * (float)iq[2 * im1 + 1] + c_0 * (float)iq[2 * n0 + 1] +
+          c_p1 * (float)iq[2 * ip1 + 1] + c_p2 * (float)iq[2 * ip2 + 1];
+}
 
 typedef struct {
     const int16_t *iq105;
     int            n105;
-    int            next_strobe; // sample index of the next symbol strobe
+    float          strobe_pos; // fractional sample index of the next strobe
     float          prev_phi;
     float          dphi; // rad/symbol carrier-offset correction
     double         evm_acc;
@@ -462,9 +584,9 @@ typedef struct {
 // Returns false when the window has no samples left for the strobe.
 static bool symrd_next(vdl2_symrd_t *r, uint8_t bits3[3], int16_t *conf_out)
 {
-    if (r->next_strobe >= r->n105) return false;
-    float re  = (float)r->iq105[2 * r->next_strobe + 0];
-    float im  = (float)r->iq105[2 * r->next_strobe + 1];
+    if (r->strobe_pos >= (float)r->n105) return false;
+    float re, im;
+    interp_iq_cubic(r->iq105, r->n105, r->strobe_pos, &re, &im);
     float phi = atan2f(im, re);
     float dphi = phi - r->prev_phi - r->dphi;
     while (dphi < 0.f)
@@ -491,7 +613,7 @@ static bool symrd_next(vdl2_symrd_t *r, uint8_t bits3[3], int16_t *conf_out)
     r->evm_acc += (double)e_rad * (double)e_rad;
     r->n_syms++;
     r->prev_phi = phi;
-    r->next_strobe += VDL2_SPS;
+    r->strobe_pos += (float)VDL2_SPS;
     return true;
 }
 
@@ -528,17 +650,25 @@ bool vdl2_demod_burst(const int16_t *iq250, int n_complex,
         if (i < VDL2_SYNC_BUFLEN) continue; // ring not warm yet
         if (!sync_attempt(&ss)) continue;
 
-        // --- preamble locked. Set up the symbol reader at the vertex.
-        int sync_sample = i - ss.vertex_off;
+        // --- preamble locked. Set up the symbol reader at the TRUE
+        // (fractional) vertex: the last preamble symbol's strobe. The
+        // reference phase comes from the interpolated matched-filter
+        // output at the same fractional instant, so the first data
+        // symbol's differential is timing-consistent with the rest.
+        int   sync_sample = i - ss.vertex_off;
+        float vertex_pos  = (float)sync_sample - ss.vertex_frac;
         vdl2_symrd_t rd;
-        rd.iq105       = iq105;
-        rd.n105        = n105;
-        rd.next_strobe = sync_sample + VDL2_SPS;
-        rd.prev_phi    = ss.ring[(ss.ringidx - ss.vertex_off + VDL2_SYNC_BUFLEN) %
-                                 VDL2_SYNC_BUFLEN];
-        rd.dphi        = ss.dphi;
-        rd.evm_acc     = 0.0;
-        rd.n_syms      = 0;
+        rd.iq105      = iq105;
+        rd.n105       = n105;
+        rd.strobe_pos = vertex_pos + (float)VDL2_SPS;
+        {
+            float vre, vim;
+            interp_iq_cubic(iq105, n105, vertex_pos, &vre, &vim);
+            rd.prev_phi = atan2f(vim, vre);
+        }
+        rd.dphi    = ss.dphi;
+        rd.evm_acc = 0.0;
+        rd.n_syms  = 0;
 
         // Header: 25 bits = 9 symbols (27 bits, 2 spare).
         uint8_t raw27[27];
@@ -623,7 +753,7 @@ bool vdl2_demod_burst(const int16_t *iq250, int n_complex,
         if (evm < 1e-3f) evm = 1e-3f;
         out->snr_db = -20.f * log10f(evm);
         // Consumed input through the last strobe read (250 k domain).
-        int end105 = rd.next_strobe;
+        int end105 = (int)rd.strobe_pos;
         if (end105 > n105) end105 = n105;
         int consumed = (int)(((int64_t)end105 * VDL2_RESAMP_DECIM) /
                              VDL2_RESAMP_INTERP);

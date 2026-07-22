@@ -25,9 +25,12 @@
 // If the capture file is absent the test SKIPs (exit 0) — same
 // fixture-dependent convention as the other capture-driven tests.
 //
-// Assertions (floors, golden-calibrated): >= 30 complete frames and
-// >= 30 RS-clean blocks over the capture (golden: 40 AVLC frames; a
+// Assertions (floors, golden-calibrated): >= 42 complete frames and
+// >= 42 RS-clean blocks over the capture (golden: 40 AVLC frames; a
 // burst can carry several AVLC frames, so burst count <= 40).
+// Measured at V4 (sharp 144-tap channel filter + fractional symbol
+// timing, 2026-07-22): 47 complete, 46 RS-clean, 0 RS-fail, 1
+// multi-block, EVM median 0.128 rad (V2: 46/37/8, median 0.182 rad).
 
 #include <math.h>
 #include <stdio.h>
@@ -218,10 +221,12 @@ int main(void)
            n_flag7e, snr_min, snr_max);
 
     // Floors calibrated against the dumpvdl2 golden decode of this
-    // capture (40 AVLC frames across the transmissions; strong signal).
-    CHECK(n_complete >= 30, "complete frames %d < 30", n_complete);
-    CHECK(n_rs_ok >= 30, "RS-clean frames %d < 30", n_rs_ok);
-    CHECK(n_flag7e >= 30, "frames starting with AVLC flag %d < 30", n_flag7e);
+    // capture (40 AVLC frames across the transmissions; strong signal)
+    // and the V4 measurement (47/46/43) — small slack for future
+    // demod-tuning churn, not for regressions.
+    CHECK(n_complete >= 42, "complete frames %d < 42", n_complete);
+    CHECK(n_rs_ok >= 42, "RS-clean frames %d < 42", n_rs_ok);
+    CHECK(n_flag7e >= 40, "frames starting with AVLC flag %d < 40", n_flag7e);
 
     free(iq250);
     if (g_fails) {

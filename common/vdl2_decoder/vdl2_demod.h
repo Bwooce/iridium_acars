@@ -9,9 +9,15 @@
 //      Kaiser-windowed-sinc Q15 taps via firmr_s16) so the symbol rate
 //      divides the sample rate exactly: SPS = 105000 / 10500 = 10,
 //      the same samples-per-symbol dumpvdl2 uses (dumpvdl2.h: SPS 10).
-//      The resampler lowpass doubles as the channel filter (fc ~9 kHz;
-//      dumpvdl2 uses a 2-pole Chebyshev at 8 kHz — demod.c:
-//      INP_LPF_CUTOFF_FREQ — before its own decimation).
+//      The resampler lowpass doubles as the channel filter (fc ~9 kHz,
+//      144 taps/phase since V4 — the sharp transition/stopband is
+//      worth ~5 dB of demod EVM on the real capture vs the V2 48-tap
+//      prototype; dumpvdl2 uses a 2-pole Chebyshev at 8 kHz —
+//      demod.c: INP_LPF_CUTOFF_FREQ — before its own decimation).
+//      Deliberately NOT an RRC matched filter: the VDL2 TX pulse is
+//      the full raised cosine, so flat passband = zero ISI; the
+//      root/root alternative measurably regressed the golden capture
+//      (A/B table at the resampler in vdl2_demod.c).
 //   2. Training-sequence (preamble) search on the per-sample PHASE
 //      trajectory: the 16-symbol VDL2 sync sequence is matched as a
 //      vector of expected cumulative phases, mean-removed (absolute
@@ -31,7 +37,10 @@
 //      from the sync vertex): dphi = phi[k] - phi[k-1] - dphi_cfo,
 //      idx = round(dphi / (pi/4)) mod 8, bits = graycode[idx]
 //      (demod.c:223 graycode = {0,1,3,2,6,7,5,4}), 3 bits/symbol
-//      MSB-first (demod.c:274 bitstream_append_msbfirst).
+//      MSB-first (demod.c:274 bitstream_append_msbfirst). V4 delta vs
+//      the reference: strobes land on the FRACTIONAL symbol instant
+//      from the sync parabola (cubic interpolation of the filtered
+//      stream) instead of dumpvdl2's whole-sample T/10 grid.
 //   4. Descramble: 15-stage additive LFSR, polynomial x^15 + x + 1,
 //      initial value 0x6959, applied to every bit from the first
 //      post-preamble symbol on (decode.c:50 LFSR_IV,
@@ -187,6 +196,26 @@ extern const uint8_t vdl2_graycode[8];
 // (coeffs zeroed).
 bool vdl2_lpf_design_q15(int16_t *coeffs, int delay_size, int interp,
                          double fc_cycles_per_vsample, double beta);
+
+// Root-raised-cosine polyphase prototype designer (Q15, firmr_s16
+// layout, per-phase DC gain 1.0 — same conventions as
+// vdl2_lpf_design_q15). vsamples_per_symbol = symbol period in VIRTUAL
+// samples (= fs_in_hz * interp / symbol_rate). Prototype spans
+// delay_size input samples, truncated (no window — windowing would
+// detune the shape); size the span so the truncated tail is negligible
+// (RRC alpha 0.6 is ~0.15 % of peak at 4 T). Returns false on
+// scratch-alloc failure (coeffs zeroed).
+//
+// NOT used by the production demod: the VDL2 transmitter applies the
+// FULL raised cosine (ICAO Annex 10 Vol III, alpha 0.6), so an RX-side
+// RRC "matched filter" un-Nyquists the cascade — measured on the
+// sigidwiki golden capture it DROPPED RS-clean frames 46 -> 21 (see
+// the resampler note in vdl2_demod.c). Kept (and unit-covered in
+// test_vdl2_demod) for V4 live-TX probing, where a real over-the-air
+// transmitter — not a capture already narrowed by the recording
+// receiver's front end — can re-arbitrate the shape question.
+bool vdl2_rrc_design_q15(int16_t *coeffs, int delay_size, int interp,
+                         double vsamples_per_symbol, double alpha);
 
 #ifdef __cplusplus
 }

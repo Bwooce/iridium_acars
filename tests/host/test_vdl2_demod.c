@@ -195,6 +195,43 @@ static void t_body_bits(void)
     CHECK(vdl2_burst_body_bits(0x4000) == -1, "over-max accepted");
 }
 
+static void t_rrc_designer(void)
+{
+    // vdl2_rrc_design_q15 is not in the production demod path (the TX
+    // pulse is the full RC, so the receive filter stays flat — see
+    // vdl2_demod.h), but it is kept for V4 live-TX probing: pin its
+    // conventions. 48 taps/phase, interp 21, 500 virtual samples per
+    // symbol (the 250 k front-door geometry).
+    enum { DS = 48, IN = 21 };
+    static int16_t c[DS * IN];
+    CHECK(vdl2_rrc_design_q15(c, DS, IN, 500.0, 0.6), "designer alloc");
+    // Per-phase DC gain 1.0 in Q15 (firmr_s16 shift=0 convention).
+    for (int p = 0; p < IN; p++) {
+        int32_t sum = 0;
+        for (int t = 0; t < DS; t++)
+            sum += c[t * IN + p];
+        CHECK(sum > 32767 - DS && sum < 32767 + DS,
+              "phase %d DC gain %ld not ~2^15", p, (long)sum);
+    }
+    // Even symmetry about the prototype centre (linear phase).
+    int n = DS * IN, worst = 0;
+    for (int k = 1; k < n / 2; k++) {
+        int d = abs((int)c[n / 2 - k] - (int)c[n / 2 + k]);
+        if (d > worst) worst = d;
+    }
+    CHECK(worst <= 1, "prototype asymmetry %d LSB", worst);
+    // Peak at the centre tap and the alpha=0.6 RRC first zero region:
+    // taps a symbol period out are well below the peak.
+    int peak = 0;
+    for (int k = 0; k < n; k++)
+        if (abs(c[k]) > peak) peak = abs(c[k]);
+    CHECK(peak == abs(c[n / 2]), "peak %d not at centre (%d)", peak,
+          abs(c[n / 2]));
+    CHECK(abs(c[n / 2 + 500]) < peak / 5,
+          "tap at +1 T not attenuated (%d vs peak %d)", abs(c[n / 2 + 500]),
+          peak);
+}
+
 static void t_scrambler(void)
 {
     uint8_t  a[257], b[257];
@@ -235,7 +272,9 @@ static void t_clean_roundtrip(void)
         CHECK(r.complete, "clean frame incomplete (datalen %u)", lens[i]);
         CHECK(r.hdr_synd_weight == 0, "clean header corrected?");
         CHECK(fabsf(r.cfo_hz) < 30.f, "cfo est %.1f Hz at 0", (double)r.cfo_hz);
-        CHECK(r.snr_db > 20.f, "clean snr proxy %.1f dB", (double)r.snr_db);
+        // V4: clean-signal EVM is ~0.011-0.025 rad (snr proxy 32-39 dB;
+        // V2's non-fractional strobes + short filter sat at ~21 dB).
+        CHECK(r.snr_db > 28.f, "clean snr proxy %.1f dB", (double)r.snr_db);
         free(r.bits);
         free(r.soft_bits);
     }
@@ -279,20 +318,20 @@ static void t_timing(void)
 static void t_awgn(void)
 {
     // Gate 1 — bit-IDENTITY over the whole 1065-bit frame at Eb/N0 =
-    // 24 dB, 20/20 trials, with a +/-400 Hz offset stacked on. Why
-    // 24 dB and not lower: differential detection (+~3 dB vs coherent)
-    // through a non-matched ~9 kHz channel filter (+~2 dB) means the
-    // per-symbol error rate only reaches "zero errors in 355 symbols,
-    // every trial" around 22 dB (measured waterline below; matches the
-    // 2Q(pi/8 / sigma_phi) hand calculation). dumpvdl2 has the same
-    // receive structure, and the real-capture reference frames run
-    // 23-31 dB — this is the regime the demod actually serves.
+    // 20 dB, 20/20 trials, with a +/-400 Hz offset stacked on. V2 ran
+    // this gate at 24 dB (whole-sample T/10 strobes + a short 48-tap
+    // channel filter cost ~5 dB); the V4 sharp channel filter +
+    // fractional-instant strobes move the measured bit-exact waterline
+    // to ~16-18 dB (INFO sweep below), so 20 dB carries ~2-4 dB of
+    // margin against flaky-trial noise. Differential detection is
+    // still ~3 dB off coherent — that part is structural (dumpvdl2
+    // matches).
     int pass_hi = 0;
     for (int t = 0; t < 20; t++) {
         vdl2_mod_params_t p;
         vdl2_mod_params_default(&p);
         p.seed       = 1000 + (uint32_t)t;
-        p.awgn_sigma = ebn0_to_sigma(24.0, p.amp, p.fs_hz);
+        p.awgn_sigma = ebn0_to_sigma(20.0, p.amp, p.fs_hz);
         p.cfo_hz     = (t % 2) ? 400.0 : -400.0; // noise + offset together
         vdl2_demod_result_t r;
         int mism = -1;
@@ -302,7 +341,7 @@ static void t_awgn(void)
             free(r.soft_bits);
         }
     }
-    CHECK(pass_hi == 20, "Eb/N0 24 dB: %d/20 bit-exact", pass_hi);
+    CHECK(pass_hi == 20, "Eb/N0 20 dB: %d/20 bit-exact", pass_hi);
 
     // Gate 2 — RS-serviceable at Eb/N0 = 18 dB: the downstream
     // RS(255,249) corrects 3 symbols/block, so a frame with every
@@ -465,6 +504,7 @@ int main(void)
 {
     t_header_codec();
     t_body_bits();
+    t_rrc_designer();
     t_scrambler();
     t_clean_roundtrip();
     t_cfo();
