@@ -2,6 +2,7 @@
 #include "app_config.h"
 #include "dsp_processor.h"
 #include "scanner.h"
+#include "decode_survey.h" // `dsurvey` — decode-based band-finder
 #include "autotune.h"
 #include "autotune_gainset.h"
 #include "class_driver.h" // incl. class_driver_prepare_for_reboot()
@@ -76,6 +77,8 @@ static void cmd_config(void)
     snprintf(buf, sizeof(buf), "autotune_gain_interval_s=%lu autotune_lo_interval_s=%lu\r\n",
              (unsigned long)c.autotune_gain_interval_s, (unsigned long)c.autotune_lo_interval_s);
     uart_puts(buf);
+    snprintf(buf, sizeof(buf), "resurvey_auto=%d\r\n", (int)c.band_resurvey_auto);
+    uart_puts(buf);
     snprintf(buf, sizeof(buf), "ota_url=%s\r\n", c.ota_url);
     uart_puts(buf);
 }
@@ -140,6 +143,8 @@ static void cmd_get(const char *key)
         snprintf(buf, sizeof(buf), "%lu\r\n", (unsigned long)c.autotune_gain_interval_s);
     else if (strcmp(key, "autotune_lo_interval_s") == 0)
         snprintf(buf, sizeof(buf), "%lu\r\n", (unsigned long)c.autotune_lo_interval_s);
+    else if (strcmp(key, "resurvey_auto") == 0)
+        snprintf(buf, sizeof(buf), "%d\r\n", (int)c.band_resurvey_auto);
     else if (strcmp(key, "ota_url") == 0)
         snprintf(buf, sizeof(buf), "%s\r\n", c.ota_url);
     else {
@@ -213,6 +218,10 @@ static void cmd_set(const char *key, const char *val)
         rc = app_config_set_autotune_gain_interval_s((uint32_t)atol(val));
     else if (strcmp(key, "autotune_lo_interval_s") == 0)
         rc = app_config_set_autotune_lo_interval_s((uint32_t)atol(val));
+    else if (strcmp(key, "resurvey_auto") == 0)
+        // Band-health auto re-survey opt-in (band_health.c). Detect+log
+        // always runs; this only gates the automatic RF action.
+        rc = app_config_set_band_resurvey_auto(atoi(val) != 0);
     else if (strcmp(key, "ota_url") == 0)
         rc = app_config_set_ota_url(val);
     else {
@@ -368,6 +377,71 @@ static void cmd_scan(char *args)
     scanner_scan(start, stop, step, dwell);
 }
 
+// Integrated commissioning survey: N full sweeps with per-center density
+// accumulation, parking on the INTEGRATED peak (a single `scan` parks on
+// whichever satellite beam was overhead; see scanner_survey in scanner.h).
+// Uses the SCAN_* grid defaults; only sweep count and dwell are tunable here.
+static void cmd_survey(char *args)
+{
+    uint32_t n = SCAN_SURVEY_SWEEPS, dwell = SCAN_DWELL_MS;
+    char    *a;
+    if ((a = strtok(args, " \t"))) n = (uint32_t)strtoul(a, NULL, 10);
+    if ((a = strtok(NULL, " \t"))) dwell = (uint32_t)strtoul(a, NULL, 10);
+    if (n < 1 || n > 50) {
+        uart_puts("ERR usage: survey [n_sweeps 1-50] [dwell_ms]\r\n");
+        return;
+    }
+    char buf[80];
+    snprintf(buf, sizeof(buf), "OK surveying: %lu sweeps x %lu ms dwell (see log)\r\n",
+             (unsigned long)n, (unsigned long)dwell);
+    uart_puts(buf);
+    scanner_survey(SCAN_START_HZ, SCAN_STOP_HZ, SCAN_STEP_HZ, dwell, (int)n);
+}
+
+// Decode-based band-finder survey (decode_survey.c). `dsurvey [budget_h] [k]`
+// starts it (defaults 24 h / 4 centers); `dsurvey stop` aborts; `dsurvey` with
+// no args and one already running prints progress. Live-park only — poll
+// /diag/survey (HTTP) for the full ranked table.
+static void cmd_dsurvey(char *args)
+{
+    char *a = args ? strtok(args, " \t") : NULL;
+    if (a && strcmp(a, "stop") == 0) {
+        if (!decode_survey_running()) {
+            uart_puts("ERR no survey running\r\n");
+            return;
+        }
+        decode_survey_stop();
+        uart_puts("OK abort requested (parks back on NVS LO)\r\n");
+        return;
+    }
+    if (decode_survey_running()) {
+        decode_survey_status_t st;
+        decode_survey_get_status(&st);
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "survey running: cycle=%lu alive=%d leader=%lu Hz "
+                 "elapsed=%lus/%lus\r\n",
+                 (unsigned long)st.cycle, st.alive,
+                 (unsigned long)st.leader_hz, (unsigned long)st.elapsed_s,
+                 (unsigned long)st.budget_s);
+        uart_puts(buf);
+        return;
+    }
+    int budget_h = 0, k = 0;
+    if (a) budget_h = atoi(a);
+    if ((a = strtok(NULL, " \t"))) k = atoi(a);
+    esp_err_t r = decode_survey_start(budget_h, k);
+    if (r == ESP_ERR_INVALID_STATE) {
+        uart_puts("ERR already running or a gain-cal/LO scan is in progress\r\n");
+        return;
+    }
+    if (r != ESP_OK) {
+        uart_puts("ERR failed to spawn survey task\r\n");
+        return;
+    }
+    uart_puts("OK decode survey started (see log + /diag/survey)\r\n");
+}
+
 static void dispatch(char *line)
 {
     // Trim trailing whitespace
@@ -401,6 +475,14 @@ static void dispatch(char *line)
     }
     if (strcmp(cmd, "scan") == 0) {
         cmd_scan(strtok(NULL, ""));
+        return;
+    }
+    if (strcmp(cmd, "survey") == 0) {
+        cmd_survey(strtok(NULL, ""));
+        return;
+    }
+    if (strcmp(cmd, "dsurvey") == 0) {
+        cmd_dsurvey(strtok(NULL, ""));
         return;
     }
     if (strcmp(cmd, "setgain") == 0) {
@@ -438,7 +520,7 @@ static void dispatch(char *line)
     }
 
     uart_puts("ERR unknown command "
-              "(set/get/config/reboot/hop/scan/map/setgain/autotune/nettest)\r\n");
+              "(set/get/config/reboot/hop/scan/survey/map/setgain/autotune/nettest)\r\n");
 }
 
 static void serial_cmd_task(void *arg)

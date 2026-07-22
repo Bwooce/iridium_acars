@@ -82,4 +82,41 @@ typedef struct {
 } status_capacity_t;
 void status_logger_get_capacity(status_capacity_t *out);
 
+// ---- Reception-environment heuristic (docs/2026-07-22-reception-environment-heuristic.md) ----
+// Classifies the RF environment from the decode funnel so a headless/new-site
+// device can tell INTERFERENCE (energy present, not Iridium) from MARGINAL
+// (weak Iridium) from QUIET (few bursts) — three cases that all read as
+// "low decode" today. The discriminator is the UW-lock rate: of the bursts the
+// worker demod-attempted (bursts_processed, which includes UW-fail bursts —
+// worker_core1.c:1305), how many reached BCH (decoded+unknown+failed). Low =
+// the tagged energy isn't Iridium (fails unique-word correlation) = interference.
+// Computed on ~20 s EMAs with an 8-window dwell so a single satellite pass can't
+// flip the state. Advisory: thresholds are conservative defaults, calibrate
+// against the raw ratios also exported here (see the doc's calibration anchors).
+typedef enum {
+    RX_STATE_INIT = 0,    // warming up — not enough windows sampled yet
+    RX_STATE_QUIET,       // few bursts — lull / weak coverage; just wait
+    RX_STATE_INTERFERENCE,// many bursts, few reach BCH — non-Iridium energy; re-site antenna
+    RX_STATE_MARGINAL,    // bursts reach BCH but decode low / BCH-fail high — weak Iridium (air-truth)
+    RX_STATE_GOOD,        // UW-lock + decode both healthy
+} rx_state_t;
+
+typedef struct {
+    rx_state_t state;
+    float uw_reach;      // EMA reached-BCH / EMA processed (the interference discriminator; low = interference)
+    float decode_frac;   // EMA decoded / EMA reached-BCH (marginal-SNR gauge)
+    float fail_frac;     // EMA BCH-failed / EMA reached-BCH
+    float tagged_ema;    // EMA tagger bursts/window
+    float processed_ema; // EMA demod-attempted bursts/window
+} status_reception_t;
+
+// Human-readable name for a reception state ("init"/"quiet"/"interference"/
+// "marginal"/"good"). Never NULL.
+const char *status_reception_state_name(rx_state_t s);
+
+// Copy the current reception classification. Same unlocked cross-core read
+// caveat as status_logger_get_capacity(). state is RX_STATE_INIT until enough
+// windows have been sampled to classify.
+void status_logger_get_reception(status_reception_t *out);
+
 #endif

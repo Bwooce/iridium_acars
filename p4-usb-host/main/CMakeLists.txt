@@ -8,7 +8,7 @@ set(_app_srcs
     "acars_push.c" "ota_runner.c" "serial_cmd.c" "fault_inject.c"
     "frame_pdu.c" "aggregator_ingest.c" "frame_link.c"
     "scanner.c" "scanner_map.c" "autotune.c" "autotune_sched.c"
-    "panic_capture.c"
+    "band_health.c" "panic_capture.c" "decode_survey.c"
 )
 set(_app_reqs
     usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash

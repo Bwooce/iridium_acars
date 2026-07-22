@@ -72,6 +72,16 @@ typedef struct {
 } frame_decoder_class_counts_t;
 void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out);
 
+// Per-LW.DA-frame relative-frequency histogram for the decode-based band
+// survey (decode_survey.c, Phase C). 40 bins spanning the ±FS_DETECT_HZ/2
+// detect window; low bin = most-negative baseband offset. Cumulative since
+// boot; the survey snapshots deltas per visit and folds them into an
+// absolute-freq map at the visit's known LO. Copies min(max_bins, BINS).
+#define FRAME_DECODER_LWDA_FREQ_BINS 40
+void    frame_decoder_get_lwda_freq_hist(uint32_t *out, int max_bins);
+// Signed baseband centre frequency (Hz, relative to the LO) of histogram bin b.
+int32_t frame_decoder_lwda_freq_bin_center_hz(int bin);
+
 // Lifetime totals (since boot) of the two ACARS-pipeline counters.
 // Cheap relaxed atomic loads; safe to call from any thread.
 uint64_t frame_decoder_acars_decoded_total(void);

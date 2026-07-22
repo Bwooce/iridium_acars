@@ -396,6 +396,16 @@ add_executable(test_autotune_sched test_autotune_sched.c)
 target_include_directories(test_autotune_sched PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
 add_test(NAME test_autotune_sched COMMAND test_autotune_sched)
 
+# Decode-based band survey decision math (decode_survey_core.h): the Poisson
+# rate-difference elimination test, round-robin scheduler bookkeeping, and the
+# Phase-C absolute-freq histogram / best-2.5MHz-window placement. Pure header,
+# no ESP/FreeRTOS deps (band_health_core.h pattern). Synthetic over-dispersed
+# Poisson streams + a near-tie + histogram placement.
+add_executable(test_decode_survey_core test_decode_survey_core.c)
+target_include_directories(test_decode_survey_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
+target_link_libraries(test_decode_survey_core PRIVATE m)
+add_test(NAME test_decode_survey_core COMMAND test_decode_survey_core)
+
 # Phase 3.6.M: C direct-IF decimator vs Python scipy reference. For
 # one burst, runs the same rotate+decim in C and compares NMSE
 # against /tmp/host_direct_if/burst_NNN.cf32 (the Python output).
@@ -1428,6 +1438,14 @@ add_executable(test_scanner_map test_scanner_map.c
 target_include_directories(test_scanner_map PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
 add_test(NAME test_scanner_map COMMAND test_scanner_map)
+
+# Band-health re-survey trigger decision core (band-finder phase 2): the
+# median + staleness-level helpers are pure static-inlines in the header,
+# so the test needs no device sources.
+add_executable(test_band_health_core test_band_health_core.c)
+target_include_directories(test_band_health_core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../p4-usb-host/main)
+add_test(NAME test_band_health_core COMMAND test_band_health_core)
 
 # Mendeley Iridium dataset burst-pipeline coverage (task #130). Only
 # built+registered if the generated fixture is present. Run

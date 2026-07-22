@@ -18,7 +18,10 @@
 #include "frame_decoder.h"
 #include "ota_runner.h"
 #include "class_driver.h"     // class_driver_prepare_for_reboot()
-#include "scanner.h"          // scanner_scan() — /scan sustained-hop test endpoint
+#include "scanner.h"          // scanner_survey() — /scan sweep/survey endpoint
+#include "decode_survey.h"    // decode-based band survey — /survey + /diag/survey
+static const char *ds_phase_name(ds_phase_t p); // defined near /diag/survey
+#include "band_health.h"      // staleness detector snapshot for /status
 #include "autotune.h"         // autotune_run_manual() — /gaincal manual trigger
 #include "autotune_gainset.h" // AUTOTUNE_R828D_GAINS/N + autotune_snap_gain — the real tuner gain steps for the /sdrcfg dropdown
 #include "c6_ota.h"           // c6_ota_* — POST /c6ota (Method B: C6 firmware update)
@@ -71,7 +74,7 @@ static uint8_t *s_download_buf = NULL;
 // httpd slot table AND in a static_assert on the routes[] array length,
 // so adding a route past the limit breaks the build instead of panic-
 // looping at boot. Each slot is ~32 bytes; 32 slots = ~1 KB negligible.
-#define HTTPD_URI_LIMIT 40
+#define HTTPD_URI_LIMIT 44 // 38 routes as of the decode-survey endpoints; headroom
 
 // NVS-write + reboot helper. MUST run with an internal-SRAM stack:
 // nvs_commit() takes spi_flash_disable_interrupts_caches_and_other_cpu(),
@@ -214,6 +217,13 @@ static esp_err_t status_get(httpd_req_t *req)
     status_capacity_t cap;
     status_logger_get_capacity(&cap);
 
+    // Reception-environment classification (INTERFERENCE / MARGINAL / QUIET /
+    // GOOD) + the raw funnel ratios it's derived from, so a headless/new-site
+    // operator can tell "not Iridium, re-site" from "weak, air-truth" from
+    // "idle band" — and calibrate the thresholds. See the design doc.
+    status_reception_t rx;
+    status_logger_get_reception(&rx);
+
     // JSON-escape the free-form string fields (M17): SSID, push host and
     // OTA URL are operator input; mount_error carries errno/driver text.
     // Any embedded quote/backslash would otherwise break the JSON. 2× the
@@ -238,7 +248,28 @@ static esp_err_t status_get(httpd_req_t *req)
     uint32_t bch_dec = 0, bch_unk = 0, bch_fail = 0, bch_chase = 0;
     worker_core1_get_bch_cumulative(&bch_dec, &bch_unk, &bch_fail, &bch_chase);
 
-    char body[1700];
+    // #29: rough estimate of bursts lost in the BLIND USB-ring drops (rb_full,
+    // dropped pre-tag so never counted). Uniform-density model: dropped/completed
+    // transfers x total tagged detections (freq_total). LOWER BOUND — flood windows
+    // drop at above-average burst density, so real loss is higher. Approximate.
+    static worker_histograms_t hgm; // ~600 B — static to spare the httpd stack
+    worker_core1_get_histograms(&hgm);
+    unsigned long long est_dropped_bursts = usbt.completed
+        ? (unsigned long long)usbt.rb_full_drops * hgm.freq_total / usbt.completed : 0ULL;
+
+    // Band-health staleness detector (band_health.h): hourly IDA rate vs the
+    // commissioning baseline, for remote "has the parked LO gone stale" checks.
+    band_health_status_t bh;
+    band_health_get_status(&bh);
+
+    // Decode-based band survey progress (decode_survey.h). Static to spare the
+    // httpd stack (the full snapshot carries the per-center table + histogram;
+    // /status only prints the scalar progress fields — the table lives at
+    // /diag/survey). httpd worker is single-threaded, matching the `hgm` idiom.
+    static decode_survey_status_t dsv;
+    decode_survey_get_status(&dsv);
+
+    char body[2560];
     int  n = snprintf(body, sizeof(body),
                       "{"
                        "\"build\":\"%s\","
@@ -252,13 +283,15 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"uptime_s\":%lld,"
                        "\"station_id\":\"%s\","
                        "\"lo_freq_hz\":%u,"
+                       "\"lo_now_hz\":%u,"
                        "\"sample_rate_hz\":%u,"
                        "\"bias_tee\":%s,"
                        "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
                        "\"ota_url\":\"%s\","
                        "\"usb\":{"
                        "\"completed\":%llu,\"rb_full_drops\":%llu,"
-                       "\"status_errors\":%llu,\"short_xfers\":%llu"
+                       "\"status_errors\":%llu,\"short_xfers\":%llu,"
+                       "\"est_dropped_bursts\":%llu"
                        "},"
                        "\"decode\":{"
                        "\"messages_total\":%llu,"
@@ -282,6 +315,17 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"bch\":{"
                        "\"decoded\":%u,\"unknown\":%u,\"failed\":%u,"
                        "\"chase_recovered\":%u},"
+                       "\"reception\":{"
+                       "\"state\":\"%s\",\"uw_reach\":%.3f,\"decode_frac\":%.3f,"
+                       "\"fail_frac\":%.3f,\"tagged_ema\":%.1f,\"processed_ema\":%.1f},"
+                       "\"band_health\":{"
+                       "\"tracked_h\":%u,\"last_1h\":%u,\"trail_med\":%u,"
+                       "\"baseline\":%u,\"cooldown_h\":%u,\"fired\":%u,"
+                       "\"stale\":%s,\"auto\":%s,\"survey_running\":%s},"
+                       "\"survey\":{"
+                       "\"running\":%s,\"phase\":\"%s\",\"cycle\":%u,"
+                       "\"elapsed_s\":%u,\"budget_s\":%u,\"alive\":%d,"
+                       "\"leader_hz\":%u,\"pick_hz\":%u},"
                        "\"sd\":{"
                        "\"mounted\":%s,\"log_open\":%s,"
                        "\"messages_written\":%u,\"bytes_written\":%llu,"
@@ -300,6 +344,11 @@ static esp_err_t status_get(httpd_req_t *req)
                       (long long)(uptime_us / 1000000),
                       station_id_esc,
                       (unsigned)cfg.lo_freq_hz,
+                      // Live parked/swept LO (scanner_hop tracks it); 0 before
+                      // the first hop. Closes the "headless device, unknown
+                      // park" gap — /status only had the CONFIG lo_freq_hz,
+                      // which a live survey does not persist.
+                      (unsigned)scanner_cur_hz(),
                       (unsigned)cfg.sample_rate_hz,
                      cfg.bias_tee ? "true" : "false",
                       host_esc,
@@ -310,6 +359,7 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned long long)usbt.rb_full_drops,
                       (unsigned long long)usbt.status_errors,
                       (unsigned long long)usbt.short_xfers,
+                      est_dropped_bursts,
                       (unsigned long long)msgs_total,
                       (unsigned long long)acars_total,
                       (unsigned long long)sbd_total,
@@ -328,6 +378,21 @@ static esp_err_t status_get(httpd_req_t *req)
                       cap.prefilter_accept_pct,
                       (unsigned)bch_dec, (unsigned)bch_unk,
                       (unsigned)bch_fail, (unsigned)bch_chase,
+                      status_reception_state_name(rx.state),
+                      rx.uw_reach, rx.decode_frac, rx.fail_frac,
+                      rx.tagged_ema, rx.processed_ema,
+                      (unsigned)bh.hours_tracked, (unsigned)bh.last_hour,
+                      (unsigned)bh.trailing_median, (unsigned)bh.baseline,
+                      (unsigned)bh.cooldown_h, (unsigned)bh.fired_total,
+                     bh.below_baseline ? "true" : "false",
+                     cfg.band_resurvey_auto ? "true" : "false",
+                     bh.survey_running ? "true" : "false",
+                     dsv.running ? "true" : "false",
+                     ds_phase_name(dsv.phase),
+                     (unsigned)dsv.cycle,
+                     (unsigned)dsv.elapsed_s, (unsigned)dsv.budget_s,
+                     dsv.alive,
+                     (unsigned)dsv.leader_hz, (unsigned)dsv.pick_hz,
                      sd.mounted ? "true" : "false",
                      sd.log_open ? "true" : "false",
                       (unsigned)sd.messages_written,
@@ -950,6 +1015,42 @@ static esp_err_t status_html_get(httpd_req_t *req)
                               HTTPD_RESP_USE_STRLEN);
         send_page_foot(req);
         return ESP_OK;
+    }
+
+    // Reception-environment banner: the at-a-glance verdict for a headless /
+    // new-site operator (see the design doc). Colour + one line of guidance +
+    // the raw funnel ratios it's derived from.
+    {
+        status_reception_t rx;
+        status_logger_get_reception(&rx);
+        const char *bg = "#eee", *fg = "#333", *msg = "Calibrating &mdash; collecting windows&hellip;";
+        switch (rx.state) {
+        case RX_STATE_GOOD:
+            bg = "#d7f5dd"; fg = "#0a5a24"; msg = "GOOD &mdash; healthy reception."; break;
+        case RX_STATE_MARGINAL:
+            bg = "#fdf1cf"; fg = "#7a5600";
+            msg = "MARGINAL &mdash; weak Iridium (reception SNR-limited). A better sky view / antenna would help."; break;
+        case RX_STATE_INTERFERENCE:
+            bg = "#fadbd8"; fg = "#8a1c12";
+            msg = "&#9888; INTERFERENCE &mdash; energy present but not Iridium. Re-site the antenna (clear sky, away from noise sources)."; break;
+        case RX_STATE_QUIET:
+            bg = "#e6e6e6"; fg = "#555";
+            msg = "QUIET &mdash; few bursts (idle band or weak coverage); waiting."; break;
+        case RX_STATE_INIT:
+        default: break;
+        }
+        n = snprintf(body, sizeof(body),
+                     "<div style=\"background:%s;color:%s;border-radius:8px;"
+                     "padding:.7em 1em;margin:.5em 0;font-weight:600\">%s"
+                     "<div style=\"font-weight:400;font-size:.85em;margin-top:.3em\">"
+                     "UW-reach %.2f &middot; decode-frac %.2f &middot; fail-frac %.2f &middot; "
+                     "tagged %.0f/win &middot; processed %.0f/win</div></div>",
+                     bg, fg, msg,
+                     rx.uw_reach, rx.decode_frac, rx.fail_frac,
+                     rx.tagged_ema, rx.processed_ema);
+        if (n < 0) n = 0;
+        if (n > (int)sizeof(body)) n = sizeof(body);
+        httpd_resp_send_chunk(req, body, n);
     }
 
     // Derived per-window figures — same formulas as status_logger emit().
@@ -1883,37 +1984,102 @@ static esp_err_t tune_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-// POST /scan — TEST endpoint: drives ONE full scanner_scan() multi-hop sweep
-// (1616-1626 MHz, 2.5 MHz step, ~5 live retunes, 2 s dwell each) on an
-// internal-stack task, exercising the live-retune scanner path under real
-// streaming. Purpose: verify sustained hopping survives on main (URB-reuse +
-// retune-retry + graceful-shutdown all landed) before investing in the
-// async-memcpy bypass. Call repeatedly for dozens of hops; watch serial for
-// wedge / worker drops. Returns immediately.
+// POST /scan[?n=<sweeps>] — drives scanner_survey() on an internal-stack
+// task, exercising the live-retune scanner path under real streaming.
+// Default n=1 is the original one-sweep TEST behavior (validated 42 hops /
+// 7 sweeps, 0 wedges); n>1 runs the integrated commissioning survey:
+// per-center density accumulated across n sweeps, parking on the INTEGRATED
+// peak instead of whichever satellite beam a single sweep landed on (see
+// scanner_survey in scanner.h). Live-park only — the LO is NOT persisted;
+// persist a pick that holds up via POST /tune. Returns immediately.
 static void scan_test_task(void *arg)
 {
-    (void)arg;
-    ESP_LOGW("SCANTEST", "=== /scan: starting scanner_scan sweep ===");
+    int n_sweeps = (int)(uintptr_t)arg;
+    ESP_LOGW("SCANTEST", "=== /scan: starting scanner survey (%d sweep%s) ===",
+             n_sweeps, n_sweeps == 1 ? "" : "s");
     // Surface it on the status page (LO "config → now" + scan row) like a real
     // rescan — scanner_hop() updates scanner_cur_hz() as it sweeps.
     int hops = (int)((SCAN_STOP_HZ - SCAN_START_HZ) / SCAN_STEP_HZ) + 1;
-    autotune_scan_mark(2, hops * (int)(SCAN_DWELL_MS / 1000));
-    scanner_scan(SCAN_START_HZ, SCAN_STOP_HZ, SCAN_STEP_HZ, SCAN_DWELL_MS);
+    autotune_scan_mark(2, hops * (int)(SCAN_DWELL_MS / 1000) * n_sweeps);
+    scanner_survey(SCAN_START_HZ, SCAN_STOP_HZ, SCAN_STEP_HZ, SCAN_DWELL_MS, n_sweeps);
     autotune_scan_unmark();
-    ESP_LOGW("SCANTEST", "=== /scan: sweep complete ===");
+    ESP_LOGW("SCANTEST", "=== /scan: survey complete ===");
     vTaskDelete(NULL);
 }
 
 static esp_err_t scan_post(httpd_req_t *req)
 {
+    // Optional ?n=<sweeps> (1..50; default 1 = legacy single sweep). At the
+    // SCAN_* defaults each sweep is ~40 s, so n=10 ≈ 6.5 min.
+    int  n_sweeps = 1;
+    char query[32], s[8];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "n", s, sizeof(s)) == ESP_OK) {
+        n_sweeps = atoi(s);
+        if (n_sweeps < 1) n_sweeps = 1;
+        if (n_sweeps > 50) n_sweeps = 50;
+    }
     httpd_resp_set_type(req, "text/plain");
     // prio 4: below worker/ingest so the scan orchestration (mostly waiting on
     // retune completion + dwell) can't starve the DSP hot path.
-    if (xTaskCreate(scan_test_task, "scan_test", 4096, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(scan_test_task, "scan_test", 4096, (void *)(uintptr_t)n_sweeps,
+                    4, NULL) != pdPASS) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_sendstr(req, "failed to spawn scan task\n");
     }
-    return httpd_resp_sendstr(req, "scan sweep started — watch serial\n");
+    char msg[80];
+    snprintf(msg, sizeof(msg), "scan started: %d sweep%s — watch serial\n",
+             n_sweeps, n_sweeps == 1 ? "" : "s");
+    return httpd_resp_sendstr(req, msg);
+}
+
+// POST /survey[?budget_h=<h>&k=<n>] — start the decode-based band-finder
+// survey (decode_survey.c): a density pre-pass shortlists K centers, then a
+// round-robin of 5 min visits ranks them by actual LW.DA decode rate and places
+// the final 2.5 MHz window on the LW.DA histogram peak. budget_h defaults to 24
+// (a true near-tie runs to budget); k defaults to 4. Live-park only — NVS
+// lo_freq_hz is NOT changed; the ranked RESULT is persisted to its own NVS
+// namespace. Returns immediately; poll /diag/survey (or /status) for progress.
+static esp_err_t survey_post(httpd_req_t *req)
+{
+    int  budget_h = 0, k = 0;
+    char query[64], s[12];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "budget_h", s, sizeof(s)) == ESP_OK)
+            budget_h = atoi(s);
+        if (httpd_query_key_value(query, "k", s, sizeof(s)) == ESP_OK)
+            k = atoi(s);
+    }
+    httpd_resp_set_type(req, "text/plain");
+    esp_err_t r = decode_survey_start(budget_h, k);
+    if (r == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(
+            req, "survey already running, or a gain-cal / LO scan is in "
+                 "progress\n");
+    }
+    if (r != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "failed to spawn survey task\n");
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "decode survey started (budget=%d h, k=%d) — poll /diag/survey\n",
+             budget_h > 0 ? budget_h : DS_DEFAULT_BUDGET_H,
+             (k >= 1 && k <= DS_MAX_CENTERS) ? k : DS_DEFAULT_K);
+    return httpd_resp_sendstr(req, msg);
+}
+
+// POST /survey/stop — abort a running survey; it parks back on the NVS
+// lo_freq_hz it started from and persists no result.
+static esp_err_t survey_stop_post(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/plain");
+    if (!decode_survey_running())
+        return httpd_resp_sendstr(req, "no survey running\n");
+    decode_survey_stop();
+    return httpd_resp_sendstr(
+        req, "survey abort requested — will park back on the NVS LO\n");
 }
 
 // POST /autotune?lo=<s>&gain=<s> — set the periodic autotune intervals in NVS
@@ -2844,6 +3010,65 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// /diag/survey: decode-based band survey state — the per-center LW.DA table
+// (rate/dwell/visits/eliminated), the absolute-freq LW.DA histogram, and the
+// verdict. This is where a headless operator reads WHY a center was chosen.
+static const char *ds_phase_name(ds_phase_t p)
+{
+    switch (p) {
+    case DS_PHASE_IDLE: return "idle";
+    case DS_PHASE_SHORTLIST: return "shortlist";
+    case DS_PHASE_RR: return "round_robin";
+    case DS_PHASE_PLACE: return "placement";
+    case DS_PHASE_DONE: return "done";
+    case DS_PHASE_ABORTED: return "aborted";
+    default: return "?";
+    }
+}
+
+static esp_err_t diag_survey_get(httpd_req_t *req)
+{
+    static decode_survey_status_t st; // ~880 B — static to spare the httpd stack
+    decode_survey_get_status(&st);
+
+    static char body[3072];
+    int         n = 0;
+    n += snprintf(body + n, sizeof(body) - n,
+                  "{\"running\":%s,\"phase\":\"%s\",\"cycle\":%lu,"
+                  "\"elapsed_s\":%lu,\"budget_s\":%lu,\"n_centers\":%d,"
+                  "\"alive\":%d,\"leader_hz\":%lu,\"pick_hz\":%lu,"
+                  "\"centers\":[",
+                  st.running ? "true" : "false",
+                  ds_phase_name(st.phase), (unsigned long)st.cycle,
+                  (unsigned long)st.elapsed_s, (unsigned long)st.budget_s,
+                  st.n_centers, st.alive, (unsigned long)st.leader_hz,
+                  (unsigned long)st.pick_hz);
+    for (int i = 0; i < st.n_centers && n < (int)sizeof(body); i++) {
+        const ds_center_t *c = &st.centers[i];
+        n += snprintf(body + n, sizeof(body) - n,
+                      "%s{\"hz\":%lu,\"lw_da\":%lu,\"lw_da_valid\":%lu,"
+                      "\"dwell_s\":%llu,\"visits\":%lu,\"rate_per_h\":%.2f,"
+                      "\"eliminated\":%s}",
+                      i ? "," : "", (unsigned long)c->center_hz,
+                      (unsigned long)c->lw_da, (unsigned long)c->lw_da_valid,
+                      (unsigned long long)(c->dwell_ms / 1000u),
+                      (unsigned long)c->visits, ds_center_rate_per_h(c),
+                      c->eliminated ? "true" : "false");
+    }
+    n += snprintf(body + n, sizeof(body) - n,
+                  "],\"abs_hist\":{\"lo_hz\":%u,\"bin_hz\":%u,\"bins\":[",
+                  (unsigned)DS_ABS_HIST_LO_HZ, (unsigned)DS_ABS_HIST_BIN_HZ);
+    for (int b = 0; b < DS_ABS_HIST_BINS && n < (int)sizeof(body); b++)
+        n += snprintf(body + n, sizeof(body) - n, "%s%lu", b ? "," : "",
+                      (unsigned long)st.abs_hist[b]);
+    n += snprintf(body + n, sizeof(body) - n, "]}}");
+
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(body)) n = sizeof(body);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, body, n);
+}
+
 // --- Dark continuous-capture coordinator (project_continuous_sd_capture_chokes) ---
 // A raw 5 MB/s continuous SD capture starves the shared SDMMC controller (SD slot 0
 // + C6 SDIO slot 1), killing HTTP + the USB stream. This runs a BOUNDED continuous
@@ -3058,6 +3283,9 @@ esp_err_t http_server_start(void)
         {.uri = "/capture/status", .method = HTTP_GET, .handler = capture_status_get, .user_ctx = NULL},
         {.uri = "/capture/file", .method = HTTP_GET, .handler = capture_file_get, .user_ctx = NULL},
         {.uri = "/scan", .method = HTTP_POST, .handler = scan_post, .user_ctx = NULL},
+        {.uri = "/survey", .method = HTTP_POST, .handler = survey_post, .user_ctx = NULL},
+        {.uri = "/survey/stop", .method = HTTP_POST, .handler = survey_stop_post, .user_ctx = NULL},
+        {.uri = "/diag/survey", .method = HTTP_GET, .handler = diag_survey_get, .user_ctx = NULL},
         {.uri = "/autotune", .method = HTTP_POST, .handler = autotune_post, .user_ctx = NULL},
         {.uri = "/besteffort", .method = HTTP_POST, .handler = besteffort_post, .user_ctx = NULL},
         {.uri = "/chase2", .method = HTTP_POST, .handler = chase2_post, .user_ctx = NULL},

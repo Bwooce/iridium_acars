@@ -145,6 +145,12 @@ typedef struct {
                                        // momentum, so this must NOT be short
                                        // (do not default 600). Default 3600.
 
+    // Band-health auto re-survey opt-in (band_health.c). Default FALSE
+    // (park-don't-steer): the staleness detector always tracks and logs, but
+    // only acts on the RF — one integrated multi-sweep survey + live re-park,
+    // never an NVS LO write — when this is set. NVS key "bh_auto".
+    bool band_resurvey_auto;
+
     char     station_id[APP_CONFIG_STATION_ID_LEN];     // for upstream/log identification
     char     wifi_ssid[APP_CONFIG_WIFI_SSID_LEN];       // for D17 C6 wireless
     char     wifi_psk[APP_CONFIG_WIFI_PSK_LEN];         // for D17 C6 wireless
@@ -221,6 +227,7 @@ esp_err_t app_config_set_autotune_gain_stride(uint8_t v);
 esp_err_t app_config_set_autotune_on_boot(bool v);
 esp_err_t app_config_set_autotune_gain_interval_s(uint32_t v);
 esp_err_t app_config_set_autotune_lo_interval_s(uint32_t v);
+esp_err_t app_config_set_band_resurvey_auto(bool v);
 esp_err_t app_config_set_station_id(const char *id);
 esp_err_t app_config_set_wifi_ssid(const char *ssid);
 esp_err_t app_config_set_wifi_psk(const char *psk);

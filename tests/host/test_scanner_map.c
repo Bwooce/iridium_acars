@@ -42,5 +42,25 @@ int main(void)
     uint32_t clamp[3];
     assert(scanner_enumerate_centers(0u, 100u, 10u, clamp, 3) == 3); // natural count 11, clamped to 3
 
+    // Multi-sweep accumulation (integrated survey): counts and dwell sum, so
+    // the rate becomes the mean over all accumulated dwell.
+    scanner_pos_t acc = {1620500000u, 0, 0, 0.0f, 0};
+    scanner_pos_t s1  = {1620500000u, 10, 20, 12.0f, 2000}; // 5.0 nb/s
+    scanner_pos_t s2  = {1620500000u, 2, 60, 18.0f, 2000};  // 1.0 nb/s
+    scanner_pos_accumulate(&acc, &s1);
+    assert(acc.narrowband_bursts == 10 && acc.all_bursts == 20 && acc.dwell_ms == 2000);
+    assert(acc.mean_snr_db == 12.0f); // first sweep dominates an empty accumulator
+    scanner_pos_accumulate(&acc, &s2);
+    assert(acc.narrowband_bursts == 12 && acc.all_bursts == 80 && acc.dwell_ms == 4000);
+    assert(scanner_pos_narrowband_rate(&acc) == 3.0f); // 12 bursts / 4 s = mean of 5 and 1
+    // Burst-weighted SNR: (12*20 + 18*60) / 80 = 16.5 dB.
+    assert(acc.mean_snr_db > 16.49f && acc.mean_snr_db < 16.51f);
+
+    // A failed-hop sweep entry (all zeros, dwell 0) must not perturb the accumulator.
+    scanner_pos_t failed = {1620500000u, 0, 0, 0.0f, 0};
+    scanner_pos_accumulate(&acc, &failed);
+    assert(acc.narrowband_bursts == 12 && acc.all_bursts == 80 && acc.dwell_ms == 4000);
+    assert(acc.mean_snr_db > 16.49f && acc.mean_snr_db < 16.51f);
+
     return 0;
 }

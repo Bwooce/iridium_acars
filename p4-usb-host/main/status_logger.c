@@ -60,6 +60,30 @@ static uint32_t s_cap_peak_qdrops    = 0; // max bursts dropped/evicted at queue
 static uint64_t s_cap_sum_processed  = 0; // Σ processed (for accept ratio)
 static uint64_t s_cap_sum_triagerej  = 0; // Σ pre-filter rejected (for accept ratio)
 
+// ---- Reception-environment heuristic (status_logger.h / the design doc) ----
+// EMAs of the per-window funnel counts (raw counts, not ratios — EMA the
+// numerator and denominator separately so a tiny window can't blow up a ratio).
+// Updated once/sec in emit(); read cross-core by the http task (unlocked torn
+// read benign, same rationale as s_last / s_cap_*).
+#define RX_EMA_ALPHA       0.05f // ~20 s time constant at 1 Hz
+#define RX_WARMUP_WINDOWS  20    // report INIT until this many windows sampled
+#define RX_DWELL_WINDOWS   8     // a new candidate state must persist this long to commit
+// Conservative default thresholds — calibrate against the exported raw ratios
+// (doc anchors: outdoor interference uw_reach≈0.04; QUIET when the band is idle).
+#define RX_QUIET_TAGGED    3.0f  // < this many tagger bursts/window ⇒ QUIET (idle band)
+#define RX_UW_INTERFERE    0.10f // reached-BCH/processed below this ⇒ INTERFERENCE (UW-lock collapsed)
+#define RX_DECODE_MARGINAL 0.15f // decoded/reached-BCH below this ⇒ MARGINAL (weak Iridium)
+#define RX_FAIL_MARGINAL   0.70f // BCH-failed/reached-BCH above this ⇒ MARGINAL
+static uint32_t s_rx_windows        = 0;             // windows folded into the EMAs
+static float    s_rx_ema_tagged     = 0.0f;          // gone_bursts/window
+static float    s_rx_ema_processed  = 0.0f;          // bursts_processed/window
+static float    s_rx_ema_reached    = 0.0f;          // (decoded+unknown+failed)/window
+static float    s_rx_ema_decoded    = 0.0f;          // bch_decoded/window
+static float    s_rx_ema_failed     = 0.0f;          // bch_failed/window
+static rx_state_t s_rx_state        = RX_STATE_INIT; // committed (debounced) state
+static rx_state_t s_rx_cand         = RX_STATE_INIT;  // candidate awaiting dwell
+static uint32_t   s_rx_cand_count   = 0;              // consecutive windows the candidate held
+
 bool status_logger_get_last(status_snapshot_t *out)
 {
     if (!s_have_last || !out) return false;
@@ -80,6 +104,84 @@ void status_logger_get_capacity(status_capacity_t *out)
     out->peak_queue_drops     = s_cap_peak_qdrops;
     uint64_t pf_total         = s_cap_sum_processed + s_cap_sum_triagerej;
     out->prefilter_accept_pct = pf_total ? (100.0f * (float)s_cap_sum_processed / (float)pf_total) : 0.0f;
+}
+
+// Fold one window's funnel counts into the reception EMAs and re-classify.
+// Called once/sec from emit() (before the verbose/quiet fork) so it runs
+// regardless of build config. Pure arithmetic on the logger task — negligible.
+static void rx_update(const status_snapshot_t *s)
+{
+    uint32_t tagged    = s->dsp.gone_bursts;
+    uint32_t processed = s->ws.bursts_processed;
+    uint32_t reached   = s->ws.bursts_bch_decoded + s->ws.bursts_bch_unknown +
+                         s->ws.bursts_bch_failed;
+    uint32_t decoded   = s->ws.bursts_bch_decoded;
+    uint32_t failed    = s->ws.bursts_bch_failed;
+
+    float a = RX_EMA_ALPHA;
+    s_rx_ema_tagged    += a * ((float)tagged - s_rx_ema_tagged);
+    s_rx_ema_processed += a * ((float)processed - s_rx_ema_processed);
+    s_rx_ema_reached   += a * ((float)reached - s_rx_ema_reached);
+    s_rx_ema_decoded   += a * ((float)decoded - s_rx_ema_decoded);
+    s_rx_ema_failed    += a * ((float)failed - s_rx_ema_failed);
+    if (s_rx_windows < UINT32_MAX) s_rx_windows++;
+
+    if (s_rx_windows < RX_WARMUP_WINDOWS) {
+        s_rx_state = RX_STATE_INIT;
+        return;
+    }
+
+    // Ratios from the EMAs (guard tiny denominators). uw_reach = of the bursts
+    // the worker demod-attempted, how many reached BCH — the interference tell.
+    float uw_reach    = s_rx_ema_reached / (s_rx_ema_processed > 1e-3f ? s_rx_ema_processed : 1e-3f);
+    float decode_frac = s_rx_ema_decoded / (s_rx_ema_reached > 1e-3f ? s_rx_ema_reached : 1e-3f);
+    float fail_frac   = s_rx_ema_failed / (s_rx_ema_reached > 1e-3f ? s_rx_ema_reached : 1e-3f);
+
+    rx_state_t cand;
+    if (s_rx_ema_tagged < RX_QUIET_TAGGED) {
+        cand = RX_STATE_QUIET; // band idle — too few bursts to judge anything else
+    } else if (uw_reach < RX_UW_INTERFERE) {
+        cand = RX_STATE_INTERFERENCE; // energy present but almost none locks a UW
+    } else if (decode_frac < RX_DECODE_MARGINAL || fail_frac > RX_FAIL_MARGINAL) {
+        cand = RX_STATE_MARGINAL; // UW locks but frames are too weak to decode cleanly
+    } else {
+        cand = RX_STATE_GOOD;
+    }
+
+    // Debounce: a new candidate must hold RX_DWELL_WINDOWS consecutive windows
+    // before it commits, so a single pass / brief spike can't flip the state.
+    if (cand == s_rx_cand) {
+        if (s_rx_cand_count < UINT32_MAX) s_rx_cand_count++;
+    } else {
+        s_rx_cand       = cand;
+        s_rx_cand_count = 1;
+    }
+    if (s_rx_cand_count >= RX_DWELL_WINDOWS || s_rx_state == RX_STATE_INIT) {
+        s_rx_state = s_rx_cand;
+    }
+}
+
+const char *status_reception_state_name(rx_state_t s)
+{
+    switch (s) {
+    case RX_STATE_QUIET:        return "quiet";
+    case RX_STATE_INTERFERENCE: return "interference";
+    case RX_STATE_MARGINAL:     return "marginal";
+    case RX_STATE_GOOD:         return "good";
+    case RX_STATE_INIT:
+    default:                    return "init";
+    }
+}
+
+void status_logger_get_reception(status_reception_t *out)
+{
+    if (!out) return;
+    out->state        = s_rx_state;
+    out->tagged_ema   = s_rx_ema_tagged;
+    out->processed_ema= s_rx_ema_processed;
+    out->uw_reach     = s_rx_ema_reached / (s_rx_ema_processed > 1e-3f ? s_rx_ema_processed : 1e-3f);
+    out->decode_frac  = s_rx_ema_decoded / (s_rx_ema_reached > 1e-3f ? s_rx_ema_reached : 1e-3f);
+    out->fail_frac    = s_rx_ema_failed / (s_rx_ema_reached > 1e-3f ? s_rx_ema_reached : 1e-3f);
 }
 
 static const char *reset_reason_name(esp_reset_reason_t r)
@@ -171,6 +273,11 @@ static void emit(const status_snapshot_t *s)
         if (proc > s_cap_peak_processed) s_cap_peak_processed = proc;
         if (qdrop > s_cap_peak_qdrops) s_cap_peak_qdrops = qdrop;
     }
+
+    // Reception-environment classifier: fold this window's funnel into the EMAs
+    // and re-classify (INTERFERENCE / MARGINAL / QUIET / GOOD). Runs every
+    // window regardless of the verbose/quiet fork below.
+    rx_update(s);
 
     double window_s = s->window_us / 1000000.0;
     if (window_s <= 0) window_s = 1.0;

@@ -33,6 +33,7 @@
 #include "esp_iot_log.h"
 #include "esp_heap_caps.h"
 #include "autotune_sched.h"
+#include "band_health.h"
 
 // One-line snapshot of internal-DMA-capable heap (the pool the USB
 // transfer ring competes for). Temporary diagnostic for the SD-link
@@ -435,6 +436,12 @@ void app_main(void)
     // stream liveness before touching the scanner/detector that
     // class_driver_task is about to create.
     autotune_sched_init();
+
+    // Band-health staleness detector (band_health.h): hourly IDA-rate
+    // tracking + the (default-off) auto re-survey trigger. Cheap — one
+    // esp_timer tick per hour; the first bucket closes an hour from now,
+    // long after the stream is live.
+    band_health_init();
 
     vTaskDelay(10); // Add a short delay to let the tasks run
 

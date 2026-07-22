@@ -77,20 +77,22 @@ static uint64_t s_wall_at_rf_now = 0; // esp_timer when s_rf_now last advanced
 
 #define FRAME_QUEUE_SLOTS 64 // 64 × ~2064 B ≈ 132 KB in PSRAM
 #define DECODER_STACK 6144
-#define DECODER_PRIO 6 // Core 0: == dsp_feed (6), < usb_pump (7),
-                       // > httpd (5), > sd_log (2), > logger (1).
-                       // Was 4, but under Path A's clean fast streaming
-                       // usb_pump(7) <-> dsp_feed(6) ping-pong keeps Core 0
-                       // continuously busy at prio >=6, so a prio-4 decoder
-                       // is NEVER the highest-ready task and starves for the
-                       // full 60 s TASK_WDT window -> frame_decoder abort/
-                       // reboot + zero decodes (2026-07-08). Equal to
-                       // dsp_feed so it gets scheduled when dsp_feed blocks
-                       // for the next USB block; it self-throttles (ONE
-                       // frame per wake then taskYIELD, below) so it takes
-                       // only a single decode's slice and yields straight
-                       // back to the tagger — it cannot runaway-starve
-                       // dsp_feed at equal priority.
+#define DECODER_PRIO 5 // Core 0: BELOW dsp_feed (6) and usb_pump (7); == httpd (5),
+                       // > sd_log (2), > logger (1). History: was 4 -> starved for the
+                       // full 60 s TASK_WDT window under fast streaming -> WDT abort/
+                       // reboot (2026-07-08); raised to 6 to be scheduled. BUT at 6 ==
+                       // dsp_feed the per-frame taskYIELD (below) only shares ~50/50 —
+                       // it can't monopolise Core 0, but that's NOT enough for the tagger
+                       // under a burst FLOOD, where dsp_feed needs >50% of Core 0 to
+                       // drain the USB ring. The un-drained deficit overflows the ring ->
+                       // blind rb_full raw-sample drops that also splice/corrupt straddling
+                       // bursts (#29). Dropped to 5 (2026-07-21) so the real-time tagger
+                       // PREEMPTS this best-effort decoder during floods (protecting
+                       // rb_full); it still runs in dsp_feed's idle gaps at normal traffic.
+                       // Flood-starvation here is safe + intended: the decoder is
+                       // WDT-unsubscribed and frames queue/drop by design (see decoder_task
+                       // comment). The reboot reason for prio-6 is fixed by that unsubscribe,
+                       // not the priority — so this is strictly safer than the old prio-4.
 #define DECODER_CORE 0 // Moved from Core 1 → Core 0 (#123,
                        // 2026-05-31). Core 1's worker (prio
                        // 5) was being preempted by anything
@@ -112,6 +114,29 @@ static _Atomic uint64_t s_class_tl       = 0;
 static _Atomic uint64_t s_class_bc       = 0;
 static _Atomic uint64_t s_class_lw_da    = 0;
 static _Atomic uint64_t s_class_lw_other = 0;
+
+// Per-LW.DA-frame relative-frequency histogram (decode-based band survey,
+// Phase C). Every classified LW.DA frame is bucketed by its baseband offset
+// (peak_bin → Hz relative to the LO) into FRAME_DECODER_LWDA_FREQ_BINS bins
+// spanning the ±FS_DETECT_HZ/2 detect window. Cumulative since boot; the
+// survey task (decode_survey.c) snapshots per-visit deltas and folds them —
+// at the visit's KNOWN LO — into an LO-independent absolute-freq histogram.
+// This is the LW.DA-only sibling of worker_core1's s_hist_freq (which counts
+// ALL detected bursts). ~160 B .bss in this Core-0 TU — it does NOT touch the
+// worker's early-alloc'd PIE buffers (heap-allocated in a different TU), so the
+// heap-position decode-bug placement discipline is unaffected.
+static _Atomic uint32_t s_lwda_freq[FRAME_DECODER_LWDA_FREQ_BINS];
+
+static inline void lwda_freq_record(int packed_peak_bin)
+{
+    int   signed_bin = (packed_peak_bin & 0xFFFF) - (int)(FFT_SIZE / 2);
+    float rel_hz     = (float)signed_bin * (float)FS_DETECT_HZ / (float)FFT_SIZE;
+    int   b = (int)((rel_hz + (float)FS_DETECT_HZ / 2.0f) /
+                    ((float)FS_DETECT_HZ / (float)FRAME_DECODER_LWDA_FREQ_BINS));
+    if (b < 0) b = 0;
+    if (b >= FRAME_DECODER_LWDA_FREQ_BINS) b = FRAME_DECODER_LWDA_FREQ_BINS - 1;
+    atomic_fetch_add_explicit(&s_lwda_freq[b], 1, memory_order_relaxed);
+}
 
 // SBD reassembler instance — single global, not thread-safe (only the
 // decoder task touches it). 8 sessions × ~330 B ≈ 2.6 KB in BSS.
@@ -521,6 +546,7 @@ static void process_one(const frame_queue_item_t *it)
     case IR_FRAME_LW:
         if (classified.lw_subtype == IR_LW_DA) {
             atomic_fetch_add_explicit(&s_class_lw_da, 1, memory_order_relaxed);
+            lwda_freq_record(it->peak_bin); // Phase-C band-survey histogram
             // Run the IDA -> SBD -> ACARS chain. Log the IDA header
             // fields up front so we can see what kind of DA content is
             // in the stream (CRC pass/fail, payload length, flags).
@@ -887,6 +913,24 @@ void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out)
     out->bc       = atomic_load_explicit(&s_class_bc, memory_order_relaxed);
     out->lw_da    = atomic_load_explicit(&s_class_lw_da, memory_order_relaxed);
     out->lw_other = atomic_load_explicit(&s_class_lw_other, memory_order_relaxed);
+}
+
+void frame_decoder_get_lwda_freq_hist(uint32_t *out, int max_bins)
+{
+    if (!out) return;
+    int n = max_bins < FRAME_DECODER_LWDA_FREQ_BINS ? max_bins
+                                                    : FRAME_DECODER_LWDA_FREQ_BINS;
+    for (int b = 0; b < n; b++)
+        out[b] = atomic_load_explicit(&s_lwda_freq[b], memory_order_relaxed);
+}
+
+int32_t frame_decoder_lwda_freq_bin_center_hz(int bin)
+{
+    // Bin b spans [-FS/2 + b·w, -FS/2 + (b+1)·w); its centre is at
+    // -FS/2 + (b+0.5)·w, where w = FS_DETECT_HZ / bins.
+    double w = (double)FS_DETECT_HZ / (double)FRAME_DECODER_LWDA_FREQ_BINS;
+    double c = -(double)FS_DETECT_HZ / 2.0 + ((double)bin + 0.5) * w;
+    return (int32_t)c;
 }
 
 uint64_t frame_decoder_acars_decoded_total(void)

@@ -50,6 +50,7 @@ static const char *NVS_NS = "iridium";
                                                 // Only runs when gain_mode==MANUAL. Each run logs a
                                                 // distinctive AUTOTUNE-START marker so any future wedge
                                                 // can be correlated to the hop that caused it.
+#define DEFAULT_BAND_RESURVEY_AUTO false // detect+log only; RF action is operator opt-in
 #define DEFAULT_STATION_ID "p4-iridium-1"
 #define DEFAULT_WIFI_SSID ""
 #define DEFAULT_WIFI_PSK ""
@@ -151,6 +152,7 @@ esp_err_t app_config_init(void)
     s_cfg.autotune_on_boot         = DEFAULT_AUTOTUNE_ON_BOOT;
     s_cfg.autotune_gain_interval_s = DEFAULT_AUTOTUNE_GAIN_INTERVAL_S;
     s_cfg.autotune_lo_interval_s   = DEFAULT_AUTOTUNE_LO_INTERVAL_S;
+    s_cfg.band_resurvey_auto       = DEFAULT_BAND_RESURVEY_AUTO;
     strncpy(s_cfg.station_id, DEFAULT_STATION_ID, APP_CONFIG_STATION_ID_LEN - 1);
     s_cfg.station_id[APP_CONFIG_STATION_ID_LEN - 1] = '\0';
     s_cfg.wifi_ssid[0]                              = '\0';
@@ -211,6 +213,9 @@ esp_err_t app_config_init(void)
     s_cfg.autotune_on_boot = (bool)at_on_boot;
     nvs_get_u32_or(h, "at_g_ivl_s", &s_cfg.autotune_gain_interval_s, DEFAULT_AUTOTUNE_GAIN_INTERVAL_S);
     nvs_get_u32_or(h, "at_lo_ivl_s", &s_cfg.autotune_lo_interval_s, DEFAULT_AUTOTUNE_LO_INTERVAL_S);
+    uint8_t bh_auto = (uint8_t)DEFAULT_BAND_RESURVEY_AUTO;
+    nvs_get_u8_or(h, "bh_auto", &bh_auto, (uint8_t)DEFAULT_BAND_RESURVEY_AUTO);
+    s_cfg.band_resurvey_auto = (bool)bh_auto;
     nvs_get_str_or(h, "station", s_cfg.station_id, APP_CONFIG_STATION_ID_LEN,
                    DEFAULT_STATION_ID);
     nvs_get_str_or(h, "wifi_ssid", s_cfg.wifi_ssid, APP_CONFIG_WIFI_SSID_LEN, "");
@@ -357,6 +362,15 @@ esp_err_t app_config_set_autotune_on_boot(bool v)
     s_cfg.autotune_on_boot = v;
     xSemaphoreGive(s_cfg_mu);
     return commit_one_u8("at_on_boot", (uint8_t)v);
+}
+
+esp_err_t app_config_set_band_resurvey_auto(bool v)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.band_resurvey_auto = v;
+    xSemaphoreGive(s_cfg_mu);
+    return commit_one_u8("bh_auto", (uint8_t)v);
 }
 
 esp_err_t app_config_set_gain_mode(gain_mode_t mode)
@@ -519,6 +533,8 @@ void app_config_log(void)
     ESP_LOGI(TAG, "autotune: on_boot=%d gain_interval_s=%lu lo_interval_s=%lu",
              (int)c.autotune_on_boot, (unsigned long)c.autotune_gain_interval_s,
              (unsigned long)c.autotune_lo_interval_s);
+    ESP_LOGI(TAG, "band-health auto re-survey: %s (bh_auto)",
+             c.band_resurvey_auto ? "ENABLED" : "disabled (detect+log only)");
     ESP_LOGI(TAG, "wifi_ssid='%s'  wifi_psk=%s",
              c.wifi_ssid, (c.wifi_psk[0] ? "(set)" : "(unset)"));
     if (c.out_host[0] && c.out_port) {
