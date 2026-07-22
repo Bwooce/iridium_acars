@@ -664,16 +664,58 @@ target_include_directories(test_band_pipeline_iridium PRIVATE
 target_link_libraries(test_band_pipeline_iridium PRIVATE m)
 add_test(NAME band_pipeline_iridium COMMAND test_band_pipeline_iridium)
 
-# VDL2 stub pipeline: interface-conformance smoke (accept-all prefilter,
-# zero frames, burst counter). Keeps the stub honest until the real
-# demod lands. Same -Werror policy as test_band_profile (all-new code).
+# VDL2 pipeline conformance smoke (accept-all prefilter, burst counter,
+# junk in -> zero frames + no callback). Written against the V0 stub;
+# still the interface gate now that the real demod is wired in (zeros
+# never sync). Same -Werror policy as test_band_profile (all-new code).
 add_executable(test_vdl2_pipeline_stub
     test_vdl2_pipeline_stub.c
     ${VDL2_DIR}/vdl2_pipeline.c
+    ${VDL2_DIR}/vdl2_demod.c
+    ${COMMON_DIR}/firmr_s16.c
 )
-target_include_directories(test_vdl2_pipeline_stub PRIVATE ${BAND_DIR} ${VDL2_DIR})
+target_include_directories(test_vdl2_pipeline_stub PRIVATE ${BAND_DIR} ${VDL2_DIR} ${COMMON_DIR})
 target_compile_options(test_vdl2_pipeline_stub PRIVATE -Werror)
+target_link_libraries(test_vdl2_pipeline_stub PRIVATE m)
 add_test(NAME vdl2_pipeline_stub COMMAND test_vdl2_pipeline_stub)
+
+# VDL2 D8PSK demod round-trip suite (plan C1): independent synthetic
+# modulator (vdl2_mod.c, host-test-only — not in the firmware SRCS) ->
+# production demod (vdl2_demod.c), asserting exact bit recovery at
+# clean SNR and under CFO / timing-offset / AWGN, header-FEC and
+# body-length boundary pins against dumpvdl2's decode.c rules,
+# scrambler involution + two-independent-implementations cross-check,
+# no false sync on noise, truncation flagging, and the multi-burst
+# (CSMA merge) pipeline loop with callback bit ownership.
+add_executable(test_vdl2_demod
+    test_vdl2_demod.c
+    ${VDL2_DIR}/vdl2_demod.c
+    ${VDL2_DIR}/vdl2_mod.c
+    ${VDL2_DIR}/vdl2_pipeline.c
+    ${COMMON_DIR}/firmr_s16.c
+)
+target_include_directories(test_vdl2_demod PRIVATE ${BAND_DIR} ${VDL2_DIR} ${COMMON_DIR})
+target_compile_options(test_vdl2_demod PRIVATE -Werror)
+target_link_libraries(test_vdl2_demod PRIVATE m)
+add_test(NAME vdl2_demod COMMAND test_vdl2_demod)
+
+# VDL2 real-signal smoke: the sigidwiki over-the-air capture
+# (channel-corrected 210 ksps raw in ~/iridium_capture/vdl2_ref/,
+# golden-decoded by dumpvdl2: 40 AVLC frames) through the production
+# demod, RS(255,249)-verifying the demodulated bytes per frame. SKIPs
+# (exit 0) when the capture file is not on this machine, so it is safe
+# to register in ctest.
+set(VDL2_RS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/vdl2)
+add_executable(test_vdl2_real_capture
+    test_vdl2_real_capture.c
+    ${VDL2_DIR}/vdl2_demod.c
+    ${VDL2_RS_DIR}/rs_vdl2.c
+    ${COMMON_DIR}/firmr_s16.c
+)
+target_include_directories(test_vdl2_real_capture PRIVATE ${VDL2_DIR} ${VDL2_RS_DIR} ${COMMON_DIR})
+target_compile_options(test_vdl2_real_capture PRIVATE -Werror)
+target_link_libraries(test_vdl2_real_capture PRIVATE m)
+add_test(NAME vdl2_real_capture COMMAND test_vdl2_real_capture)
 
 # Drift + AWGN parameter-sweep regression (#121). Same wideband pipeline
 # as test_pipeline_wideband_resampled, but each cell applies a synthetic
@@ -1608,3 +1650,39 @@ target_include_directories(test_rs_vdl2 PRIVATE
 )
 target_compile_options(test_rs_vdl2 PRIVATE -Werror)
 add_test(NAME rs_vdl2 COMMAND test_rs_vdl2)
+
+# test_crc16_x25 (2026-07-22): the reflected CRC-16/X-25 pair added to
+# crc16.c for the VDL2 AVLC FCS. Canonical vector (0x906E), bit-serial
+# reference over a random corpus, the HDLC 0xF0B8 good-residue convention
+# (dumpvdl2 GOOD_FCS parity) + single-bit-flip detection.
+add_executable(test_crc16_x25
+    test_crc16_x25.c
+    ${COMMON_DIR}/crc16.c
+)
+target_include_directories(test_crc16_x25 PRIVATE ${COMMON_DIR})
+target_compile_options(test_crc16_x25 PRIVATE -Werror)
+add_test(NAME crc16_x25 COMMAND test_crc16_x25)
+
+# test_avlc (2026-07-22): VDL Mode 2 AVLC deframer (common/vdl2/avlc.c) —
+# HDLC flag walk, bit-unstuffing, X-25 FCS, address/control parse, ACARS-vs-
+# link-management classification. Two vector sets: (1) 40 REAL over-the-air
+# frames (fixture_vdl2_avlc_golden.h, dumpvdl2 2.6.0 decode of the sigidwiki
+# 136.975 MHz capture — addresses, control octets, C/R + A/G bits, ACARS
+# reg/mode all pinned); (2) synthetic frames from an independent encoder
+# (inverse of dumpvdl2's parse_dlc_addr): byte-exact recovery, FCS reject on
+# every corrupted octet, stuffing edge cases (0xFF runs, 0x7E in data,
+# straddled five-1s runs), multi-frame bursts, invalid-sequence aborts,
+# 2000-frame random corpus. Pure C, no IDF deps — built with -Werror
+# (new-code policy from V0).
+add_executable(test_avlc
+    test_avlc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/vdl2/avlc.c
+    ${COMMON_DIR}/crc16.c
+)
+target_include_directories(test_avlc PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/vdl2
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures      # fixture_vdl2_avlc_golden.h
+    ${COMMON_DIR}
+)
+target_compile_options(test_avlc PRIVATE -Werror)
+add_test(NAME avlc COMMAND test_avlc)
