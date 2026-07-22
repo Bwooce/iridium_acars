@@ -28,19 +28,27 @@
 extern "C" {
 #endif
 
-// Maximum demod bit count we ever queue. Sized to the Iridium L-band
-// TDMA spec, not to what any one corpus frame happens to have:
+// Maximum demod bit count we ever queue. The queue is band-agnostic
+// (bits + metadata), so this is sized to the LARGEST frame any band
+// pushes:
 //
+// Iridium L-band TDMA (the original sizing):
 //   - One TDMA slot:    8.28 ms × 25 ksym/s × 2 bit/sym  = ~414 bits
 //   - Single-slot burst (most IDA / IBC / IRA frames):   ~382 bits
 //   - Two-slot data burst (concatenated next-access):    ~828 bits
 //   - Four-slot voice burst (theoretical max):          ~1656 bits
+//   (was 2048 through 2026-07; Iridium never comes close to the new cap)
 //
-// Round up to 2048 (= 256 bytes packed; we store 0/1-per-byte so 2048 B)
-// to cover any realistic frame including the 4-slot worst case plus
-// preamble margin. Per-item cost: 2048 + 16 metadata = 2064 B; 64-slot
-// queue is ~132 KB in PSRAM. (We have 32 MB free PSRAM; this is noise.)
-#define FRAME_QUEUE_MAX_BITS 2048
+// VDL Mode 2 (band=vdl2, phase V3): one transmission = 25 header bits
+// + 8 × (data octets + RS FEC octets). The header length cap
+// (VDL2_MAX_FRAME_BITS = 0x3FFF data bits, dumpvdl2 decode.c:45) gives
+// 2048 data octets + 52 FEC octets = 16825 bits worst case. Round up
+// to 16832 (multiple of 64). Per-item cost: 16832 + 768 soft + 24
+// metadata ≈ 17.6 KB; the 64-slot queue is ~1.13 MB in PSRAM (fits the
+// ~4 MB headroom — PSRAM-budget memory note). Runtime cost for Iridium
+// is UNCHANGED: push/pop copy only the n_bits/n_soft prefixes
+// (frame_queue.c), so the larger slots cost PSRAM, not cycles.
+#define FRAME_QUEUE_MAX_BITS 16832
 
 // Maximum per-bit soft metrics carried alongside bits[] (Chase-2 soft
 // BCH, task #16). Sized for one standard 382-bit burst frame (the only

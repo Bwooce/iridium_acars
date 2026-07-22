@@ -16,9 +16,10 @@ set(_app_reqs
     usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash
     esp_wifi esp_netif esp_event esp_http_server esp_app_format
     esp_https_ota app_update lwip iridium_decoder
-    # VHF/VDL2 foundation: generic band interface + the VDL2 stub
-    # pipeline (band_select.c references both concrete bands).
-    band_pipeline vdl2_decoder
+    # VHF/VDL2: generic band interface + the VDL2 pipeline (band_select.c
+    # references both concrete bands) + the L2 codecs (frame_decoder.c's
+    # band=vdl2 branch consumes avlc.h/vdl2_l2.h directly — V3).
+    band_pipeline vdl2_decoder vdl2
     # SDMMC + FATFS always declared so idf_component_register sees them
     # on first-pass CMake evaluation (CONFIG_* isn't readable until pass
     # two, but PRIV_REQUIRES is consumed on pass one). The runtime cost

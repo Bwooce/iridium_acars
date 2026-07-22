@@ -16,6 +16,7 @@
 #include "app_config.h"
 #include "msg_ring.h"
 #include "frame_decoder.h"
+#include "vdl2_pipeline.h" // vdl2 demod counters for /status "decode.vdl2" (V3)
 #include "ota_runner.h"
 #include "class_driver.h"     // class_driver_prepare_for_reboot()
 #include "scanner.h"          // scanner_survey() — /scan sweep/survey endpoint
@@ -269,7 +270,12 @@ static esp_err_t status_get(httpd_req_t *req)
     static decode_survey_status_t dsv;
     decode_survey_get_status(&dsv);
 
-    char body[2560];
+    // band=vdl2 decode funnel (V3). All-zero under band=iridium; emitted
+    // unconditionally so dashboards see a stable JSON shape either way.
+    frame_decoder_vdl2_stats_t vd = {0};
+    frame_decoder_get_vdl2_stats(&vd);
+
+    char body[3072]; // +vdl2 block (V3); headroom re-checked vs worst case
     int  n = snprintf(body, sizeof(body),
                       "{"
                        "\"build\":\"%s\","
@@ -301,6 +307,13 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"frames\":{"
                        "\"ms\":%llu,\"tl\":%llu,\"bc\":%llu,"
                        "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu"
+                       "},"
+                       "\"vdl2\":{"
+                       "\"bursts\":%u,\"synced\":%u,\"phy_ok\":%llu,\"l2_fail\":%llu,"
+                       "\"rs_ok\":%u,\"rs_fail\":%u,\"rs_fixed\":%u,"
+                       "\"avlc_ok\":%llu,\"acars\":%llu,\"x25\":%llu,"
+                       "\"sup\":%llu,\"unnum\":%llu,"
+                       "\"bad_fcs\":%llu,\"too_short\":%llu"
                        "}"
                        "},"
                        "\"health_wdt\":{\"gw\":\"%u.%u.%u.%u\",\"gw_armed\":%s,\"gw_fails\":%d,"
@@ -367,6 +380,15 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned long long)cc.ms, (unsigned long long)cc.tl,
                       (unsigned long long)cc.bc, (unsigned long long)cc.lw_da,
                       (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown,
+                      (unsigned)vdl2_pipeline_bursts_seen(),
+                      (unsigned)vdl2_pipeline_sync_count(),
+                      (unsigned long long)vd.phy_frames, (unsigned long long)vd.l2_fail,
+                      (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_blocks_fail,
+                      (unsigned)vd.rs_octets_fixed,
+                      (unsigned long long)vd.avlc_ok, (unsigned long long)vd.acars,
+                      (unsigned long long)vd.x25,
+                      (unsigned long long)vd.supervisory, (unsigned long long)vd.unnumbered,
+                      (unsigned long long)vd.bad_fcs, (unsigned long long)vd.too_short,
                       (unsigned)(wdt_gw & 0xff), (unsigned)((wdt_gw >> 8) & 0xff),
                       (unsigned)((wdt_gw >> 16) & 0xff), (unsigned)((wdt_gw >> 24) & 0xff),
                      wdt_armed ? "true" : "false", wdt_fails,

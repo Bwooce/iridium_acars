@@ -131,6 +131,25 @@ typedef struct {
 } frame_decoder_reasm_stats_t;
 void frame_decoder_get_reasm_stats(frame_decoder_reasm_stats_t *out);
 
+// band=vdl2 decode-funnel counters (V3): PHY frames popped -> RS block
+// verdicts -> AVLC frame kinds -> ACARS routed to libacars. All zero
+// under band=iridium. Cumulative since boot; cheap relaxed loads (the
+// RS trio are plain single-writer reads, torn-read benign). Served in
+// /status "decode.vdl2".
+typedef struct {
+    uint64_t phy_frames; // demodulated VDL2 transmissions popped
+    uint64_t l2_fail;    // dropped whole (header/truncation/RS failure)
+    uint32_t rs_blocks_ok, rs_blocks_fail, rs_octets_fixed;
+    uint64_t avlc_ok;     // FCS-valid AVLC frames (= acars+x25+sup+unnum)
+    uint64_t acars;       // ACARS-bearing I frames handed to libacars
+    uint64_t x25;         // ATN/X.25 I frames (counted, not decoded — V5)
+    uint64_t supervisory; // S frames (RR/REJ/... link management)
+    uint64_t unnumbered;  // U frames (XID/TEST/...)
+    uint64_t bad_fcs;     // FCS-failed frames
+    uint64_t too_short;   // destuffed frames < 11 octets
+} frame_decoder_vdl2_stats_t;
+void frame_decoder_get_vdl2_stats(frame_decoder_vdl2_stats_t *out);
+
 // Rolling decode-rate counters (#117). Sum of classified-as-known-type
 // frames over the last 1 h and 24 h, snapped on a 1-minute esp_timer
 // tick. A WARN log fires automatically when 24h>10 && 1h==0 ("we

@@ -36,6 +36,7 @@
 #include "sd_capture.h"
 #include "band_pipeline.h" // per-band demod dispatch (VHF/VDL2 foundation)
 #include "band_select.h"
+#include "vdl2_pipeline.h" // vdl2_pipeline() identity — picks the VDL2 emit sink
 #include "app_config.h"    // NVS band -> pipeline resolution at init
 #include "burst_pipeline.h" // TRIAGE_EXT_RAW derivation (BURST_PIPELINE_TRIAGE_LEN_250K)
 #include "direct_if_decim.h"
@@ -61,6 +62,13 @@ static const char *TAG = "WORKER1";
 // this file used to make directly (bit-identity pinned by
 // tests/host/test_band_pipeline_iridium.c). Never NULL after init.
 static const band_pipeline_t *s_band_pipeline = NULL;
+// Per-band frame emit sink, resolved alongside s_band_pipeline at init
+// (plan §C4): band=iridium -> worker_emit_frame (BCH + classify +
+// frame_decoder/PDU hand-off, unchanged); band=vdl2 ->
+// worker_emit_frame_vdl2 (thin forwarder pushing the descrambled PHY
+// bit vector to the frame_decoder task, where the RS + AVLC + libacars
+// L2 runs — the worker stays DSP-only). Never NULL after init.
+static band_frame_cb_t s_emit_cb = NULL;
 
 // SNR priority queue (T59). The worker can only fully-decode ~13 bursts/s
 // (~76 ms each, dominated by the demod pipeline); the tagger, at the
@@ -1004,6 +1012,47 @@ static void worker_emit_frame(band_frame_t *bframe, void *ctx)
     wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);
 }
 
+// VDL2 frame sink (band=vdl2 only; plan §C4 / phase V3). The pipeline
+// already ran the whole D8PSK demod (sync, slicing, descramble, burst
+// header) — this forwarder just ships the PHY bit vector to the Core-0
+// frame_decoder task, whose band=vdl2 branch runs the byte-work L2
+// (vdl2_l2_feed: RS(255,249) de-interleave/correct + AVLC deframe +
+// libacars). No soft bits are queued: the VDL2 FEC is hard-decision RS.
+// direction is band_frame_t's band-defined value (0 for VDL2 — the
+// ACARS direction is derived per AVLC frame from the source address
+// type downstream). demod_ok=false frames (header-locked but truncated
+// by the tagger window) are counted by the pipeline's own diagnostics
+// and dropped here — a truncated transmission cannot RS-verify.
+static void worker_emit_frame_vdl2(band_frame_t *bframe, void *ctx)
+{
+    wb_worker_ctx_t *wctx   = (wb_worker_ctx_t *)ctx;
+    int64_t          t_bch0 = esp_timer_get_time();
+
+    if (bframe->demod_ok) {
+        ESP_LOGI(TAG, "VDL2 FRAME: %d bits snr=%.1f dB (queued for L2)",
+                 bframe->n_bits, (double)bframe->snr_db);
+        // Same capture-timestamp derivation as the Iridium sink.
+        const uint64_t cap_us =
+            signal_buffer_stream_epoch_us() +
+            wctx->burst->start_sample_idx * 1000000ULL / FS_DETECT_HZ;
+#if CONFIG_DEVICE_ROLE_WORKER || CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK
+        // Distributed front end ships Iridium PDUs only; band=vdl2 is a
+        // STANDALONE feature for now (plan V4 scope). Drop with the
+        // diagnostic counters the pipeline already keeps.
+        (void)cap_us;
+#else
+        frame_decoder_push(bframe->bits, (size_t)bframe->n_bits,
+                           NULL, 0,
+                           (ir_direction_t)bframe->direction, 0u,
+                           wctx->burst->peak_bin, wctx->burst->peak_snr_db,
+                           cap_us);
+#endif
+    }
+    free(bframe->bits);
+    free(bframe->soft_bits);
+    wctx->t_bch_accum += (uint64_t)(esp_timer_get_time() - t_bch0);
+}
+
 // Chunked ring-read → rotate-to-DC → 10× decim into s_decim_buf.
 // Factored out of worker_task for P1.5a so the triage pass (truncated
 // window) and the escalated full pass (today's exact path) share one
@@ -1303,7 +1352,7 @@ void worker_task(void *arg)
             };
             int n_frames = s_band_pipeline->process_burst(
                 s_decim_buf, n_250k,
-                worker_emit_frame, &worker_ctx);
+                s_emit_cb, &worker_ctx);
             int64_t t_pipe1 = esp_timer_get_time();
             // burst_pipeline includes the per-frame BCH+log+queue cost
             // inside the callback. Subtract that out so s_t_pipeline_us
@@ -1362,6 +1411,11 @@ esp_err_t worker_core1_init(void)
     app_config_t cfg = {0}; // {0}: snapshot is a no-op pre-app_config_init; band 0 = iridium
     app_config_snapshot(&cfg);
     s_band_pipeline = band_select_pipeline((band_id_t)cfg.band);
+    // Emit sink pairs with the pipeline (plan §C4): Iridium keeps the
+    // historical worker_emit_frame path bit-identically; VDL2 forwards
+    // PHY bits to the frame_decoder task's L2 branch.
+    s_emit_cb = (s_band_pipeline == vdl2_pipeline()) ? worker_emit_frame_vdl2
+                                                     : worker_emit_frame;
     ESP_LOGI(TAG, "band pipeline: %s", s_band_pipeline->name);
 
     hot_bin_table_init(&s_hot); // A6: entries empty, boost enabled (default ON)

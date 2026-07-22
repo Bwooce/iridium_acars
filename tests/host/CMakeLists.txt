@@ -717,6 +717,31 @@ target_compile_options(test_vdl2_real_capture PRIVATE -Werror)
 target_link_libraries(test_vdl2_real_capture PRIVATE m)
 add_test(NAME vdl2_real_capture COMMAND test_vdl2_real_capture)
 
+# V3 L2 feed (vdl2_l2.c): synthetic round-trip of PHY bits -> byte pack
+# -> RS-block de-interleave -> RS(255,249) correction -> AVLC deframe,
+# against an INDEPENDENT test-local encoder (stuffing, block split, RS
+# parity, dumpvdl2 decode.c:135-163 interleave walk). Real golden AVLC
+# frames as payloads. Pins the MULTI-BLOCK (>249 octet) path the
+# single-block sigidwiki capture cannot exercise, plus per-block error
+# injection to the t=3 bound, shortened 2-/4-parity erasure schemes,
+# uncorrectable -> whole-burst drop, truncation.
+add_executable(test_vdl2_l2
+    test_vdl2_l2.c
+    ${VDL2_DIR}/vdl2_l2.c
+    ${VDL2_DIR}/vdl2_demod.c
+    ${VDL2_RS_DIR}/rs_vdl2.c
+    ${VDL2_RS_DIR}/avlc.c
+    ${COMMON_DIR}/crc16.c
+    ${COMMON_DIR}/firmr_s16.c
+)
+target_include_directories(test_vdl2_l2 PRIVATE
+    ${VDL2_DIR} ${VDL2_RS_DIR} ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures      # fixture_vdl2_avlc_golden.h
+)
+target_compile_options(test_vdl2_l2 PRIVATE -Werror)
+target_link_libraries(test_vdl2_l2 PRIVATE m)
+add_test(NAME vdl2_l2 COMMAND test_vdl2_l2)
+
 # Drift + AWGN parameter-sweep regression (#121). Same wideband pipeline
 # as test_pipeline_wideband_resampled, but each cell applies a synthetic
 # LO drift (±5/10/15 kHz) and added AWGN (sigma 0..400 int16 LSB), then
@@ -1686,3 +1711,59 @@ target_include_directories(test_avlc PRIVATE
 )
 target_compile_options(test_avlc PRIVATE -Werror)
 add_test(NAME avlc COMMAND test_avlc)
+
+# test_vdl2_e2e_acars (2026-07-22, V3 ACCEPTANCE): the FULL VDL2 chain
+# on the real sigidwiki capture — production vdl2_demod_burst ->
+# vdl2_l2_feed (RS de-interleave/correct + AVLC) -> vendored libacars
+# (la_acars_parse_and_reassemble, the same minimum source set the IDF
+# component / test_libacars_link builds). Asserts >= 7 of the 9 dumpvdl2
+# golden ACARS messages are reproduced (reg + mode, expectations from
+# fixture_vdl2_avlc_golden.h) and >= 32 FCS-valid AVLC frames (golden
+# 40). SKIPs (exit 0) when the capture file is absent. -Werror is scoped
+# to the NEW sources (test + vdl2 chain) — the vendored libacars files
+# keep the same warning-silencing flags as test_libacars_link.
+add_executable(test_vdl2_e2e_acars
+    test_vdl2_e2e_acars.c
+    ${VDL2_DIR}/vdl2_demod.c
+    ${VDL2_DIR}/vdl2_l2.c
+    ${VDL2_RS_DIR}/rs_vdl2.c
+    ${VDL2_RS_DIR}/avlc.c
+    ${COMMON_DIR}/crc16.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_vdl2_e2e_acars PRIVATE
+    ${VDL2_DIR} ${VDL2_RS_DIR} ${COMMON_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures     # fixture_vdl2_avlc_golden.h
+    ${LIBACARS_UPSTREAM}                        # <libacars/...> includes
+    ${LIBACARS_IDF_DIR}                         # "config.h"
+)
+target_compile_options(test_vdl2_e2e_acars PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -D_DARWIN_C_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+set_source_files_properties(
+    test_vdl2_e2e_acars.c
+    ${VDL2_DIR}/vdl2_demod.c
+    ${VDL2_DIR}/vdl2_l2.c
+    PROPERTIES COMPILE_OPTIONS "-Werror"
+)
+target_link_libraries(test_vdl2_e2e_acars PRIVATE m)
+add_test(NAME vdl2_e2e_acars COMMAND test_vdl2_e2e_acars)

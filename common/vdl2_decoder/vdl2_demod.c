@@ -13,6 +13,24 @@
 
 #include "firmr_s16.h" // common/iridium_decoder — host-proven polyphase core
 
+// Large per-burst transients — the resampled iq105 window (worst case
+// ~110 KB for a full tagger window) and the demodulated bits/soft
+// vectors (up to ~17 KB / ~34 KB at the spec-max transmission length)
+// — go to PSRAM on target. Internal SRAM is almost fully committed to
+// the USB URB pool (DMA-INT budget memory note, ~40 KB free), so a
+// plain malloc() of any of these would fail or starve the USB path.
+// free() releases heap_caps memory fine, so ownership handoff to the
+// emit callback is unchanged. Host build: no heap_caps — fall back to
+// malloc() (same __has_include guard family as bch_decoder.c). The
+// small coefficient/scratch allocations in vdl2_lpf_design_q15 stay on
+// the default heap (a few hundred bytes, freed before return).
+#if __has_include("esp_heap_caps.h")
+#include "esp_heap_caps.h"
+#define vd_malloc_psram(sz) heap_caps_malloc((sz), MALLOC_CAP_SPIRAM)
+#else
+#define vd_malloc_psram(sz) malloc(sz)
+#endif
+
 #define VD_PI 3.14159265358979323846f
 
 // ---- dumpvdl2 demod constants (src/demod.c:37-48) ----
@@ -490,8 +508,9 @@ bool vdl2_demod_burst(const int16_t *iq250, int n_complex,
     sync_lr_init();
 
     int      max105 = n_complex * VDL2_RESAMP_INTERP / VDL2_RESAMP_DECIM + 4;
-    int16_t *iq105  = (int16_t *)malloc((size_t)max105 * 2 * sizeof(int16_t));
-    if (!iq105) return false;
+    int16_t *iq105  = (int16_t *)vd_malloc_psram((size_t)max105 * 2 *
+                                                 sizeof(int16_t));
+    if (!iq105) return false; // PSRAM pressure: drop the burst, no crash
     int n105 = resample_250_to_105(iq250, n_complex, iq105, max105);
 
     vdl2_sync_t ss;
@@ -555,12 +574,13 @@ bool vdl2_demod_burst(const int16_t *iq250, int n_complex,
         int needed      = VDL2_HDR_BITS + body;
         int needed_syms = (needed + VDL2_BPS - 1) / VDL2_BPS;
 
-        uint8_t *bits = (uint8_t *)malloc((size_t)needed);
-        int16_t *soft = (int16_t *)malloc((size_t)needed * sizeof(int16_t));
+        uint8_t *bits = (uint8_t *)vd_malloc_psram((size_t)needed);
+        int16_t *soft = (int16_t *)vd_malloc_psram((size_t)needed *
+                                                   sizeof(int16_t));
         if (!bits || !soft) {
             free(bits);
             free(soft);
-            break; // OOM: give up on the window
+            break; // OOM: give up on the window (no frame emitted)
         }
         int n_avail = needed < 27 ? needed : 27;
         memcpy(bits, raw27, (size_t)n_avail);

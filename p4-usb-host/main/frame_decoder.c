@@ -39,7 +39,9 @@
 #include "msg_ring.h"
 #include "acars_push.h"
 #include "sd_log.h"
-#include "app_config.h" // best_effort_decode gate (Task B4)
+#include "app_config.h" // best_effort_decode gate (Task B4); band soft-switch
+#include "band_profile.h" // band_id_t — the decoder task branches per band (V3)
+#include "vdl2_l2.h"      // band=vdl2: RS de-interleave/correct + AVLC deframe
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
 #include <libacars/reassembly.h>
@@ -107,6 +109,11 @@ static uint64_t s_wall_at_rf_now = 0; // esp_timer when s_rf_now last advanced
 static frame_queue_t *s_queue       = NULL;
 static TaskHandle_t   s_task        = NULL;
 static volatile bool  s_initialised = false;
+// Band soft-switch snapshot (V3). Resolved ONCE at init, exactly like
+// worker_core1's s_band_pipeline: band=vdl2 routes popped bit vectors
+// through the VDL2 L2 (vdl2_l2_feed) instead of iridium_frame_classify.
+// band=iridium (default) takes the historical path untouched.
+static bool s_band_vdl2 = false;
 
 static _Atomic uint64_t s_class_unknown  = 0;
 static _Atomic uint64_t s_class_ms       = 0;
@@ -374,32 +381,40 @@ static void strip_acars_prefix(const uint8_t **p, int *n)
     }
 }
 
-// Try to parse the reassembled SBD payload as ACARS. Logs the
-// decoded fields if a recognisable ACARS frame is found.
-static void try_acars(const sbd_message_t *msg,
-                      int32_t peak_bin, float snr_db)
+// Shared libacars delivery helper (V3): the ONE
+// la_acars_parse_and_reassemble() call site + result handling for every
+// band. Callers hand it a bare ACARS block (mode char onward, any
+// band-specific envelope already stripped) plus the message direction
+// and per-burst metadata:
+//   - Iridium SBD: try_acars() below (payload after strip_acars_prefix,
+//     dir from the SBD envelope's uplink flag) — behaviour bit-identical
+//     to the pre-factoring code (regression gates: host libacars_link /
+//     libacars_best_effort / ida / sbd / band_pipeline_iridium suites).
+//   - VDL2 AVLC: vdl2_avlc_cb() (f->acars/acars_len from the AVLC I
+//     frame, dir from the source address type, NO prefix stripping —
+//     the 0xFF 0xFF 0x01 discriminator was already consumed by avlc.c,
+//     matching dumpvdl2 src/avlc.c:255-262 + src/acars.c:100-108).
+// D14: the persistent la_reasm_ctx makes multi-block ACARS messages
+// (block_id 1-5 with more_blocks_follow) accumulate across calls. The
+// returned la_acars_msg has reasm_status set:
+//   LA_REASM_COMPLETE      → fully reassembled, log + emit
+//   LA_REASM_IN_PROGRESS   → fragment buffered, return silently
+//   LA_REASM_SKIPPED       → single-block (immediate complete)
+//   LA_REASM_DUPLICATE     → already-seen fragment, drop
+//   LA_REASM_FRAG_OUT_OF_SEQUENCE → unrecoverable, drop
+// Single-task only (the decoder task owns s_reasm_ctx / msg_ring emit).
+static void acars_deliver(const uint8_t *buf, int len, la_msg_dir dir,
+                          uint64_t timestamp_us,
+                          int32_t peak_bin, float snr_db)
 {
-    if (!msg || msg->payload_len < 8) return;
-    const uint8_t *acars_buf = msg->payload;
-    int            acars_len = msg->payload_len;
-    strip_acars_prefix(&acars_buf, &acars_len);
-    if (acars_len < 8) return;
-    la_msg_dir dir = msg->uplink ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
-    // D14: use la_acars_parse_and_reassemble with our persistent
-    // la_reasm_ctx so multi-block ACARS messages (block_id 1-5 with
-    // more_blocks_follow set) accumulate across SBD packets. The
-    // returned la_acars_msg has reasm_status set:
-    //   LA_REASM_COMPLETE      → fully reassembled, log + emit
-    //   LA_REASM_IN_PROGRESS   → fragment buffered, return silently
-    //   LA_REASM_SKIPPED       → single-block (immediate complete)
-    //   LA_REASM_DUPLICATE     → already-seen fragment, drop
-    //   LA_REASM_FRAG_OUT_OF_SEQUENCE → unrecoverable, drop
+    if (!buf || len <= 0) return;
+    bool           uplink  = (dir == LA_MSG_DIR_GND2AIR);
     struct timeval rx_time = {
-        .tv_sec  = (time_t)(msg->timestamp_us / 1000000ULL),
-        .tv_usec = (suseconds_t)(msg->timestamp_us % 1000000ULL),
+        .tv_sec  = (time_t)(timestamp_us / 1000000ULL),
+        .tv_usec = (suseconds_t)(timestamp_us % 1000000ULL),
     };
-    la_proto_node *node = la_acars_parse_and_reassemble(
-        acars_buf, acars_len, dir, s_reasm_ctx, rx_time);
+    la_proto_node *node =
+        la_acars_parse_and_reassemble(buf, len, dir, s_reasm_ctx, rx_time);
     if (!node) return;
     la_acars_msg *a = find_acars_msg(node);
     if (a) {
@@ -418,7 +433,7 @@ static void try_acars(const sbd_message_t *msg,
                 reg_nodot++;
             ESP_LOGI(TAG, "ACARS: %s mode=%c reg=%s label='%.2s' block=%c "
                           "msgnum='%.4s' flight='%.6s' crc=%s txt=\"%s\"",
-                     msg->uplink ? "UL" : "DL",
+                     uplink ? "UL" : "DL",
                      a->mode ? a->mode : '?',
                      reg_nodot,
                      a->label, a->block_id ? a->block_id : '?',
@@ -426,10 +441,10 @@ static void try_acars(const sbd_message_t *msg,
                      a->crc_ok ? "OK" : "BAD",
                      a->txt ? a->txt : "");
 
-            // Push to /messages-visible ring.
+            // Push to /messages-visible ring + UDP push + SD log.
             acars_msg_t out  = {0};
-            out.timestamp_us = msg->timestamp_us;
-            out.uplink       = msg->uplink;
+            out.timestamp_us = timestamp_us;
+            out.uplink       = uplink;
             out.mode         = a->mode ? a->mode : '?';
             out.label[0]     = a->label[0];
             out.label[1]     = a->label[1];
@@ -455,6 +470,23 @@ static void try_acars(const sbd_message_t *msg,
         // DUPLICATE / OUT_OF_SEQUENCE / ARGS_INVALID: silent drop.
     }
     la_proto_tree_destroy(node);
+}
+
+// Try to parse the reassembled SBD payload as ACARS (Iridium path).
+// Strips the SBD-specific SOH/0x03 prefix, derives the direction from
+// the SBD envelope, and hands the bare ACARS block to the shared
+// acars_deliver() helper above.
+static void try_acars(const sbd_message_t *msg,
+                      int32_t peak_bin, float snr_db)
+{
+    if (!msg || msg->payload_len < 8) return;
+    const uint8_t *acars_buf = msg->payload;
+    int            acars_len = msg->payload_len;
+    strip_acars_prefix(&acars_buf, &acars_len);
+    if (acars_len < 8) return;
+    la_msg_dir dir = msg->uplink ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
+    acars_deliver(acars_buf, acars_len, dir, msg->timestamp_us,
+                  peak_bin, snr_db);
 }
 
 static void process_one(const frame_queue_item_t *it)
@@ -705,6 +737,100 @@ static void process_one(const frame_queue_item_t *it)
     }
 }
 
+// ---- band=vdl2 branch (V3) -------------------------------------------------
+// Popped items carry the demod's descrambled PHY bit vector (header
+// included). vdl2_l2_feed runs the byte-work L2 (pack -> RS de-inter-
+// leave/correct -> AVLC deframe) and fires vdl2_avlc_cb once per AVLC
+// frame; ACARS-bearing I frames go to the SAME acars_deliver() helper
+// the Iridium SBD path uses. All counters single-writer (this task).
+
+static _Atomic uint64_t s_vdl2_phy       = 0; // PHY frames popped (vdl2 items)
+static _Atomic uint64_t s_vdl2_l2_fail   = 0; // vdl2_l2_feed < 0 (hdr/trunc/RS)
+static _Atomic uint64_t s_vdl2_avlc_ok   = 0; // FCS-valid AVLC frames
+static _Atomic uint64_t s_vdl2_acars     = 0; // ...of which ACARS-bearing I frames
+static _Atomic uint64_t s_vdl2_x25       = 0; // ...ATN/X.25 I frames (counted, not decoded)
+static _Atomic uint64_t s_vdl2_srej      = 0; // ...S (supervisory) frames
+static _Atomic uint64_t s_vdl2_unnum     = 0; // ...U (XID etc.) frames
+static _Atomic uint64_t s_vdl2_bad_fcs   = 0; // FCS-failed frames (counted, not parsed)
+static _Atomic uint64_t s_vdl2_too_short = 0; // destuffed frame < 11 octets
+
+static void vdl2_avlc_cb(const avlc_frame_t *f, void *ctx)
+{
+    const frame_queue_item_t *it = (const frame_queue_item_t *)ctx;
+    switch (f->kind) {
+    case AVLC_KIND_ACARS:
+        atomic_fetch_add_explicit(&s_vdl2_avlc_ok, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_vdl2_acars, 1, memory_order_relaxed);
+        {
+            // Direction from the AVLC source address type — dumpvdl2
+            // src/acars.c:100-108: aircraft source = AIR2GND (downlink),
+            // ground-station source = GND2AIR (uplink). f->acars already
+            // points past the 0xFF 0xFF 0x01 discriminator (avlc.h) — no
+            // SOH/0x03 stripping here; that envelope is Iridium-SBD-only.
+            la_msg_dir dir = (f->src_type == AVLC_ADDRTYPE_AIRCRAFT)
+                                 ? LA_MSG_DIR_AIR2GND
+                                 : LA_MSG_DIR_GND2AIR;
+            acars_deliver(f->acars, f->acars_len, dir, it->timestamp_us,
+                          it->peak_bin, it->snr_db);
+        }
+        break;
+    case AVLC_KIND_X25:
+        atomic_fetch_add_explicit(&s_vdl2_avlc_ok, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_vdl2_x25, 1, memory_order_relaxed);
+        break;
+    case AVLC_KIND_SUPERVISORY:
+        atomic_fetch_add_explicit(&s_vdl2_avlc_ok, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_vdl2_srej, 1, memory_order_relaxed);
+        break;
+    case AVLC_KIND_UNNUMBERED:
+        atomic_fetch_add_explicit(&s_vdl2_avlc_ok, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_vdl2_unnum, 1, memory_order_relaxed);
+        break;
+    case AVLC_KIND_BAD_FCS:
+        atomic_fetch_add_explicit(&s_vdl2_bad_fcs, 1, memory_order_relaxed);
+        break;
+    case AVLC_KIND_TOO_SHORT:
+    default:
+        atomic_fetch_add_explicit(&s_vdl2_too_short, 1, memory_order_relaxed);
+        break;
+    }
+}
+
+static void process_one_vdl2(const frame_queue_item_t *it)
+{
+    atomic_fetch_add_explicit(&s_vdl2_phy, 1, memory_order_relaxed);
+    int rc = vdl2_l2_feed(it->bits, (int)it->n_bits, vdl2_avlc_cb, (void *)it);
+    if (rc < 0) {
+        atomic_fetch_add_explicit(&s_vdl2_l2_fail, 1, memory_order_relaxed);
+        ESP_LOGI(TAG, "VDL2 L2: rc=%d (n_bits=%u snr=%.1f) — burst dropped",
+                 rc, it->n_bits, (double)it->snr_db);
+    } else {
+        ESP_LOGI(TAG, "VDL2 L2: %d AVLC frame(s) from %u PHY bits snr=%.1f",
+                 rc, it->n_bits, (double)it->snr_db);
+    }
+}
+
+void frame_decoder_get_vdl2_stats(frame_decoder_vdl2_stats_t *out)
+{
+    if (!out) return;
+    out->phy_frames = atomic_load_explicit(&s_vdl2_phy, memory_order_relaxed);
+    out->l2_fail    = atomic_load_explicit(&s_vdl2_l2_fail, memory_order_relaxed);
+    out->avlc_ok    = atomic_load_explicit(&s_vdl2_avlc_ok, memory_order_relaxed);
+    out->acars      = atomic_load_explicit(&s_vdl2_acars, memory_order_relaxed);
+    out->x25        = atomic_load_explicit(&s_vdl2_x25, memory_order_relaxed);
+    out->supervisory = atomic_load_explicit(&s_vdl2_srej, memory_order_relaxed);
+    out->unnumbered  = atomic_load_explicit(&s_vdl2_unnum, memory_order_relaxed);
+    out->bad_fcs    = atomic_load_explicit(&s_vdl2_bad_fcs, memory_order_relaxed);
+    out->too_short  = atomic_load_explicit(&s_vdl2_too_short, memory_order_relaxed);
+    // L2-module counters (RS funnel) — single writer = decoder task,
+    // torn reads benign (the s_ida_reasm counter convention).
+    vdl2_l2_stats_t l2;
+    vdl2_l2_get_stats(&l2);
+    out->rs_blocks_ok    = l2.rs_blocks_ok;
+    out->rs_blocks_fail  = l2.rs_blocks_fail;
+    out->rs_octets_fixed = l2.rs_octets_fixed;
+}
+
 static void decoder_task(void *arg)
 {
     (void)arg;
@@ -724,10 +850,13 @@ static void decoder_task(void *arg)
     // watchdogs elsewhere still cover a genuinely wedged pipeline.
 
     // Decoder task is a single serial consumer (one xTaskCreatePinnedToCoreWithCaps
-    // instance, non-reentrant). Move the ~2.1 KB frame_queue_item_t from stack to
-    // static .bss to relieve stack pressure (6144 B stack was marginal). Safe
-    // because the item is not captured/reused across task iterations.
-    static frame_queue_item_t item      = {0};
+    // instance, non-reentrant). The item lives off-stack because 6144 B of
+    // stack was marginal even at the old ~2.1 KB size; now that the slot is
+    // ~17.6 KB (FRAME_QUEUE_MAX_BITS grew for VDL2, V3) it goes to PSRAM
+    // (EXT_RAM_BSS_ATTR) — internal .bss can't spare 17 KB (DMA-INT budget
+    // memory note), and this task is cold-path. Safe because the item is
+    // not captured/reused across task iterations.
+    static EXT_RAM_BSS_ATTR frame_queue_item_t item;
     uint64_t                  last_tick = (uint64_t)esp_timer_get_time();
     while (1) {
         bool got = frame_queue_pop(s_queue, &item);
@@ -755,7 +884,10 @@ static void decoder_task(void *arg)
             last_tick = now;
         }
         if (got) {
-            process_one(&item);
+            if (s_band_vdl2)
+                process_one_vdl2(&item); // V3: RS + AVLC + libacars
+            else
+                process_one(&item); // Iridium: classify + IDA/SBD chain
             // ONE frame per wake, then taskYIELD — do NOT drain a batch.
             // Now that this task runs at prio 6 (== dsp_feed, raised from 4
             // to escape the usb_pump<->dsp_feed ping-pong that TASK_WDT-
@@ -788,6 +920,16 @@ esp_err_t frame_decoder_init(void)
         ESP_LOGE(TAG, "frame_queue_create(%d) failed (PSRAM exhausted?)",
                  FRAME_QUEUE_SLOTS);
         return ESP_ERR_NO_MEM;
+    }
+    // Band soft-switch snapshot (V3) — same resolve-once-at-boot rule as
+    // worker_core1_init; a pre-app_config zeroed snapshot yields band 0
+    // (iridium), so the default path can never be misrouted.
+    {
+        app_config_t cfg = {0};
+        app_config_snapshot(&cfg);
+        s_band_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+        if (s_band_vdl2)
+            ESP_LOGI(TAG, "band=vdl2: decoder routes frames via RS+AVLC L2");
     }
     sbd_reassembler_init(&s_sbd);
     ida_reassembler_init(&s_ida_reasm);
