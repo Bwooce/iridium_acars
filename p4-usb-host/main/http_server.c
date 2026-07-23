@@ -18,6 +18,7 @@
 #include "frame_decoder.h"
 #include "vdl2_pipeline.h" // vdl2 demod counters for /status "decode.vdl2" (V3)
 #include "band_profile.h"  // BAND_VDL2 — gates the dashboard's VDL2 section
+#include "fft_burst_tagger.h" // /diag/tagger_trace — VDL2 measure-first trace
 #include "ota_runner.h"
 #include "class_driver.h"     // class_driver_prepare_for_reboot()
 #include "scanner.h"          // scanner_survey() — /scan sweep/survey endpoint
@@ -254,7 +255,7 @@ static esp_err_t status_get(httpd_req_t *req)
     // dropped pre-tag so never counted). Uniform-density model: dropped/completed
     // transfers x total tagged detections (freq_total). LOWER BOUND — flood windows
     // drop at above-average burst density, so real loss is higher. Approximate.
-    static worker_histograms_t hgm; // ~600 B — static to spare the httpd stack
+    static EXT_RAM_BSS_ATTR worker_histograms_t hgm; // ~600 B — static/PSRAM, spare httpd stack + DMA-INT
     worker_core1_get_histograms(&hgm);
     unsigned long long est_dropped_bursts = usbt.completed
         ? (unsigned long long)usbt.rb_full_drops * hgm.freq_total / usbt.completed : 0ULL;
@@ -268,7 +269,7 @@ static esp_err_t status_get(httpd_req_t *req)
     // httpd stack (the full snapshot carries the per-center table + histogram;
     // /status only prints the scalar progress fields — the table lives at
     // /diag/survey). httpd worker is single-threaded, matching the `hgm` idiom.
-    static decode_survey_status_t dsv;
+    static EXT_RAM_BSS_ATTR decode_survey_status_t dsv;
     decode_survey_get_status(&dsv);
 
     // band=vdl2 decode funnel (V3). All-zero under band=iridium; emitted
@@ -312,6 +313,7 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"vdl2\":{"
                        "\"bursts\":%u,\"synced\":%u,\"phy_ok\":%llu,\"l2_fail\":%llu,"
                        "\"rs_ok\":%u,\"rs_fail\":%u,\"rs_fixed\":%u,"
+                       "\"rs_erasure_recovered\":%u,"
                        "\"avlc_ok\":%llu,\"acars\":%llu,\"x25\":%llu,"
                        "\"sup\":%llu,\"unnum\":%llu,"
                        "\"bad_fcs\":%llu,\"too_short\":%llu"
@@ -386,6 +388,7 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned long long)vd.phy_frames, (unsigned long long)vd.l2_fail,
                       (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_blocks_fail,
                       (unsigned)vd.rs_octets_fixed,
+                      (unsigned)vd.rs_erasure_recovered,
                       (unsigned long long)vd.avlc_ok, (unsigned long long)vd.acars,
                       (unsigned long long)vd.x25,
                       (unsigned long long)vd.supervisory, (unsigned long long)vd.unnumbered,
@@ -643,7 +646,7 @@ static esp_err_t diag_histograms_get(httpd_req_t *req)
 // 384-value array does not fit /diag/histograms' shared 3072-byte body.
 static esp_err_t diag_dcfine_get(httpd_req_t *req)
 {
-    static uint32_t dc[WORKER_DCFINE_BINS];
+    static EXT_RAM_BSS_ATTR uint32_t dc[WORKER_DCFINE_BINS];
     uint32_t        total = 0;
     worker_core1_get_dcfine(dc, WORKER_DCFINE_BINS, &total);
 
@@ -777,7 +780,13 @@ static const char s_index_reset_block[] =
 
 static esp_err_t index_get(httpd_req_t *req)
 {
-    send_page_head(req, "Iridium ACARS", 0);
+    // Snapshot early (moved ahead of send_page_head) so the page title/<h1>
+    // can be mode-aware — band=vdl2 shows "VDL2 ACARS", band=iridium keeps
+    // the original "Iridium ACARS" (byte-identical to before).
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+    send_page_head(req, is_vdl2 ? "VDL2 ACARS" : "Iridium ACARS", 0);
     httpd_resp_send_chunk(req,
                           "<p>Configure the device. Wi-Fi changes reboot on save; "
                           "UDP push fields take effect immediately. SDR tuning changes "
@@ -788,8 +797,6 @@ static esp_err_t index_get(httpd_req_t *req)
     // can see what's saved (SSID was missing from the rendered form
     // before; clicking Save with the empty SSID field bounced the
     // form because of `required` validation).
-    app_config_t cfg;
-    app_config_snapshot(&cfg);
 
     char ssid_esc[2 * sizeof(cfg.wifi_ssid) + 8];
     char psk_esc[2 * sizeof(cfg.wifi_psk) + 8];
@@ -927,6 +934,88 @@ static esp_err_t index_get(httpd_req_t *req)
     if (sc > (int)sizeof(sdrform_c)) sc = sizeof(sdrform_c);
     httpd_resp_send_chunk(req, sdrform_c, sc);
 
+    // Full config snapshot (Task 4 — every persisted app_config_t field, not
+    // just the ones with an editable widget above). Read-only: fields not
+    // otherwise editable on this page (band, sample_rate_hz, best_effort_
+    // decode, chase2_decode, dcmask_lo/hi, the autotune_* calibration ranges,
+    // band_resurvey_auto, station_id) are set via other endpoints (/scan,
+    // /besteffort, /chase2, /gaincal, serial `set`) — this table is a single
+    // place to SEE them all. wifi_psk is deliberately masked (length only,
+    // not the value) — unlike the password <input> above, this table's cells
+    // are plain visible text, not a masked form field.
+    {
+        const band_profile_t *bp = band_profile_get((band_id_t)cfg.band);
+        char station_esc[2 * sizeof(cfg.station_id) + 8];
+        html_attr_escape(station_esc, sizeof(station_esc), cfg.station_id);
+
+        char cfgdump_a[1500];
+        int  ca = snprintf(cfgdump_a, sizeof(cfgdump_a),
+                           "<h2>Full config (read-only snapshot)</h2>"
+                            "<table><tr><th>Field</th><th>Value</th></tr>"
+                            "<tr><td>band</td><td class=v>%s (%u)</td></tr>"
+                            "<tr><td>lo_freq_hz</td><td class=v>%u</td></tr>"
+                            "<tr><td>sample_rate_hz</td><td class=v>%u</td></tr>"
+                            "<tr><td>gain_mode</td><td class=v>%u</td></tr>"
+                            "<tr><td>gain_db_x10</td><td class=v>%d</td></tr>"
+                            "<tr><td>bias_tee</td><td class=v>%s</td></tr>"
+                            "<tr><td>tagger_threshold_db</td><td class=v>%.1f</td></tr>"
+                            "<tr><td>best_effort_decode</td><td class=v>%s</td></tr>"
+                            "<tr><td>chase2_decode</td><td class=v>%s</td></tr>"
+                            "<tr><td>uart_log</td><td class=v>%u</td></tr>"
+                            "<tr><td>coalesce_min_bursts</td><td class=v>%u</td></tr>"
+                            "<tr><td>dcmask_lo / dcmask_hi</td><td class=v>%d / %d</td></tr>"
+                            "<tr><td>station_id</td><td class=v>%s</td></tr>",
+                           bp ? bp->name : "?", (unsigned)cfg.band,
+                           (unsigned)cfg.lo_freq_hz,
+                           (unsigned)cfg.sample_rate_hz,
+                           (unsigned)cfg.gain_mode,
+                           (int)cfg.gain_db_x10,
+                           cfg.bias_tee ? "on" : "off",
+                           (double)cfg.tagger_threshold_db,
+                           cfg.best_effort_decode ? "on" : "off",
+                           cfg.chase2_decode ? "on" : "off",
+                           (unsigned)cfg.uart_log,
+                           (unsigned)cfg.coalesce_min_bursts,
+                           (int)cfg.dcmask_lo, (int)cfg.dcmask_hi,
+                           station_esc);
+        if (ca < 0) ca = 0;
+        if (ca > (int)sizeof(cfgdump_a)) ca = sizeof(cfgdump_a);
+        httpd_resp_send_chunk(req, cfgdump_a, ca);
+
+        char cfgdump_b[1500];
+        int  cb = snprintf(cfgdump_b, sizeof(cfgdump_b),
+                           "<tr><td>autotune_gain_dwell_s</td><td class=v>%u</td></tr>"
+                            "<tr><td>autotune_ira_lo_hz</td><td class=v>%u</td></tr>"
+                            "<tr><td>autotune_gain_min/max_dbx10</td><td class=v>%d / %d</td></tr>"
+                            "<tr><td>autotune_gain_stride</td><td class=v>%u</td></tr>"
+                            "<tr><td>autotune_on_boot</td><td class=v>%s</td></tr>"
+                            "<tr><td>autotune_gain_interval_s</td><td class=v>%u</td></tr>"
+                            "<tr><td>autotune_lo_interval_s</td><td class=v>%u</td></tr>"
+                            "<tr><td>band_resurvey_auto</td><td class=v>%s</td></tr>"
+                            "<tr><td>wifi_ssid</td><td class=v>%s</td></tr>"
+                            "<tr><td>wifi_psk</td><td class=v>%s</td></tr>"
+                            "<tr><td>out_host / out_port</td><td class=v>%s : %u</td></tr>"
+                            "<tr><td>iot_log_host</td><td class=v>%s</td></tr>"
+                            "<tr><td>ota_url</td><td class=v>%s</td></tr>"
+                            "</table>",
+                           (unsigned)cfg.autotune_gain_dwell_s,
+                           (unsigned)cfg.autotune_ira_lo_hz,
+                           (int)cfg.autotune_gain_min_dbx10, (int)cfg.autotune_gain_max_dbx10,
+                           (unsigned)cfg.autotune_gain_stride,
+                           cfg.autotune_on_boot ? "on" : "off",
+                           (unsigned)cfg.autotune_gain_interval_s,
+                           (unsigned)cfg.autotune_lo_interval_s,
+                           cfg.band_resurvey_auto ? "on" : "off",
+                           ssid_esc,
+                           cfg.wifi_psk[0] ? "(set)" : "(empty)",
+                           host_esc, (unsigned)cfg.out_port,
+                           iot_log_host_esc,
+                           ota_esc);
+        if (cb < 0) cb = 0;
+        if (cb > (int)sizeof(cfgdump_b)) cb = sizeof(cfgdump_b);
+        httpd_resp_send_chunk(req, cfgdump_b, cb);
+    }
+
     // Graceful reboot control — always available (both AP and STA). Parks the
     // tuner first (see reboot_post), so it's the safe way to restart without a
     // physical power-cycle. Lives here rather than on /status because that
@@ -959,6 +1048,10 @@ static esp_err_t status_html_get(httpd_req_t *req)
 
     app_config_t cfg;
     app_config_snapshot(&cfg);
+    // Active band, computed once — gates the mode-aware wording (reception
+    // banner) and the Iridium-only / VDL2-only dashboard rows below. Same
+    // accessor pattern as frame_decoder.c:930.
+    bool                   is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
     const esp_app_desc_t *app = esp_app_get_description();
 
     status_snapshot_t s;
@@ -1042,33 +1135,56 @@ static esp_err_t status_html_get(httpd_req_t *req)
 
     // Reception-environment banner: the at-a-glance verdict for a headless /
     // new-site operator (see the design doc). Colour + one line of guidance +
-    // the raw funnel ratios it's derived from.
+    // the raw funnel ratios it's derived from. Wording is mode-aware (V4):
+    // status_logger_get_reception() reuses the same struct fields for both
+    // bands (see status_logger.c rx_update / status_logger.h comments) — the
+    // FIELD VALUES already carry the right funnel, only the LABELS differ
+    // here so band=iridium stays byte-identical.
     {
         status_reception_t rx;
         status_logger_get_reception(&rx);
         const char *bg = "#eee", *fg = "#333", *msg = "Calibrating &mdash; collecting windows&hellip;";
-        switch (rx.state) {
-        case RX_STATE_GOOD:
-            bg = "#d7f5dd"; fg = "#0a5a24"; msg = "GOOD &mdash; healthy reception."; break;
-        case RX_STATE_MARGINAL:
-            bg = "#fdf1cf"; fg = "#7a5600";
-            msg = "MARGINAL &mdash; weak Iridium (reception SNR-limited). A better sky view / antenna would help."; break;
-        case RX_STATE_INTERFERENCE:
-            bg = "#fadbd8"; fg = "#8a1c12";
-            msg = "&#9888; INTERFERENCE &mdash; energy present but not Iridium. Re-site the antenna (clear sky, away from noise sources)."; break;
-        case RX_STATE_QUIET:
-            bg = "#e6e6e6"; fg = "#555";
-            msg = "QUIET &mdash; few bursts (idle band or weak coverage); waiting."; break;
-        case RX_STATE_INIT:
-        default: break;
+        if (is_vdl2) {
+            switch (rx.state) {
+            case RX_STATE_GOOD:
+                bg = "#d7f5dd"; fg = "#0a5a24"; msg = "GOOD &mdash; decoding VDL2."; break;
+            case RX_STATE_MARGINAL:
+                bg = "#fdf1cf"; fg = "#7a5600";
+                msg = "MARGINAL &mdash; weak VDL2 (marginal SNR). A better sky view / antenna would help."; break;
+            case RX_STATE_INTERFERENCE:
+                bg = "#fadbd8"; fg = "#8a1c12";
+                msg = "&#9888; INTERFERENCE &mdash; energy present but not locking VDL2. Re-site the antenna (clear sky, away from noise sources)."; break;
+            case RX_STATE_QUIET:
+                bg = "#e6e6e6"; fg = "#555";
+                msg = "QUIET &mdash; no VDL2 traffic in range right now (normal when no aircraft are transmitting)."; break;
+            case RX_STATE_INIT:
+            default: break;
+            }
+        } else {
+            switch (rx.state) {
+            case RX_STATE_GOOD:
+                bg = "#d7f5dd"; fg = "#0a5a24"; msg = "GOOD &mdash; healthy reception."; break;
+            case RX_STATE_MARGINAL:
+                bg = "#fdf1cf"; fg = "#7a5600";
+                msg = "MARGINAL &mdash; weak Iridium (reception SNR-limited). A better sky view / antenna would help."; break;
+            case RX_STATE_INTERFERENCE:
+                bg = "#fadbd8"; fg = "#8a1c12";
+                msg = "&#9888; INTERFERENCE &mdash; energy present but not Iridium. Re-site the antenna (clear sky, away from noise sources)."; break;
+            case RX_STATE_QUIET:
+                bg = "#e6e6e6"; fg = "#555";
+                msg = "QUIET &mdash; few bursts (idle band or weak coverage); waiting."; break;
+            case RX_STATE_INIT:
+            default: break;
+            }
         }
         n = snprintf(body, sizeof(body),
                      "<div style=\"background:%s;color:%s;border-radius:8px;"
                      "padding:.7em 1em;margin:.5em 0;font-weight:600\">%s"
                      "<div style=\"font-weight:400;font-size:.85em;margin-top:.3em\">"
-                     "UW-reach %.2f &middot; decode-frac %.2f &middot; fail-frac %.2f &middot; "
+                     "%s %.2f &middot; decode-frac %.2f &middot; fail-frac %.2f &middot; "
                      "tagged %.0f/win &middot; processed %.0f/win</div></div>",
                      bg, fg, msg,
+                     is_vdl2 ? "sync-reach" : "UW-reach",
                      rx.uw_reach, rx.decode_frac, rx.fail_frac,
                      rx.tagged_ema, rx.processed_ema);
         if (n < 0) n = 0;
@@ -1109,6 +1225,20 @@ static esp_err_t status_html_get(httpd_req_t *req)
     else
         snprintf(at_buf, sizeof(at_buf), "idle");
 
+    // BCH decoded/unknown rows are Iridium-only (BCH is Iridium's inner
+    // code; ALWAYS ZERO under band=vdl2 — worker_core1.c only reaches the
+    // BCH block via the iridium band_pipeline). Gate them out of the VDL2
+    // dashboard so it isn't cluttered with dead Iridium metrics (the VDL2
+    // funnel table below carries the VDL2-equivalent counters instead).
+    char bch_rows[220] = "";
+    if (!is_vdl2) {
+        snprintf(bch_rows, sizeof(bch_rows),
+                 "<tr><td>BCH decoded / unknown (window)</td><td class=v>%u / %u</td></tr>"
+                 "<tr><td>BCH decoded / unknown (since boot)</td><td class=v>%u / %u</td></tr>",
+                 (unsigned)s.ws.bursts_bch_decoded, (unsigned)s.ws.bursts_bch_unknown,
+                 (unsigned)bch_dec, (unsigned)bch_unk);
+    }
+
     n = snprintf(body, sizeof(body),
                  "<table><tr><th>Metric</th><th>Value</th></tr>"
                  "<tr><td>Wi-Fi</td><td class=v>%s (%s), %d dBm, up %s</td></tr>"
@@ -1117,8 +1247,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  "<tr><td>Bursts dispatched</td><td class=v>%u</td></tr>"
                  "<tr><td>Processed</td><td class=v>%u</td></tr>"
                  "<tr><td>Triage rejected</td><td class=v>%u</td></tr>"
-                 "<tr><td>BCH decoded / unknown (window)</td><td class=v>%u / %u</td></tr>"
-                 "<tr><td>BCH decoded / unknown (since boot)</td><td class=v>%u / %u</td></tr>"
+                 "%s"
                  "<tr><td>rb_full drops (window)</td><td class=v>%u</td></tr>"
                  "<tr><td>rb_full drops (since boot)</td><td class=v>%llu</td></tr>"
                  "<tr><td>DSP load (%% used, &gt;100%% = overloaded)</td><td class=v>%.0f %%</td></tr>"
@@ -1137,8 +1266,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                  (int)wrssi, wconn_str,
                  rate, (unsigned)s.dsp_frame_count, (unsigned)s.dsp.gone_bursts,
                  (unsigned)s.ws.bursts_processed, (unsigned)s.ws.bursts_triage_rejected,
-                 (unsigned)s.ws.bursts_bch_decoded, (unsigned)s.ws.bursts_bch_unknown,
-                 (unsigned)bch_dec, (unsigned)bch_unk,
+                 bch_rows,
                  (unsigned)s.us.rb_full_drops, (unsigned long long)usbt.rb_full_drops,
                  dsp_cap, worker_cap,
                  lo_str, lo_mhz - half_mhz, lo_mhz + half_mhz,
@@ -1155,7 +1283,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
     // Gated on the active band so the iridium dashboard stays
     // byte-identical (band=iridium emits nothing here). Separate chunk,
     // same truncation guard as the tables above.
-    if ((band_id_t)cfg.band == BAND_VDL2) {
+    if (is_vdl2) {
         frame_decoder_vdl2_stats_t vd = {0};
         frame_decoder_get_vdl2_stats(&vd);
         n = snprintf(body, sizeof(body),
@@ -1164,6 +1292,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                      "<tr><td>Bursts &rarr; demod sync</td><td class=v>%u / %u</td></tr>"
                      "<tr><td>PHY frames / L2 fail</td><td class=v>%llu / %llu</td></tr>"
                      "<tr><td>RS blocks ok / fail / octets fixed</td><td class=v>%u / %u / %u</td></tr>"
+                     "<tr><td>RS erasure-recovered blocks</td><td class=v>%u</td></tr>"
                      "<tr><td>AVLC FCS-valid / bad FCS / too short</td><td class=v>%llu / %llu / %llu</td></tr>"
                      "<tr><td>ACARS / X.25 / S / U frames</td><td class=v>%llu / %llu / %llu / %llu</td></tr>"
                      "</table>",
@@ -1172,6 +1301,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                      (unsigned long long)vd.phy_frames, (unsigned long long)vd.l2_fail,
                      (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_blocks_fail,
                      (unsigned)vd.rs_octets_fixed,
+                     (unsigned)vd.rs_erasure_recovered,
                      (unsigned long long)vd.avlc_ok, (unsigned long long)vd.bad_fcs,
                      (unsigned long long)vd.too_short,
                      (unsigned long long)vd.acars, (unsigned long long)vd.x25,
@@ -1885,9 +2015,49 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
     uint32_t sb_fails      = signal_buffer_stash_alloc_fails();
     uint32_t sb_recoveries = signal_buffer_stash_alloc_recoveries();
     uint32_t sb_audio_drop = (sb_fails > sb_recoveries) ? (sb_fails - sb_recoveries) : 0;
-    char     body[640];
-    int      n = snprintf(body, sizeof(body),
-                          "{"
+
+    // Band-aware decode_recovery section: the live decode funnel in the band's
+    // OWN terms so tagged->synced junk ratio + RS-repair load (vdl2) or the
+    // BCH decode/Chase rescue rate (iridium) are pollable here. Same accessor
+    // pattern as status_html_get / status_logger rx_update. char dr[] is built
+    // separately then spliced in via %s so the two bands share one snprintf.
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+    char dr[384];
+    if (is_vdl2) {
+        frame_decoder_vdl2_stats_t vd = {0};
+        frame_decoder_get_vdl2_stats(&vd);
+        snprintf(dr, sizeof(dr),
+                 "\"decode_recovery\":{"
+                 "\"mode\":\"vdl2\","
+                 "\"tagged\":%u,\"synced\":%u,"
+                 "\"rs_blocks_ok\":%u,\"rs_blocks_fail\":%u,\"rs_octets_fixed\":%u,"
+                 "\"rs_erasure_recovered\":%u,"
+                 "\"avlc_ok\":%llu,\"bad_fcs\":%llu,\"acars\":%llu"
+                 "},",
+                 (unsigned)vdl2_pipeline_bursts_seen(),
+                 (unsigned)vdl2_pipeline_sync_count(),
+                 (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_blocks_fail,
+                 (unsigned)vd.rs_octets_fixed,
+                 (unsigned)vd.rs_erasure_recovered,
+                 (unsigned long long)vd.avlc_ok, (unsigned long long)vd.bad_fcs,
+                 (unsigned long long)vd.acars);
+    } else {
+        uint32_t bch_d = 0, bch_u = 0, bch_f = 0, bch_c = 0;
+        worker_core1_get_bch_cumulative(&bch_d, &bch_u, &bch_f, &bch_c);
+        snprintf(dr, sizeof(dr),
+                 "\"decode_recovery\":{"
+                 "\"mode\":\"iridium\","
+                 "\"bch\":{\"decoded\":%u,\"unknown\":%u,\"failed\":%u,\"chase_recovered\":%u}"
+                 "},",
+                 (unsigned)bch_d, (unsigned)bch_u, (unsigned)bch_f, (unsigned)bch_c);
+    }
+
+    char body[1024];
+    int  n = snprintf(body, sizeof(body),
+                      "{"
+                          "%s"
                                "\"signal_buffer\":{"
                                "\"stash_alloc_fails\":%u,"
                                "\"stash_alloc_recoveries\":%u,"
@@ -1903,6 +2073,7 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
                                "\"xfer_pool_lost\":%u"
                                "}"
                                "}\n",
+                          dr,
                           (unsigned)sb_fails, (unsigned)sb_recoveries, (unsigned)sb_audio_drop,
                           (unsigned)signal_buffer_dma_timeouts(),
                           (unsigned)ingest_core1_dispatch_drops(),
@@ -1990,6 +2161,78 @@ static esp_err_t debug_fault_inject_post(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 #endif // CONFIG_FAULT_INJECT
+
+// POST /band?name=<iridium|vdl2>[&lo=<hz>][&bias=<0|1>] — switch the SDR band
+// profile (+ optionally LO and bias-tee) and reboot to apply. Exists because
+// band is serial-only (serial_cmd/UART0) and /tune restricts LO to the Iridium
+// band, so a VDL2 bring-up (band + 136.8125 MHz LO + bias off) can't be done
+// over the network otherwise. Preserves WiFi + all other config. NVS writes run
+// on an internal-SRAM-stack task (same cache-disable rule as tune_apply).
+typedef struct {
+    int  band;     // band id, or -1 = leave unchanged
+    long lo;       // lo_hz
+    int  bias;     // 0/1
+    bool has_lo;
+    bool has_bias;
+} band_apply_t;
+
+static void band_apply_reboot_task(void *arg)
+{
+    band_apply_t *a = (band_apply_t *)arg;
+    if (a->band >= 0) app_config_set_band((uint8_t)a->band);
+    if (a->has_lo)    app_config_set_lo_freq_hz((uint32_t)a->lo);
+    if (a->has_bias)  app_config_set_bias_tee(a->bias != 0);
+    ESP_LOGI(TAG, "/band: band=%d lo=%ld bias=%d(set=%d) — rebooting to apply",
+             a->band, a->lo, a->bias, (int)a->has_bias);
+    free(a);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    class_driver_prepare_for_reboot();
+    esp_restart();
+}
+
+static esp_err_t band_post(httpd_req_t *req)
+{
+    char query[96] = {0}, v[24];
+    int  band = -1;
+    long lo = 0;
+    int  bias = 0;
+    bool has_lo = false, has_bias = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "name", v, sizeof(v)) == ESP_OK && v[0])
+            band = (int)band_profile_from_str(v);
+        if (httpd_query_key_value(query, "lo", v, sizeof(v)) == ESP_OK && v[0]) {
+            lo = (long)strtoul(v, NULL, 10);
+            has_lo = true;
+        }
+        if (httpd_query_key_value(query, "bias", v, sizeof(v)) == ESP_OK && v[0]) {
+            bias = atoi(v);
+            has_bias = true;
+        }
+    }
+    if (band < 0 && !has_lo && !has_bias) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req,
+                               "usage: POST /band?name=<iridium|vdl2>[&lo=<hz>][&bias=<0|1>]\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    band_apply_t *a = malloc(sizeof(*a));
+    if (!a) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "nomem\n");
+    }
+    a->band = band; a->lo = lo; a->bias = bias; a->has_lo = has_lo; a->has_bias = has_bias;
+    char body[128];
+    int  n = snprintf(body, sizeof(body),
+                      "{\"result\":\"ok\",\"band\":%d,\"lo\":%ld,\"bias_set\":%d,\"reboot\":true}",
+                      band, lo, (int)has_bias);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, body, n);
+    if (xTaskCreate(band_apply_reboot_task, "band_apply", 4096, a, 5, NULL) != pdPASS)
+        free(a);
+    return ESP_OK;
+}
 
 // POST /tune?hz=<lo_freq_hz> — set the SDR centre frequency dynamically and
 // reboot to apply (the LO is programmed at stream start, class_driver.c).
@@ -2458,13 +2701,23 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     }
 
     uint32_t lo_hz = (uint32_t)strtoul(lo_s, NULL, 10);
-    if (lo_hz < 1615000000u || lo_hz > 1628000000u) {
+    // Band-aware LO validation: /sdrcfg is used to set gain/tag_thr live in
+    // BOTH bands, so the range must follow the active band, not assume Iridium
+    // L-band (which rejected every VDL2 submission and blocked gain control in
+    // VDL2 mode). Same band accessor as the reception classifier / index_get.
+    app_config_t cfg_band;
+    app_config_snapshot(&cfg_band);
+    bool     is_vdl2 = ((band_id_t)cfg_band.band == BAND_VDL2);
+    uint32_t lo_min  = is_vdl2 ? 135000000u : 1615000000u;
+    uint32_t lo_max  = is_vdl2 ? 138000000u : 1628000000u;
+    if (lo_hz < lo_min || lo_hz > lo_max) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
-        char m[112];
+        char m[128];
         int  mn = snprintf(m, sizeof(m),
-                           "lo_hz=%u out of Iridium band [1615000000, 1628000000]\n",
-                           (unsigned)lo_hz);
+                           "lo_hz=%u out of %s band [%u, %u]\n",
+                           (unsigned)lo_hz, is_vdl2 ? "VDL2" : "Iridium",
+                           (unsigned)lo_min, (unsigned)lo_max);
         return httpd_resp_send(req, m, mn);
     }
 
@@ -3064,6 +3317,72 @@ static esp_err_t diag_reassembler_get(httpd_req_t *req)
     return httpd_resp_send(req, body, n);
 }
 
+// /diag/tagger_trace: VDL2 measure-first burst-tagger trace. Dumps the ring
+// filled by fft_burst_tagger's update_bursts/create/delete paths (armed only
+// when band==vdl2 — see fft_burst_tagger_set_trace_enabled). Each WINDOW entry
+// carries, for one tracked burst on one FFT window, the peak-bin
+// energy-over-baseline (peak_db — the quantity the threshold test uses), the
+// energy integrated over the band's channel width (integ_db), the threshold
+// line (thr_db, same dB units), and whether the burst stayed active
+// (last_active advanced). OPEN/CLOSE markers bracket a burst (CLOSE carries
+// final length_samples). Read-only, no-store. On band==iridium the ring is
+// empty (trace disarmed), so this returns entries:[].
+static esp_err_t diag_tagger_trace_get(httpd_req_t *req)
+{
+    // Copy the ring out into a PSRAM static (the httpd task stack is only
+    // ~6 KB; FBT_TRACE_RING entries is ~14 KB). Single httpd worker → static
+    // reuse across requests is safe (requests are serviced serially).
+    static EXT_RAM_BSS_ATTR fbt_trace_entry_t s_tr[FBT_TRACE_RING];
+    uint32_t total = 0;
+    int      cnt   = fft_burst_tagger_get_trace(s_tr, FBT_TRACE_RING, &total);
+
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    char hdr[192];
+    int  hn = snprintf(hdr, sizeof(hdr),
+                       "{\"band_vdl2\":%s,\"ring\":%d,\"total_written\":%lu,"
+                       "\"returned\":%d,\"wrapped\":%s,"
+                       "\"units\":\"db values are dB, integ over WIDTH_BINS bins\","
+                       "\"entries\":[",
+                       is_vdl2 ? "true" : "false", (int)FBT_TRACE_RING,
+                       (unsigned long)total, cnt,
+                       (total > (uint32_t)cnt) ? "true" : "false");
+    httpd_resp_send_chunk(req, hdr, hn);
+
+    char item[224];
+    for (int i = 0; i < cnt; i++) {
+        const fbt_trace_entry_t *e = &s_tr[i];
+        const char *kind = (e->kind == FBT_TRACE_KIND_OPEN)    ? "open"
+                           : (e->kind == FBT_TRACE_KIND_CLOSE) ? "close"
+                                                               : "win";
+        // dB×10 → dB, INT16_MIN sentinel → JSON null (undefined ratio).
+        char pk[16], ig[16], th[16];
+        if (e->peak_db == INT16_MIN) snprintf(pk, sizeof(pk), "null");
+        else snprintf(pk, sizeof(pk), "%.1f", (double)e->peak_db / 10.0);
+        if (e->integ_db == INT16_MIN) snprintf(ig, sizeof(ig), "null");
+        else snprintf(ig, sizeof(ig), "%.1f", (double)e->integ_db / 10.0);
+        if (e->thr_db == INT16_MIN) snprintf(th, sizeof(th), "null");
+        else snprintf(th, sizeof(th), "%.1f", (double)e->thr_db / 10.0);
+
+        int in = snprintf(item, sizeof(item),
+                          "%s{\"w\":%lu,\"id\":%lu,\"kind\":\"%s\",\"bin\":%d,"
+                          "\"peak_db\":%s,\"integ_db\":%s,\"thr_db\":%s,"
+                          "\"active\":%d,\"len\":%lu}",
+                          i ? "," : "", (unsigned long)e->w,
+                          (unsigned long)e->burst_id, kind, (int)e->bin,
+                          pk, ig, th, (int)e->active, (unsigned long)e->len);
+        httpd_resp_send_chunk(req, item, in);
+    }
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0); // end response
+    return ESP_OK;
+}
+
 // /diag/survey: decode-based band survey state — the per-center LW.DA table
 // (rate/dwell/visits/eliminated), the absolute-freq LW.DA histogram, and the
 // verdict. This is where a headless operator reads WHY a center was chosen.
@@ -3082,10 +3401,10 @@ static const char *ds_phase_name(ds_phase_t p)
 
 static esp_err_t diag_survey_get(httpd_req_t *req)
 {
-    static decode_survey_status_t st; // ~880 B — static to spare the httpd stack
+    static EXT_RAM_BSS_ATTR decode_survey_status_t st; // ~880 B — static/PSRAM, spare httpd stack + DMA-INT
     decode_survey_get_status(&st);
 
-    static char body[3072];
+    static EXT_RAM_BSS_ATTR char body[3072];
     int         n = 0;
     n += snprintf(body + n, sizeof(body) - n,
                   "{\"running\":%s,\"phase\":\"%s\",\"cycle\":%lu,"
@@ -3315,6 +3634,7 @@ esp_err_t http_server_start(void)
         {.uri = "/diag/dsp_health", .method = HTTP_GET, .handler = diag_dsp_health_get, .user_ctx = NULL},
         {.uri = "/diag/recovery_counters", .method = HTTP_GET, .handler = diag_recovery_counters_get, .user_ctx = NULL},
         {.uri = "/diag/reassembler", .method = HTTP_GET, .handler = diag_reassembler_get, .user_ctx = NULL},
+        {.uri = "/diag/tagger_trace", .method = HTTP_GET, .handler = diag_tagger_trace_get, .user_ctx = NULL},
         {.uri = "/messages", .method = HTTP_GET, .handler = messages_get, .user_ctx = NULL},
         {.uri = "/ota", .method = HTTP_GET, .handler = ota_get, .user_ctx = NULL},
         {.uri = "/config", .method = HTTP_POST, .handler = config_post, .user_ctx = NULL},
@@ -3325,6 +3645,7 @@ esp_err_t http_server_start(void)
         {.uri = "/debug/fault_inject", .method = HTTP_POST, .handler = debug_fault_inject_post, .user_ctx = NULL},
 #endif
         {.uri = "/tune", .method = HTTP_POST, .handler = tune_post, .user_ctx = NULL},
+        {.uri = "/band", .method = HTTP_POST, .handler = band_post, .user_ctx = NULL},
         {.uri = "/sdrcfg", .method = HTTP_POST, .handler = sdrcfg_post, .user_ctx = NULL},
         {.uri = "/sd/mount", .method = HTTP_POST, .handler = sd_mount_post, .user_ctx = NULL},
         {.uri = "/sd/format", .method = HTTP_POST, .handler = sd_format_post, .user_ctx = NULL},

@@ -1770,3 +1770,55 @@ set_source_files_properties(
 )
 target_link_libraries(test_vdl2_e2e_acars PRIVATE m)
 add_test(NAME vdl2_e2e_acars COMMAND test_vdl2_e2e_acars)
+
+# decode_burst_capture_vdl2: not a test — a host-side replay tool (the
+# VDL2 sibling of decode_burst_capture). Reads a device-captured .u8
+# burst file, runs the SAME per-burst front end the firmware runs
+# (rotate to DC at rel_freq_hz + direct_if_decim 10× → 250 ksps), then
+# feeds each burst to the production VDL2 chain (vdl2_demod_burst ->
+# vdl2_l2_feed RS/AVLC -> vendored libacars) and emits CSV + summary.
+# Used to decide whether device bursts that the LIVE demod failed to
+# sync are decodable VDL2 (host demod gap) or not (other signals).
+# Build-only, no add_test — same convention as decode_burst_capture.
+add_executable(decode_burst_capture_vdl2
+    decode_burst_capture_vdl2.c
+    ${COMMON_DIR}/direct_if_decim.c
+    ${COMMON_DIR}/rotate_to_dc.c
+    ${VDL2_DIR}/vdl2_demod.c
+    ${VDL2_DIR}/vdl2_l2.c
+    ${VDL2_RS_DIR}/rs_vdl2.c
+    ${VDL2_RS_DIR}/avlc.c
+    ${COMMON_DIR}/crc16.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(decode_burst_capture_vdl2 PRIVATE
+    ${COMMON_DIR}
+    ${VDL2_DIR}
+    ${VDL2_RS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}    # esp_log.h stub
+    ${LIBACARS_UPSTREAM}           # for <libacars/...> includes
+    ${LIBACARS_IDF_DIR}            # for "config.h"
+)
+target_compile_options(decode_burst_capture_vdl2 PRIVATE
+    -D_XOPEN_SOURCE=600
+    -D_POSIX_C_SOURCE=200809L
+    -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE
+    -D_DARWIN_C_SOURCE
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+)
+target_link_libraries(decode_burst_capture_vdl2 PRIVATE m)

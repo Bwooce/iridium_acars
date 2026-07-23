@@ -74,6 +74,30 @@ int rs_vdl2_decode_erasures(uint8_t block[RS_VDL2_N],
 int rs_vdl2_decode_shortened(uint8_t block[RS_VDL2_N], int data_len,
                              int *n_corrected);
 
+// Soft-decision shortened-block errata decode. Combines the STRUCTURAL
+// erasures derived from data_len (the untransmitted parity octets, exactly
+// as rs_vdl2_decode_shortened) with the caller-supplied CONFIDENCE erasures
+// (the least-reliable transmitted symbols, from the soft-decision front
+// end) and runs the errata decode over the COMBINED set. This is the
+// shortened-block analog of rs_vdl2_decode_erasures used as a fallback after
+// rs_vdl2_decode_shortened fails on the hard decision.
+//
+// conf_erasure_pos lists n_conf_erasures confidence-erasure block indices,
+// which MUST be confined to the transmitted symbols — data octets
+// [0 .. data_len-1] or transmitted parity [RS_K .. RS_K+fec-1]. A position
+// in the zero-pad or the untransmitted-parity (structural) region is
+// rejected (-1), as is a duplicate or an out-of-range index. The combined
+// erasure count f_total = (NROOTS - fec) + n_conf_erasures must satisfy
+// f_total <= NROOTS; the underlying decoder additionally enforces
+// 2*e + f_total <= NROOTS. Returns as rs_vdl2_decode_erasures (0 on success,
+// *n_corrected counting every symbol whose value changed — corrected errors
+// plus recovered erasure fills, structural and confidence alike; -1 if
+// uncorrectable, the budget is exceeded, or a position is invalid). For
+// data_len < 3 (uncoded) it is a pass-through iff n_conf_erasures == 0.
+int rs_vdl2_decode_shortened_erasures(uint8_t block[RS_VDL2_N], int data_len,
+                                      const uint8_t *conf_erasure_pos,
+                                      int n_conf_erasures, int *n_corrected);
+
 #ifdef __cplusplus
 }
 #endif

@@ -16,18 +16,29 @@
 
 #include "rs_vdl2.h"
 
+// Cold, CPU-only lookup tables (scalar Galois arithmetic — never DMA/PIE
+// touched) -> PSRAM on target to keep internal DMA-INT free for the USB
+// URB pool. Same guard pattern as vdl2_l2.c / bch_decoder.c; host build
+// falls back to plain .bss.
+#if __has_include("esp_attr.h")
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+
 #define GF_POLY 0x187 // x^8 + x^7 + x^2 + x + 1 (primitive over GF(2))
 #define GF_FCR  120   // first consecutive generator root exponent
 
 // Antilog table doubled (indices 0..508 reachable as log a + log b) so
 // gf_mul needs no mod-255. gf_log[0] is never read: every use is guarded
 // by a zero check.
-static uint8_t gf_exp[510];
-static uint8_t gf_log[256];
+static EXT_RAM_BSS_ATTR uint8_t gf_exp[510];
+static EXT_RAM_BSS_ATTR uint8_t gf_log[256];
 
 // g(x) = prod_{i=0..5} (x - alpha^(fcr+i)); gpoly[j] = coeff of x^j,
 // gpoly[6] = 1 (monic). Only the encoder uses it.
-static uint8_t gpoly[RS_VDL2_NROOTS + 1];
+static EXT_RAM_BSS_ATTR uint8_t gpoly[RS_VDL2_NROOTS + 1];
 
 // Lazy-init guard, same release/acquire pattern as bch_decoder.c: the
 // tables are deterministic and idempotent to fill, but a reader that
@@ -313,33 +324,94 @@ int rs_vdl2_decode_erasures(uint8_t block[RS_VDL2_N],
     return apply_errata(block, syn, psi, dpsi, n_corrected);
 }
 
-int rs_vdl2_decode_shortened(uint8_t block[RS_VDL2_N], int data_len,
-                             int *n_corrected)
+// dumpvdl2 FEC-octet schedule (get_fec_octetcount, decode.c:124-133): the
+// number of parity octets a (shortened) block with `data_len` data octets
+// actually transmits. The remaining RS_VDL2_NROOTS - fec parity octets are
+// untransmitted (structural erasures).
+static int short_fec_octetcount(int data_len)
 {
-    // dumpvdl2 FEC-octet schedule (get_fec_octetcount).
-    int fec;
     if (data_len < 3)
-        fec = 0;
-    else if (data_len < 31)
-        fec = 2;
-    else if (data_len < 68)
-        fec = 4;
-    else
-        fec = RS_VDL2_NROOTS;
+        return 0;
+    if (data_len < 31)
+        return 2;
+    if (data_len < 68)
+        return 4;
+    return RS_VDL2_NROOTS;
+}
+
+int rs_vdl2_decode_shortened_erasures(uint8_t block[RS_VDL2_N], int data_len,
+                                      const uint8_t *conf_erasure_pos,
+                                      int n_conf_erasures, int *n_corrected)
+{
+    if (n_conf_erasures < 0)
+        return -1;
+
+    int fec = short_fec_octetcount(data_len);
 
     if (fec == 0) {
-        // Uncoded block: nothing to verify here; the frame CRC is the only
-        // integrity check. Report clean pass-through.
+        // Uncoded block: no parity, so no error-correcting capacity — a
+        // confidence erasure is meaningless. Pass-through only when none is
+        // requested (the frame CRC is the only integrity check).
+        if (n_conf_erasures != 0)
+            return -1;
         if (n_corrected)
             *n_corrected = 0;
         return 0;
     }
 
-    // Untransmitted parity positions [RS_K + fec .. 254] are the erasures.
-    int f = RS_VDL2_NROOTS - fec;
-    uint8_t erasures[RS_VDL2_NROOTS];
-    for (int i = 0; i < f; i++)
-        erasures[i] = (uint8_t)(RS_VDL2_K + fec + i);
+    // Structural erasures: the untransmitted parity octets
+    // [RS_K + fec .. 254]. f_structural = NROOTS - fec.
+    int f_structural = RS_VDL2_NROOTS - fec;
 
-    return rs_vdl2_decode_erasures(block, erasures, f, n_corrected);
+    // Combined budget must respect the errata bound 2e + f_total <= NROOTS;
+    // here f_total = f_structural + n_conf_erasures and any error correction
+    // needs 2e >= 0, so f_total <= NROOTS is the necessary condition (the
+    // underlying errata decoder rejects the rest via its own 2*L + f check).
+    int f_total = f_structural + n_conf_erasures;
+    if (f_total > RS_VDL2_NROOTS)
+        return -1;
+
+    // First transmitted-parity octet NOT sent = start of the structural
+    // erasure region. Confidence erasures must be confined to the actually
+    // transmitted symbols: data octets [0 .. data_len-1] or transmitted
+    // parity [RS_K .. RS_K+fec-1]. A position in the zero-pad
+    // [data_len .. RS_K-1] is a known-zero (untransmitted) symbol and one in
+    // [RS_K+fec .. 254] is already a structural erasure — neither may be
+    // supplied as a confidence erasure (the former wastes budget on a
+    // known-good symbol; the latter would duplicate a structural root and
+    // corrupt the erasure locator).
+    int struct_lo = RS_VDL2_K + fec; // structural erasures begin here
+
+    uint8_t erasures[RS_VDL2_NROOTS];
+    int     n = 0;
+    for (int i = 0; i < f_structural; i++)
+        erasures[n++] = (uint8_t)(struct_lo + i);
+
+    for (int i = 0; i < n_conf_erasures; i++) {
+        int p = conf_erasure_pos[i];
+        // Confinement to transmitted symbols.
+        bool is_data   = (p >= 0 && p < data_len);
+        bool is_parity = (p >= RS_VDL2_K && p < struct_lo);
+        if (!is_data && !is_parity)
+            return -1;
+        // Reject duplicates (a repeated erasure position would corrupt the
+        // erasure locator). Structural positions are excluded above, so we
+        // only need to check the confidence positions against each other.
+        for (int j = 0; j < i; j++)
+            if ((int)conf_erasure_pos[j] == p)
+                return -1;
+        erasures[n++] = (uint8_t)p;
+    }
+
+    return rs_vdl2_decode_erasures(block, erasures, n, n_corrected);
+}
+
+int rs_vdl2_decode_shortened(uint8_t block[RS_VDL2_N], int data_len,
+                             int *n_corrected)
+{
+    // Hard-decision shortened decode: only the structural erasures, no
+    // confidence erasures. rs_vdl2_decode_shortened_erasures derives the
+    // structural set from data_len (including the fec == 0 pass-through).
+    return rs_vdl2_decode_shortened_erasures(block, data_len, NULL, 0,
+                                             n_corrected);
 }

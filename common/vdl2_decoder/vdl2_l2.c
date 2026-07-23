@@ -5,6 +5,7 @@
 
 #include "vdl2_l2.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "rs_vdl2.h"    // common/vdl2 — RS(255,249) codec
@@ -31,6 +32,16 @@ static EXT_RAM_BSS_ATTR uint8_t s_data[L2_MAX_DATA_OCTETS]; // interleaved data
 static EXT_RAM_BSS_ATTR uint8_t s_fec[L2_MAX_FEC_OCTETS];   // interleaved FEC
 static EXT_RAM_BSS_ATTR uint8_t s_rs_tab[L2_MAX_BLOCKS][RS_VDL2_N];
 static EXT_RAM_BSS_ATTR uint8_t s_octets[L2_MAX_DATA_OCTETS]; // corrected stream
+
+// Soft-decision confidence, mirroring s_data/s_fec/s_rs_tab exactly (built
+// only when the caller supplies soft_bits). Per-octet confidence is the
+// weakest-link MIN over the octet's 8 constituent bits' |soft_bits|; it is
+// de-interleaved through the SAME walk as the data/FEC so s_conf_tab[r][c]
+// aligns index-for-index with s_rs_tab[r][c]. int16 to preserve the demod's
+// full confidence resolution (avoids ranking ties a uint8 clamp would add).
+static EXT_RAM_BSS_ATTR int16_t s_data_conf[L2_MAX_DATA_OCTETS];
+static EXT_RAM_BSS_ATTR int16_t s_fec_conf[L2_MAX_FEC_OCTETS];
+static EXT_RAM_BSS_ATTR int16_t s_conf_tab[L2_MAX_BLOCKS][RS_VDL2_N];
 
 static vdl2_l2_stats_t s_stats; // single writer; torn reads benign
 
@@ -95,7 +106,122 @@ static int l2_deinterleave(const uint8_t *in, uint32_t len, uint32_t rows,
     return 0;
 }
 
-int vdl2_l2_feed(const uint8_t *bits, int n_bits,
+// Per-OCTET confidence parallel to pack_lsbfirst: octet i's confidence is
+// the MIN over its 8 bits of |soft_bits[bit]| (weakest-link — an octet is
+// only as trustworthy as its least-confident bit). |INT16_MIN| is clamped
+// to 32767 so the negation cannot overflow.
+static void pack_conf_lsbfirst(const int16_t *soft, uint32_t base_bit,
+                               uint32_t n_octets, int16_t *out)
+{
+    for (uint32_t i = 0; i < n_octets; i++) {
+        int32_t m = 32767;
+        for (int j = 0; j < 8; j++) {
+            int32_t a = soft[base_bit + 8 * i + j];
+            if (a < 0) a = -a;
+            if (a > 32767) a = 32767;
+            if (a < m) m = a;
+        }
+        out[i] = (int16_t)m;
+    }
+}
+
+// int16 twin of l2_deinterleave() — IDENTICAL (row, col) walk so the
+// confidence table lands in lockstep with s_rs_tab. Zero-pad positions of
+// a shortened last row get confidence 0; the shortened-block fallback never
+// selects them because select_weakest_confined restricts candidates to the
+// transmitted symbols (data + transmitted parity) — a confidence 0 here must
+// NOT be read as "erase me first".
+static int l2_deinterleave_conf(const int16_t *in, uint32_t len, uint32_t rows,
+                                int16_t out[][RS_VDL2_N], uint32_t fillwidth,
+                                uint32_t offset)
+{
+    if (rows == 0 || fillwidth == 0) return -1;
+    uint32_t last_row_len = len % fillwidth;
+    if (last_row_len == 0) last_row_len = fillwidth;
+    if (fillwidth + offset > RS_VDL2_N) return -2;
+    if (len > rows * fillwidth) return -3;
+    if (rows > 1 && len - last_row_len < (rows - 1) * fillwidth) return -4;
+    uint32_t row = 0, col = offset;
+    last_row_len += offset;
+    for (uint32_t i = 0; i < len; i++) {
+        if (row == rows - 1 && col >= last_row_len) {
+            out[row][col] = 0;
+            row           = 0;
+            col++;
+        }
+        out[row++][col] = in[i];
+        if (row == rows) {
+            row = 0;
+            col++;
+        }
+    }
+    return 0;
+}
+
+// Pick the `count` lowest-confidence positions among block row `r`
+// (all RS_VDL2_N positions are candidates — used only for FULL blocks,
+// where every symbol is transmitted). Writes distinct block indices into
+// erasure_pos[0..count). count must be <= RS_VDL2_NROOTS (the erasure
+// budget: 2e+f <= NROOTS). O(count * N), trivial next to the RS decode.
+// The f-sweep calls this once per rung; since it always ranks from the
+// weakest, the count=2 set is a strict prefix of count=4 and count=6.
+static void select_weakest(const int16_t conf[RS_VDL2_N],
+                           uint8_t erasure_pos[], int count)
+{
+    bool taken[RS_VDL2_N] = { false };
+    for (int e = 0; e < count; e++) {
+        int     best_pos  = -1;
+        int32_t best_conf = 0;
+        for (int p = 0; p < RS_VDL2_N; p++) {
+            if (taken[p]) continue;
+            if (best_pos < 0 || conf[p] < best_conf) {
+                best_pos  = p;
+                best_conf = conf[p];
+            }
+        }
+        taken[best_pos]  = true;
+        erasure_pos[e]   = (uint8_t)best_pos;
+    }
+}
+
+// Confined twin of select_weakest for SHORTENED blocks: the candidate set
+// is restricted to the actually TRANSMITTED symbols — data octets
+// [0 .. data_len-1] and transmitted parity [RS_K .. RS_K+fec-1]. Zero-pad
+// positions [data_len .. RS_K-1] (known-zero, untransmitted) and
+// untransmitted-parity positions [RS_K+fec .. 254] (already structural
+// erasures) are NEVER selected, even though their confidence is 0 (the
+// weakest possible) — picking them would waste the tiny confidence budget on
+// a known-good symbol or duplicate a structural erasure. `count` distinct
+// weakest transmitted positions are written to erasure_pos[0..count). The
+// caller guarantees count <= (number of transmitted symbols); for every
+// dumpvdl2 shortened scheme the transmitted count (data + fec) comfortably
+// exceeds the confidence budget fec. Like select_weakest, the count=2 set is
+// a strict prefix of count=4/6 (weakest-first), so the f-sweep rungs nest.
+static void select_weakest_confined(const int16_t conf[RS_VDL2_N],
+                                    uint8_t erasure_pos[], int count,
+                                    uint32_t data_len, int fec)
+{
+    uint32_t struct_lo = RS_VDL2_K + (uint32_t)fec; // structural region start
+    bool     taken[RS_VDL2_N] = { false };
+    for (int e = 0; e < count; e++) {
+        int     best_pos  = -1;
+        int32_t best_conf = 0;
+        for (uint32_t p = 0; p < RS_VDL2_N; p++) {
+            bool transmitted = (p < data_len) ||
+                               (p >= RS_VDL2_K && p < struct_lo);
+            if (!transmitted || taken[p]) continue;
+            if (best_pos < 0 || conf[p] < best_conf) {
+                best_pos  = (int)p;
+                best_conf = conf[p];
+            }
+        }
+        if (best_pos < 0) break; // no more transmitted candidates (defensive)
+        taken[best_pos] = true;
+        erasure_pos[e]  = (uint8_t)best_pos;
+    }
+}
+
+int vdl2_l2_feed(const uint8_t *bits, const int16_t *soft_bits, int n_bits,
                  avlc_frame_cb_t cb, void *ctx)
 {
     s_stats.fed++;
@@ -159,6 +285,28 @@ int vdl2_l2_feed(const uint8_t *bits, int n_bits,
         return VDL2_L2_ERR_INTERNAL;
     }
 
+    // Soft-decision confidence table, built in lockstep with the data/FEC
+    // de-interleave above so s_conf_tab[r][c] is the reliability of the
+    // symbol at s_rs_tab[r][c]. Only when the caller supplied soft_bits.
+    bool have_conf = (soft_bits != NULL);
+    if (have_conf) {
+        pack_conf_lsbfirst(soft_bits, VDL2_HDR_BITS, datalen_octets,
+                           s_data_conf);
+        pack_conf_lsbfirst(soft_bits, VDL2_HDR_BITS + 8 * datalen_octets,
+                           fec_octets, s_fec_conf);
+        // memset the confidence rows so a shortened last row's zero-pad and
+        // untransmitted-parity positions read as 0 (never chosen — the
+        // shortened fallback's select_weakest_confined excludes them).
+        memset(s_conf_tab, 0, num_blocks * RS_VDL2_N * sizeof(int16_t));
+        if (l2_deinterleave_conf(s_data_conf, datalen_octets, num_blocks,
+                                 s_conf_tab, RS_VDL2_K, 0) < 0)
+            have_conf = false;
+        if (have_conf && fec_rows > 0 &&
+            l2_deinterleave_conf(s_fec_conf, fec_octets, fec_rows, s_conf_tab,
+                                 RS_VDL2_NROOTS, RS_VDL2_K) < 0)
+            have_conf = false;
+    }
+
     // RS-correct each block; any uncorrectable block drops the whole
     // transmission (decode.c:311-316 "FEC check failed" -> cleanup).
     for (uint32_t r = 0; r < num_blocks; r++) {
@@ -166,18 +314,130 @@ int vdl2_l2_feed(const uint8_t *bits, int n_bits,
         int rc;
         int fec_this = (r == num_blocks - 1) ? fec_octetcount(last)
                                              : RS_VDL2_NROOTS;
+        // A block is FULL (all 255 symbols transmitted, no structural
+        // erasure/shortening) when it carries the whole 249 data octets:
+        // every non-last block, plus the last block when the octet count
+        // divides evenly (last == RS_VDL2_K).
+        uint32_t data_this = (r == num_blocks - 1) ? last : RS_VDL2_K;
+        bool     is_full   = (data_this == RS_VDL2_K);
+
+        // Hard-decision FIRST (unchanged fast path). Save the received
+        // codeword so the erasure retry starts from clean data: a failed
+        // rs_vdl2_decode may have partially XOR'd a miscorrection into the
+        // block before rejecting it (rs_vdl2.h "contents unspecified").
+        // Needed for BOTH the full- and shortened-block fallbacks below.
+        uint8_t saved[RS_VDL2_N];
+        if (have_conf) memcpy(saved, s_rs_tab[r], RS_VDL2_N);
+
         if (r == num_blocks - 1) {
             rc = rs_vdl2_decode_shortened(s_rs_tab[r], (int)last, &corr);
         } else {
             rc = rs_vdl2_decode(s_rs_tab[r], &corr);
         }
+
+        bool erasure_rescued = false;
+        if (rc != 0 && have_conf && is_full) {
+            // Soft-decision erasure fallback (the VDL2 analog of Iridium's
+            // Chase-2 fallback after hard-BCH fails). rs_vdl2_decode_erasures
+            // corrects 2e+f <= 6: marking the f least-reliable positions as
+            // erasures buys error-correction reach beyond the hard t=3.
+            //
+            // ITERATIVE f-SWEEP (ascending f): try f=2 (still corrects e<=2
+            // errors ANYWHERE), then f=4 (e<=1), then f=6 (e=0). Accept the
+            // FIRST f that decodes. Smallest f wins = maximum residual
+            // error-correction margin = safest: we only *assume* a symbol is
+            // erased when a smaller-f attempt has already failed. This
+            // strictly dominates a single f=6 attempt (f=6 is merely the last
+            // rung): it also catches patterns where a true error lies OUTSIDE
+            // the 6 weakest symbols (f=6/e=0 cannot fix those; f=2/e<=2 can),
+            // and it lowers miscorrection risk because more parity is left for
+            // detection at low f. Because select_weakest always ranks from the
+            // weakest, the f=2 erasure set is a prefix of f=4's, which is a
+            // prefix of f=6's — the rungs are nested.
+            //
+            // SAFETY: a full-erasure (f=6) decode always yields *some* valid
+            // codeword, so a wrong guess is a miscorrection, not a hard
+            // error. That is acceptable here because the downstream AVLC
+            // X.25 FCS validates the entire transmission: a bad erasure
+            // correction produces garbage octets that fail the FCS
+            // (AVLC_KIND_BAD_FCS) — it cannot fabricate a false-positive
+            // ACARS. The FCS is the final arbiter, exactly as the frame CRC
+            // is for Iridium's speculative decodes. Ascending f only tightens
+            // this: lower f leaves more parity for FCS-independent detection.
+            static const int k_erasure_sweep[] = { 2, 4, RS_VDL2_NROOTS };
+            uint8_t          erasure_pos[RS_VDL2_NROOTS];
+            for (unsigned si = 0;
+                 si < sizeof(k_erasure_sweep) / sizeof(k_erasure_sweep[0]);
+                 si++) {
+                int f = k_erasure_sweep[si];
+                // Restore the clean received codeword before EACH attempt: a
+                // failed erasure decode may also partially mutate the block.
+                memcpy(s_rs_tab[r], saved, RS_VDL2_N);
+                select_weakest(s_conf_tab[r], erasure_pos, f);
+                rc = rs_vdl2_decode_erasures(s_rs_tab[r], erasure_pos, f,
+                                             &corr);
+                if (rc == 0) {
+                    erasure_rescued = true;
+                    break;
+                }
+            }
+        } else if (rc != 0 && have_conf && !is_full) {
+            // SHORTENED-block soft-decision erasure fallback — the piece that
+            // makes erasure recovery apply to real VDL2 traffic (almost all
+            // of which is short). The block already spends f_structural =
+            // NROOTS - fec parity symbols on the untransmitted-parity
+            // structural erasures, so the confidence budget is only
+            // NROOTS - f_structural = fec erasures:
+            //   2-parity (fec=2): budget 2 -> single rung f_conf=2 (2e+f=6 =>
+            //                     e=0; a pure 2-symbol erasure fix, extending
+            //                     the hard t=1 to "2 errors iff they are the
+            //                     2 weakest transmitted symbols").
+            //   4-parity (fec=4): budget 4 -> rungs f_conf=2 (e<=1), 4 (e=0).
+            //   6-parity (fec=6, shortened, last<RS_K): budget 6 -> rungs
+            //                     2/4/6, identical reach to a full block.
+            // Same ASCENDING f-sweep rationale as the full-block branch:
+            // smallest f wins (max residual error-correction margin, most
+            // parity left for detection), rungs are nested. The confidence
+            // erasures are selected from the TRANSMITTED symbols ONLY
+            // (select_weakest_confined): a zero-pad or untransmitted-parity
+            // position is never chosen (it is known-zero / already
+            // structural), which is mandatory here because those positions
+            // carry confidence 0 (weakest) and an unconfined select would
+            // spend the whole budget on them. FCS-backstop safety is
+            // identical to the full-block branch: a wrong erasure guess
+            // miscorrects to garbage that fails the AVLC X.25 FCS — it cannot
+            // fabricate a false-positive ACARS.
+            int budget = fec_this; // == NROOTS - f_structural
+            static const int k_short_sweep[] = { 2, 4, RS_VDL2_NROOTS };
+            uint8_t          conf_pos[RS_VDL2_NROOTS];
+            for (unsigned si = 0;
+                 si < sizeof(k_short_sweep) / sizeof(k_short_sweep[0]);
+                 si++) {
+                int f_conf = k_short_sweep[si];
+                if (f_conf > budget) break; // ascending; rest exceed budget
+                memcpy(s_rs_tab[r], saved, RS_VDL2_N);
+                select_weakest_confined(s_conf_tab[r], conf_pos, f_conf, last,
+                                        fec_this);
+                rc = rs_vdl2_decode_shortened_erasures(s_rs_tab[r], (int)last,
+                                                       conf_pos, f_conf, &corr);
+                if (rc == 0) {
+                    erasure_rescued = true;
+                    break;
+                }
+            }
+        }
+
         if (rc != 0) {
             s_stats.rs_blocks_fail++;
             return VDL2_L2_ERR_RS;
         }
         s_stats.rs_blocks_ok++;
+        // True rescue: hard-decision had FAILED and the erasure fallback
+        // succeeded (subset of rs_blocks_ok, like chase_recovered).
+        if (erasure_rescued) s_stats.rs_erasure_recovered++;
         // Corrected-octet accounting excludes the intended erasures of
-        // a shortened block (dumpvdl2 decode.c:321-322).
+        // a shortened block (dumpvdl2 decode.c:321-322). For a full-block
+        // erasure rescue, fec_this == NROOTS so no adjustment applies.
         int fixed = corr - (RS_VDL2_NROOTS - fec_this);
         if (fixed > 0) s_stats.rs_octets_fixed += (uint32_t)fixed;
     }

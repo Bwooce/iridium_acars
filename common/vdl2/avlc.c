@@ -31,12 +31,22 @@
 
 #include "crc16.h" // crc16_x25_raw — common/iridium_decoder (shared FCS home)
 
+// Cold single-consumer byte buffer -> PSRAM on target (CPU-only bit/byte
+// work, never DMA/PIE touched), keeping internal DMA-INT free for the USB
+// URB pool. Same guard pattern as vdl2_l2.c; host build: plain .bss.
+#if __has_include("esp_attr.h")
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+
 // Destuffed-frame assembly buffer. Static, not stack: 2 KB would be a large
 // bite out of an ESP task stack, and the only caller is a single task (the
 // Core-0 frame_decoder task — plan §C4) / single-threaded host tests, the
 // same s_-static single-consumer pattern the Iridium L2 modules use.
 // NOT reentrant; documented in avlc.h.
-static uint8_t s_frame[AVLC_MAX_FRAME_OCTETS];
+static EXT_RAM_BSS_ATTR uint8_t s_frame[AVLC_MAX_FRAME_OCTETS];
 
 // ---------------------------------------------------------------------------
 // Address field

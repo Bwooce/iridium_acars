@@ -140,6 +140,9 @@ typedef struct {
     uint64_t phy_frames; // demodulated VDL2 transmissions popped
     uint64_t l2_fail;    // dropped whole (header/truncation/RS failure)
     uint32_t rs_blocks_ok, rs_blocks_fail, rs_octets_fixed;
+    uint32_t rs_erasure_recovered; // hard-RS failed, soft-erasure fallback
+                                   // rescued the block (subset of rs_blocks_ok;
+                                   // VDL2 analog of Iridium chase_recovered)
     uint64_t avlc_ok;     // FCS-valid AVLC frames (= acars+x25+sup+unnum)
     uint64_t acars;       // ACARS-bearing I frames handed to libacars
     uint64_t x25;         // ATN/X.25 I frames (counted, not decoded — V5)

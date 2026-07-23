@@ -27,6 +27,8 @@
 #include "esp_libusb.h"
 #include "frame_decoder.h" // lw_da / CRC-fail / sbd reception telemetry
 #include "wifi_link.h"     // gw-watchdog / stream-stall counts for reboot-cause tracing
+#include "band_profile.h"  // band_id_t / BAND_VDL2 — rx_update() branches per band
+#include "vdl2_pipeline.h" // vdl2_pipeline_sync_count() — VDL2 UW-lock analog
 
 static const char *TAG = "CLASS"; // match the original tag for log continuity
 
@@ -74,6 +76,15 @@ static uint64_t s_cap_sum_triagerej  = 0; // Σ pre-filter rejected (for accept 
 #define RX_UW_INTERFERE    0.10f // reached-BCH/processed below this ⇒ INTERFERENCE (UW-lock collapsed)
 #define RX_DECODE_MARGINAL 0.15f // decoded/reached-BCH below this ⇒ MARGINAL (weak Iridium)
 #define RX_FAIL_MARGINAL   0.70f // BCH-failed/reached-BCH above this ⇒ MARGINAL
+// band=vdl2 reuses these same four thresholds against the VDL2 funnel (see
+// rx_update): RX_QUIET_TAGGED against tagger bursts/window (shared tagger,
+// band-agnostic — unchanged), RX_UW_INTERFERE against sync/tagged
+// ("sync_frac"), RX_DECODE_MARGINAL/RX_FAIL_MARGINAL against AVLC-ok /
+// bad-FCS over synced. UNVALIDATED for VDL2: no live calibration data yet
+// (VDL2 traffic is CSMA-bursty/sparse by nature, unlike Iridium's steady
+// satellite passes) — if the live ratios prove a poor fit, add
+// BAND_VDL2-prefixed thresholds here rather than retuning these Iridium
+// values.
 static uint32_t s_rx_windows        = 0;             // windows folded into the EMAs
 static float    s_rx_ema_tagged     = 0.0f;          // gone_bursts/window
 static float    s_rx_ema_processed  = 0.0f;          // bursts_processed/window
@@ -83,6 +94,18 @@ static float    s_rx_ema_failed     = 0.0f;          // bch_failed/window
 static rx_state_t s_rx_state        = RX_STATE_INIT; // committed (debounced) state
 static rx_state_t s_rx_cand         = RX_STATE_INIT;  // candidate awaiting dwell
 static uint32_t   s_rx_cand_count   = 0;              // consecutive windows the candidate held
+
+// band=vdl2 previous-window snapshot (rx_update below). The VDL2 funnel
+// accessors (vdl2_pipeline_sync_count() / frame_decoder_get_vdl2_stats())
+// are CUMULATIVE-since-boot, unlike the Iridium ws.* counters which
+// status_snapshot_t already carries pre-diffed per-window — so this classifier
+// keeps its own previous-value snapshot and diffs it each window. Latches on
+// first use (s_vdl2_prev_valid) so the very first window doesn't see a huge
+// since-boot count as a one-window spike.
+static bool     s_vdl2_prev_valid   = false;
+static uint32_t s_vdl2_prev_sync    = 0;
+static uint64_t s_vdl2_prev_avlc_ok = 0;
+static uint64_t s_vdl2_prev_bad_fcs = 0;
 
 bool status_logger_get_last(status_snapshot_t *out)
 {
@@ -109,14 +132,74 @@ void status_logger_get_capacity(status_capacity_t *out)
 // Fold one window's funnel counts into the reception EMAs and re-classify.
 // Called once/sec from emit() (before the verbose/quiet fork) so it runs
 // regardless of build config. Pure arithmetic on the logger task — negligible.
+//
+// Band-aware (VHF/VDL2 foundation): the Iridium ws.bursts_bch_* counters
+// this classifier used to read unconditionally are ALWAYS ZERO under
+// band=vdl2 (BCH is Iridium-only), which used to report a permanent false
+// "QUIET · UW-reach 0.00" even while VDL2 was actively decoding ACARS. Below,
+// only the four INPUT counts (tagged/processed/reached/decoded/failed) differ
+// by band — the EMA/dwell/warmup/classify machinery beneath is untouched, and
+// the band=iridium path is byte-identical to before.
 static void rx_update(const status_snapshot_t *s)
 {
-    uint32_t tagged    = s->dsp.gone_bursts;
-    uint32_t processed = s->ws.bursts_processed;
-    uint32_t reached   = s->ws.bursts_bch_decoded + s->ws.bursts_bch_unknown +
-                         s->ws.bursts_bch_failed;
-    uint32_t decoded   = s->ws.bursts_bch_decoded;
-    uint32_t failed    = s->ws.bursts_bch_failed;
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    // Same accessor pattern as http_server.c:1158 / frame_decoder.c:930.
+    bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+
+    uint32_t tagged, processed, reached, decoded, failed;
+    if (is_vdl2) {
+        // VDL2 funnel: tagger dispatch (gone_bursts) is shared with Iridium
+        // (same tagger fires in both bands). Downstream mapping onto the
+        // Iridium funnel's shape:
+        //   reached (UW-lock analog) = vdl2_pipeline_sync_count() — VDL2
+        //     preamble+header lock, i.e. the burst's D8PSK training sequence
+        //     synced (mirrors Iridium's UW-correlator lock — the "did the
+        //     tagged energy actually look like our signal" gate).
+        //   decoded = frame_decoder_get_vdl2_stats().avlc_ok — FCS-valid
+        //     AVLC frame, the counterpart of a clean BCH decode.
+        //   failed  = ...bad_fcs — FCS-failed frame, the counterpart of a
+        //     BCH decode failure.
+        // Both accessors are CUMULATIVE-since-boot (unlike ws.* below, which
+        // status_snapshot_t already carries pre-diffed per-window) — diff
+        // against the s_vdl2_prev_* snapshot statics.
+        uint32_t                   sync_now = vdl2_pipeline_sync_count();
+        frame_decoder_vdl2_stats_t vd;
+        frame_decoder_get_vdl2_stats(&vd);
+        if (!s_vdl2_prev_valid) {
+            s_vdl2_prev_sync    = sync_now;
+            s_vdl2_prev_avlc_ok = vd.avlc_ok;
+            s_vdl2_prev_bad_fcs = vd.bad_fcs;
+            s_vdl2_prev_valid   = true;
+        }
+        reached = (sync_now >= s_vdl2_prev_sync) ? (sync_now - s_vdl2_prev_sync) : 0;
+        decoded = (vd.avlc_ok >= s_vdl2_prev_avlc_ok)
+                      ? (uint32_t)(vd.avlc_ok - s_vdl2_prev_avlc_ok)
+                      : 0;
+        failed  = (vd.bad_fcs >= s_vdl2_prev_bad_fcs)
+                      ? (uint32_t)(vd.bad_fcs - s_vdl2_prev_bad_fcs)
+                      : 0;
+        s_vdl2_prev_sync    = sync_now;
+        s_vdl2_prev_avlc_ok = vd.avlc_ok;
+        s_vdl2_prev_bad_fcs = vd.bad_fcs;
+
+        tagged = s->dsp.gone_bursts;
+        // No distinct "demod-attempted" stage exists upstream of sync for
+        // VDL2 (the tagger hands straight into vdl2_process_burst —
+        // vdl2_pipeline.c); feeding `processed` with `tagged` itself makes
+        // the UNCHANGED formula below (uw_reach = reached_ema/processed_ema)
+        // compute exactly reached/tagged — the design doc's "sync_frac" —
+        // with no other formula change, here or in
+        // status_logger_get_reception().
+        processed = tagged;
+    } else {
+        tagged    = s->dsp.gone_bursts;
+        processed = s->ws.bursts_processed;
+        reached   = s->ws.bursts_bch_decoded + s->ws.bursts_bch_unknown +
+                    s->ws.bursts_bch_failed;
+        decoded   = s->ws.bursts_bch_decoded;
+        failed    = s->ws.bursts_bch_failed;
+    }
 
     float a = RX_EMA_ALPHA;
     s_rx_ema_tagged    += a * ((float)tagged - s_rx_ema_tagged);
@@ -176,6 +259,13 @@ const char *status_reception_state_name(rx_state_t s)
 void status_logger_get_reception(status_reception_t *out)
 {
     if (!out) return;
+    // Field reuse across bands: rx_update() feeds the EMAs different INPUT
+    // counts per band (see its comment), but the ratio formulas below are
+    // untouched — so under band=vdl2 these SAME fields carry the VDL2
+    // funnel's ratios instead: uw_reach -> sync_frac (synced/tagged),
+    // decode_frac -> AVLC-ok/synced, fail_frac -> bad-FCS/synced. Callers
+    // (http_server.c) must read the active band themselves to label these
+    // correctly for display.
     out->state        = s_rx_state;
     out->tagged_ema   = s_rx_ema_tagged;
     out->processed_ema= s_rx_ema_processed;
@@ -660,7 +750,10 @@ esp_err_t status_logger_init(void)
     // CAVEAT (topology review 2026-07-17 §F1): being above the worker
     // means this task's UART output steals from the worker during
     // passes; the console TX path is a busy-spin, so keep STATUS lines
-    // lean and keep the console baud high (921600).
+    // lean. (The console baud is pinned to 115200 for the whole device
+    // lifetime — see sdkconfig.defaults / serial_cmd.c — the rate the macOS
+    // CH34x host reliably frames; busy-spin cost is bounded by uart_log AUTO
+    // muting when network-up.)
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(logger_task, "status_logger",
                                                     6144, NULL, 6, NULL, 1,
                                                     MALLOC_CAP_SPIRAM);

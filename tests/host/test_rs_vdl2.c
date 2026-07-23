@@ -420,6 +420,196 @@ int main(void)
         nc = -99;
         CHECK(rs_vdl2_decode_shortened(block, 2, &nc) == 0 && nc == 0,
               "uncoded (L=2) pass-through must succeed with 0 corrected");
+        // A confidence erasure on an uncoded block is meaningless (no
+        // parity): must be rejected, not silently accepted.
+        uint8_t bad = 5;
+        CHECK(rs_vdl2_decode_shortened_erasures(block, 2, &bad, 1, &nc) == -1,
+              "uncoded confidence-erasure request must be rejected");
+    }
+
+    // ---- 10. rs_vdl2_decode_shortened_erasures across all three shortened
+    //          schemes: structural + confidence erasure combination. ----
+    // For each size: (b) within hard budget corrects via the plain shortened
+    // decoder; (c) beyond the hard budget but confidence-recoverable when the
+    // extra error positions are supplied as confidence erasures; (d) beyond
+    // the combined erasure capacity fails (no false clean recovery); (f) a
+    // full encode->shorten->corrupt->recover round trip is byte-exact.
+    {
+        // {data_len, fec, hard_t, conf_budget, recoverable_errs,
+        //  beyond_capacity_errs}
+        struct {
+            int L, fec, hard_t, budget, rec_errs, cap_errs;
+        } sz[] = {
+            { 20, 2, 1, 2, 2, 3 },   // 2-parity: f_struct=4
+            { 50, 4, 2, 4, 3, 5 },   // 4-parity: f_struct=2
+            { 100, 6, 3, 6, 4, 7 },  // 6-parity shortened: f_struct=0
+        };
+        for (unsigned c = 0; c < sizeof(sz) / sizeof(sz[0]); c++) {
+            int L = sz[c].L, fec = sz[c].fec;
+            CHECK(fec_for_len(L) == fec, "L=%d expected fec=%d got %d", L, fec,
+                  fec_for_len(L));
+            int struct_lo = RS_VDL2_K + fec; // structural region begins here
+
+            // Distinct data error positions spread across [0, L).
+            int epos[8];
+            for (int i = 0; i < 8; i++) epos[i] = (i * 11 + 1) % L;
+            // De-dup (spread may collide for small L): re-space if needed.
+            for (int i = 1; i < 8; i++)
+                for (int j = 0; j < i; j++)
+                    if (epos[i] == epos[j]) epos[i] = (epos[i] + 1) % L;
+
+            uint8_t data[128], full[RS_VDL2_N], eras[RS_VDL2_NROOTS];
+            int     ne;
+            for (int i = 0; i < L; i++) data[i] = (uint8_t)((i * 13 + 7) & 0xFF);
+            memset(full, 0, sizeof(full));
+            memcpy(full, data, (size_t)L);
+            rs_vdl2_encode(full); // reference full 6-parity codeword
+
+            // (b) within hard budget: plain shortened decoder (no confidence).
+            for (int nerr = 1; nerr <= sz[c].hard_t; nerr++) {
+                build_shortened(block, data, L, eras, &ne);
+                for (int e = 0; e < nerr; e++) {
+                    uint8_t d = (uint8_t)(0x30 + e);
+                    block[epos[e]] ^= d ? d : 0xA5;
+                }
+                nc = -99;
+                int rc = rs_vdl2_decode_shortened(block, L, &nc);
+                CHECK(rc == 0, "L=%d hard %d-err decode failed", L, nerr);
+                CHECK(memcmp(block, full, sizeof(full)) == 0,
+                      "L=%d hard %d-err: block != full codeword", L, nerr);
+            }
+
+            // (c) beyond hard budget, confidence-recoverable: supply the extra
+            // error positions as confidence erasures.
+            {
+                int nerr = sz[c].rec_errs;
+                CHECK(nerr > sz[c].hard_t, "L=%d test bug: rec %d <= hard %d",
+                      L, nerr, sz[c].hard_t);
+                build_shortened(block, data, L, eras, &ne);
+                uint8_t conf[RS_VDL2_NROOTS];
+                for (int e = 0; e < nerr; e++) {
+                    uint8_t d = (uint8_t)(0x40 + e);
+                    block[epos[e]] ^= d ? d : 0x5C;
+                    conf[e] = (uint8_t)epos[e];
+                }
+                // Sanity: plain shortened (no confidence) must FAIL here (so
+                // the recovery is genuinely the confidence fallback's).
+                {
+                    uint8_t tmp[RS_VDL2_N];
+                    memcpy(tmp, block, sizeof(tmp));
+                    int rc_hard = rs_vdl2_decode_shortened(tmp, L, &nc);
+                    CHECK(rc_hard != 0 || memcmp(tmp, full, sizeof(full)) != 0,
+                          "L=%d %d-err: plain shortened unexpectedly clean",
+                          L, nerr);
+                }
+                nc = -99;
+                int rc = rs_vdl2_decode_shortened_erasures(block, L, conf,
+                                                           nerr, &nc);
+                CHECK(rc == 0, "L=%d %d-err confidence recovery failed",
+                      L, nerr);
+                CHECK(memcmp(block, full, sizeof(full)) == 0,
+                      "L=%d %d-err confidence: block != full codeword",
+                      L, nerr);
+            }
+
+            // (d) beyond combined capacity: must NOT false-recover. Supply as
+            // many confidence erasures as the budget allows; the residual
+            // errors exceed 2e+f_total<=6, so either -1 or a valid-but-
+            // different codeword — never the original data claimed clean.
+            {
+                int nerr = sz[c].cap_errs;
+                build_shortened(block, data, L, eras, &ne);
+                uint8_t conf[RS_VDL2_NROOTS];
+                int     ncf = sz[c].budget < nerr ? sz[c].budget : nerr;
+                for (int e = 0; e < nerr; e++) {
+                    uint8_t d = (uint8_t)(0x50 + e);
+                    block[epos[e]] ^= d ? d : 0x3C;
+                }
+                for (int e = 0; e < ncf; e++) conf[e] = (uint8_t)epos[e];
+                nc = -99;
+                int rc = rs_vdl2_decode_shortened_erasures(block, L, conf,
+                                                           ncf, &nc);
+                if (rc == 0)
+                    CHECK(memcmp(block, full, sizeof(full)) != 0,
+                          "L=%d over-capacity (%d err): impossible exact "
+                          "recovery", L, nerr);
+                else
+                    CHECK(rc == -1, "L=%d over-capacity: bad return %d", L, rc);
+            }
+
+            // (e) CONFINEMENT contract on the RS entry point: reject a
+            // confidence erasure that is not a transmitted symbol, a
+            // duplicate, an out-of-range index, or a budget overrun.
+            {
+                build_shortened(block, data, L, eras, &ne);
+                uint8_t p;
+                // structural (untransmitted-parity) region -> reject
+                if (fec < RS_VDL2_NROOTS) {
+                    p = (uint8_t)struct_lo;
+                    CHECK(rs_vdl2_decode_shortened_erasures(block, L, &p, 1,
+                                                            &nc) == -1,
+                          "L=%d: structural-region conf erasure not rejected",
+                          L);
+                }
+                // zero-pad region [L, RS_K) -> reject (known-zero, not sent)
+                if (L < RS_VDL2_K) {
+                    p = (uint8_t)L;
+                    CHECK(rs_vdl2_decode_shortened_erasures(block, L, &p, 1,
+                                                            &nc) == -1,
+                          "L=%d: zero-pad conf erasure not rejected", L);
+                }
+                // duplicate confidence positions -> reject
+                {
+                    uint8_t dup[2] = { (uint8_t)epos[0], (uint8_t)epos[0] };
+                    CHECK(rs_vdl2_decode_shortened_erasures(block, L, dup, 2,
+                                                            &nc) == -1,
+                          "L=%d: duplicate conf erasure not rejected", L);
+                }
+                // budget overrun (n_conf > conf_budget => f_total > NROOTS)
+                {
+                    uint8_t many[RS_VDL2_NROOTS + 1];
+                    for (int i = 0; i <= sz[c].budget; i++)
+                        many[i] = (uint8_t)epos[i]; // budget+1 distinct data pos
+                    CHECK(rs_vdl2_decode_shortened_erasures(
+                              block, L, many, sz[c].budget + 1, &nc) == -1,
+                          "L=%d: budget overrun (%d conf) not rejected", L,
+                          sz[c].budget + 1);
+                }
+                // A transmitted-PARITY confidence erasure IS valid: erasing a
+                // corrupted transmitted-parity octet must recover. (parity
+                // errors don't touch the data region, so the frame is intact
+                // regardless, but this proves the parity range is accepted.)
+                {
+                    build_shortened(block, data, L, eras, &ne);
+                    int ppos = RS_VDL2_K; // first transmitted parity octet
+                    block[ppos] ^= 0x9E;
+                    p = (uint8_t)ppos;
+                    nc = -99;
+                    int rc = rs_vdl2_decode_shortened_erasures(block, L, &p, 1,
+                                                               &nc);
+                    CHECK(rc == 0 && memcmp(block, full, sizeof(full)) == 0,
+                          "L=%d: transmitted-parity conf erasure not accepted",
+                          L);
+                }
+            }
+
+            // (f) round trip: encode -> shorten -> corrupt (beyond hard) ->
+            // recover via confidence erasures -> byte-exact vs original data.
+            {
+                int nerr = sz[c].rec_errs;
+                build_shortened(block, data, L, eras, &ne);
+                uint8_t conf[RS_VDL2_NROOTS];
+                for (int e = 0; e < nerr; e++) {
+                    block[epos[e]] ^= 0x7B;
+                    conf[e] = (uint8_t)epos[e];
+                }
+                nc = -99;
+                int rc = rs_vdl2_decode_shortened_erasures(block, L, conf,
+                                                           nerr, &nc);
+                CHECK(rc == 0 && memcmp(block, data, (size_t)L) == 0,
+                      "L=%d round-trip: data not byte-exact after recovery", L);
+            }
+        }
     }
 
     printf("test_rs_vdl2: %d checks passed, %d failed\n", s_pass, s_fail);

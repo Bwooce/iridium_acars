@@ -45,17 +45,41 @@ extern "C" {
 // vdl2_demod_result_t.bits / the frame_queue item payload. n_bits must
 // cover the whole transmission (the demod's `complete` flag).
 //
+// soft_bits: OPTIONAL per-bit soft confidence, aligned index-for-index
+// with bits[] over the same n_bits (sign = hard decision, magnitude =
+// reliability; vdl2_demod.h). When non-NULL it enables the soft-decision
+// RS erasure fallback on ANY block hard-decision decoding cannot correct,
+// retried as an erasure decode over its least-reliable symbols:
+//   - FULL blocks (all 255 symbols transmitted): the f-sweep marks the f
+//     globally weakest symbols as erasures. rs_vdl2_decode_erasures corrects
+//     2e+f <= 6, sweeping f ascending (2, 4, 6) and accepting the first that
+//     decodes — max error-correction margin at low f, escalating to f=6/e=0
+//     only as a last resort.
+//   - SHORTENED last blocks (real VDL2 traffic is almost all short): the
+//     block already spends f_struct = 6 - fec syndromes on structural
+//     (untransmitted-parity) erasures, so the confidence budget is fec. The
+//     f-sweep (rs_vdl2_decode_shortened_erasures) marks the fec weakest
+//     *transmitted* symbols only — never a zero-pad or untransmitted-parity
+//     position — up to that budget. Note: with a large structural budget
+//     (2-/4-parity) the hard decoder frequently ALIASES rather than fails on
+//     just-past-bound error counts, so the fallback only engages on the
+//     subset of patterns hard decoding actually rejects.
+// soft_bits == NULL keeps the classic hard-decision-only behaviour
+// (backward compatible). The AVLC X.25 FCS is the final arbiter for every
+// erasure rescue: a wrong guess miscorrects to garbage that fails the FCS.
+//
 // Runs header re-decode (cheap, deterministic — the length field is
 // needed again here), packs the body LSB-first, de-interleaves into
-// RS blocks, corrects each block (full blocks: 6 parity; shortened
-// last block: dumpvdl2's 0/2/4/6-parity erasure scheme), assembles the
-// corrected data octets and calls avlc_deframe_octets() once over the
-// transmission, firing cb per AVLC frame.
+// RS blocks, corrects each block (full blocks: 6 parity, + optional
+// soft-erasure fallback; shortened last block: dumpvdl2's 0/2/4/6-parity
+// erasure scheme), assembles the corrected data octets and calls
+// avlc_deframe_octets() once over the transmission, firing cb per AVLC
+// frame.
 //
 // Returns the number of AVLC frames emitted, or VDL2_L2_ERR_* (whole
 // transmission dropped, mirroring dumpvdl2's per-burst abort). cb may
 // be NULL (count only).
-int vdl2_l2_feed(const uint8_t *bits, int n_bits,
+int vdl2_l2_feed(const uint8_t *bits, const int16_t *soft_bits, int n_bits,
                  avlc_frame_cb_t cb, void *ctx);
 
 // Cumulative L2 counters (never reset; the /status pattern). Single
@@ -68,6 +92,11 @@ typedef struct {
     uint32_t rs_blocks_fail;   // uncorrectable RS blocks (each drops its burst)
     uint32_t rs_octets_fixed;  // corrected data/parity octets, erasure fills
                                // excluded (dumpvdl2 decode.c:322 accounting)
+    uint32_t rs_erasure_recovered; // RS blocks where hard-decision RS failed
+                               // but the soft-decision erasure fallback
+                               // rescued it — VDL2 analog of Iridium's
+                               // bursts_bch_chase_recovered (#112); subset of
+                               // rs_blocks_ok.
     uint32_t avlc_frames;      // AVLC frames emitted (all kinds)
 } vdl2_l2_stats_t;
 void vdl2_l2_get_stats(vdl2_l2_stats_t *out);

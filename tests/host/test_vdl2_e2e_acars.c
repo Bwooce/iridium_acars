@@ -227,7 +227,7 @@ int main(void)
         }
         if (r.complete) {
             n_phy++;
-            int rc = vdl2_l2_feed(r.bits, r.n_bits, avlc_cb, NULL);
+            int rc = vdl2_l2_feed(r.bits, r.soft_bits, r.n_bits, avlc_cb, NULL);
             if (rc < 0) n_l2_fail++;
         }
         free(r.bits);

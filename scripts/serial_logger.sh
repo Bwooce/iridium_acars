@@ -40,27 +40,69 @@ LOG_KEEP="${LOG_KEEP:-3}"
 RECONNECT_S="${RECONNECT_S:-2}"
 
 P4_FLASH_ID="1a86:55d3"      # CH343 USB-UART -> P4 UART0 (flash port)
+BAUD="${BAUD:-115200}"       # P4 console baud (whole lifetime; matches
+                             # CONFIG_ESP_CONSOLE_UART_BAUDRATE + serial_cmd.c).
+
+# --- platform shims (macOS BSD vs Linux GNU) ---
+UNAME="$(uname -s)"
+if [ "$UNAME" = "Darwin" ]; then STTY_F="-f"; else STTY_F="-F"; fi
+stat_size() {
+    if [ "$UNAME" = "Darwin" ]; then stat -f %z "$1" 2>/dev/null || echo 0
+    else stat -c %s "$1" 2>/dev/null || echo 0; fi
+}
 
 # --- helpers ---
 
-find_p4_port() {
-    # Prefer explicit override, else scan /dev/ttyACM* by vendor:product.
-    if [ -n "${PORT:-}" ]; then
-        echo "$PORT"; return 0
-    fi
-    for n in 0 1 2 3 4; do
-        local dev="/dev/ttyACM$n"
-        [ -e "$dev" ] || continue
-        local id
-        id=$(udevadm info -q property -n "$dev" 2>/dev/null | awk -F= '
-            /^ID_VENDOR_ID=/  { v=$2 }
-            /^ID_MODEL_ID=/   { m=$2 }
-            END { if (v && m) print v":"m }
-        ')
-        if [ "$id" = "$P4_FLASH_ID" ]; then
-            echo "$dev"; return 0
+# Find a python that has pyserial (used for cross-platform vid:pid matching).
+# Prefer the IDF env's python if IDF is sourced (it always ships pyserial).
+_py_with_pyserial() {
+    local py
+    for py in "${IDF_PYTHON_ENV_PATH:-}/bin/python" python3 python; do
+        [ -n "$py" ] || continue
+        command -v "$py" >/dev/null 2>&1 || [ -x "$py" ] || continue
+        if "$py" -c "import serial.tools.list_ports" >/dev/null 2>&1; then
+            echo "$py"; return 0
         fi
     done
+    return 1
+}
+
+find_p4_port() {
+    # Explicit override always wins.
+    if [ -n "${PORT:-}" ]; then echo "$PORT"; return 0; fi
+    # Preferred cross-platform path: pyserial vid:pid match (macOS + Linux).
+    local py
+    if py=$(_py_with_pyserial); then
+        local dev
+        dev=$(P4ID="$P4_FLASH_ID" "$py" - <<'PYEOF'
+import os, sys
+from serial.tools import list_ports
+want = os.environ["P4ID"].lower()
+for p in list_ports.comports():
+    if p.vid is None or p.pid is None:
+        continue
+    if ("%04x:%04x" % (p.vid, p.pid)) == want:
+        sys.stdout.write(p.device); break
+PYEOF
+)
+        if [ -n "$dev" ]; then echo "$dev"; return 0; fi
+    fi
+    # Linux fallback: scan /dev/ttyACM* via udevadm (no pyserial needed).
+    if [ "$UNAME" = "Linux" ]; then
+        for n in 0 1 2 3 4; do
+            local dev="/dev/ttyACM$n"
+            [ -e "$dev" ] || continue
+            local id
+            id=$(udevadm info -q property -n "$dev" 2>/dev/null | awk -F= '
+                /^ID_VENDOR_ID=/  { v=$2 }
+                /^ID_MODEL_ID=/   { m=$2 }
+                END { if (v && m) print v":"m }
+            ')
+            if [ "$id" = "$P4_FLASH_ID" ]; then echo "$dev"; return 0; fi
+        done
+    fi
+    # macOS with no pyserial: we cannot safely tell the P4 (CH343) from the
+    # C3/C6 coprocessor's port, so refuse to guess — require an explicit PORT.
     return 1
 }
 

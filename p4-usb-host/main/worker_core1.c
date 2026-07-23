@@ -1041,8 +1041,12 @@ static void worker_emit_frame_vdl2(band_frame_t *bframe, void *ctx)
         // diagnostic counters the pipeline already keeps.
         (void)cap_us;
 #else
+        // Carry the demod's per-bit soft confidence (n_soft = n_bits) so
+        // the L2 RS stage can run its soft-decision erasure fallback. NULL
+        // when the demod produced none (OOM); L2 then hard-decodes only.
         frame_decoder_push(bframe->bits, (size_t)bframe->n_bits,
-                           NULL, 0,
+                           bframe->soft_bits,
+                           bframe->soft_bits ? (size_t)bframe->n_bits : 0,
                            (ir_direction_t)bframe->direction, 0u,
                            wctx->burst->peak_bin, wctx->burst->peak_snr_db,
                            cap_us);

@@ -369,6 +369,23 @@ esp_err_t app_config_set_band(uint8_t v)
     xSemaphoreGive(s_cfg_mu);
     return commit_one_u8("band", v);
 }
+void app_config_set_band_ram(uint8_t v)
+{
+    // Live RAM apply only — no NVS commit (mirrors set_chase2_decode_ram).
+    // The on-device SMOKE_TEST variants use this to FORCE their pipeline band
+    // (iridium for the Iridium fixtures, vdl2 for the VDL2 fixture) regardless
+    // of the persisted NVS "band" byte, WITHOUT clobbering the operator's real
+    // NVS setting. The pipeline (dsp_processor_create / worker_core1_init /
+    // frame_decoder_init) resolves the band from app_config_snapshot() at
+    // create/init time, so this must be called BEFORE those inits — which the
+    // smoke does at the very top of smoke_test_run(). Not persisted; a normal
+    // boot is unaffected.
+    if (!s_cfg_mu) return;
+    if (v >= (uint8_t)BAND_COUNT) v = (uint8_t)BAND_IRIDIUM; // same clamp as init()
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.band = v;
+    xSemaphoreGive(s_cfg_mu);
+}
 SET_FIELD_NUM(app_config_set_sample_rate_hz, sample_rate_hz, uint32_t, "rate_hz", commit_one_u32)
 SET_FIELD_NUM(app_config_set_gain_db_x10, gain_db_x10, int16_t, "gain_dbx10", commit_one_i16)
 SET_FIELD_NUM(app_config_set_tagger_threshold_db, tagger_threshold_db, float, "tag_thr", commit_one_f32)

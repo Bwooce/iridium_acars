@@ -563,6 +563,12 @@ static void serial_cmd_task(void *arg)
 
 void serial_cmd_init(void)
 {
+    // This re-configures the CONSOLE UART (UART_NUM_0) so serial_cmd can
+    // read RX. baud_rate MUST match CONFIG_ESP_CONSOLE_UART_BAUDRATE
+    // (sdkconfig / sdkconfig.defaults) or the console changes baud mid-boot
+    // and a fixed-baud host reader garbles. Both are pinned at 115200 — the
+    // rate the macOS CH34x host reliably frames. Keep them in lockstep if
+    // either is ever changed.
     uart_config_t cfg = {
         .baud_rate  = 115200,
         .data_bits  = UART_DATA_8_BITS,

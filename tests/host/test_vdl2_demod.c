@@ -391,6 +391,240 @@ static void t_awgn(void)
     }
 }
 
+// ---- per-bit soft-demapping (Gray-8PSK) vs the old shared metric ----
+//
+// The demod now emits a PER-BIT confidence (vdl2_softbit_conf) instead
+// of one value shared by a symbol's 3 bits. This is a UNIT + A/B test of
+// that function (constructing the exact end-to-end RS-erasure recovery
+// deterministically is impractical, so the mechanism is asserted
+// directly). The legacy shared value was (0.5-|efrac|)*2*24576, which by
+// construction equals min(conf3) — the toward-neighbour bit. So:
+//   (a) a symbol offset toward a neighbour -> exactly ONE low bit, and it
+//       is the CORRECT bit (the one flipping between idx and that
+//       neighbour per vdl2_graycode); the other two are high;
+//   (b) a dead-centre symbol -> all three saturate high;
+//   (c) over a phase sweep, min(conf3) reproduces the legacy shared
+//       value (erasure decisions keyed on the weakest bit are preserved)
+//       and the hard decision is a pure function of idx (unchanged).
+// The A/B contrast: at a near-boundary symbol the OLD shared metric
+// drags all 3 bits down (would erase 2 confident bits' worth of budget),
+// while per-bit isolates the single uncertain bit.
+
+// Bit index (0=MSB..2=LSB) that differs between two Gray phase indices
+// known to differ in exactly one bit; -1 if not exactly one.
+static int diff_bit(int a, int b)
+{
+    unsigned x   = (unsigned)vdl2_graycode[a] ^ (unsigned)vdl2_graycode[b];
+    int      idx = -1, n = 0;
+    for (int s = 0; s < 3; s++)
+        if (x & (1u << s)) {
+            n++;
+            idx = 2 - s; // bit 0 is (g>>2), bit 2 is (g&1)
+        }
+    return n == 1 ? idx : -1;
+}
+
+static int16_t legacy_shared(float efrac)
+{
+    float c = (0.5f - fabsf(efrac)) * 2.f * 24576.f;
+    if (c < 0.f) c = 0.f;
+    return (int16_t)c;
+}
+
+static void t_perbit_softmetric(void)
+{
+    const int16_t LOW_THR  = 12288; // half-scale: "uncertain"
+    const int16_t HIGH_THR = 20000; // near-saturated: "confident"
+
+    // (a) Offset toward a neighbour: exactly one low bit, correct bit.
+    for (int idx = 0; idx < 8; idx++) {
+        for (int dir = -1; dir <= 1; dir += 2) {
+            float   efrac = 0.45f * (float)dir; // hard against a boundary
+            int16_t c3[3];
+            vdl2_softbit_conf(idx, efrac, c3);
+            int nbr    = ((idx + dir) % 8 + 8) % 8;
+            int expect = diff_bit(idx, nbr); // bit flipping toward nbr
+            CHECK(expect >= 0, "graycode idx %d/%d not adjacent-Gray", idx,
+                  nbr);
+            int low = 0, low_bit = -1, high = 0;
+            for (int b = 0; b < 3; b++) {
+                if (c3[b] < LOW_THR) {
+                    low++;
+                    low_bit = b;
+                }
+                if (c3[b] >= HIGH_THR) high++;
+            }
+            CHECK(low == 1, "idx %d dir %+d: %d low bits (want 1)", idx, dir,
+                  low);
+            CHECK(low_bit == expect,
+                  "idx %d dir %+d: low bit %d != flip bit %d", idx, dir,
+                  low_bit, expect);
+            CHECK(high == 2, "idx %d dir %+d: %d high bits (want 2)", idx,
+                  dir, high);
+            // The low bit reproduces the legacy shared value exactly.
+            CHECK(c3[low_bit] == legacy_shared(efrac),
+                  "idx %d dir %+d: low %d != legacy %d", idx, dir,
+                  c3[low_bit], legacy_shared(efrac));
+        }
+    }
+
+    // (b) Dead-centre symbol: all three bits saturate high.
+    for (int idx = 0; idx < 8; idx++) {
+        int16_t c3[3];
+        vdl2_softbit_conf(idx, 0.0f, c3);
+        for (int b = 0; b < 3; b++)
+            CHECK(c3[b] == 24576, "idx %d dead-centre bit %d = %d (want max)",
+                  idx, b, c3[b]);
+    }
+
+    // (c) Phase sweep: min(conf3) reproduces the legacy shared metric, and
+    // every per-bit value is >= the legacy value (per-bit only ever
+    // sharpens, never weakens, so the golden hard decode cannot regress).
+    for (int idx = 0; idx < 8; idx++) {
+        for (int e = -49; e <= 49; e++) {
+            float   efrac = (float)e / 100.f;
+            int16_t c3[3];
+            vdl2_softbit_conf(idx, efrac, c3);
+            int16_t mn  = c3[0];
+            for (int b = 1; b < 3; b++)
+                if (c3[b] < mn) mn = c3[b];
+            int16_t leg = legacy_shared(efrac);
+            CHECK(mn == leg, "idx %d efrac %.2f: min %d != legacy %d", idx,
+                  (double)efrac, (int)mn, (int)leg);
+            for (int b = 0; b < 3; b++)
+                CHECK(c3[b] >= leg,
+                      "idx %d efrac %.2f bit %d: %d < legacy %d (weaker!)",
+                      idx, (double)efrac, b, (int)c3[b], (int)leg);
+        }
+    }
+
+    // A/B contrast at a near-boundary symbol: quantify erasure budget.
+    // OLD shared metric = one value replicated to all 3 bits -> if it is
+    // low, ALL 3 bits are marked uncertain (2 confident bits wasted). NEW
+    // per-bit marks exactly the 1 truly uncertain bit.
+    {
+        int     idx = 0;
+        float   efrac = 0.47f; // toward idx 1
+        int16_t c3[3];
+        vdl2_softbit_conf(idx, efrac, c3);
+        int16_t shared = legacy_shared(efrac);
+        int shared_low = 0, perbit_low = 0;
+        for (int b = 0; b < 3; b++) {
+            if (shared < LOW_THR) shared_low++; // replicated to every bit
+            if (c3[b] < LOW_THR) perbit_low++;
+        }
+        CHECK(shared_low == 3,
+              "A/B: shared marks %d/3 bits low (want 3)", shared_low);
+        CHECK(perbit_low == 1,
+              "A/B: per-bit marks %d/3 bits low (want 1)", perbit_low);
+        printf("INFO: near-boundary symbol conf3 = [%d %d %d] "
+               "(shared=%d): per-bit erases 1 bit vs shared 3\n",
+               c3[0], c3[1], c3[2], shared);
+    }
+}
+
+// ---- soft-decision (Chase) header fallback ----
+//
+// The (25,20) burst header block code guarantees only single-bit
+// correction; a genuine 2-3-bit header error is REJECTED by the hard
+// syndrome decode (vdl2_hdr_decode -> -1). vdl2_hdr_decode_soft retries
+// by flipping small subsets of the least-reliable header bits. This
+// asserts, deterministically:
+//   - a clean header decodes hard (weight 0) — the fast path is untouched
+//     (soft is never consulted for a decodable header);
+//   - a 2-bit and a 3-bit header error that HARD REJECTS is RECOVERED by
+//     the soft fallback when the errored bits carry the lowest confidence,
+//     yielding the exact transmitted word and length;
+//   - the confidence hint is load-bearing: with the errored bits marked
+//     CONFIDENT (and unrelated bits weak) the fallback does NOT
+//     mis-recover to the true length (the Chase test set no longer covers
+//     the real errors).
+static void t_soft_header_fallback(void)
+{
+    const uint32_t datalen = 992;
+    uint32_t       enc     = vdl2_hdr_encode(datalen); // clean 25-bit word
+
+    // (1) Clean header: hard fast-path returns weight 0 + correct length;
+    // soft on the same clean word (no errors) also returns weight 0
+    // unchanged. Word-position p maps to air bit (24 - p).
+    {
+        uint32_t w = enc, got = 0;
+        int      sw = vdl2_hdr_decode(&w, &got);
+        CHECK(sw == 0 && got == datalen, "clean hard decode sw=%d len=%u", sw,
+              got);
+        // Soft is a FALLBACK: the demod only consults it AFTER the hard
+        // decode rejects, so a clean header never reaches it. Called
+        // directly on a clean word it still yields the correct word/length
+        // (it always applies >=1 Chase flip, so the reported weight is >=1,
+        // not the hard-path 0 — the point is it does not corrupt a good
+        // header).
+        uint32_t ws = enc, gots = 0;
+        int      sws = vdl2_hdr_decode_soft(&ws, NULL, &gots);
+        CHECK(sws >= 0 && gots == datalen && ws == enc,
+              "soft on clean word sw=%d len=%u", sws, gots);
+    }
+
+    // (2) Find a 2-bit error the HARD decode REJECTS and the soft fallback
+    // recovers when those two bits are the least reliable. Search over the
+    // 22 meaningful word positions (reserved MSBs are forced to 0).
+    int found2 = 0, found3 = 0;
+    for (int a = 0; a < 22 && !found2; a++)
+        for (int b = a + 1; b < 22 && !found2; b++) {
+            uint32_t bad = enc ^ (1u << a) ^ (1u << b);
+            uint32_t w = bad, got = 0;
+            if (vdl2_hdr_decode(&w, &got) >= 0)
+                continue; // hard did not reject -> not an A/B case
+            int16_t conf[25];
+            for (int k = 0; k < 25; k++)
+                conf[k] = 24000;
+            conf[24 - a] = 10; // errored bits = least reliable
+            conf[24 - b] = 10;
+            uint32_t ws = bad, gots = 0;
+            int      sws = vdl2_hdr_decode_soft(&ws, conf, &gots);
+            if (sws >= 0 && gots == datalen && ws == enc) {
+                found2 = 1;
+                // A/B: same errored word, but now the errored bits are
+                // CONFIDENT and two unrelated bits are weak -> the Chase
+                // test set misses the real errors, so no false recovery.
+                for (int k = 0; k < 25; k++)
+                    conf[k] = 24000;
+                int wa = (24 - a + 3) % 22, wb = (24 - b + 5) % 22;
+                conf[wa] = 10;
+                conf[wb] = 10;
+                uint32_t wm = bad, gotm = 0;
+                int      swm = vdl2_hdr_decode_soft(&wm, conf, &gotm);
+                CHECK(!(swm >= 0 && gotm == datalen && wm == enc),
+                      "misleading-conf soft falsely recovered 2-bit err");
+            }
+        }
+    CHECK(found2, "no 2-bit hard-reject / soft-recover example found");
+
+    // (3) A 3-bit error the hard decode rejects, recovered when all three
+    // errored bits are the least reliable (M=3 Chase window).
+    for (int a = 0; a < 22 && !found3; a++)
+        for (int b = a + 1; b < 22 && !found3; b++)
+            for (int c = b + 1; c < 22 && !found3; c++) {
+                uint32_t bad = enc ^ (1u << a) ^ (1u << b) ^ (1u << c);
+                uint32_t w = bad, got = 0;
+                if (vdl2_hdr_decode(&w, &got) >= 0) continue;
+                int16_t conf[25];
+                for (int k = 0; k < 25; k++)
+                    conf[k] = 24000;
+                conf[24 - a] = 5;
+                conf[24 - b] = 10;
+                conf[24 - c] = 15;
+                uint32_t ws = bad, gots = 0;
+                int      sws = vdl2_hdr_decode_soft(&ws, conf, &gots);
+                if (sws >= 1 && gots == datalen && ws == enc) found3 = 1;
+            }
+    CHECK(found3, "no 3-bit hard-reject / soft-recover example found");
+
+    // (4) The stats getter exists and the rescue counter is readable.
+    vdl2_demod_stats_t st;
+    vdl2_demod_get_stats(&st);
+    CHECK(st.soft_hdr_rescued == st.soft_hdr_rescued, "stats getter");
+}
+
 static void t_false_sync_on_noise(void)
 {
     int false_syncs = 0;
@@ -510,6 +744,8 @@ int main(void)
     t_cfo();
     t_timing();
     t_awgn();
+    t_perbit_softmetric();
+    t_soft_header_fallback();
     t_false_sync_on_noise();
     t_truncated();
     t_pipeline_two_bursts();

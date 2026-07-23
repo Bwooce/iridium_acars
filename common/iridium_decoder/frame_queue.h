@@ -50,12 +50,19 @@ extern "C" {
 // (frame_queue.c), so the larger slots cost PSRAM, not cycles.
 #define FRAME_QUEUE_MAX_BITS 16832
 
-// Maximum per-bit soft metrics carried alongside bits[] (Chase-2 soft
-// BCH, task #16). Sized for one standard 382-bit burst frame (the only
-// consumer, ida_chase, needs soft coverage of frame bits [0, 382) —
-// UW+LCW+data); multi-slot frames simply truncate. 384 int16 = 768 B
-// per slot; 64 slots ≈ +48 KB PSRAM (noise next to the 32 MB pool).
-#define FRAME_QUEUE_MAX_SOFT 384
+// Maximum per-bit soft metrics carried alongside bits[]. Two consumers:
+//   - Iridium Chase-2 soft BCH (task #16): needs soft coverage of frame
+//     bits [0, 382) only (UW+LCW+data); a standard burst is ~382 bits.
+//   - VDL2 RS soft-decision erasure fallback (feat/vhf-vdl2): vdl2_l2
+//     needs per-bit confidence for the WHOLE transmission (data + RS FEC
+//     octets), because the erasure decoder picks the least-reliable
+//     symbols of EACH RS block — so soft must cover every block, not just
+//     the first. Sized to FRAME_QUEUE_MAX_BITS to match.
+// Producers set n_soft = n_bits; frame_decoder_push truncates to this cap.
+// Iridium frames stay tiny (~382), so their push/pop copy cost is
+// unchanged — the larger array costs PSRAM (int16 × 16832 ≈ 33 KB/slot,
+// 64 slots ≈ 2.1 MB, within the ~3 MB PSRAM headroom), not cycles.
+#define FRAME_QUEUE_MAX_SOFT FRAME_QUEUE_MAX_BITS
 
 typedef struct {
     // Host timestamp at enqueue (esp_timer_get_time / gettimeofday).

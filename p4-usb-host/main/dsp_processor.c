@@ -359,6 +359,10 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
 
     fft_burst_tagger_set_start(p->tagger, 0);
     fft_burst_tagger_set_dc_mask(p->tagger, cfg.dcmask_lo, cfg.dcmask_hi);
+    // Measure-first VDL2 burst-tagger trace (/diag/tagger_trace). Armed ONLY
+    // for band==vdl2 — the entire trace path self-gates on this flag, so
+    // band==iridium is byte-identical and pays nothing.
+    fft_burst_tagger_set_trace_enabled((band_id_t)cfg.band == BAND_VDL2);
     s_default = p; // publish for cross-task diagnostic readers
     return p;
 }

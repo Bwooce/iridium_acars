@@ -77,7 +77,13 @@ static inline uint32_t reasm_freq_key_hz(int packed_peak_bin)
 static uint64_t s_rf_now         = 0; // max it->timestamp_us seen (RF arrival clock)
 static uint64_t s_wall_at_rf_now = 0; // esp_timer when s_rf_now last advanced
 
-#define FRAME_QUEUE_SLOTS 64 // 64 × ~2064 B ≈ 132 KB in PSRAM
+// 32 slots × ~50 KB/slot ≈ 1.6 MB PSRAM. Each slot now holds bits[16832]
+// + soft[16832] (VDL2 max transmission + erasure soft-bits), ~50 KB — so
+// the slot count is a big PSRAM multiplier. Was 64 (≈3.2 MB), which pushed
+// free PSRAM below the 4 MB USB stream ring -> USBRING alloc failed ->
+// stream never started (rate=0). 32 keeps ample worker->decoder buffering
+// while leaving the 4 MB ring room. Must stay a power of two (fast modulo).
+#define FRAME_QUEUE_SLOTS 32
 #define DECODER_STACK 6144
 #define DECODER_PRIO 5 // Core 0: BELOW dsp_feed (6) and usb_pump (7); == httpd (5),
                        // > sd_log (2), > logger (1). History: was 4 -> starved for the
@@ -147,11 +153,14 @@ static inline void lwda_freq_record(int packed_peak_bin)
 
 // SBD reassembler instance — single global, not thread-safe (only the
 // decoder task touches it). 8 sessions × ~330 B ≈ 2.6 KB in BSS.
-static sbd_reassembler_t s_sbd;
+// -> PSRAM: CPU-only reassembly state, only the Core-0 decoder task touches
+// it, cold per-frame path — keep internal .bss for the USB URB pool
+// (DMA-INT budget, same reason as s_drate_*/item below).
+static EXT_RAM_BSS_ATTR sbd_reassembler_t s_sbd;
 // Cross-burst IDA fragment reassembler (see ida_reassembler.h) — feeds
 // s_sbd a complete SBD envelope even when it spanned multiple physical
-// LW.DA bursts. 4 sessions × ~330 B ≈ 1.3 KB in BSS.
-static ida_reassembler_t s_ida_reasm;
+// LW.DA bursts. 4 sessions × ~330 B ≈ 1.3 KB in BSS. -> PSRAM (as s_sbd).
+static EXT_RAM_BSS_ATTR ida_reassembler_t s_ida_reasm;
 static _Atomic uint64_t  s_sbd_complete      = 0; // SBD messages reassembled
 static _Atomic uint64_t  s_acars_decoded     = 0; // ACARS messages successfully parsed
 static _Atomic uint64_t  s_acars_fragments   = 0; // ACARS fragments awaiting reassembly
@@ -799,7 +808,12 @@ static void vdl2_avlc_cb(const avlc_frame_t *f, void *ctx)
 static void process_one_vdl2(const frame_queue_item_t *it)
 {
     atomic_fetch_add_explicit(&s_vdl2_phy, 1, memory_order_relaxed);
-    int rc = vdl2_l2_feed(it->bits, (int)it->n_bits, vdl2_avlc_cb, (void *)it);
+    // Pass per-bit soft confidence (carried in it->soft, n_soft == n_bits
+    // for VDL2) so vdl2_l2 can run its soft-decision RS erasure fallback;
+    // NULL when the producer had none (hard-decision only).
+    const int16_t *soft = (it->n_soft > 0) ? it->soft : NULL;
+    int rc = vdl2_l2_feed(it->bits, soft, (int)it->n_bits, vdl2_avlc_cb,
+                          (void *)it);
     if (rc < 0) {
         atomic_fetch_add_explicit(&s_vdl2_l2_fail, 1, memory_order_relaxed);
         ESP_LOGI(TAG, "VDL2 L2: rc=%d (n_bits=%u snr=%.1f) — burst dropped",
@@ -829,6 +843,7 @@ void frame_decoder_get_vdl2_stats(frame_decoder_vdl2_stats_t *out)
     out->rs_blocks_ok    = l2.rs_blocks_ok;
     out->rs_blocks_fail  = l2.rs_blocks_fail;
     out->rs_octets_fixed = l2.rs_octets_fixed;
+    out->rs_erasure_recovered = l2.rs_erasure_recovered;
 }
 
 static void decoder_task(void *arg)

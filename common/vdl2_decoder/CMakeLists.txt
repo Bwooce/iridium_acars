@@ -8,8 +8,17 @@
 # host-test-only and deliberately NOT compiled into the firmware.
 # firmr_s16.c comes from iridium_decoder (shared polyphase core).
 # vdl2 is a public REQUIRES: vdl2_l2.h exposes avlc_frame_cb_t.
+# vdl2_mod.c (synthetic D8PSK test modulator) is normally host-test-only and
+# NOT in the firmware. The on-device VDL2 smoke (CONFIG_SMOKE_TEST_VDL2) needs
+# it to generate golden ACARS bursts in RAM, so pull it in for that build only
+# — production images are unchanged.
+set(_vdl2_srcs "vdl2_pipeline.c" "vdl2_demod.c" "vdl2_l2.c")
+if(CONFIG_SMOKE_TEST_VDL2)
+    list(APPEND _vdl2_srcs "vdl2_mod.c")
+endif()
+
 idf_component_register(
-    SRCS "vdl2_pipeline.c" "vdl2_demod.c" "vdl2_l2.c"
+    SRCS ${_vdl2_srcs}
     INCLUDE_DIRS "."
     REQUIRES band_pipeline iridium_decoder vdl2
 )

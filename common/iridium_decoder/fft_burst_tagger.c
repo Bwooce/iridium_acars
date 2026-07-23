@@ -302,6 +302,113 @@ struct fft_burst_tagger_s {
 // HISTORY_SIZE slots still sum inside int32 (baseline_sum's type).
 #define FBT_EMA_SLOT_CLAMP (INT32_MAX / FBT_HISTORY_SIZE)
 
+// -------- VDL2 burst-tagger trace (measure-first instrumentation) --------
+// See fft_burst_tagger.h for the rationale. The ENTIRE facility is gated on
+// s_trace_band_vdl2 (armed by fft_burst_tagger_set_trace_enabled, called only
+// for band==vdl2), so with band==iridium every path below is skipped and the
+// hot loop is byte-identical to the pre-instrumentation code.
+//
+// The ring is a static side buffer (PSRAM .bss on device via EXT_RAM_BSS_ATTR
+// — it is CPU-touched only, never PIE-read, so placement is perf-only, not
+// correctness). No hot-path allocation. Single tagger instance per process,
+// same file-static idiom as the s_acc_* accumulators; write index is atomic
+// so the (Core-0 http) reader can't tear the 32-bit counter.
+#if defined(ESP_PLATFORM)
+#define FBT_TRACE_BSS_ATTR EXT_RAM_BSS_ATTR
+#else
+#define FBT_TRACE_BSS_ATTR
+#endif
+static FBT_TRACE_BSS_ATTR fbt_trace_entry_t s_trace_ring[FBT_TRACE_RING];
+static _Atomic(uint32_t)  s_trace_wr;        // monotonic total entries written
+static uint32_t           s_trace_win_no;    // window sequence (Core-0 dsp_feed)
+static bool               s_trace_band_vdl2; // gate: false => iridium, zero cost
+
+void fft_burst_tagger_set_trace_enabled(bool enabled)
+{
+    s_trace_band_vdl2 = enabled;
+}
+
+// 10·log10(num/den) in dB×10 (integer). Guards non-positive operands
+// (undefined ratio) with the INT16_MIN sentinel the JSON reader maps to null.
+static inline int16_t fbt_db10_ratio(int64_t num, int64_t den)
+{
+    if (num <= 0 || den <= 0) return INT16_MIN;
+    float db = 100.0f * log10f((float)num / (float)den);
+    if (db > 30000.0f) db = 30000.0f;
+    if (db < -30000.0f) db = -30000.0f;
+    return (int16_t)(db >= 0.0f ? db + 0.5f : db - 0.5f);
+}
+
+static inline void fbt_trace_push(const fbt_trace_entry_t *e)
+{
+    uint32_t idx                       = atomic_load_explicit(&s_trace_wr, memory_order_relaxed);
+    s_trace_ring[idx % FBT_TRACE_RING] = *e;
+    atomic_store_explicit(&s_trace_wr, idx + 1, memory_order_relaxed);
+}
+
+// Record one per-window sample for a tracked burst. peak = center bin; the
+// integrated window spans the band's burst_width bins centred on it.
+static inline void fbt_trace_window(fft_burst_tagger_t *t, int center_bin,
+                                    uint32_t burst_id, bool active)
+{
+    int32_t pk_mag  = t->magnitude_shifted[center_bin];
+    int32_t pk_base = t->baseline_sum[center_bin];
+    int     half    = t->burst_width / 2;
+    int     lo      = center_bin - half;
+    int     hi      = center_bin + half;
+    if (lo < 0) lo = 0;
+    if (hi > N - 1) hi = N - 1;
+    int64_t sum_mag = 0, sum_base = 0;
+    for (int k = lo; k <= hi; k++) {
+        sum_mag += t->magnitude_shifted[k];
+        sum_base += t->baseline_sum[k];
+    }
+    fbt_trace_entry_t e = {
+        .w        = s_trace_win_no,
+        .burst_id = burst_id,
+        .len      = 0,
+        .bin      = (int16_t)center_bin,
+        .peak_db  = fbt_db10_ratio((int64_t)pk_mag * (int64_t)FBT_HISTORY_SIZE, pk_base),
+        .integ_db = fbt_db10_ratio(sum_mag * (int64_t)FBT_HISTORY_SIZE, sum_base),
+        .thr_db   = fbt_db10_ratio((int64_t)t->threshold_q15, 32768),
+        .active   = active ? 1u : 0u,
+        .kind     = FBT_TRACE_KIND_WINDOW,
+    };
+    fbt_trace_push(&e);
+}
+
+// Stamp a burst OPEN or CLOSE marker (len used for CLOSE = stop-start).
+static inline void fbt_trace_event(uint8_t kind, int center_bin,
+                                   uint32_t burst_id, uint32_t len)
+{
+    fbt_trace_entry_t e = {
+        .w        = s_trace_win_no,
+        .burst_id = burst_id,
+        .len      = len,
+        .bin      = (int16_t)center_bin,
+        .peak_db  = 0,
+        .integ_db = 0,
+        .thr_db   = 0,
+        .active   = 0,
+        .kind     = kind,
+    };
+    fbt_trace_push(&e);
+}
+
+int fft_burst_tagger_get_trace(fbt_trace_entry_t *out, int max_entries,
+                               uint32_t *total_written)
+{
+    uint32_t wr = atomic_load_explicit(&s_trace_wr, memory_order_relaxed);
+    if (total_written) *total_written = wr;
+    if (!out || max_entries <= 0) return 0;
+    uint32_t avail = (wr < FBT_TRACE_RING) ? wr : (uint32_t)FBT_TRACE_RING;
+    int      n     = (avail < (uint32_t)max_entries) ? (int)avail : max_entries;
+    uint32_t start = wr - (uint32_t)n; // oldest of the n we return
+    for (int i = 0; i < n; i++)
+        out[i] = s_trace_ring[(start + (uint32_t)i) % FBT_TRACE_RING];
+    return n;
+}
+
 // Carrier-absorption fix (2026-07-07 decode-regression batch).
 //
 // PROBLEM: gri's float baseline absorbs a persistent strong carrier —
@@ -619,7 +726,11 @@ void fft_burst_tagger_flush(fft_burst_tagger_t *t,
     int max     = (n_gone && *n_gone > 0) ? *n_gone : 0;
     int emitted = 0;
     for (int b = 0; b < t->n_bursts && emitted < max; b++) {
-        t->bursts[b].stop   = t->d_index; // force-close at current sample
+        t->bursts[b].stop = t->d_index; // force-close at current sample
+        if (s_trace_band_vdl2)
+            fbt_trace_event(FBT_TRACE_KIND_CLOSE, t->bursts[b].center_bin,
+                            t->bursts[b].id,
+                            (uint32_t)(t->bursts[b].stop - t->bursts[b].start));
         out_gone[emitted++] = t->bursts[b];
     }
     if (n_gone) *n_gone = emitted;
@@ -755,8 +866,12 @@ static inline bool above_threshold(int32_t mag2, int32_t baseline_sum,
 // Update existing bursts' last_active timestamp.
 static FBT_HOT void update_bursts_internal(fft_burst_tagger_t *t)
 {
+    // Trace: one window sequence tick per call (per FFT window). Gated so the
+    // Iridium path never touches it. See fbt_trace_* above.
+    if (s_trace_band_vdl2) s_trace_win_no++;
     for (int b = 0; b < t->n_bursts; b++) {
-        int cb = t->bursts[b].center_bin;
+        int  cb       = t->bursts[b].center_bin;
+        bool advanced = false; // observe-only: did last_active advance?
         // Check ±1 bin around center (gri's update_bursts).
         for (int dk = -1; dk <= 1; dk++) {
             int bin = cb + dk;
@@ -770,9 +885,13 @@ static FBT_HOT void update_bursts_internal(fft_burst_tagger_t *t)
                 // creation suppressed too — is not re-created.
                 if (bin_carrier_saturated(bin)) continue;
                 t->bursts[b].last_active = t->d_index;
+                advanced                 = true;
                 break;
             }
         }
+        // Instrumentation only — does not affect detection.
+        if (s_trace_band_vdl2)
+            fbt_trace_window(t, cb, t->bursts[b].id, advanced);
     }
 }
 
@@ -958,6 +1077,10 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
 
         mask_burst(t, bin);
 
+        // Trace: burst OPEN marker (gated to band==vdl2).
+        if (s_trace_band_vdl2)
+            fbt_trace_event(FBT_TRACE_KIND_OPEN, bin, b->id, 0);
+
         if (out_new && n_emitted < max_new) {
             out_new[n_emitted++] = *b;
         }
@@ -1022,6 +1145,9 @@ static FBT_HOT int create_new_bursts_internal(fft_burst_tagger_t *t,
                 continue;
             }
             bb->stop = t->d_index; // (a) quiet: dispatch as gone
+            if (s_trace_band_vdl2)
+                fbt_trace_event(FBT_TRACE_KIND_CLOSE, bb->center_bin, bb->id,
+                                (uint32_t)(bb->stop - bb->start));
             if (out_gone && ng < max_gone) {
                 out_gone[ng++] = *bb;
             }
@@ -1080,6 +1206,12 @@ static FBT_HOT int delete_gone_bursts_internal(fft_burst_tagger_t *t,
         if (long_burst) update_noise_floor = true;
         if (b->last_active + t->burst_post_len <= t->d_index || long_burst) {
             b->stop = t->d_index;
+            // Trace: burst CLOSE marker with final length (gated to vdl2).
+            // This is the post-len timeout / max-burst-len force-close — the
+            // path that ends VDL2 bursts early, so it brackets the window run.
+            if (s_trace_band_vdl2)
+                fbt_trace_event(FBT_TRACE_KIND_CLOSE, b->center_bin, b->id,
+                                (uint32_t)(b->stop - b->start));
             if (out_gone && n_emitted < max_gone) {
                 out_gone[n_emitted++] = *b;
             }

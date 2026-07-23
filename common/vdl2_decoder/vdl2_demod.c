@@ -7,6 +7,7 @@
 
 #include "vdl2_demod.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +32,27 @@
 #define vd_malloc_psram(sz) malloc(sz)
 #endif
 
+// EXT_RAM_BSS_ATTR for the static preamble-regression buffer below (tiny,
+// cold, single-consumer — DMA-INT/internal-.bss hygiene, same guard pattern
+// as vdl2_l2.c:16-21). Host build: plain .bss (no EXT_RAM_BSS_ATTR there).
+#if __has_include("esp_attr.h")
+#include "esp_attr.h"
+#endif
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+
 #define VD_PI 3.14159265358979323846f
+
+// Cumulative demod counters (never reset; the /status pattern, mirroring
+// vdl2_l2_stats_t). Single writer = the demodulating worker task; torn
+// reads benign for diagnostics.
+static vdl2_demod_stats_t s_demod_stats;
+
+void vdl2_demod_get_stats(vdl2_demod_stats_t *out)
+{
+    if (out) *out = s_demod_stats;
+}
 
 // ---- dumpvdl2 demod constants (src/demod.c:37-48) ----
 #define VDL2_SYNC_BUFLEN (VDL2_PREAMBLE_SYMS * VDL2_SPS) // 160, dumpvdl2.h:43
@@ -55,6 +76,33 @@ const float vdl2_preamble_phase[VDL2_PREAMBLE_SYMS] = {
 
 // D8PSK Gray map, dumpvdl2 demod.c:223.
 const uint8_t vdl2_graycode[8] = {0, 1, 3, 2, 6, 7, 5, 4};
+
+// Per-bit Gray-8PSK soft-demapping (see header). For each bit, find the
+// nearest constellation decision boundary that flips it and scale the
+// distance to [0, 24576]. Boundaries live at the midpoint j+0.5 of any
+// adjacent phase pair (j, j+1) whose Gray codes differ in that bit, so
+// the mapping stays correct if vdl2_graycode[] changes.
+void vdl2_softbit_conf(int idx, float efrac, int16_t conf3[3])
+{
+    float u = (float)idx + efrac; // received position, pi/4 units, [0,8)
+    for (int b = 0; b < 3; b++) {
+        int   shift = 2 - b; // bit 0 is MSB (g>>2), bit 2 is LSB (g&1)
+        float best  = 8.f;   // min boundary distance for this bit
+        for (int j = 0; j < 8; j++) {
+            int jn = (j + 1) & 7;
+            if (((vdl2_graycode[j] >> shift) & 1u) ==
+                ((vdl2_graycode[jn] >> shift) & 1u))
+                continue; // no bit-b boundary between j and j+1
+            float d = fabsf(u - ((float)j + 0.5f));
+            if (d > 4.f) d = 8.f - d; // wrap around the circle
+            if (d < best) best = d;
+        }
+        float c = best * 2.f * 24576.f;
+        if (c < 0.f) c = 0.f;
+        if (c > 24576.f) c = 24576.f;
+        conf3[b] = (int16_t)c;
+    }
+}
 
 // ---- (25,20) header block code, dumpvdl2 decode.c:55-100 ----
 // Parity-check matrix rows (25-bit words; the 5 parity bits are the 5
@@ -164,6 +212,89 @@ int vdl2_hdr_decode(uint32_t *hdr, uint32_t *datalen_bits)
     *datalen_bits =
         reverse_bits((w >> VDL2_HDR_FEC_BITS) & 0x1FFFFu, VDL2_HDR_TRLEN_BITS);
     return (int)s_hdr_synd_weight[syndrome];
+}
+
+// Number of least-reliable header bits the Chase fallback probes. 3 ->
+// 2^3-1 = 7 non-empty flip patterns (the empty pattern is the hard path
+// that already failed). The (25,20) code guarantees only single-error
+// correction, so a genuine 2-3-bit header error is exactly what a hard
+// syndrome decode cannot resolve — flipping the weakest bits first moves
+// the candidate onto a decodable coset.
+#define VDL2_HDR_SOFT_M 3
+// Meaningful header bits (the 3 reserved MSBs are forced to 0 by
+// vdl2_hdr_decode, so they are never error positions worth flipping).
+#define VDL2_HDR_DATA_BITS (VDL2_HDR_TRLEN_BITS + VDL2_HDR_FEC_BITS) // 22
+
+int vdl2_hdr_decode_soft(uint32_t *hdr, const int16_t *conf_air,
+                         uint32_t *datalen_bits)
+{
+    // Received word, reserved bits dropped (mirrors vdl2_hdr_decode's
+    // mask). Header bit k (air order, MSB-first) sits at w-position
+    // VDL2_HDR_BITS-1-k; build a confidence array indexed by w-position
+    // over the 22 meaningful bits.
+    uint32_t w0 = *hdr & ((1u << VDL2_HDR_DATA_BITS) - 1u);
+    int16_t  confp[VDL2_HDR_DATA_BITS];
+    for (int p = 0; p < VDL2_HDR_DATA_BITS; p++) {
+        int k    = VDL2_HDR_BITS - 1 - p; // air-bit index for w-position p
+        confp[p] = conf_air ? conf_air[k] : (int16_t)24576;
+    }
+
+    // Least-reliable positions (lowest confidence first), insertion sort
+    // into a tiny fixed array.
+    int weak[VDL2_HDR_SOFT_M];
+    int nweak = 0;
+    for (int p = 0; p < VDL2_HDR_DATA_BITS; p++) {
+        int ins = nweak;
+        while (ins > 0 && confp[p] < confp[weak[ins - 1]]) ins--;
+        if (ins >= VDL2_HDR_SOFT_M) continue; // not weak enough
+        int last = (nweak < VDL2_HDR_SOFT_M) ? nweak : VDL2_HDR_SOFT_M - 1;
+        for (int j = last; j > ins; j--) weak[j] = weak[j - 1];
+        weak[ins] = p;
+        if (nweak < VDL2_HDR_SOFT_M) nweak++;
+    }
+
+    uint32_t best_w = 0, best_len = 0;
+    long     best_metric = LONG_MAX;
+    int      best_syndw  = -1;
+
+    // Enumerate every non-empty subset of the weak positions. For each,
+    // flip those bits, run the SAME hard syndrome decode (its own
+    // single-bit correction stacks on top), and keep the valid header
+    // (zero reserved bits + plausible length) closest to the received
+    // word in reliability-weighted distance.
+    for (uint32_t mask = 1; mask < (1u << nweak); mask++) {
+        uint32_t test = 0;
+        for (int i = 0; i < nweak; i++)
+            if (mask & (1u << i)) test |= (1u << weak[i]);
+        uint32_t w   = w0 ^ test;
+        uint32_t len = 0;
+        int      sw  = vdl2_hdr_decode(&w, &len);
+        if (sw < 0) continue;
+        // Length plausibility — identical gate to the demod's hard path
+        // (tighter cap when any correction was applied).
+        if ((sw != 0 && len > VDL2_MAX_FRAME_BITS_CORRECTED) ||
+            len > VDL2_MAX_FRAME_BITS)
+            continue;
+        if (vdl2_burst_body_bits(len) < 0) continue;
+        // Soft metric: total unreliability of the bits the FINAL codeword
+        // differs from the received word by (Chase flips + the syndrome
+        // correction combined). Lowest = most likely.
+        uint32_t diff   = (w ^ w0) & ((1u << VDL2_HDR_DATA_BITS) - 1u);
+        long     metric = 0;
+        for (int p = 0; p < VDL2_HDR_DATA_BITS; p++)
+            if (diff & (1u << p)) metric += confp[p];
+        if (metric < best_metric) {
+            best_metric = metric;
+            best_w      = w;
+            best_len    = len;
+            best_syndw  = sw;
+        }
+    }
+
+    if (best_syndw < 0) return -1;
+    *hdr          = best_w;
+    *datalen_bits = best_len;
+    return best_syndw;
 }
 
 int vdl2_burst_body_bits(uint32_t datalen_bits)
@@ -364,7 +495,12 @@ bool vdl2_rrc_design_q15(int16_t *coeffs, int delay_size, int interp,
 // tagger window) — VDL2-only, scalar, no PIE.
 #define VDL2_RS_DSIZE 144
 
-static int16_t s_rs_coeffs[VDL2_RS_DSIZE * VDL2_RESAMP_INTERP];
+// 6 KB Q15 tap bank — CPU-only (firmr_s16 is the scalar ANSI polyphase
+// FIR, no PIE/esp-dsp vector read of the coeffs), cold, single-consumer.
+// -> PSRAM on target to keep internal DMA-INT free for the USB URB pool
+// (same DMA-INT/internal-.bss hygiene as s_lr_X above). Host build: the
+// EXT_RAM_BSS_ATTR guard above makes this a plain .bss.
+static EXT_RAM_BSS_ATTR int16_t s_rs_coeffs[VDL2_RS_DSIZE * VDL2_RESAMP_INTERP];
 static int     s_init_done = 0;
 
 static void vdl2_demod_init_once(void)
@@ -438,7 +574,7 @@ typedef struct {
 
 // Linear-regression constants over the 16 preamble symbols
 // (demod.c:81-96 demod_sync_init).
-static float s_lr_X[VDL2_PREAMBLE_SYMS];
+static EXT_RAM_BSS_ATTR float s_lr_X[VDL2_PREAMBLE_SYMS];
 static float s_lr_denom;
 static int   s_lr_init = 0;
 
@@ -580,9 +716,20 @@ typedef struct {
     int            n_syms;
 } vdl2_symrd_t;
 
-// Demodulate one symbol: 3 hard bits (MSB-first) + shared confidence.
+// Demodulate one symbol: 3 hard bits (MSB-first) + PER-BIT confidence.
 // Returns false when the window has no samples left for the strobe.
-static bool symrd_next(vdl2_symrd_t *r, uint8_t bits3[3], int16_t *conf_out)
+//
+// Gray-coded 8PSK soft-demapping: each bit's confidence is the angular
+// distance (in pi/4 units) from the received phase to the NEAREST
+// constellation decision boundary that flips THAT bit, scaled so a
+// boundary-adjacent bit reads 0 and a >=0.5-unit margin saturates at
+// 24576. Because adjacent phases differ in exactly one bit, the bit
+// flipping toward the received offset direction keeps the old shared
+// low value (its boundary is the globally nearest, at 0.5-|efrac|),
+// while the other two bits earn their larger, farther-boundary margins.
+// Boundaries are derived from vdl2_graycode[] at runtime (scan adjacent
+// phase pairs) so the mapping stays correct if the constant changes.
+static bool symrd_next(vdl2_symrd_t *r, uint8_t bits3[3], int16_t conf3[3])
 {
     if (r->strobe_pos >= (float)r->n105) return false;
     float re, im;
@@ -599,15 +746,12 @@ static bool symrd_next(vdl2_symrd_t *r, uint8_t bits3[3], int16_t *conf_out)
     idx         = ((idx % 8) + 8) % 8;
 
     uint8_t g = vdl2_graycode[idx];
-    bits3[0]  = (uint8_t)((g >> 2) & 1u);
+    bits3[0]  = (uint8_t)((g >> 2) & 1u); // UNCHANGED hard decisions
     bits3[1]  = (uint8_t)((g >> 1) & 1u);
     bits3[2]  = (uint8_t)(g & 1u);
-    // Confidence: distance from the decision boundary, 0 at the
-    // boundary, 24576 dead-centre. Shared by the symbol's 3 bits (the
-    // qpsk_demod symbol-confidence convention).
-    float c = (0.5f - fabsf(efrac)) * 2.f * 24576.f;
-    if (c < 0.f) c = 0.f;
-    *conf_out = (int16_t)c;
+
+    // Per-bit confidence via nearest bit-flip boundary.
+    vdl2_softbit_conf(idx, efrac, conf3);
 
     float e_rad = efrac * (VD_PI / 4.f);
     r->evm_acc += (double)e_rad * (double)e_rad;
@@ -675,12 +819,14 @@ bool vdl2_demod_burst(const int16_t *iq250, int n_complex,
         int16_t conf27[27];
         bool    short_window = false;
         for (int s = 0; s < 9; s++) {
-            int16_t c;
-            if (!symrd_next(&rd, &raw27[3 * s], &c)) {
+            int16_t c3[3];
+            if (!symrd_next(&rd, &raw27[3 * s], c3)) {
                 short_window = true;
                 break;
             }
-            conf27[3 * s + 0] = conf27[3 * s + 1] = conf27[3 * s + 2] = c;
+            conf27[3 * s + 0] = c3[0];
+            conf27[3 * s + 1] = c3[1];
+            conf27[3 * s + 2] = c3[2];
         }
         if (short_window) continue; // resume scanning (window nearly over)
 
@@ -692,8 +838,17 @@ bool vdl2_demod_burst(const int16_t *iq250, int n_complex,
         for (int k = 0; k < VDL2_HDR_BITS; k++)
             w = (w << 1) | hdr_bits[k];
         uint32_t datalen  = 0;
+        uint32_t w_orig   = w; // pre-correction copy for the soft fallback
         int      syndw    = vdl2_hdr_decode(&w, &datalen);
-        if (syndw < 0) continue; // header uncorrectable -> keep scanning
+        if (syndw < 0) {
+            // Hard (25,20) syndrome decode rejected (correction landed in
+            // the reserved bits). Retry with the Chase-style soft fallback
+            // over the least-reliable header bits before giving up.
+            w     = w_orig;
+            syndw = vdl2_hdr_decode_soft(&w, conf27, &datalen);
+            if (syndw < 0) continue; // still uncorrectable -> keep scanning
+            s_demod_stats.soft_hdr_rescued++;
+        }
         // Length plausibility, decode.c:227 (tighter cap if corrected).
         if ((syndw != 0 && datalen > VDL2_MAX_FRAME_BITS_CORRECTED) ||
             datalen > VDL2_MAX_FRAME_BITS)
@@ -718,11 +873,11 @@ bool vdl2_demod_burst(const int16_t *iq250, int n_complex,
 
         for (int s = 9; s < needed_syms; s++) {
             uint8_t b3[3];
-            int16_t c;
-            if (!symrd_next(&rd, b3, &c)) break; // truncated by window end
+            int16_t c3[3];
+            if (!symrd_next(&rd, b3, c3)) break; // truncated by window end
             for (int k = 0; k < 3 && n_avail < needed; k++) {
                 bits[n_avail] = b3[k];
-                soft[n_avail] = c;
+                soft[n_avail] = c3[k];
                 n_avail++;
             }
         }

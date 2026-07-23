@@ -193,6 +193,12 @@ void                app_config_unlock(void);
 // the load-time guard. Takes effect on next boot (profile + pipeline
 // are resolved once at create/init time).
 esp_err_t app_config_set_band(uint8_t v);
+// RAM-only apply of the live band id: instant, flash-free (no NVS commit), so
+// it does NOT persist across reboot and cannot clobber the operator's NVS
+// "band" byte. Used by the on-device SMOKE_TEST variants to force their band
+// (iridium for the Iridium fixtures, vdl2 for the VDL2 fixture) before the
+// pipeline resolves it — see smoke_test_run(). Out-of-range clamps to iridium.
+void app_config_set_band_ram(uint8_t v);
 
 esp_err_t app_config_set_lo_freq_hz(uint32_t hz);
 esp_err_t app_config_set_sample_rate_hz(uint32_t hz);

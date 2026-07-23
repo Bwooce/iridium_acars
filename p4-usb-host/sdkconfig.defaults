@@ -232,9 +232,15 @@ CONFIG_ENABLE_SD_LOG=y
 # error. Enable it: the volume-label API is native to exFAT anyway (tiny code).
 CONFIG_FATFS_USE_LABEL=y
 
-# Console 921600 (rec #1): cut UART-TX busy-spin cost on Core 0 during
-# passes (frame_decoder log spin). 2026-07-19.
+# Console 115200 (2026-07-23): pinned to a single baud for the WHOLE device
+# lifetime — 2nd-stage bootloader, IDF console init, AND the serial_cmd
+# runtime re-config (serial_cmd.c) must ALL agree at 115200, or the console
+# changes baud mid-boot and a fixed-baud host reader garbles one phase.
+# 115200 is the rate this Mac's CH34x driver reliably frames (921600 was
+# tried and the P4 console-TX would not read cleanly on the Mac). Core-0
+# UART-TX busy-spin is bounded by uart_log AUTO muting when network-up, so
+# the lower baud's cost only applies while logs are explicitly on.
 # CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
 CONFIG_ESP_CONSOLE_UART_CUSTOM=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
-CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200

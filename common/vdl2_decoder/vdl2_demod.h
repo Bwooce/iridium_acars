@@ -138,6 +138,17 @@ typedef struct {
     int consumed_complex_250k;
 } vdl2_demod_result_t;
 
+// Cumulative demod counters (never reset; the /status pattern, mirroring
+// vdl2_l2_stats_t). Single writer = the demodulating worker task; torn
+// reads benign for diagnostics.
+typedef struct {
+    uint32_t soft_hdr_rescued; // burst headers the hard (25,20) syndrome
+                               // decode REJECTED but vdl2_hdr_decode_soft
+                               // recovered — VDL2 header analog of
+                               // vdl2_l2_stats_t.rs_erasure_recovered.
+} vdl2_demod_stats_t;
+void vdl2_demod_get_stats(vdl2_demod_stats_t *out);
+
 // Demodulate the FIRST decodable VDL2 burst found in the window.
 // iq250: interleaved int16 IQ at 250 ksps, channel centred at DC
 // (band_pipeline input contract). Returns false if no preamble locked
@@ -171,6 +182,24 @@ uint32_t vdl2_hdr_encode(uint32_t datalen_bits);
 // length field.
 int vdl2_hdr_decode(uint32_t *hdr, uint32_t *datalen_bits);
 
+// Chase-style soft-decision fallback for vdl2_hdr_decode, called by the
+// demod ONLY when the hard syndrome decode rejects (return -1). conf_air
+// is the per-bit confidence MAGNITUDE ([0,24576], higher = more reliable)
+// for the 25 header bits in air order (conf_air[0] = first bit on air =
+// MSB of the word), i.e. the demod's per-symbol soft metric. The (25,20)
+// code only guarantees single-error correction, so a genuine 2-3-bit
+// header error is uncorrectable hard; this flips small non-empty subsets
+// of the least-reliable header bits, re-runs the hard syndrome decode on
+// each candidate, and accepts the valid header (zero reserved bits +
+// plausible length) whose total flipped-bit unreliability is lowest.
+// On success *hdr is the corrected word, *datalen_bits the length field,
+// and the return is the winning candidate's syndrome weight (>=0); -1 if
+// no subset yields a valid header. Downstream RS(255,249) + AVLC FCS are
+// the ultimate validators of an accepted soft header. conf_air may be
+// NULL (all bits treated equally reliable) — mainly for tests.
+int vdl2_hdr_decode_soft(uint32_t *hdr, const int16_t *conf_air,
+                         uint32_t *datalen_bits);
+
 // Additive scrambler/descrambler (same operation both directions):
 // XOR bits[0..n) with the LFSR keystream, advancing *lfsr. Feedback
 // bit = (lfsr ^ lfsr>>14) & 1, shifted in at stage 14
@@ -185,6 +214,17 @@ extern const float vdl2_preamble_phase[VDL2_PREAMBLE_SYMS];
 // D8PSK Gray map: 3 transmitted bits for differential phase index
 // 0..7 (units of pi/4), dumpvdl2 demod.c:223.
 extern const uint8_t vdl2_graycode[8];
+
+// Per-bit soft-demapping confidence for one D8PSK symbol. idx is the
+// decided phase index (0..7); efrac is the fractional phase offset from
+// that index's centre toward a neighbour, in [-0.5, 0.5] units of pi/4.
+// Fills conf3[0..2] (MSB-first, matching vdl2_graycode's bit order) with
+// each bit's confidence in [0, 24576]: the angular distance from the
+// received phase to the nearest decision boundary that flips that bit,
+// scaled so a boundary-adjacent bit reads 0 and a >=0.5-unit margin
+// saturates. Boundaries are derived from vdl2_graycode[] at runtime.
+// Exposed for host unit tests; also the production per-bit metric.
+void vdl2_softbit_conf(int idx, float efrac, int16_t conf3[3]);
 
 // Kaiser-windowed-sinc polyphase lowpass designer (Q15, firmr_s16
 // layout coeffs[tap * interp + phase], per-phase DC gain normalised to

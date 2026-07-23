@@ -212,6 +212,35 @@ config SMOKE_TEST_PIE_PLACEMENT
         per-address map. Takes precedence over the other smoke modes
         when set (smoke_test_run runs it first and parks).
 
+config SMOKE_TEST_VDL2
+    bool "End-to-end VDL2 ACARS smoke test (synthetic vdl2_mod bursts -> demod -> L2 -> libacars)"
+    depends on SMOKE_TEST_MODE
+    depends on !SMOKE_TEST_CORPUS
+    depends on !SMOKE_TEST_FRAME_DECODER
+    depends on !SMOKE_TEST_RAW_IRIDIUM
+    depends on !SMOKE_TEST_REAL_IRIDIUM
+    depends on !SMOKE_TEST_LIVE_SDR
+    depends on !SMOKE_TEST_PIE_PLACEMENT
+    default n
+    help
+        On-silicon gate for the VHF/VDL Mode 2 decode path (feat/vhf-vdl2).
+        Forces the pipeline band to vdl2 (RAM only — NVS is untouched), then
+        GENERATES known golden VDL2 ACARS transmissions in RAM with the
+        synthetic D8PSK modulator (common/vdl2_decoder/vdl2_mod.c, compiled
+        into the firmware ONLY for this smoke) and runs each through the SAME
+        production decode chain the firmware uses:
+          vdl2_demod_burst  (D8PSK demod, on-device DSP)
+          vdl2_l2_feed      (RS(255,249) de-interleave/correct + AVLC deframe)
+          la_acars_parse_and_reassemble (vendored libacars)
+        The golden expectations (registration + mode) come from
+        tests/fixtures/fixture_vdl2_avlc_golden.h — the same ground truth the
+        host test_vdl2_e2e_acars / test_vdl2_l2 suites use.
+
+        No live SDR, USB, or WiFi needed: it modulates + decodes at boot and
+        prints "matched=X/Y" plus SMOKE_PASS / SMOKE_FAIL. PASS iff every
+        generated ACARS message is reproduced byte-exact (registration + mode).
+        Mutually exclusive with the other SMOKE_TEST_* fixture modes.
+
 config SMOKE_TEST_FRAME_DECODER
     bool "Drive the frame_decoder task with canned post-demod bits from the Albuquerque corpus"
     depends on SMOKE_TEST_MODE

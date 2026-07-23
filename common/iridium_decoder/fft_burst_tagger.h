@@ -233,6 +233,61 @@ void fft_burst_tagger_get_squelch_stats(uint32_t *squelch_events,
                                         uint32_t *squelch_dropped,
                                         uint32_t *noise_resets);
 
+// -------- VDL2 burst-tagger trace (measure-first instrumentation) --------
+//
+// Per-window, per-tracked-burst diagnostic trace plus burst OPEN/CLOSE
+// markers, recorded ONLY when band==vdl2 (armed via
+// fft_burst_tagger_set_trace_enabled). Answers "why do VDL2 bursts close
+// after ~4-19 ms when the transmission is 50-500 ms": for every tracked
+// burst on every FFT window it logs the peak-bin energy-over-baseline (the
+// exact quantity the threshold test uses) AND the energy integrated over
+// the band's channel width, both in dB, against the threshold line — so a
+// D8PSK burst whose PEAK bin dips below threshold (energy spread across the
+// channel) while its INTEGRATED channel energy is still present shows up
+// directly. It adds NO detection logic and touches NO thresholds; the whole
+// path is gated on the vdl2 flag, so band==iridium is byte-identical and
+// pays nothing.
+//
+// Ring sizing: one window = FBT_FFT_SIZE (2048) samples = 819.2 µs at
+// 2.5 MSPS. 1024 entries hold ~1024 × 819.2 µs ≈ 839 ms of single-burst
+// windows — one full 50-500 ms VDL2 transmission for one burst. Entries are
+// SHARED across all concurrently-tracked bursts plus OPEN/CLOSE markers, so
+// a busy multi-burst period holds proportionally less wall-time; total_written
+// from the getter lets a reader detect wrap.
+#define FBT_TRACE_RING 1024
+
+#define FBT_TRACE_KIND_WINDOW 0 // per-window sample for a tracked burst
+#define FBT_TRACE_KIND_OPEN   1 // burst created this window
+#define FBT_TRACE_KIND_CLOSE  2 // burst force-closed / timed out this window
+
+typedef struct {
+    uint32_t w;        // monotonic window sequence number (burst timeline)
+    uint32_t burst_id; // burst id — brackets a burst's window entries
+    uint32_t len;      // CLOSE: final length_samples (stop-start); else 0
+    int16_t  bin;      // peak/center FFT bin
+    int16_t  peak_db;  // 10·log10(mag²[peak]·HISTORY / baseline_sum[peak]),
+                       // in dB×10. INT16_MIN if baseline/mag ≤ 0 (undefined).
+    int16_t  integ_db; // 10·log10(Σmag²·HISTORY / Σbaseline_sum) over the
+                       // band's WIDTH_BINS bins centred on peak, dB×10.
+    int16_t  thr_db;   // threshold line 10·log10(threshold_q15/32768), dB×10
+                       //   (same units as peak_db/integ_db; WINDOW kind only)
+    uint8_t  active;   // 1 = last_active advanced this window (threshold passed)
+    uint8_t  kind;     // FBT_TRACE_KIND_*
+} fbt_trace_entry_t;
+
+// Arm/disarm trace recording. Pass true ONLY for band==vdl2. When false
+// (the default, and always for band==iridium) every trace path is skipped —
+// the Iridium hot path is byte-identical and costs nothing.
+void fft_burst_tagger_set_trace_enabled(bool enabled);
+
+// Copy up to max_entries of the most recent trace entries into `out` in
+// chronological order (oldest first). Returns the count copied. If non-NULL,
+// *total_written receives the monotonic count of entries EVER written, so a
+// reader can detect ring wrap (total_written > returned => older entries were
+// overwritten). Safe to call when tracing was never armed (returns 0).
+int fft_burst_tagger_get_trace(fbt_trace_entry_t *out, int max_entries,
+                               uint32_t *total_written);
+
 // Scalar Q15 window-multiply kernel — the tagger's window stage AND
 // the bit-exact REFERENCE for any SIMD replacement (T50 golden
 // harness, tests/host/test_window_multiply_golden.c). For each

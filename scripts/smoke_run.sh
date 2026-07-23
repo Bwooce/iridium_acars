@@ -7,11 +7,11 @@
 #
 # Usage:
 #   scripts/smoke_run.sh corpus            # one variant
-#   scripts/smoke_run.sh corpus frame raw real
+#   scripts/smoke_run.sh corpus frame raw real vdl2
 #   scripts/smoke_run.sh restore           # rebuild+flash production
 #
-# Variants: corpus frame raw real (map to SMOKE_TEST_{CORPUS,
-# FRAME_DECODER,RAW_IRIDIUM,REAL_IRIDIUM}). Each is built from a
+# Variants: corpus frame raw real vdl2 (map to SMOKE_TEST_{CORPUS,
+# FRAME_DECODER,RAW_IRIDIUM,REAL_IRIDIUM,VDL2}). Each is built from a
 # pristine copy of the production sdkconfig so variants can't cross-
 # contaminate. Env: PORT=/dev/ttyACM0, CAP_SECS=90.
 
@@ -36,6 +36,7 @@ sym_for() {
         frame)    echo CONFIG_SMOKE_TEST_FRAME_DECODER ;;
         raw)      echo CONFIG_SMOKE_TEST_RAW_IRIDIUM ;;
         real)     echo CONFIG_SMOKE_TEST_REAL_IRIDIUM ;;
+        vdl2)     echo CONFIG_SMOKE_TEST_VDL2 ;;
         pieplace) echo CONFIG_SMOKE_TEST_PIE_PLACEMENT ;;
         *)        echo "" ;;
     esac
@@ -75,8 +76,8 @@ import sys, re
 path, extra = sys.argv[1], sys.argv[2]
 syms = ['CONFIG_SMOKE_TEST_MODE','CONFIG_SMOKE_TEST_CORPUS',
         'CONFIG_SMOKE_TEST_FRAME_DECODER','CONFIG_SMOKE_TEST_RAW_IRIDIUM',
-        'CONFIG_SMOKE_TEST_REAL_IRIDIUM','CONFIG_SMOKE_TEST_PIE_PLACEMENT',
-        'CONFIG_SMOKE_TEST_LIVE_SDR']
+        'CONFIG_SMOKE_TEST_REAL_IRIDIUM','CONFIG_SMOKE_TEST_VDL2',
+        'CONFIG_SMOKE_TEST_PIE_PLACEMENT','CONFIG_SMOKE_TEST_LIVE_SDR']
 enable = {'CONFIG_SMOKE_TEST_MODE', extra}
 def canon(s): return (f"{s}=y" if s in enable else f"# {s} is not set")
 lines = open(path).read().splitlines()
@@ -152,7 +153,7 @@ build_flash_capture() {  # $1 = label (variant name or "production")
 
 # ---- main ----
 if [ "$#" -eq 0 ]; then
-    echo "usage: $0 <corpus|frame|raw|real ...> | restore"; exit 1
+    echo "usage: $0 <corpus|frame|raw|real|vdl2 ...> | restore"; exit 1
 fi
 
 if [ "$1" = restore ]; then
@@ -167,7 +168,7 @@ fi
 snapshot_prod || exit 1
 for v in "$@"; do
     sym="$(sym_for "$v")"
-    if [ -z "$sym" ]; then log "unknown variant '$v' (want corpus|frame|raw|real)"; continue; fi
+    if [ -z "$sym" ]; then log "unknown variant '$v' (want corpus|frame|raw|real|vdl2)"; continue; fi
     log "=== SMOKE variant: $v ($sym) ==="
     set_config "$sym"
     build_flash_capture "$v"

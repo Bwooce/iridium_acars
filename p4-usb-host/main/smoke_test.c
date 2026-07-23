@@ -38,6 +38,8 @@
 #include "smoke_test.h"
 #include "crc16.h"       // on-silicon CRC-16 table self-test (all variants)
 #include "iridium_bch.h" // on-silicon BCH syndrome-table vs _ref self-test (all variants)
+#include "app_config.h"  // app_config_set_band_ram — FORCE the pipeline band per variant
+#include "band_profile.h" // BAND_IRIDIUM / BAND_VDL2 ids
 
 #if CONFIG_SMOKE_TEST_CORPUS
 #include "fixture_corpus_uint8.h"
@@ -57,6 +59,25 @@
 #include "worker_core1.h"
 #include "bch_decoder.h"
 #include "qpsk_demod.h"
+#endif
+
+#if CONFIG_SMOKE_TEST_VDL2
+// On-silicon VDL2 ACARS gate: generate golden ACARS bursts with the synthetic
+// D8PSK modulator, then run them through the SAME production decode chain the
+// firmware uses (vdl2_demod -> vdl2_l2 -> libacars). Golden truth is the same
+// fixture the host test_vdl2_e2e_acars / test_vdl2_l2 suites use.
+#include <stdlib.h>    // free (demod result buffers)
+#include <stdio.h>     // snprintf
+#include <sys/time.h>  // gettimeofday / struct timeval (libacars rx_time)
+#include "vdl2_mod.h"   // synthetic modulator (compiled in only for this smoke)
+#include "vdl2_demod.h" // D8PSK demod + vdl2_hdr_encode / vdl2_burst_body_bits
+#include "vdl2_l2.h"    // RS de-interleave/correct + AVLC deframe
+#include "avlc.h"       // avlc_frame_t / AVLC_KIND_ACARS / AVLC_ADDRTYPE_AIRCRAFT
+#include "rs_vdl2.h"    // RS(255,249) encode + block geometry constants
+#include "fixture_vdl2_avlc_golden.h" // golden AVLC frames (reg + mode ground truth)
+#include <libacars/libacars.h>
+#include <libacars/acars.h>
+#include <libacars/reassembly.h>
 #endif
 
 #if CONFIG_SMOKE_TEST_FRAME_DECODER
@@ -456,6 +477,320 @@ static void smoke_test_run_frame_decoder(void)
 }
 #endif
 
+#if CONFIG_SMOKE_TEST_VDL2
+// ===========================================================================
+// VDL2 on-silicon ACARS gate.
+//
+// Mirrors the host test_vdl2_e2e_acars generate->decode->verify model but with
+// NO giant IQ fixture: the synthetic D8PSK modulator (vdl2_mod) makes each
+// golden ACARS burst deterministic + tiny in RAM. The decode chain is exactly
+// the firmware's (vdl2_demod -> vdl2_l2 -> libacars), so this exercises the
+// real on-device DSP (PIE/heap), RS(255,249), AVLC deframe, and libacars.
+//
+// The air-side transmission encoder below is ported verbatim from
+// tests/host/test_vdl2_l2.c build_tx() (the independent two-implementations
+// discipline): flag / stuffed-frame / flag -> RS-block segment + parity ->
+// byte interleave -> 25-bit header + interleaved data+FEC bit vector. That
+// vector's post-header bits ARE the modulator's `body_bits`.
+// ===========================================================================
+
+#define VDL2_SMK_MAX_BITS    4096
+#define VDL2_SMK_MAX_OCTETS  512
+#define VDL2_SMK_MAX_BLOCKS  3
+#define VDL2_SMK_MAX_COMPLEX 40000
+#define VDL2_SMK_MAX_ACARS   16
+
+// One HDLC flag, LSB-first (0x7E).
+static int vdl2_smk_append_flag(uint8_t *bits, int pos)
+{
+    static const uint8_t f[8] = {0, 1, 1, 1, 1, 1, 1, 0};
+    memcpy(bits + pos, f, 8);
+    return pos + 8;
+}
+// Frame octets LSB-first with HDLC bit stuffing (a 0 after five 1s).
+static int vdl2_smk_append_stuffed(uint8_t *bits, int pos, const uint8_t *oct,
+                                   int n)
+{
+    int ones = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < 8; j++) {
+            uint8_t b   = (uint8_t)((oct[i] >> j) & 1u);
+            bits[pos++] = b;
+            if (b) {
+                if (++ones == 5) {
+                    bits[pos++] = 0;
+                    ones        = 0;
+                }
+            } else {
+                ones = 0;
+            }
+        }
+    }
+    return pos;
+}
+// dumpvdl2 decode.c get_fec_octetcount.
+static int vdl2_smk_fec_octetcount(uint32_t len)
+{
+    if (len < 3) return 0;
+    if (len < 31) return 2;
+    if (len < 68) return 4;
+    return 6;
+}
+// Byte interleaver: inverse of the production de-interleave by construction.
+static void vdl2_smk_interleave_walk(uint8_t *out, uint32_t len, uint32_t rows,
+                                     const uint8_t tab[][RS_VDL2_N],
+                                     uint32_t fillwidth, uint32_t offset)
+{
+    uint32_t last_row_len = len % fillwidth;
+    if (last_row_len == 0) last_row_len = fillwidth;
+    uint32_t row = 0, col = offset;
+    last_row_len += offset;
+    for (uint32_t i = 0; i < len; i++) {
+        if (row == rows - 1 && col >= last_row_len) {
+            row = 0;
+            col++;
+        }
+        out[i] = tab[row++][col];
+        if (row == rows) {
+            row = 0;
+            col++;
+        }
+    }
+}
+
+typedef struct {
+    uint8_t  bits[VDL2_SMK_MAX_BITS]; // 25-bit header + interleaved data + FEC
+    int      n_bits;
+    uint32_t datalen; // header transmission length (bits)
+} vdl2_smk_tx_t;
+
+// Build a single-golden-frame transmission (flag F flag) into a PHY bit
+// vector. Returns true on success. tx buffers are small; the caller's tx is
+// stack-local (a few KB) — fine on the 32 KB smoke task stack.
+static bool vdl2_smk_build_tx(vdl2_smk_tx_t *tx, int golden_idx)
+{
+    static uint8_t stuffed[VDL2_SMK_MAX_BITS];
+    const vdl2_avlc_golden_t *g = &k_vdl2_avlc_golden[golden_idx];
+    int pos = vdl2_smk_append_flag(stuffed, 0);
+    pos     = vdl2_smk_append_stuffed(stuffed, pos, g->raw, g->raw_len);
+    pos     = vdl2_smk_append_flag(stuffed, pos);
+    uint32_t datalen        = (uint32_t)pos;
+    uint32_t datalen_octets = (datalen + 7) / 8;
+    if (datalen_octets > VDL2_SMK_MAX_OCTETS) return false;
+
+    static uint8_t stream[VDL2_SMK_MAX_OCTETS];
+    memset(stream, 0, sizeof(stream));
+    for (uint32_t i = 0; i < datalen; i++)
+        stream[i >> 3] |= (uint8_t)((stuffed[i] & 1u) << (i & 7));
+
+    uint32_t num_blocks = datalen_octets / RS_VDL2_K;
+    uint32_t last       = datalen_octets % RS_VDL2_K;
+    uint32_t fec_octets = num_blocks * RS_VDL2_NROOTS;
+    if (last) num_blocks++;
+    fec_octets += (uint32_t)vdl2_smk_fec_octetcount(last);
+    if (last == 0) last = RS_VDL2_K;
+    if (num_blocks > VDL2_SMK_MAX_BLOCKS) return false;
+
+    static uint8_t tab[VDL2_SMK_MAX_BLOCKS][RS_VDL2_N];
+    memset(tab, 0, sizeof(tab));
+    uint32_t off = 0;
+    for (uint32_t r = 0; r < num_blocks; r++) {
+        uint32_t n = (r == num_blocks - 1) ? last : RS_VDL2_K;
+        memcpy(tab[r], stream + off, n);
+        off += n;
+        rs_vdl2_encode(tab[r]);
+    }
+
+    static uint8_t data_il[VDL2_SMK_MAX_OCTETS];
+    static uint8_t fec_il[VDL2_SMK_MAX_BLOCKS * RS_VDL2_NROOTS];
+    vdl2_smk_interleave_walk(data_il, datalen_octets, num_blocks, tab,
+                             RS_VDL2_K, 0);
+    uint32_t fec_rows = num_blocks;
+    if (vdl2_smk_fec_octetcount(last) == 0) fec_rows--;
+    vdl2_smk_interleave_walk(fec_il, fec_octets, fec_rows, tab, RS_VDL2_NROOTS,
+                             RS_VDL2_K);
+
+    uint32_t hdr = vdl2_hdr_encode(datalen);
+    int      n   = 0;
+    for (int k = VDL2_HDR_BITS - 1; k >= 0; k--)
+        tx->bits[n++] = (uint8_t)((hdr >> k) & 1u);
+    for (uint32_t i = 0; i < 8 * datalen_octets; i++)
+        tx->bits[n++] = (uint8_t)((data_il[i >> 3] >> (i & 7)) & 1u);
+    for (uint32_t i = 0; i < 8 * fec_octets; i++)
+        tx->bits[n++] = (uint8_t)((fec_il[i >> 3] >> (i & 7)) & 1u);
+    tx->n_bits  = n;
+    tx->datalen = datalen;
+    return true;
+}
+
+// ---- decoded-ACARS collector (ported from test_vdl2_e2e_acars) ----
+typedef struct {
+    char reg[16];
+    char mode;
+    int  claimed;
+} vdl2_smk_dec_t;
+
+static vdl2_smk_dec_t s_vdl2_dec[VDL2_SMK_MAX_ACARS];
+static int            s_vdl2_n_dec  = 0;
+static int            s_vdl2_avlc_ok = 0; // FCS-valid AVLC frames (all kinds)
+static la_reasm_ctx  *s_vdl2_reasm  = NULL;
+
+extern la_type_descriptor const la_DEF_acars_message;
+static la_acars_msg            *vdl2_smk_find_acars(la_proto_node *node)
+{
+    while (node) {
+        if (node->td == &la_DEF_acars_message && node->data)
+            return (la_acars_msg *)node->data;
+        node = node->next;
+    }
+    return NULL;
+}
+
+// Same rule as frame_decoder.c vdl2_avlc_cb (dumpvdl2 src/acars.c:100-108):
+// aircraft source = downlink; f->acars already past the discriminator.
+static void vdl2_smk_avlc_cb(const avlc_frame_t *f, void *ctx)
+{
+    (void)ctx;
+    if (f->fcs_ok) s_vdl2_avlc_ok++;
+    if (f->kind != AVLC_KIND_ACARS) return;
+    la_msg_dir dir = (f->src_type == AVLC_ADDRTYPE_AIRCRAFT)
+                         ? LA_MSG_DIR_AIR2GND
+                         : LA_MSG_DIR_GND2AIR;
+    struct timeval rx_time;
+    gettimeofday(&rx_time, NULL);
+    la_proto_node *node = la_acars_parse_and_reassemble(
+        f->acars, (size_t)f->acars_len, dir, s_vdl2_reasm, rx_time);
+    if (!node) return;
+    la_acars_msg *a = vdl2_smk_find_acars(node);
+    if (a && (a->reasm_status == LA_REASM_COMPLETE ||
+              a->reasm_status == LA_REASM_SKIPPED) &&
+        s_vdl2_n_dec < VDL2_SMK_MAX_ACARS) {
+        const char *reg = a->reg;
+        while (*reg == '.')
+            reg++; // strip libacars '.' left-padding
+        snprintf(s_vdl2_dec[s_vdl2_n_dec].reg,
+                 sizeof(s_vdl2_dec[s_vdl2_n_dec].reg), "%s", reg);
+        s_vdl2_dec[s_vdl2_n_dec].mode    = a->mode;
+        s_vdl2_dec[s_vdl2_n_dec].claimed = 0;
+        ESP_LOGI(TAG, "VDL2 ACARS %s: reg=%s mode=%c crc=%s",
+                 dir == LA_MSG_DIR_AIR2GND ? "DL" : "UL",
+                 s_vdl2_dec[s_vdl2_n_dec].reg, a->mode ? a->mode : '?',
+                 a->crc_ok ? "OK" : "BAD");
+        s_vdl2_n_dec++;
+    }
+    la_proto_tree_destroy(node);
+}
+
+// Modulator output IQ (PSRAM) — 160 KB, far too big for the smoke stack.
+static EXT_RAM_BSS_ATTR int16_t s_vdl2_iq[VDL2_SMK_MAX_COMPLEX * 2]
+    __attribute__((aligned(16)));
+
+// Golden ACARS-bearing frames to transmit (indices into k_vdl2_avlc_golden).
+// Four DISTINCT registrations from the sigidwiki golden decode; each is a
+// single ACARS I-frame, modulated as its own burst.
+static const int VDL2_SMK_GOLDEN_IDX[] = {5, 10, 14, 20};
+//   5 -> F-GCBG (94-octet, 6-parity single block)
+//  10 -> HB-IJW (63-octet, 4-parity)
+//  14 -> LN-RPA (41-octet, 4-parity)
+//  20 -> TC-JRA (41-octet, 4-parity)
+
+static void smoke_test_run_vdl2(void)
+{
+    ESP_LOGI(TAG, "=== Smoke test start (VDL2 ACARS mode) ===");
+    const int n_golden = (int)(sizeof(VDL2_SMK_GOLDEN_IDX) /
+                               sizeof(VDL2_SMK_GOLDEN_IDX[0]));
+
+    s_vdl2_reasm = la_reasm_ctx_new();
+    if (!s_vdl2_reasm) {
+        ESP_LOGE(TAG, "la_reasm_ctx_new failed");
+        ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
+        vTaskSuspend(NULL);
+        return;
+    }
+
+    int n_mod = 0, n_demod = 0;
+    for (int gi = 0; gi < n_golden; gi++) {
+        int                       idx = VDL2_SMK_GOLDEN_IDX[gi];
+        const vdl2_avlc_golden_t *g   = &k_vdl2_avlc_golden[idx];
+
+        vdl2_smk_tx_t tx;
+        if (!vdl2_smk_build_tx(&tx, idx)) {
+            ESP_LOGE(TAG, "  golden idx %d: build_tx overflow", idx);
+            continue;
+        }
+        // The modulator's body_bits length must equal what the header claims.
+        int body_n = vdl2_burst_body_bits(tx.datalen);
+        if (body_n < 0 || body_n != tx.n_bits - VDL2_HDR_BITS) {
+            ESP_LOGE(TAG, "  golden idx %d: body_bits mismatch (%d vs %d)", idx,
+                     body_n, tx.n_bits - VDL2_HDR_BITS);
+            continue;
+        }
+        vdl2_mod_params_t p;
+        vdl2_mod_params_default(&p); // amp 8000, sigma 0 -> clean, deterministic
+        int n = vdl2_mod_burst(tx.datalen, tx.bits + VDL2_HDR_BITS, &p,
+                               s_vdl2_iq, VDL2_SMK_MAX_COMPLEX);
+        if (n <= 0) {
+            ESP_LOGE(TAG, "  golden idx %d: modulator returned %d", idx, n);
+            continue;
+        }
+        n_mod++;
+        ESP_LOGI(TAG, "  golden idx %d (reg=%s): datalen=%u bits, %d complex "
+                      "samples -> demod",
+                 idx, g->acars_reg, (unsigned)tx.datalen, n);
+
+        vdl2_demod_result_t r;
+        if (!vdl2_demod_burst(s_vdl2_iq, n, &r)) {
+            ESP_LOGE(TAG, "  golden idx %d: demod found no burst", idx);
+            continue;
+        }
+        n_demod++;
+        int rc = vdl2_l2_feed(r.bits, r.soft_bits, r.n_bits, vdl2_smk_avlc_cb,
+                              NULL);
+        if (rc < 0) {
+            ESP_LOGW(TAG, "  golden idx %d: vdl2_l2_feed rc=%d", idx, rc);
+        }
+        free(r.bits);
+        free(r.soft_bits);
+    }
+
+    // Greedy golden matching by (registration, mode) — the e2e test's rule.
+    int n_matched = 0;
+    for (int gi = 0; gi < n_golden; gi++) {
+        const vdl2_avlc_golden_t *g = &k_vdl2_avlc_golden[VDL2_SMK_GOLDEN_IDX[gi]];
+        const char               *greg = g->acars_reg;
+        while (*greg == '.')
+            greg++;
+        for (int d = 0; d < s_vdl2_n_dec; d++) {
+            if (!s_vdl2_dec[d].claimed && s_vdl2_dec[d].mode == g->acars_mode &&
+                strcmp(s_vdl2_dec[d].reg, greg) == 0) {
+                s_vdl2_dec[d].claimed = 1;
+                n_matched++;
+                break;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "VDL2 summary: modulated=%d demodulated=%d avlc_fcs_ok=%d "
+                  "acars_parsed=%d",
+             n_mod, n_demod, s_vdl2_avlc_ok, s_vdl2_n_dec);
+    // The line scripts/smoke_run.sh greps for the pass/fail verdict.
+    ESP_LOGI(TAG, "GOLDEN gate: matched=%d/%d (need matched>=%d)", n_matched,
+             n_golden, n_golden);
+
+    bool pass = (n_matched >= n_golden);
+    if (pass) {
+        ESP_LOGI(TAG, "===== SMOKE_PASS =====");
+    } else {
+        ESP_LOGE(TAG, "  VDL2 matched %d < %d — decode REGRESSION (demod / RS / "
+                      "AVLC / libacars path broken on silicon)",
+                 n_matched, n_golden);
+        ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
+    }
+
+    vTaskSuspend(NULL);
+}
+#endif // CONFIG_SMOKE_TEST_VDL2
+
 #if CONFIG_SMOKE_TEST_LIVE_SDR
 // Live-SDR smoke. Stands up the production USB-host + ingest + DSP
 // chain (same task topology as app_main's non-smoke branch) so a real
@@ -571,6 +906,25 @@ extern void fbt_detect_screen_diff_run(void); // detect-scan pre-screen: silicon
 
 void smoke_test_run(void)
 {
+    // FORCE the pipeline band, RAM-only (no NVS write), BEFORE any pipeline
+    // component reads app_config. dsp_processor_create / worker_core1_init /
+    // frame_decoder_init all resolve the band from app_config_snapshot() at
+    // create/init time (see dsp_processor.c:310, worker_core1.c:1417,
+    // frame_decoder.c:945), and every one of those runs LATER in this function
+    // (or in smoke_test_run_frame_decoder). Forcing here guarantees the smoke
+    // fixture is decoded by the matching pipeline regardless of the persisted
+    // NVS "band" byte — which is now vdl2 on dual-band devices. Historically
+    // the Iridium fixtures inherited that NVS band and ran through the VDL2
+    // pipeline, reporting matched=0. VDL2 smoke wants vdl2; all others (raw,
+    // real, corpus, frame, live, tone) want iridium.
+#if CONFIG_SMOKE_TEST_VDL2
+    app_config_set_band_ram((uint8_t)BAND_VDL2);
+    ESP_LOGW(TAG, "SMOKE: forced band=vdl2 (RAM, no NVS) before pipeline init");
+#else
+    app_config_set_band_ram((uint8_t)BAND_IRIDIUM);
+    ESP_LOGW(TAG, "SMOKE: forced band=iridium (RAM, no NVS) before pipeline init");
+#endif
+
 #if CONFIG_SMOKE_TEST_PIE_PLACEMENT
     // Standalone PIE heap-placement sweep — runs FIRST and parks, before
     // any pipeline init, so the internal-SRAM arena is as large as possible.
@@ -623,6 +977,15 @@ void smoke_test_run(void)
         }
         ESP_LOGI(TAG, "===== SELFTEST_PASS (CRC+BCH tables verified on silicon) =====");
     }
+
+#if CONFIG_SMOKE_TEST_VDL2
+    // VDL2 gate runs right after the CRC/BCH self-test and parks. It uses a
+    // self-contained decode chain (vdl2_demod -> vdl2_l2 -> libacars) and
+    // does NOT touch the Iridium-only PIE FFT / detect-scan harnesses below.
+    smoke_test_run_vdl2();
+    vTaskSuspend(NULL);
+    return;
+#endif
 
     pie_fft_diff_run();
     fbt_detect_screen_diff_run(); // detect-scan pre-screen bit-exact silicon check

@@ -93,6 +93,14 @@ void status_logger_get_capacity(status_capacity_t *out);
 // Computed on ~20 s EMAs with an 8-window dwell so a single satellite pass can't
 // flip the state. Advisory: thresholds are conservative defaults, calibrate
 // against the raw ratios also exported here (see the doc's calibration anchors).
+//
+// Band-aware (VHF/VDL2 foundation, status_logger.c rx_update): under
+// band=vdl2 the discriminator is preamble/header sync (vdl2_pipeline_sync_
+// count(), the VDL2 counterpart of the UW-correlator lock) and the decode
+// gate is FCS-valid AVLC (counterpart of a clean BCH decode) — same states,
+// same struct fields (see status_reception_t below), different funnel.
+// QUIET is the EXPECTED steady state for VDL2 (CSMA traffic only when an
+// aircraft transmits) — not a fault, unlike a genuinely idle Iridium pass.
 typedef enum {
     RX_STATE_INIT = 0,    // warming up — not enough windows sampled yet
     RX_STATE_QUIET,       // few bursts — lull / weak coverage; just wait
@@ -103,11 +111,15 @@ typedef enum {
 
 typedef struct {
     rx_state_t state;
-    float uw_reach;      // EMA reached-BCH / EMA processed (the interference discriminator; low = interference)
-    float decode_frac;   // EMA decoded / EMA reached-BCH (marginal-SNR gauge)
-    float fail_frac;     // EMA BCH-failed / EMA reached-BCH
-    float tagged_ema;    // EMA tagger bursts/window
-    float processed_ema; // EMA demod-attempted bursts/window
+    // band=iridium: EMA reached-BCH / EMA processed (the interference
+    // discriminator; low = interference). band=vdl2: EMA synced / EMA
+    // tagged — the design doc's "sync_frac" (see status_logger.c rx_update
+    // for the field-reuse rationale).
+    float uw_reach;
+    float decode_frac;   // iridium: EMA decoded / EMA reached-BCH. vdl2: EMA AVLC-ok / EMA synced
+    float fail_frac;     // iridium: EMA BCH-failed / EMA reached-BCH. vdl2: EMA bad-FCS / EMA synced
+    float tagged_ema;    // EMA tagger bursts/window (shared tagger, both bands)
+    float processed_ema; // iridium: EMA demod-attempted bursts/window. vdl2: == tagged_ema (see rx_update)
 } status_reception_t;
 
 // Human-readable name for a reception state ("init"/"quiet"/"interference"/
