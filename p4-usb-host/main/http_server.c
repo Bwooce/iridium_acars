@@ -1591,27 +1591,57 @@ static esp_err_t messages_html_get(httpd_req_t *req)
 
     // Cumulative decode-type totals (since boot) — same getters the /status
     // JSON uses. These count every classified frame, not just what fits in the
-    // 32-entry ring, so they keep climbing after the ring wraps.
-    frame_decoder_class_counts_t cc = {0};
-    frame_decoder_get_class_counts(&cc);
-    uint64_t acars_total = frame_decoder_acars_decoded_total();
-    uint64_t sbd_total   = frame_decoder_sbd_complete_total();
+    // 32-entry ring, so they keep climbing after the ring wraps. The funnel is
+    // band-specific: Iridium classifies LW/MS/TL/BC frames + SBD envelopes;
+    // VDL2 has none of those frame types — its funnel is bursts→sync→RS→AVLC→
+    // ACARS. Show the table that matches the active band so the counts aren't
+    // just misleading zeros (this is the same source data /status "decode.vdl2"
+    // vs "decode.frames" uses).
+    app_config_t cfg;
+    app_config_snapshot(&cfg);
+    bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
 
     static EXT_RAM_BSS_ATTR char body[768];
-    int                          bn = snprintf(body, sizeof(body),
-                                               "<p><small>%llu messages in ring &middot; showing last %u "
-                                                                        "&middot; auto-refresh 10 s</small></p>"
-                                                                        "<h2>Decoded totals (since boot)</h2>"
-                                                                        "<table><tr><th>ACARS</th><th>SBD</th><th>MS</th><th>TL</th>"
-                                                                        "<th>BC</th><th>LW·DA</th><th>LW·oth</th><th>Unknown</th></tr>"
-                                                                        "<tr><td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
-                                                                        "<td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
-                                                                        "<td class=v>%llu</td><td class=v>%llu</td></tr></table>",
-                                               (unsigned long long)total, (unsigned)n,
-                                               (unsigned long long)acars_total, (unsigned long long)sbd_total,
-                                               (unsigned long long)cc.ms, (unsigned long long)cc.tl,
-                                               (unsigned long long)cc.bc, (unsigned long long)cc.lw_da,
-                                               (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown);
+    int                          bn;
+    if (is_vdl2) {
+        frame_decoder_vdl2_stats_t vd = {0};
+        frame_decoder_get_vdl2_stats(&vd);
+        bn = snprintf(body, sizeof(body),
+                      "<p><small>%llu messages in ring &middot; showing last %u "
+                      "&middot; auto-refresh 10 s</small></p>"
+                      "<h2>VDL2 decode funnel (since boot)</h2>"
+                      "<table><tr><th>Bursts</th><th>Synced</th><th>RS·ok</th><th>RS·fix</th>"
+                      "<th>RS·resc</th><th>AVLC·ok</th><th>ACARS</th><th>bad·FCS</th></tr>"
+                      "<tr><td class=v>%u</td><td class=v>%u</td><td class=v>%u</td>"
+                      "<td class=v>%u</td><td class=v>%u</td><td class=v>%llu</td>"
+                      "<td class=v>%llu</td><td class=v>%llu</td></tr></table>",
+                      (unsigned long long)total, (unsigned)n,
+                      (unsigned)vdl2_pipeline_bursts_seen(),
+                      (unsigned)vdl2_pipeline_sync_count(),
+                      (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_octets_fixed,
+                      (unsigned)vd.rs_erasure_recovered,
+                      (unsigned long long)vd.avlc_ok, (unsigned long long)vd.acars,
+                      (unsigned long long)vd.bad_fcs);
+    } else {
+        frame_decoder_class_counts_t cc = {0};
+        frame_decoder_get_class_counts(&cc);
+        uint64_t acars_total = frame_decoder_acars_decoded_total();
+        uint64_t sbd_total   = frame_decoder_sbd_complete_total();
+        bn                   = snprintf(body, sizeof(body),
+                                        "<p><small>%llu messages in ring &middot; showing last %u "
+                                                          "&middot; auto-refresh 10 s</small></p>"
+                                                          "<h2>Decoded totals (since boot)</h2>"
+                                                          "<table><tr><th>ACARS</th><th>SBD</th><th>MS</th><th>TL</th>"
+                                                          "<th>BC</th><th>LW·DA</th><th>LW·oth</th><th>Unknown</th></tr>"
+                                                          "<tr><td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
+                                                          "<td class=v>%llu</td><td class=v>%llu</td><td class=v>%llu</td>"
+                                                          "<td class=v>%llu</td><td class=v>%llu</td></tr></table>",
+                                        (unsigned long long)total, (unsigned)n,
+                                        (unsigned long long)acars_total, (unsigned long long)sbd_total,
+                                        (unsigned long long)cc.ms, (unsigned long long)cc.tl,
+                                        (unsigned long long)cc.bc, (unsigned long long)cc.lw_da,
+                                        (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown);
+    }
     if (bn < 0) bn = 0;
     if (bn > (int)sizeof(body)) bn = sizeof(body);
     httpd_resp_send_chunk(req, body, bn);

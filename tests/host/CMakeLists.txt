@@ -699,6 +699,24 @@ target_compile_options(test_vdl2_demod PRIVATE -Werror)
 target_link_libraries(test_vdl2_demod PRIVATE m)
 add_test(NAME vdl2_demod COMMAND test_vdl2_demod)
 
+# VDL2 integrated-active tagger fix (fft_burst_tagger.c update_bursts_internal):
+# drives the REAL tagger over a synthetic continuous 2.5 MSPS stream (noise +
+# spread D8PSK burst + noise) in integrated mode vs peak mode and asserts the
+# integrated mode does not truncate the burst. Regression guard for the on-air
+# truncation (peak_db dips < thr while integ_db stays > thr). Compiles the
+# tagger + modulator (needs vdl2_demod.c for vdl2_hdr_encode + firmr_s16.c).
+add_executable(test_vdl2_tagger_extend
+    test_vdl2_tagger_extend.c
+    ${VDL2_DIR}/vdl2_mod.c
+    ${VDL2_DIR}/vdl2_demod.c
+    ${COMMON_DIR}/firmr_s16.c
+    ${COMMON_DIR}/fft_burst_tagger.c
+    ${COMMON_DIR}/fft_sc16_2048.c
+)
+target_include_directories(test_vdl2_tagger_extend PRIVATE ${BAND_DIR} ${VDL2_DIR} ${COMMON_DIR})
+target_link_libraries(test_vdl2_tagger_extend PRIVATE m)
+add_test(NAME vdl2_tagger_extend COMMAND test_vdl2_tagger_extend)
+
 # VDL2 real-signal smoke: the sigidwiki over-the-air capture
 # (channel-corrected 210 ksps raw in ~/iridium_capture/vdl2_ref/,
 # golden-decoded by dumpvdl2: 40 AVLC frames) through the production

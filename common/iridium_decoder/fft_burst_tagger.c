@@ -863,6 +863,30 @@ static inline bool above_threshold(int32_t mag2, int32_t baseline_sum,
     return lhs > rhs;
 }
 
+// VDL2 integrated-over-width active test (band=vdl2 only). D8PSK spreads a
+// burst's energy across the whole ~14-bin channel, so no single bin clears
+// above_threshold() even when the channel is clearly hot — the peak-bin test
+// then marks the burst idle and it truncates to the post-pad floor. Measured
+// via /diag/tagger_trace: real VDL2 bursts read ~18-19 dB integrated but only
+// ~11-13 dB peak-bin, while noise reads ~7 dB integrated — so summing mag²+
+// baseline over burst_width and applying the SAME relative threshold cleanly
+// splits signal from noise and holds the burst active through the spread-
+// energy data. int64 sums: burst_width × per-bin values can exceed int32.
+static inline bool integrated_active(const fft_burst_tagger_t *t, int center_bin)
+{
+    int half = t->burst_width / 2;
+    int lo   = center_bin - half; if (lo < 0) lo = 0;
+    int hi   = center_bin + half; if (hi > N - 1) hi = N - 1;
+    int64_t sum_mag = 0, sum_base = 0;
+    for (int k = lo; k <= hi; k++) {
+        sum_mag  += t->magnitude_shifted[k];
+        sum_base += t->baseline_sum[k];
+    }
+    int64_t lhs = sum_mag * (int64_t)FBT_HISTORY_SIZE;
+    int64_t rhs = (sum_base * (int64_t)t->threshold_q15) >> 15;
+    return lhs > rhs;
+}
+
 // Update existing bursts' last_active timestamp.
 static FBT_HOT void update_bursts_internal(fft_burst_tagger_t *t)
 {
@@ -871,8 +895,9 @@ static FBT_HOT void update_bursts_internal(fft_burst_tagger_t *t)
     if (s_trace_band_vdl2) s_trace_win_no++;
     for (int b = 0; b < t->n_bursts; b++) {
         int  cb       = t->bursts[b].center_bin;
-        bool advanced = false; // observe-only: did last_active advance?
-        // Check ±1 bin around center (gri's update_bursts).
+        bool advanced = false; // did last_active advance this window?
+        // Peak-bin ±1 test (gri's update_bursts) — runs for BOTH bands, exactly
+        // as before. This is the sole test for Iridium (byte-identical).
         for (int dk = -1; dk <= 1; dk++) {
             int bin = cb + dk;
             if (bin < 0 || bin >= N) continue;
@@ -889,7 +914,21 @@ static FBT_HOT void update_bursts_internal(fft_burst_tagger_t *t)
                 break;
             }
         }
-        // Instrumentation only — does not affect detection.
+        // VDL2 union fallback: if the carrier bin didn't clear threshold this
+        // window, try the integrated-over-channel-width test. Real VDL2 D8PSK
+        // spreads its energy and the carrier bin drifts/dips mid-burst (on-air:
+        // peak 11 dB < thr while integ 20 dB > thr) — integrated rescues the
+        // burst so it isn't truncated to the post-pad floor. OR-logic: this can
+        // only KEEP a burst the peak test dropped, never truncate one the peak
+        // test would have held, so it's strictly safer than peak-only (a clean
+        // strong-carrier burst is still held by the peak test above). Iridium
+        // never reaches here (s_trace_band_vdl2 == false).
+        if (!advanced && s_trace_band_vdl2 && integrated_active(t, cb) &&
+            !bin_carrier_saturated(cb)) {
+            t->bursts[b].last_active = t->d_index;
+            advanced                 = true;
+        }
+        // Trace (instrumentation only — does not affect detection).
         if (s_trace_band_vdl2)
             fbt_trace_window(t, cb, t->bursts[b].id, advanced);
     }
