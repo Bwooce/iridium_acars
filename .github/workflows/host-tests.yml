@@ -19,7 +19,12 @@ jobs:
         run: sudo apt-get install -y cmake gcc
 
       - name: Configure
-        run: cmake -B tests/host/build -S tests/host -DCMAKE_BUILD_TYPE=Release
+        # Debug (NOT Release): host tests are assert-based, so NDEBUG (Release)
+        # compiles the asserts out — making the tests pass VACUOUSLY and turning
+        # every assert-only variable into an -Werror unused-variable failure.
+        # Debug keeps asserts live (the actual checks) and matches the local
+        # `build-dbg` flow. See the "host tests need Debug build" project note.
+        run: cmake -B tests/host/build -S tests/host -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
         run: cmake --build tests/host/build --parallel
