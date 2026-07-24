@@ -6,7 +6,10 @@
 #include "class_driver.h"
 #include "scanner.h"
 #include "worker_core1.h"
-#include "band_select.h" // band_decode_stats_get + band_id_t (band-aware metric)
+#include "band_select.h"    // band_decode_stats_get + band_id_t (band-aware metric)
+#include "signal_buffer.h"  // fill-based gain-cal: read a noise window (VDL2)
+#include "esp_heap_caps.h"  // fill-cal scratch (PSRAM)
+#include <math.h>           // sqrt (noise-floor std)
 
 #include <stdatomic.h>
 #include "esp_log.h"
@@ -164,6 +167,121 @@ int autotune_scan_status(int *elapsed_s, int *remaining_s)
     return t;
 }
 
+// --- Fill-based gain calibration (VHF/VDL2) ------------------------------
+// VDL2 has no always-on reference beacon (Iridium's IRA), so a decode-
+// maximizing gain sweep can't work there. Instead sweep gains and measure the
+// ADC NOISE-FLOOR std from a signal_buffer window: at low gain it's pinned to
+// the quantization step (flat), then lifts off as analog noise dominates. Pick
+// the "knee" — the lowest gain where std has risen to FILL_KNEE_MULT x the
+// plateau (analog/quant ~3x, quantization negligible) — matching the manual
+// sweep that found ~28-34 dB. Traffic-INDEPENDENT (measures the noise floor,
+// not decodes) and no hot-path cost (reads only during the sweep).
+// See [[reference_vdl2_gain_and_adc_fill]].
+#define FILL_WIN_COMPLEX 8192u // ~3.3 ms window (bursts are rarer than this)
+#define FILL_KNEE_MULT   2.0f  // std >= 2x plateau => analog/quant ~3x (see notes)
+
+static float measure_noise_std_lsb(int16_t *scratch, uint32_t n)
+{
+    uint32_t cap    = SIGNAL_BUF_CAPACITY_COMPLEX;
+    uint32_t head   = signal_buffer_head();
+    uint32_t margin = 8192u; // back off from the in-flight write region
+    uint32_t start  = (head + cap - n - margin) % cap;
+    signal_buffer_invalidate_range(start, n);
+    signal_buffer_read_chunk(start, n, scratch); // 2n int16, interleaved I/Q
+    int64_t  sum = 0, sumsq = 0;
+    uint32_t N = 2u * n;
+    for (uint32_t i = 0; i < N; i++) {
+        int32_t v = scratch[i];
+        sum += v;
+        sumsq += (int64_t)v * v;
+    }
+    double mean = (double)sum / (double)N;
+    double var  = (double)sumsq / (double)N - mean * mean;
+    return (float)(var > 0.0 ? sqrt(var) : 0.0);
+}
+
+// Fill-cal body. Caller holds the busy guard + verified MANUAL gain mode.
+// Sweeps gains LIVE (no reboot), picks the quantization knee, applies +
+// persists it. Does NOT hop the LO (measures at the current VDL2 LO).
+static void autotune_run_fill_gaincal_locked(const app_config_t *cfg)
+{
+    int gains[AUTOTUNE_R828D_N];
+    int ng = autotune_build_gain_set(cfg->autotune_gain_min_dbx10,
+                                     cfg->autotune_gain_max_dbx10,
+                                     cfg->autotune_gain_stride, gains, AUTOTUNE_R828D_N);
+    if (ng <= 0) {
+        ESP_LOGW(TAG, "fill-cal REFUSED: empty gain set (min=%d max=%d stride=%u)",
+                 (int)cfg->autotune_gain_min_dbx10, (int)cfg->autotune_gain_max_dbx10,
+                 (unsigned)cfg->autotune_gain_stride);
+        return;
+    }
+    int saved_gain = class_driver_get_tuner_gain_dbx10();
+    if (saved_gain < 0) saved_gain = cfg->gain_db_x10;
+
+    int16_t *scr = heap_caps_malloc((size_t)FILL_WIN_COMPLEX * 2 * sizeof(int16_t),
+                                    MALLOC_CAP_SPIRAM);
+    if (!scr) {
+        ESP_LOGE(TAG, "fill-cal: %u-sample scratch alloc failed", (unsigned)FILL_WIN_COMPLEX);
+        return;
+    }
+
+    scan_begin(1, (int64_t)ng * (int64_t)(AUTOTUNE_PRIME_MS + 300) * 1000);
+    ESP_LOGI(TAG, "=== fill-based gain-cal (VDL2): %d gains, ADC-noise-floor knee ===", ng);
+
+    float std_lsb[AUTOTUNE_R828D_N];
+    float plateau = 1e30f;
+    for (int i = 0; i < ng; i++) {
+        if (!class_driver_set_gain_quiesced(gains[i])) {
+            std_lsb[i] = -1.0f;
+            continue;
+        }
+        atomic_store_explicit(&s_scan_gain_dbx10, gains[i], memory_order_relaxed);
+        scanner_reset_baseline();                     // floor moves with gain
+        vTaskDelay(pdMS_TO_TICKS(AUTOTUNE_PRIME_MS)); // let fresh-gain samples fill the ring
+        std_lsb[i] = measure_noise_std_lsb(scr, FILL_WIN_COMPLEX);
+        if (std_lsb[i] > 0.0f && std_lsb[i] < plateau) plateau = std_lsb[i];
+        ESP_LOGI(TAG, "  gain %2d.%d dB: noise std = %.2f LSB", gains[i] / 10,
+                 gains[i] % 10, (double)std_lsb[i]);
+    }
+
+    // Knee: lowest gain whose std has lifted to >= FILL_KNEE_MULT x the plateau
+    // (analog noise now dominates quantization). Below the knee everything is
+    // equally quantization-starved; above it more gain only risks clipping.
+    int   chosen     = saved_gain;
+    bool  found      = false;
+    float chosen_std = 0.0f;
+    if (plateau < 1e30f) {
+        for (int i = 0; i < ng; i++) {
+            if (std_lsb[i] > 0.0f && std_lsb[i] >= FILL_KNEE_MULT * plateau) {
+                chosen     = gains[i];
+                chosen_std = std_lsb[i];
+                found      = true;
+                break;
+            }
+        }
+    }
+
+    // Apply the chosen gain live + persist (band-namespaced via the phase-2 setter).
+    if (!class_driver_set_gain_quiesced(chosen))
+        ESP_LOGE(TAG, "fill-cal: failed to apply gain %d.%d dB", chosen / 10, chosen % 10);
+    scanner_reset_baseline();
+    if (found) {
+        autotune_persist(false, (int32_t)chosen);
+        ESP_LOGI(TAG,
+                 "=== fill-cal done: chose %d.%d dB (knee std %.2f >= %.1fx plateau %.2f), "
+                 "persisted ===",
+                 chosen / 10, chosen % 10, (double)chosen_std, (double)FILL_KNEE_MULT,
+                 (double)plateau);
+    } else {
+        ESP_LOGW(TAG,
+                 "=== fill-cal done: no knee (flat/absent noise floor?); kept %d.%d dB "
+                 "(not persisted) ===",
+                 chosen / 10, chosen % 10);
+    }
+    heap_caps_free(scr);
+    scan_end();
+}
+
 static void autotune_run_manual_locked(void)
 {
     app_config_t cfg;
@@ -180,11 +298,10 @@ static void autotune_run_manual_locked(void)
     // Gain-cal maximizes decodes against the Iridium IRA reference beacon (a
     // known always-on downlink at autotune_ira_lo_hz). VDL2 has no equivalent
     // always-on reference, so a decode-maximizing sweep can't discriminate
-    // there (see the band-mode plan). Refuse under band=vdl2 — the fill-based
-    // ADC-quantization gain sweep is the band-agnostic method instead.
+    // there — use the fill-based ADC-noise-floor-knee cal instead (traffic-
+    // independent), and return (skip the Iridium IRA-hop path below).
     if ((band_id_t)cfg.band == BAND_VDL2) {
-        ESP_LOGW(TAG, "REFUSED: gain-cal unsupported for band=vdl2 (no IRA-equivalent "
-                      "reference beacon); use the fill-based gain sweep");
+        autotune_run_fill_gaincal_locked(&cfg);
         return;
     }
 
