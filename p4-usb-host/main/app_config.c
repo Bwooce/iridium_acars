@@ -127,6 +127,111 @@ static esp_err_t nvs_set_f32(nvs_handle_t h, const char *k, float v)
     return nvs_set_u32(h, k, raw);
 }
 
+// --- Per-band NVS namespacing (band-mode overhaul, phase 2) --------------
+//
+// Band-specific tunables (LO, gain mode, gain, bias-tee, tagger threshold)
+// are stored under BAND-NAMESPACED keys ("ir_"/"v2_" + base) so each band
+// keeps its OWN value — a band switch (reboot) no longer inherits the other
+// band's gain (the "gain footgun"). The in-memory app_config_t stays flat and
+// always holds the ACTIVE band's values (bands are mutually exclusive — one
+// runs at a time, reboot to switch), so no consumer changes. Defaults for LO
+// and tagger threshold come from the band PROFILE (this is where the tagger
+// threshold's fresh-NVS default becomes the profile's 14.0, not the legacy
+// global 10.0 mis-default). NVS keys cap at 15 chars: "v2_"/"ir_" (3) + base
+// (<=10, e.g. "gain_dbx10") fits.
+static void band_key(char *buf, size_t cap, uint8_t band, const char *base)
+{
+    snprintf(buf, cap, "%s%s", (band == (uint8_t)BAND_VDL2) ? "v2_" : "ir_", base);
+}
+
+// Band-namespaced typed getters (namespaced key only; legacy keys are handled
+// once by the migration pass below, so the load path never reads them).
+static esp_err_t nvs_get_u32_band(nvs_handle_t h, uint8_t b, const char *base,
+                                  uint32_t *v, uint32_t def)
+{
+    char k[16];
+    band_key(k, sizeof(k), b, base);
+    return nvs_get_u32_or(h, k, v, def);
+}
+static esp_err_t nvs_get_i16_band(nvs_handle_t h, uint8_t b, const char *base,
+                                  int16_t *v, int16_t def)
+{
+    char k[16];
+    band_key(k, sizeof(k), b, base);
+    return nvs_get_i16_or(h, k, v, def);
+}
+static esp_err_t nvs_get_u8_band(nvs_handle_t h, uint8_t b, const char *base,
+                                 uint8_t *v, uint8_t def)
+{
+    char k[16];
+    band_key(k, sizeof(k), b, base);
+    return nvs_get_u8_or(h, k, v, def);
+}
+static esp_err_t nvs_get_f32_band(nvs_handle_t h, uint8_t b, const char *base,
+                                  float *v, float def)
+{
+    char k[16];
+    band_key(k, sizeof(k), b, base);
+    return nvs_get_f32_or(h, k, v, def);
+}
+
+// One-time legacy migration: move a present legacy GLOBAL key to the ACTIVE
+// band's namespace and DELETE the legacy key. Delete (not keep) is deliberate:
+// it migrates the value to exactly ONE band, so it can never later leak to the
+// other band's fresh load (that leak WOULD be the footgun). Returns true if it
+// wrote (caller commits once). Skips if the namespaced key already exists.
+#define DEFINE_MIGRATE(suffix, ctype, getfn, setfn)                          \
+    static bool migrate_##suffix(nvs_handle_t h, uint8_t band, const char *base) \
+    {                                                                         \
+        char nk[16];                                                          \
+        band_key(nk, sizeof(nk), band, base);                                 \
+        ctype tmp;                                                            \
+        if (getfn(h, nk, &tmp) == ESP_OK) return false; /* already migrated */\
+        if (getfn(h, base, &tmp) != ESP_OK) return false; /* no legacy value */\
+        if (setfn(h, nk, tmp) != ESP_OK) return false;                        \
+        nvs_erase_key(h, base);                                               \
+        return true;                                                          \
+    }
+DEFINE_MIGRATE(u32, uint32_t, nvs_get_u32, nvs_set_u32)
+DEFINE_MIGRATE(i16, int16_t, nvs_get_i16, nvs_set_i16)
+DEFINE_MIGRATE(u8, uint8_t, nvs_get_u8, nvs_set_u8)
+// f32 is stored as a bit-cast u32; migrate the raw u32 (nvs_set_f32/get_f32
+// wrap the same key), so the u32 migrator handles "tag_thr" transparently.
+
+// Runs once on the first post-upgrade boot; a no-op thereafter (no legacy keys
+// left). On app_config_init's task (main, internal stack) so the commit is
+// cache-safe (unlike the autotune_sched PSRAM-stack path).
+static void migrate_legacy_band_keys(uint8_t band)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    bool dirty = false;
+    dirty |= migrate_u32(h, band, "lo_hz");
+    dirty |= migrate_u8(h, band, "gain_mode");
+    dirty |= migrate_i16(h, band, "gain_dbx10");
+    dirty |= migrate_u8(h, band, "bias_tee");
+    dirty |= migrate_u32(h, band, "tag_thr"); // f32-as-u32
+    if (dirty) {
+        nvs_commit(h);
+        ESP_LOGW(TAG, "migrated legacy global band tunables -> %s namespace",
+                 (band == (uint8_t)BAND_VDL2) ? "vdl2" : "iridium");
+    }
+    nvs_close(h);
+}
+
+// Read just the persisted band (clamped) for the migration pass, which must
+// run BEFORE the main load so the namespaced keys exist when it reads them.
+static uint8_t read_persisted_band(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return (uint8_t)DEFAULT_BAND;
+    uint8_t b = (uint8_t)DEFAULT_BAND;
+    nvs_get_u8_or(h, "band", &b, (uint8_t)DEFAULT_BAND);
+    nvs_close(h);
+    if (b >= (uint8_t)BAND_COUNT) b = (uint8_t)BAND_IRIDIUM;
+    return b;
+}
+
 // --- Public API ----------------------------------------------------------
 
 esp_err_t app_config_init(void)
@@ -147,7 +252,10 @@ esp_err_t app_config_init(void)
     s_cfg.best_effort_decode       = DEFAULT_BEST_EFFORT_DECODE;
     s_cfg.uart_log                 = DEFAULT_UART_LOG_MODE;
     s_cfg.chase2_decode            = DEFAULT_CHASE2_DECODE;
-    s_cfg.tagger_threshold_db      = DEFAULT_TAGGER_THRESHOLD_DB;
+    // Default from the band PROFILE (14.0), not the legacy global 10.0 macro —
+    // so even the NVS-init-failed fallback path uses the correct threshold
+    // (phase 2 tag_thr fix). DEFAULT_BAND is iridium here (pre-NVS-load).
+    s_cfg.tagger_threshold_db      = band_profile_get((band_id_t)DEFAULT_BAND)->tagger_threshold_db;
     s_cfg.coalesce_min_bursts      = DEFAULT_COALESCE_MIN_BURSTS;
     s_cfg.dcmask_lo                = DEFAULT_DCMASK_LO;
     s_cfg.dcmask_hi                = DEFAULT_DCMASK_HI;
@@ -181,6 +289,12 @@ esp_err_t app_config_init(void)
         return ESP_OK; // defaults already populated
     }
 
+    // Phase 2 (band-mode overhaul): one-time migration of the legacy global
+    // band-tunable keys (lo/gain/bias/tag_thr/gain_mode) into the ACTIVE band's
+    // namespace, BEFORE the load reads the namespaced keys. No-op after the
+    // first post-upgrade boot (legacy keys gone).
+    migrate_legacy_band_keys(read_persisted_band());
+
     nvs_handle_t h;
     r = nvs_open(NVS_NS, NVS_READONLY, &h);
     if (r == ESP_ERR_NVS_NOT_FOUND) {
@@ -208,16 +322,22 @@ esp_err_t app_config_init(void)
         ESP_LOGW(TAG, "NVS band=%u out of range; using iridium", s_cfg.band);
         s_cfg.band = (uint8_t)BAND_IRIDIUM;
     }
-    nvs_get_u32_or(h, "lo_hz", &s_cfg.lo_freq_hz,
-                   band_profile_get((band_id_t)s_cfg.band)->default_lo_hz);
+    // Band-specific tunables: read from the ACTIVE band's namespace (phase 2).
+    // Defaults for LO + tagger threshold come from the band PROFILE — so a
+    // fresh-NVS tagger threshold is the profile's 14.0, fixing the legacy
+    // global 10.0 mis-default (which dsp_processor never overrode because 10.0
+    // is in-range). rate/best_eff/uart_log/chase2 stay GLOBAL (not band-specific).
+    nvs_get_u32_band(h, s_cfg.band, "lo_hz", &s_cfg.lo_freq_hz,
+                     band_profile_get((band_id_t)s_cfg.band)->default_lo_hz);
     nvs_get_u32_or(h, "rate_hz", &s_cfg.sample_rate_hz, DEFAULT_SAMPLE_RATE_HZ);
-    nvs_get_u8_or(h, "gain_mode", &gm, (uint8_t)DEFAULT_GAIN_MODE);
-    nvs_get_i16_or(h, "gain_dbx10", &s_cfg.gain_db_x10, DEFAULT_GAIN_DB_X10);
-    nvs_get_u8_or(h, "bias_tee", &bt, (uint8_t)DEFAULT_BIAS_TEE);
+    nvs_get_u8_band(h, s_cfg.band, "gain_mode", &gm, (uint8_t)DEFAULT_GAIN_MODE);
+    nvs_get_i16_band(h, s_cfg.band, "gain_dbx10", &s_cfg.gain_db_x10, DEFAULT_GAIN_DB_X10);
+    nvs_get_u8_band(h, s_cfg.band, "bias_tee", &bt, (uint8_t)DEFAULT_BIAS_TEE);
     nvs_get_u8_or(h, "best_eff", &be, (uint8_t)DEFAULT_BEST_EFFORT_DECODE);
     nvs_get_u8_or(h, "uart_log", &ul, (uint8_t)DEFAULT_UART_LOG_MODE);
     nvs_get_u8_or(h, "chase2", &c2, (uint8_t)DEFAULT_CHASE2_DECODE);
-    nvs_get_f32_or(h, "tag_thr", &s_cfg.tagger_threshold_db, DEFAULT_TAGGER_THRESHOLD_DB);
+    nvs_get_f32_band(h, s_cfg.band, "tag_thr", &s_cfg.tagger_threshold_db,
+                     band_profile_get((band_id_t)s_cfg.band)->tagger_threshold_db);
     nvs_get_u8_or(h, "coal_n", &s_cfg.coalesce_min_bursts, DEFAULT_COALESCE_MIN_BURSTS);
     nvs_get_i16_or(h, "dcmask_lo", &s_cfg.dcmask_lo, DEFAULT_DCMASK_LO);
     nvs_get_i16_or(h, "dcmask_hi", &s_cfg.dcmask_hi, DEFAULT_DCMASK_HI);
@@ -358,7 +478,23 @@ static esp_err_t commit_one_str(const char *k, const char *v)
         return commit_fn(nvs_key, v);                                       \
     }
 
-SET_FIELD_NUM(app_config_set_lo_freq_hz, lo_freq_hz, uint32_t, "lo_hz", commit_one_u32)
+// Band-namespaced variant (phase 2): persists to the ACTIVE band's key
+// ("ir_"/"v2_" + base), so each band keeps its own value. The in-memory
+// field still holds the active band's value (flat, single-band-at-a-time).
+#define SET_FIELD_NUM_BAND(field_setter_name, member, ctype, nvs_base, commit_fn) \
+    esp_err_t field_setter_name(ctype v)                                          \
+    {                                                                             \
+        if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;                              \
+        xSemaphoreTake(s_cfg_mu, portMAX_DELAY);                                  \
+        s_cfg.member  = v;                                                        \
+        uint8_t band_ = s_cfg.band;                                               \
+        xSemaphoreGive(s_cfg_mu);                                                 \
+        char k_[16];                                                              \
+        band_key(k_, sizeof(k_), band_, nvs_base);                                \
+        return commit_fn(k_, v);                                                  \
+    }
+
+SET_FIELD_NUM_BAND(app_config_set_lo_freq_hz, lo_freq_hz, uint32_t, "lo_hz", commit_one_u32)
 
 esp_err_t app_config_set_band(uint8_t v)
 {
@@ -387,8 +523,8 @@ void app_config_set_band_ram(uint8_t v)
     xSemaphoreGive(s_cfg_mu);
 }
 SET_FIELD_NUM(app_config_set_sample_rate_hz, sample_rate_hz, uint32_t, "rate_hz", commit_one_u32)
-SET_FIELD_NUM(app_config_set_gain_db_x10, gain_db_x10, int16_t, "gain_dbx10", commit_one_i16)
-SET_FIELD_NUM(app_config_set_tagger_threshold_db, tagger_threshold_db, float, "tag_thr", commit_one_f32)
+SET_FIELD_NUM_BAND(app_config_set_gain_db_x10, gain_db_x10, int16_t, "gain_dbx10", commit_one_i16)
+SET_FIELD_NUM_BAND(app_config_set_tagger_threshold_db, tagger_threshold_db, float, "tag_thr", commit_one_f32)
 SET_FIELD_NUM(app_config_set_coalesce_min_bursts, coalesce_min_bursts, uint8_t, "coal_n", commit_one_u8)
 SET_FIELD_NUM(app_config_set_dcmask_lo, dcmask_lo, int16_t, "dcmask_lo", commit_one_i16)
 SET_FIELD_NUM(app_config_set_dcmask_hi, dcmask_hi, int16_t, "dcmask_hi", commit_one_i16)
@@ -423,16 +559,22 @@ esp_err_t app_config_set_gain_mode(gain_mode_t mode)
     if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
     s_cfg.gain_mode = mode;
+    uint8_t band_   = s_cfg.band;
     xSemaphoreGive(s_cfg_mu);
-    return commit_one_u8("gain_mode", (uint8_t)mode);
+    char k_[16]; // band-namespaced (phase 2): per-band gain mode
+    band_key(k_, sizeof(k_), band_, "gain_mode");
+    return commit_one_u8(k_, (uint8_t)mode);
 }
 esp_err_t app_config_set_bias_tee(bool on)
 {
     if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
     s_cfg.bias_tee = on;
+    uint8_t band_  = s_cfg.band;
     xSemaphoreGive(s_cfg_mu);
-    return commit_one_u8("bias_tee", (uint8_t)on);
+    char k_[16]; // band-namespaced (phase 2): per-band bias-tee
+    band_key(k_, sizeof(k_), band_, "bias_tee");
+    return commit_one_u8(k_, (uint8_t)on);
 }
 esp_err_t app_config_set_best_effort_decode(bool on)
 {
