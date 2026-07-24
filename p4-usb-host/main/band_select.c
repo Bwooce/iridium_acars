@@ -21,6 +21,18 @@ const band_pipeline_t *band_select_pipeline(band_id_t id)
     }
 }
 
+const band_runtime_t *band_runtime_resolve(band_id_t id)
+{
+    if ((unsigned)id >= (unsigned)BAND_COUNT) id = BAND_IRIDIUM;
+    // Static per-band entries; profile/pipeline pointers are runtime-constant
+    // (addresses of static tables), so fill on call and return the stable slot.
+    static band_runtime_t rt[BAND_COUNT];
+    rt[id].band     = id;
+    rt[id].profile  = band_profile_get(id);
+    rt[id].pipeline = band_select_pipeline(id);
+    return &rt[id];
+}
+
 void band_decode_stats_get(band_id_t id, band_decode_stats_t *out)
 {
     if (!out) return;

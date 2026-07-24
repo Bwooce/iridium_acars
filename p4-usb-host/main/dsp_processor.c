@@ -28,6 +28,7 @@
 #include "worker_core1.h"
 #include "app_config.h"
 #include "band_profile.h" // per-band tagger parameters (VHF/VDL2 foundation)
+#include "band_select.h"  // band_runtime_resolve — resolve band once (phase 3)
 
 static const char *TAG = "DSP_PROC";
 
@@ -307,7 +308,8 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     // parameters come from the selected band. For band=iridium (the
     // default) every value equals the historical constants (see the
     // _Static_asserts above) — bit-identical behaviour.
-    const band_profile_t *bp  = band_profile_get((band_id_t)cfg.band);
+    const band_runtime_t *rt  = band_runtime_resolve((band_id_t)cfg.band); // resolve once (phase 3)
+    const band_profile_t *bp  = rt->profile;
     float                 thr = cfg.tagger_threshold_db;
     if (thr <= 0.0f || thr > 30.0f) thr = bp->tagger_threshold_db; // sanity
     ESP_LOGI(TAG,
@@ -362,7 +364,7 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     // Measure-first VDL2 burst-tagger trace (/diag/tagger_trace). Armed ONLY
     // for band==vdl2 — the entire trace path self-gates on this flag, so
     // band==iridium is byte-identical and pays nothing.
-    fft_burst_tagger_set_trace_enabled((band_id_t)cfg.band == BAND_VDL2);
+    fft_burst_tagger_set_trace_enabled(rt->band == BAND_VDL2);
     s_default = p; // publish for cross-task diagnostic readers
     return p;
 }

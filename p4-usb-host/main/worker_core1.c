@@ -1414,12 +1414,16 @@ esp_err_t worker_core1_init(void)
     // leave s_band_pipeline NULL.
     app_config_t cfg = {0}; // {0}: snapshot is a no-op pre-app_config_init; band 0 = iridium
     app_config_snapshot(&cfg);
-    s_band_pipeline = band_select_pipeline((band_id_t)cfg.band);
-    // Emit sink pairs with the pipeline (plan §C4): Iridium keeps the
-    // historical worker_emit_frame path bit-identically; VDL2 forwards
-    // PHY bits to the frame_decoder task's L2 branch.
-    s_emit_cb = (s_band_pipeline == vdl2_pipeline()) ? worker_emit_frame_vdl2
-                                                     : worker_emit_frame;
+    const band_runtime_t *rt = band_runtime_resolve((band_id_t)cfg.band); // resolve once (phase 3)
+    s_band_pipeline          = rt->pipeline;
+    // Emit sink pairs with the band (plan §C4): Iridium keeps the historical
+    // worker_emit_frame path bit-identically; VDL2 forwards PHY bits to the
+    // frame_decoder task's L2 branch. Phase 4: key off the resolved band id
+    // rather than a vdl2_pipeline() pointer-identity comparison — same result,
+    // single band source. (The emit sinks stay local statics here rather than
+    // fn-ptrs in a shared descriptor: exporting them would make band_select
+    // depend on worker/frame_decoder internals — worse coupling, no gain.)
+    s_emit_cb = (rt->band == BAND_VDL2) ? worker_emit_frame_vdl2 : worker_emit_frame;
     ESP_LOGI(TAG, "band pipeline: %s", s_band_pipeline->name);
 
     hot_bin_table_init(&s_hot); // A6: entries empty, boost enabled (default ON)

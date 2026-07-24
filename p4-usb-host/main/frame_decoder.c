@@ -41,6 +41,7 @@
 #include "sd_log.h"
 #include "app_config.h" // best_effort_decode gate (Task B4); band soft-switch
 #include "band_profile.h" // band_id_t — the decoder task branches per band (V3)
+#include "band_select.h"  // band_runtime_resolve — resolve band once (phase 3)
 #include "vdl2_l2.h"      // band=vdl2: RS de-interleave/correct + AVLC deframe
 #include <libacars/libacars.h>
 #include <libacars/acars.h>
@@ -942,7 +943,7 @@ esp_err_t frame_decoder_init(void)
     {
         app_config_t cfg = {0};
         app_config_snapshot(&cfg);
-        s_band_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+        s_band_vdl2 = (band_runtime_resolve((band_id_t)cfg.band)->band == BAND_VDL2);
         if (s_band_vdl2)
             ESP_LOGI(TAG, "band=vdl2: decoder routes frames via RS+AVLC L2");
     }
