@@ -6,6 +6,7 @@
 #include "class_driver.h"
 #include "scanner.h"
 #include "worker_core1.h"
+#include "band_select.h" // band_decode_stats_get + band_id_t (band-aware metric)
 
 #include <stdatomic.h>
 #include "esp_log.h"
@@ -176,6 +177,17 @@ static void autotune_run_manual_locked(void)
         return;
     }
 
+    // Gain-cal maximizes decodes against the Iridium IRA reference beacon (a
+    // known always-on downlink at autotune_ira_lo_hz). VDL2 has no equivalent
+    // always-on reference, so a decode-maximizing sweep can't discriminate
+    // there (see the band-mode plan). Refuse under band=vdl2 — the fill-based
+    // ADC-quantization gain sweep is the band-agnostic method instead.
+    if ((band_id_t)cfg.band == BAND_VDL2) {
+        ESP_LOGW(TAG, "REFUSED: gain-cal unsupported for band=vdl2 (no IRA-equivalent "
+                      "reference beacon); use the fill-based gain sweep");
+        return;
+    }
+
     // Save current state so restore runs on every non-abort exit path.
     uint32_t saved_lo   = cfg.lo_freq_hz;
     int      saved_gain = class_driver_get_tuner_gain_dbx10();
@@ -224,13 +236,17 @@ static void autotune_run_manual_locked(void)
         scanner_reset_baseline();                     // floor moves with gain
         vTaskDelay(pdMS_TO_TICKS(AUTOTUNE_PRIME_MS)); // discard prime transient
 
-        uint32_t d0 = 0, u0 = 0, d1 = 0, u1 = 0;
-        worker_core1_get_decode_counts(&d0, &u0);
+        // Band-agnostic funnel snapshot (Iridium: the SAME cumulative BCH
+        // decoded/unknown counters as before, via the unified accessor). VDL2
+        // is gated out above, so this loop is Iridium-only; the accessor keeps
+        // the metric band-correct should that ever change.
+        band_decode_stats_t s0 = {0}, s1 = {0};
+        band_decode_stats_get((band_id_t)cfg.band, &s0);
         vTaskDelay(pdMS_TO_TICKS(dwell_ms));
-        worker_core1_get_decode_counts(&d1, &u1);
+        band_decode_stats_get((band_id_t)cfg.band, &s1);
 
-        decoded[i] = (int)(d1 - d0);
-        unknown[i] = (int)(u1 - u0);
+        decoded[i] = (int)(s1.decoded - s0.decoded);
+        unknown[i] = (int)(s1.unknown - s0.unknown);
         ESP_LOGI(TAG, "  gain %2d.%d dB: bch_decoded=%d bch_unknown=%d",
                  gains[i] / 10, gains[i] % 10, decoded[i], unknown[i]);
     }
