@@ -580,6 +580,13 @@ static void test_erasure_fsweep(void)
     CHECK(s1.rs_erasure_recovered - s0.rs_erasure_recovered == 1,
           "fsweep rs_erasure_recovered delta %u != 1",
           s1.rs_erasure_recovered - s0.rs_erasure_recovered);
+    // Joint rescue×FCS tap: the golden fixture frames carry valid FCS, so a
+    // byte-exact rescue must tally ALL 5 frames as rescued_fcs_ok, none bad.
+    CHECK(s1.rescued_fcs_ok - s0.rescued_fcs_ok == 5,
+          "fsweep rescued_fcs_ok delta %u != 5",
+          s1.rescued_fcs_ok - s0.rescued_fcs_ok);
+    CHECK(s1.rescued_fcs_bad == s0.rescued_fcs_bad,
+          "fsweep rescued_fcs_bad advanced on a byte-exact rescue");
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +740,14 @@ static void shortened_fallback_case(const char *name, const int *idx,
             CHECK(s1.rs_erasure_recovered - s0.rs_erasure_recovered == 1,
                   "%s(c) rs_erasure_recovered delta %u != 1", name,
                   s1.rs_erasure_recovered - s0.rs_erasure_recovered);
+            // Joint rescue×FCS tap: byte-exact recovery of FCS-valid golden
+            // frames must count every frame as rescued_fcs_ok, none bad.
+            CHECK(s1.rescued_fcs_ok - s0.rescued_fcs_ok == (uint32_t)n_frames,
+                  "%s(c) rescued_fcs_ok delta %u != %d", name,
+                  s1.rescued_fcs_ok - s0.rescued_fcs_ok, n_frames);
+            CHECK(s1.rescued_fcs_bad == s0.rescued_fcs_bad,
+                  "%s(c) rescued_fcs_bad advanced on a byte-exact rescue",
+                  name);
         }
     }
 

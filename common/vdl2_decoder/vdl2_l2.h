@@ -97,6 +97,18 @@ typedef struct {
                                // rescued it — VDL2 analog of Iridium's
                                // bursts_bch_chase_recovered (#112); subset of
                                // rs_blocks_ok.
+    // Joint rescue×FCS outcome (transmission granularity — see the
+    // l2_avlc_tap comment in vdl2_l2.c). rs_erasure_recovered is per RS
+    // BLOCK and the caller's bad_fcs is per AVLC FRAME, so neither can say
+    // whether a rescue ever actually yielded a good frame; these two can.
+    uint32_t rescued_fcs_ok;  // AVLC frames with a VALID FCS from a
+                              // transmission where >=1 RS block was
+                              // erasure-rescued — "the rescue produced a
+                              // real decode".
+    uint32_t rescued_fcs_bad; // ...and the FCS-FAILED frames from those same
+                              // transmissions. ok==0 while bad grows = every
+                              // rescue miscorrects at this SNR — evidence
+                              // for gating the erasure fallback off.
     uint32_t avlc_frames;      // AVLC frames emitted (all kinds)
 } vdl2_l2_stats_t;
 void vdl2_l2_get_stats(vdl2_l2_stats_t *out);

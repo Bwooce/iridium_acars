@@ -277,7 +277,7 @@ static esp_err_t status_get(httpd_req_t *req)
     frame_decoder_vdl2_stats_t vd = {0};
     frame_decoder_get_vdl2_stats(&vd);
 
-    char body[3072]; // +vdl2 block (V3); headroom re-checked vs worst case
+    char body[3200]; // +vdl2 block (V3) + rescued_fcs split; headroom re-checked vs worst case
     int  n = snprintf(body, sizeof(body),
                       "{"
                        "\"build\":\"%s\","
@@ -314,6 +314,7 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"bursts\":%u,\"synced\":%u,\"phy_ok\":%llu,\"l2_fail\":%llu,"
                        "\"rs_ok\":%u,\"rs_fail\":%u,\"rs_fixed\":%u,"
                        "\"rs_erasure_recovered\":%u,"
+                       "\"rescued_fcs_ok\":%u,\"rescued_fcs_bad\":%u,"
                        "\"avlc_ok\":%llu,\"acars\":%llu,\"x25\":%llu,"
                        "\"sup\":%llu,\"unnum\":%llu,"
                        "\"bad_fcs\":%llu,\"too_short\":%llu"
@@ -389,6 +390,7 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_blocks_fail,
                       (unsigned)vd.rs_octets_fixed,
                       (unsigned)vd.rs_erasure_recovered,
+                      (unsigned)vd.rescued_fcs_ok, (unsigned)vd.rescued_fcs_bad,
                       (unsigned long long)vd.avlc_ok, (unsigned long long)vd.acars,
                       (unsigned long long)vd.x25,
                       (unsigned long long)vd.supervisory, (unsigned long long)vd.unnumbered,
@@ -1292,7 +1294,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                      "<tr><td>Bursts &rarr; demod sync</td><td class=v>%u / %u</td></tr>"
                      "<tr><td>PHY frames / L2 fail</td><td class=v>%llu / %llu</td></tr>"
                      "<tr><td>RS blocks ok / fail / octets fixed</td><td class=v>%u / %u / %u</td></tr>"
-                     "<tr><td>RS erasure-recovered blocks</td><td class=v>%u</td></tr>"
+                     "<tr><td>RS erasure-recovered blocks (frame FCS ok / bad)</td><td class=v>%u (%u / %u)</td></tr>"
                      "<tr><td>AVLC FCS-valid / bad FCS / too short</td><td class=v>%llu / %llu / %llu</td></tr>"
                      "<tr><td>ACARS / X.25 / S / U frames</td><td class=v>%llu / %llu / %llu / %llu</td></tr>"
                      "</table>",
@@ -1302,6 +1304,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
                      (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_blocks_fail,
                      (unsigned)vd.rs_octets_fixed,
                      (unsigned)vd.rs_erasure_recovered,
+                     (unsigned)vd.rescued_fcs_ok, (unsigned)vd.rescued_fcs_bad,
                      (unsigned long long)vd.avlc_ok, (unsigned long long)vd.bad_fcs,
                      (unsigned long long)vd.too_short,
                      (unsigned long long)vd.acars, (unsigned long long)vd.x25,
@@ -2054,7 +2057,7 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
     app_config_t cfg;
     app_config_snapshot(&cfg);
     bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
-    char dr[384];
+    char dr[448]; // +rescued_fcs split; headroom re-checked vs worst case
     if (is_vdl2) {
         frame_decoder_vdl2_stats_t vd = {0};
         frame_decoder_get_vdl2_stats(&vd);
@@ -2064,6 +2067,7 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
                  "\"tagged\":%u,\"synced\":%u,"
                  "\"rs_blocks_ok\":%u,\"rs_blocks_fail\":%u,\"rs_octets_fixed\":%u,"
                  "\"rs_erasure_recovered\":%u,"
+                 "\"rescued_fcs_ok\":%u,\"rescued_fcs_bad\":%u,"
                  "\"avlc_ok\":%llu,\"bad_fcs\":%llu,\"acars\":%llu"
                  "},",
                  (unsigned)vdl2_pipeline_bursts_seen(),
@@ -2071,6 +2075,7 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
                  (unsigned)vd.rs_blocks_ok, (unsigned)vd.rs_blocks_fail,
                  (unsigned)vd.rs_octets_fixed,
                  (unsigned)vd.rs_erasure_recovered,
+                 (unsigned)vd.rescued_fcs_ok, (unsigned)vd.rescued_fcs_bad,
                  (unsigned long long)vd.avlc_ok, (unsigned long long)vd.bad_fcs,
                  (unsigned long long)vd.acars);
     } else {

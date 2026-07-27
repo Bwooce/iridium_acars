@@ -845,6 +845,8 @@ void frame_decoder_get_vdl2_stats(frame_decoder_vdl2_stats_t *out)
     out->rs_blocks_fail  = l2.rs_blocks_fail;
     out->rs_octets_fixed = l2.rs_octets_fixed;
     out->rs_erasure_recovered = l2.rs_erasure_recovered;
+    out->rescued_fcs_ok       = l2.rescued_fcs_ok;
+    out->rescued_fcs_bad      = l2.rescued_fcs_bad;
 }
 
 static void decoder_task(void *arg)

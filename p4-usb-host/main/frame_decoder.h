@@ -143,6 +143,13 @@ typedef struct {
     uint32_t rs_erasure_recovered; // hard-RS failed, soft-erasure fallback
                                    // rescued the block (subset of rs_blocks_ok;
                                    // VDL2 analog of Iridium chase_recovered)
+    uint32_t rescued_fcs_ok;  // AVLC FCS-valid frames from a transmission with
+                              // >=1 erasure-rescued RS block — the joint
+                              // "rescue produced a real decode" counter
+                              // (vdl2_l2.h; transmission granularity)
+    uint32_t rescued_fcs_bad; // ...FCS-failed frames from those transmissions
+                              // (ok==0 while bad grows = rescues only
+                              // miscorrect at this SNR)
     uint64_t avlc_ok;     // FCS-valid AVLC frames (= acars+x25+sup+unnum)
     uint64_t acars;       // ACARS-bearing I frames handed to libacars
     uint64_t x25;         // ATN/X.25 I frames (counted, not decoded — V5)

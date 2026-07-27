@@ -45,6 +45,38 @@ static EXT_RAM_BSS_ATTR int16_t s_conf_tab[L2_MAX_BLOCKS][RS_VDL2_N];
 
 static vdl2_l2_stats_t s_stats; // single writer; torn reads benign
 
+// Rescued-transmission FCS tap. rs_erasure_recovered counts per RS BLOCK and
+// the caller's FCS verdicts arrive per AVLC FRAME, so the aggregates cannot
+// answer "does an erasure rescue ever yield an FCS-valid frame?". This
+// wrapper closes the gap without any cross-module plumbing: vdl2_l2_feed
+// hands avlc_deframe_octets THIS callback with `rescued` = "any RS block in
+// the current transmission was erasure-rescued", tallies every yielded
+// frame's FCS verdict into rescued_fcs_ok/bad, then forwards to the caller's
+// cb untouched. Transmission granularity is deliberate: in a multi-block
+// transmission the rescued block's octets may or may not fall inside the
+// specific frame checked, but per-octet attribution would need range
+// bookkeeping through the destuffer for no extra decision value — the
+// gate-the-fallback question only needs "rescues sometimes produce good
+// frames" vs "never". TOO_SHORT frames never reach an FCS check and count
+// as neither. Instrumentation only — frame delivery is unchanged.
+typedef struct {
+    avlc_frame_cb_t cb;      // caller's callback (may be NULL = count only)
+    void           *ctx;     // caller's context, forwarded untouched
+    bool            rescued; // >=1 RS block in this transmission was rescued
+} l2_cb_tap_t;
+
+static void l2_avlc_tap(const avlc_frame_t *f, void *ctx)
+{
+    l2_cb_tap_t *t = (l2_cb_tap_t *)ctx;
+    if (t->rescued) {
+        if (f->kind == AVLC_KIND_BAD_FCS)
+            s_stats.rescued_fcs_bad++;
+        else if (f->kind != AVLC_KIND_TOO_SHORT)
+            s_stats.rescued_fcs_ok++;
+    }
+    if (t->cb) t->cb(f, t->ctx);
+}
+
 // FEC octet count of a (shortened) block with `len` data octets —
 // dumpvdl2 decode.c:124-133 get_fec_octetcount(). Same table
 // vdl2_burst_body_bits() uses for the length pre-check; kept verbatim
@@ -309,6 +341,7 @@ int vdl2_l2_feed(const uint8_t *bits, const int16_t *soft_bits, int n_bits,
 
     // RS-correct each block; any uncorrectable block drops the whole
     // transmission (decode.c:311-316 "FEC check failed" -> cleanup).
+    bool any_rescued = false; // >=1 block erasure-rescued (l2_avlc_tap flag)
     for (uint32_t r = 0; r < num_blocks; r++) {
         int corr = 0;
         int rc;
@@ -434,7 +467,10 @@ int vdl2_l2_feed(const uint8_t *bits, const int16_t *soft_bits, int n_bits,
         s_stats.rs_blocks_ok++;
         // True rescue: hard-decision had FAILED and the erasure fallback
         // succeeded (subset of rs_blocks_ok, like chase_recovered).
-        if (erasure_rescued) s_stats.rs_erasure_recovered++;
+        if (erasure_rescued) {
+            s_stats.rs_erasure_recovered++;
+            any_rescued = true;
+        }
         // Corrected-octet accounting excludes the intended erasures of
         // a shortened block (dumpvdl2 decode.c:321-322). For a full-block
         // erasure rescue, fec_this == NROOTS so no adjustment applies.
@@ -454,7 +490,10 @@ int vdl2_l2_feed(const uint8_t *bits, const int16_t *soft_bits, int n_bits,
     // AVLC deframe over exactly `datalen` BITS — the transmission
     // length is usually not a multiple of 8 because of bit stuffing;
     // dumpvdl2 truncates the padding bits the same way (decode.c:336-342).
-    int nf = avlc_deframe_octets(s_octets, (int)datalen, cb, ctx);
+    // Routed through l2_avlc_tap so a rescued transmission's frames get
+    // their FCS verdicts tallied (rescued_fcs_ok/bad) before forwarding.
+    l2_cb_tap_t tap = { .cb = cb, .ctx = ctx, .rescued = any_rescued };
+    int nf = avlc_deframe_octets(s_octets, (int)datalen, l2_avlc_tap, &tap);
     if (nf > 0) s_stats.avlc_frames += (uint32_t)nf;
     return nf;
 }
