@@ -1730,6 +1730,26 @@ target_include_directories(test_avlc PRIVATE
 target_compile_options(test_avlc PRIVATE -Werror)
 add_test(NAME avlc COMMAND test_avlc)
 
+# test_airframes_fmt (2026-07-27): airframes.io wire-JSON formatter
+# (common/acars_feed/airframes_fmt.c) — one pure-C module emitting BOTH
+# feed shapes (dumpvdl2 2.6.0 native for VDL2, iridium-toolkit
+# reassembler -a json for Iridium). Byte-exact full-string fixtures per
+# schema (the dumpvdl2 t.sec=1785148910 sample is the anchor), an
+# exhaustive truncation sweep (every cap <= needed must return 0 — no
+# torn JSON on the wire), JSON escaping, and the omission/special-byte
+# rules (unsynced time, NAK ack -> "!", label "_\x7f" -> "_d", the
+# reg-dot VDL2/Iridium asymmetry). Pure C11, no IDF deps — -Werror per
+# the new-code policy.
+add_executable(test_airframes_fmt
+    test_airframes_fmt.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/acars_feed/airframes_fmt.c
+)
+target_include_directories(test_airframes_fmt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/acars_feed
+)
+target_compile_options(test_airframes_fmt PRIVATE -Werror)
+add_test(NAME airframes_fmt COMMAND test_airframes_fmt)
+
 # test_vdl2_e2e_acars (2026-07-22, V3 ACCEPTANCE): the FULL VDL2 chain
 # on the real sigidwiki capture — production vdl2_demod_burst ->
 # vdl2_l2_feed (RS de-interleave/correct + AVLC) -> vendored libacars

@@ -32,6 +32,19 @@ typedef struct {
                                    // or sd_log, see frame_decoder.c ida_salvage_drain.
     int32_t peak_bin;              // tagger peak bin (informational)
     float   snr_db;                // tagger SNR at detection (informational)
+    // Fields below feed the airframes.io exporter (acars_push.c) and are
+    // otherwise unused by /messages/SD. Populated in acars_deliver().
+    char     reg[8];               // libacars raw registration (may be dot-
+                                   // prefixed, e.g. ".F-GCBG"); "" = none
+    char     ack;                  // ACARS ack byte (0 = none; 0x15 = NAK)
+    char     msg_num_seq;          // sequence char (0 = none)
+    bool     more;                 // ACARS more-to-come bit (block_end = !more)
+    bool     has_avlc;             // VDL2 AVLC identity present (below); false
+                                   // for Iridium (no AVLC layer)
+    uint32_t avlc_src_addr;        // 24-bit AVLC source address (0 = none)
+    uint32_t avlc_dst_addr;        // 24-bit AVLC destination address
+    uint8_t  avlc_src_type;        // AVLC_ADDRTYPE_* (0 = none)
+    uint8_t  avlc_dst_type;
     char    txt[MSG_RING_TXT_MAX]; // NUL-terminated payload text; may be empty
 } acars_msg_t;
 

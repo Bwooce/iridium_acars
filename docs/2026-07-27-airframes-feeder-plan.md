@@ -31,44 +31,77 @@ bands, now that VDL2 is first-class (band-mode overhaul, `feat/vhf-vdl2`).
   task cannot `nvs_commit`; memory `feedback_psram_stack_no_flash_write`).
   `/status` JSON has the `udp_push:{host,port,enabled}` block (~L297) to clone.
 
-## 1. What airframes.io ingests (assumptions flagged)
+## 1. What airframes.io ingests — RESEARCH CONFIRMED 2026-07-27
 
-Known / high-confidence (from prior research in `project_airframes_feed` +
-docs.airframes.io "for developers"):
+Confirmed from docs.airframes.io/docs/feeding/how/, the airframesio/iridium-toolkit
+source (`iridiumtk/reassembler/sbd.py::ReassembleIDASBDACARS`), the
+airframesio Iridium feeder script (`iridium-acars-to-airframes.py`), and a
+locally-generated dumpvdl2 2.6.0 JSON sample (`~/iridium_capture/vdl2_ref`).
 
-- Airframes ingests **decoder-native JSON over unicast UDP (TCP also accepted
-  for some apps)** to `feed.airframes.io`, one datagram per message, **no API
-  key** — the station is identified by a station ident string inside each
-  message; the operator claims/annotates the station (name, coordinates) via
-  the airframes.io web account. Per-message lat/lon is NOT required.
-- Per-app conventions it already understands:
-  - **acarsdec** JSON (planar: `timestamp, station_id, channel, freq, level,
-    error, mode, label, block_id, ack, tail, flight, msgno, text`) on its
-    VHF-ACARS port.
-  - **dumpvdl2** native JSON (`{"vdl2":{"app":{...},"station":...,"t":{"sec",
-    "usec"},"freq","sig_level","avlc":{...,"acars":{...}}}}`) on the VDL2
-    port — this is the *preferred* VDL2 shape (carries AVLC addresses).
-  - **iridium-toolkit** `acars.py -a json` output for Iridium ACARS.
-- `station` ident should allow ≥36 chars (UUID-length; our
-  `APP_CONFIG_STATION_ID_LEN` is 32 — too short, see §4).
+- **Transport:** unicast, **newline-delimited JSON** (one `{...}\n` per
+  message). **No API key.** The feeder is identified by a **station ident**
+  string embedded in each message (an ident like `KE-KMHR-IRIDIUM1` OR a UUID
+  — UUID lets you rename on the website without relinking). Per-message lat/lon
+  NOT required (coords come from the web station profile).
+- **Ingest endpoints** (`feed.airframes.io`):
 
-**VERIFY against airframes.io docs / Discord before Phase 3 (the biggest open
-assumption):** the exact **ingest ports** for (a) Iridium ACARS from a
-non-iridium-toolkit app and (b) dumpvdl2-style VDL2 JSON, and whether a custom
-`app.name` (`"iridium_acars_p4"`) is accepted on those ports or whether
-messages must masquerade as a known app's schema exactly. Public docs
-historically list ports per app (e.g. 5550 acarsdec, 5552 dumpvdl2-family) but
-the Iridium ingest endpoint was explicitly NOT public — memory note says
-confirm via Discord / api@airframes.io. Do not hardcode ports in the plan;
-they are NVS config precisely because of this.
+  | mode | proto | port |
+  |---|---|---|
+  | VHF ACARS (acarsdec) | UDP | 5550 |
+  | VDL2 (dumpvdl2) | UDP | 5552 |
+  | VDL2 (dumpvdl2) | TCP | 5553 |
+  | HFDL (dumphfdl) | UDP | 5556 |
+  | **Iridium ACARS (iridium-toolkit)** | **UDP/TCP** | **5590** |
 
-## 2. Message schema per band
+  So this device feeds **two ports**: VDL2 → 5552, Iridium → 5590. (The
+  Iridium port 5590 was the previously-unknown value — now confirmed.)
+- **We emit each decoder's native schema on its own port** (§2). No
+  masquerading needed — `app.name` is `dumpvdl2`/`iridium-toolkit`'s own value;
+  a custom name would risk the router not recognising the shape, so we mirror
+  the native app names.
 
-Emit **dumpvdl2-native JSON for VDL2** and **an iridium-toolkit-compatible
-planar JSON for Iridium** (both already understood upstream), from one
-formatter with a band switch. The resolved band is fixed per boot, so the
-formatter selection is a boot-time branch exactly like `s_band_vdl2`
-(`frame_decoder.c` L123).
+## 2. Message schema per band — CONFIRMED (verbatim from the two sources)
+
+Two distinct native schemas, one formatter per band (band is fixed per boot,
+so it's a boot-time branch like `s_band_vdl2`, `frame_decoder.c` L123). Both
+are one-line JSON + `\n`. NOTE both carry a **wall-clock** timestamp
+(dumpvdl2 `t.sec/usec` epoch; Iridium `acars.timestamp` ISO8601) → SNTP is a
+hard prerequisite (Phase 2), not optional polish.
+
+**VDL2 → 5552 (dumpvdl2-native), only the ACARS-bearing subset we produce:**
+```json
+{"vdl2":{
+  "app":{"name":"dumpvdl2","ver":"2.6.0"},
+  "t":{"sec":1785148910,"usec":428657},
+  "freq":136975000,"sig_level":-11.02,"noise_level":-10.69,
+  "station":"<af_id>",
+  "avlc":{
+    "src":{"addr":"390826","type":"Aircraft","status":"Airborne"},
+    "dst":{"addr":"26B117","type":"Ground station"},
+    "cr":"Command","frame_type":"I",
+    "acars":{"err":false,"crc_ok":true,"more":false,"reg":".F-GCBG",
+             "mode":"2","label":"2T","blk_id":"7","ack":"!","flight":"AF0000",
+             "msg_num":"M06","msg_num_seq":"A","msg_text":"..."}}}}
+```
+(`station` is dumpvdl2's `--station-id` field. `addr` = 6-hex AVLC address;
+`type`/`status` are enum strings. `more` = ACARS "more to come" bit; `ack` is
+`"!"` for NAK. Fields we can't fill are simply omitted.)
+
+**Iridium → 5590 (iridium-toolkit `reassembler.py -m acars -a json`):**
+```json
+{"app":{"name":"iridium-toolkit","version":"0.0.1"},
+ "source":{"transport":"iridium","protocol":"acars","station_id":"<af_id>"},
+ "acars":{"timestamp":"2026-01-05T10:30:00+0000","errors":0,
+          "link_direction":"downlink","block_end":true,
+          "mode":"2","tail":"F-GCBG","flight":"AF0000","label":"2T",
+          "block_id":"7","message_number":"M06","ack":"!","text":"..."},
+ "header":"<hdr-bytes-hex>"}
+```
+(Note: Iridium schema carries **no freq/level**; `timestamp` is ISO8601
+`%Y-%m-%dT%H:%M:%S%z`; `tail` has leading dots stripped; `label` maps
+`_\x7f`→`_d`; `ack` maps `\x15`→`!`; `link_direction` from the uplink bit;
+`block_end` = not-continued. `header` = SBD header hex — optional, omit if not
+readily available in `acars_msg_t`.)
 
 Field mapping from `acars_msg_t` (`msg_ring.h`) + additions (§2a):
 

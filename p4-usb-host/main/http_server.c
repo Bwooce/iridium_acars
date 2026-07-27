@@ -94,6 +94,11 @@ typedef struct {
     char     iot_log_host[64];
     char     ota_url[128];
     bool     bias_tee;
+    // airframes.io feed
+    char     af_host[64];
+    uint16_t af_port;
+    char     af_id[40];
+    bool     af_on;
     bool     clear_only; // true = reset_post path (clear SSID+PSK, ignore other fields)
 } nvs_save_args_t;
 
@@ -102,6 +107,7 @@ static void nvs_save_and_reboot_task(void *arg)
     nvs_save_args_t *a = (nvs_save_args_t *)arg;
 
     esp_err_t r1, r2, r3 = ESP_OK, r4 = ESP_OK, r5 = ESP_OK, r6 = ESP_OK, r7 = ESP_OK;
+    esp_err_t r8 = ESP_OK, r9 = ESP_OK, r10 = ESP_OK, r11 = ESP_OK;
     if (a->clear_only) {
         r1 = app_config_set_wifi_ssid("");
         r2 = app_config_set_wifi_psk("");
@@ -113,13 +119,19 @@ static void nvs_save_and_reboot_task(void *arg)
         r5 = app_config_set_ota_url(a->ota_url);
         r6 = app_config_set_bias_tee(a->bias_tee);
         r7 = app_config_set_iot_log_host(a->iot_log_host);
+        r8 = app_config_set_af_host(a->af_host);
+        r9 = app_config_set_af_port(a->af_port);
+        r10 = app_config_set_af_id(a->af_id);
+        r11 = app_config_set_af_on(a->af_on);
     }
-    if (r1 || r2 || r3 || r4 || r5 || r6 || r7) {
-        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s bias=%s iot_log=%s",
+    if (r1 || r2 || r3 || r4 || r5 || r6 || r7 || r8 || r9 || r10 || r11) {
+        ESP_LOGE(TAG, "NVS write failed: ssid=%s psk=%s host=%s port=%s ota=%s bias=%s iot_log=%s af_host=%s af_port=%s af_id=%s af_on=%s",
                  esp_err_to_name(r1), esp_err_to_name(r2),
                  esp_err_to_name(r3), esp_err_to_name(r4),
                  esp_err_to_name(r5), esp_err_to_name(r6),
-                 esp_err_to_name(r7));
+                 esp_err_to_name(r7), esp_err_to_name(r8),
+                 esp_err_to_name(r9), esp_err_to_name(r10),
+                 esp_err_to_name(r11));
     }
 
     free(a);
@@ -234,6 +246,7 @@ static esp_err_t status_get(httpd_req_t *req)
     char ssid_esc[2 * 33 + 1]; // wifi_link_ssid() is a char[33] SSID
     char host_esc[2 * sizeof(cfg.out_host) + 1];
     char ota_esc[2 * sizeof(cfg.ota_url) + 1];
+    char af_host_esc[2 * sizeof(cfg.af_host) + 1];
     char mnt_err_esc[2 * sizeof(sd.mount_error) + 1];
     char station_id_esc[2 * sizeof(cfg.station_id) + 1];
     json_escape(ssid_esc, sizeof(ssid_esc), wifi_link_ssid());
@@ -242,6 +255,7 @@ static esp_err_t status_get(httpd_req_t *req)
     wifi_link_get_signal(&wifi_rssi, &wifi_conn_s);
     json_escape(host_esc, sizeof(host_esc), cfg.out_host);
     json_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
+    json_escape(af_host_esc, sizeof(af_host_esc), cfg.af_host);
     json_escape(mnt_err_esc, sizeof(mnt_err_esc), sd.mount_error);
     json_escape(station_id_esc, sizeof(station_id_esc), cfg.station_id);
 
@@ -277,7 +291,7 @@ static esp_err_t status_get(httpd_req_t *req)
     frame_decoder_vdl2_stats_t vd = {0};
     frame_decoder_get_vdl2_stats(&vd);
 
-    char body[3200]; // +vdl2 block (V3) + rescued_fcs split; headroom re-checked vs worst case
+    char body[3392]; // +vdl2 block (V3) + rescued_fcs split + af_push block; headroom re-checked vs worst case
     int  n = snprintf(body, sizeof(body),
                       "{"
                        "\"build\":\"%s\","
@@ -295,6 +309,7 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"sample_rate_hz\":%u,"
                        "\"bias_tee\":%s,"
                        "\"udp_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
+                       "\"af_push\":{\"host\":\"%s\",\"port\":%u,\"enabled\":%s},"
                        "\"ota_url\":\"%s\","
                        "\"usb\":{"
                        "\"completed\":%llu,\"rb_full_drops\":%llu,"
@@ -371,6 +386,9 @@ static esp_err_t status_get(httpd_req_t *req)
                       host_esc,
                       (unsigned)cfg.out_port,
                      (cfg.out_host[0] && cfg.out_port) ? "true" : "false",
+                      af_host_esc,
+                      (unsigned)cfg.af_port,
+                     (cfg.af_on && cfg.af_host[0] && cfg.af_port) ? "true" : "false",
                       ota_esc,
                       (unsigned long long)usbt.completed,
                       (unsigned long long)usbt.rb_full_drops,
@@ -805,13 +823,17 @@ static esp_err_t index_get(httpd_req_t *req)
     char host_esc[2 * sizeof(cfg.out_host) + 8];
     char iot_log_host_esc[2 * sizeof(cfg.iot_log_host) + 8];
     char ota_esc[2 * sizeof(cfg.ota_url) + 8];
+    char af_host_esc[2 * sizeof(cfg.af_host) + 8];
+    char af_id_esc[2 * sizeof(cfg.af_id) + 8];
     html_attr_escape(ssid_esc, sizeof(ssid_esc), cfg.wifi_ssid);
     html_attr_escape(psk_esc, sizeof(psk_esc), cfg.wifi_psk);
     html_attr_escape(host_esc, sizeof(host_esc), cfg.out_host);
     html_attr_escape(iot_log_host_esc, sizeof(iot_log_host_esc), cfg.iot_log_host);
     html_attr_escape(ota_esc, sizeof(ota_esc), cfg.ota_url);
+    html_attr_escape(af_host_esc, sizeof(af_host_esc), cfg.af_host);
+    html_attr_escape(af_id_esc, sizeof(af_id_esc), cfg.af_id);
 
-    static EXT_RAM_BSS_ATTR char form[2048]; // static: 6144 B httpd stack (see head[] note)
+    static EXT_RAM_BSS_ATTR char form[3072]; // static: 6144 B httpd stack (see head[] note)
     int                          n = snprintf(form, sizeof(form),
                                               "<form method=\"POST\" action=\"/config\">"
                                                                        "<h2>Wi-Fi</h2>"
@@ -833,6 +855,14 @@ static esp_err_t index_get(httpd_req_t *req)
                                                                        "<h2>OTA</h2>"
                                                                        "<label>Firmware URL (http:// or https://)</label>"
                                                                        "<input type=\"text\" name=\"ota_url\" maxlength=\"127\" placeholder=\"http://server/p4-usb-host.bin\" value=\"%s\">"
+                                                                       "<h2>airframes.io feed (optional)</h2>"
+                                                                       "<label><input type=\"checkbox\" name=\"af_on\" value=\"1\"%s> Enable feed to airframes.io</label>"
+                                                                       "<label>Ingest host (e.g. feed.airframes.io)</label>"
+                                                                       "<input type=\"text\" name=\"af_host\" maxlength=\"63\" value=\"%s\">"
+                                                                       "<label>Port (VDL2 5552 / Iridium 5590)</label>"
+                                                                       "<input type=\"number\" name=\"af_port\" min=\"0\" max=\"65535\" placeholder=\"5552\" value=\"%u\">"
+                                                                       "<label>Station ident or UUID</label>"
+                                                                       "<input type=\"text\" name=\"af_id\" maxlength=\"39\" value=\"%s\">"
                                                                        "<button type=\"submit\">Save &amp; reboot</button>"
                                                                        "</form>",
                                               ssid_esc, psk_esc,
@@ -840,7 +870,11 @@ static esp_err_t index_get(httpd_req_t *req)
                                               host_esc,
                                               (unsigned)cfg.out_port,
                                               iot_log_host_esc,
-                                              ota_esc);
+                                              ota_esc,
+                     cfg.af_on ? " checked" : "",
+                                              af_host_esc,
+                                              (unsigned)cfg.af_port,
+                                              af_id_esc);
     if (n < 0) n = 0;
     if (n > (int)sizeof(form)) n = sizeof(form);
     httpd_resp_send_chunk(req, form, n);
@@ -1454,6 +1488,18 @@ static esp_err_t config_post(httpd_req_t *req)
     char ota_url[128] = {0};
     form_field(body, total, "ota_url", ota_url, sizeof(ota_url));
 
+    // Optional airframes.io feed. af_host empty / af_port 0 / af_on unchecked
+    // = disabled.
+    char af_host[64]  = {0};
+    char af_port_s[8] = {0};
+    char af_id[40]    = {0};
+    form_field(body, total, "af_host", af_host, sizeof(af_host));
+    form_field(body, total, "af_port", af_port_s, sizeof(af_port_s));
+    form_field(body, total, "af_id", af_id, sizeof(af_id));
+    uint16_t af_port = (uint16_t)strtoul(af_port_s, NULL, 10);
+    char     af_on_s[4] = {0};
+    bool     af_on = (form_field(body, total, "af_on", af_on_s, sizeof(af_on_s)) == ESP_OK);
+
     // Bias-tee checkbox: present in form body only if checked (HTML form
     // convention). form_field returns ESP_OK iff the key is present.
     char bias_tee_s[4] = {0};
@@ -1481,6 +1527,10 @@ static esp_err_t config_post(httpd_req_t *req)
     strlcpy(args->iot_log_host, iot_log_host, sizeof(args->iot_log_host));
     strlcpy(args->ota_url, ota_url, sizeof(args->ota_url));
     args->bias_tee   = bias_tee;
+    strlcpy(args->af_host, af_host, sizeof(args->af_host));
+    args->af_port = af_port;
+    strlcpy(args->af_id, af_id, sizeof(args->af_id));
+    args->af_on      = af_on;
     args->clear_only = false;
 
     // Send the OK page BEFORE spawning the writer — once it runs,

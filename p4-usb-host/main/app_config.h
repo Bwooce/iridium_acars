@@ -28,6 +28,8 @@
 #define APP_CONFIG_OUT_HOST_LEN 64     // UDP push target (hostname or IP); empty = disabled
 #define APP_CONFIG_IOT_LOG_HOST_LEN 64 // iot_log unicast target (hostname or IP); empty = disabled
 #define APP_CONFIG_OTA_URL_LEN 128     // D19 OTA pull URL (http://… or https://…); empty = disabled
+#define APP_CONFIG_AF_HOST_LEN 64      // airframes.io ingest host (feed.airframes.io); empty = disabled
+#define APP_CONFIG_AF_ID_LEN 40        // airframes feeder station ident or UUID (≥36 chars); empty = anonymous
 
 typedef enum {
     GAIN_MODE_TUNER_AGC = 0,    // R820T/R828D internal AGC. Default
@@ -168,6 +170,12 @@ typedef struct {
     uint16_t out_port;                                  // UDP push target port; 0 = no push
     char     iot_log_host[APP_CONFIG_IOT_LOG_HOST_LEN]; // iot_log unicast target host; empty = disabled
     char     ota_url[APP_CONFIG_OTA_URL_LEN];           // D19 OTA pull URL; empty = disabled
+    // airframes.io feed (acars_push.c). Global (one band per boot). Master
+    // gate af_on defaults OFF: enable once decode volume justifies a feeder.
+    bool     af_on;                                     // airframes feed enable
+    char     af_host[APP_CONFIG_AF_HOST_LEN];           // ingest host; empty = disabled
+    uint16_t af_port;                                   // ingest port (VDL2 5552 / Iridium 5590); 0 = disabled
+    char     af_id[APP_CONFIG_AF_ID_LEN];               // feeder station ident/UUID
 } app_config_t;
 
 // Initialise from NVS. Missing keys get compile-time defaults.
@@ -254,6 +262,10 @@ esp_err_t app_config_set_wifi_ssid(const char *ssid);
 esp_err_t app_config_set_wifi_psk(const char *psk);
 esp_err_t app_config_set_out_host(const char *host);
 esp_err_t app_config_set_out_port(uint16_t port);
+esp_err_t app_config_set_af_on(bool on);
+esp_err_t app_config_set_af_host(const char *host);
+esp_err_t app_config_set_af_port(uint16_t port);
+esp_err_t app_config_set_af_id(const char *id);
 esp_err_t app_config_set_iot_log_host(const char *host);
 esp_err_t app_config_set_ota_url(const char *url);
 

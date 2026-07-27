@@ -36,34 +36,44 @@
 #include "esp_heap_caps.h"
 
 #include "app_config.h"
+#include "airframes_fmt.h" // af_msg_t + airframes_format() (common/acars_feed)
+#include "net_time.h"      // net_time_epoch_us() — wall clock for the feed
+#include "band_profile.h"  // BAND_VDL2 (band id from app_config)
+#include "avlc.h"          // AVLC_ADDRTYPE_* (VDL2 address-type strings)
 
 static const char *TAG = "PUSH";
 
 #define QUEUE_DEPTH 16
+#define DNS_REFRESH_US (30LL * 1000000LL)
 
 static QueueHandle_t s_q      = NULL;
 static volatile bool s_active = false;
 
-static int                s_sock = -1;
-static struct sockaddr_in s_dst;
-static char               s_host_resolved[64];
-static uint16_t           s_port_resolved = 0;
-// DNS re-resolution backoff: timestamp of the last SUCCESSFUL
-// getaddrinfo (0 = never). getaddrinfo blocks this task for up to
-// seconds when the resolver is unreachable, so we only re-resolve when
-// the cache is absent/stale (>30 s) or the target changed — never
-// per-message.
-static int64_t s_resolved_at_us = 0;
-#define DNS_REFRESH_US (30LL * 1000000LL)
-// Set when sendto fails — the lwip UDP fd can wedge after netif churn
-// (DHCP renew, AP roam). The next send closes + recreates the socket.
-static bool s_sock_bad = false;
+// One UDP egress endpoint: its own socket, resolved address, DNS cache and
+// wedge flag, so the two targets (local debug push + airframes.io) fail
+// independently — a dead Mac listener must not stall the airframes feed and
+// vice-versa. resolved_at_us: timestamp of the last SUCCESSFUL getaddrinfo
+// (0 = never); getaddrinfo blocks for seconds against an unreachable
+// resolver, so we re-resolve only when the cache is absent/stale (>30 s) or
+// the target changed — never per-message. sock_bad: set when sendto fails
+// (the lwip UDP fd can wedge after netif churn); the next send recreates it.
+typedef struct {
+    int                sock;
+    struct sockaddr_in dst;
+    char               host_resolved[64];
+    uint16_t           port_resolved;
+    int64_t            resolved_at_us;
+    bool               sock_bad;
+} push_target_t;
 
-static bool resolve_target(const char *host, uint16_t port)
+static push_target_t s_dbg = {.sock = -1}; // GET-/messages-style debug JSON
+static push_target_t s_af  = {.sock = -1}; // airframes.io wire JSON
+
+static bool resolve_target(push_target_t *t, const char *host, uint16_t port)
 {
-    if (s_sock < 0) {
-        s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (s_sock < 0) {
+    if (t->sock < 0) {
+        t->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (t->sock < 0) {
             ESP_LOGE(TAG, "socket() failed errno=%d", errno);
             return false;
         }
@@ -75,18 +85,114 @@ static bool resolve_target(const char *host, uint16_t port)
         ESP_LOGW(TAG, "DNS lookup '%s' failed (will retry on next push)", host);
         return false;
     }
-    s_dst          = *(struct sockaddr_in *)res->ai_addr;
-    s_dst.sin_port = htons(port);
+    t->dst          = *(struct sockaddr_in *)res->ai_addr;
+    t->dst.sin_port = htons(port);
     freeaddrinfo(res);
 
-    strlcpy(s_host_resolved, host, sizeof(s_host_resolved));
-    s_port_resolved  = port;
-    s_resolved_at_us = esp_timer_get_time(); // cache fresh for DNS_REFRESH_US
+    strlcpy(t->host_resolved, host, sizeof(t->host_resolved));
+    t->port_resolved  = port;
+    t->resolved_at_us = esp_timer_get_time(); // cache fresh for DNS_REFRESH_US
     char ipstr[16];
-    inet_ntoa_r(s_dst.sin_addr, ipstr, sizeof(ipstr));
+    inet_ntoa_r(t->dst.sin_addr, ipstr, sizeof(ipstr));
     ESP_LOGI(TAG, "target resolved: %s:%u → %s:%u",
              host, (unsigned)port, ipstr, (unsigned)port);
     return true;
+}
+
+// Send one already-formatted datagram to a target, mirroring the original
+// inline logic: recreate a wedged socket, re-resolve DNS only when stale/
+// changed, ensure a socket exists, sendto, mark bad on failure. Drops the
+// message (no retry/queue) on any unrecoverable step — a slow/backed-up WAN
+// must never back-pressure the decoder.
+static void deliver(push_target_t *t, const char *host, uint16_t port,
+                    const char *pkt, size_t len)
+{
+    if (t->sock_bad) {
+        if (t->sock >= 0) close(t->sock);
+        t->sock     = -1;
+        t->sock_bad = false;
+    }
+
+    int64_t now            = esp_timer_get_time();
+    bool    target_changed = (t->port_resolved != port ||
+                           strncmp(t->host_resolved, host,
+                                      sizeof(t->host_resolved)) != 0);
+    if (target_changed || t->resolved_at_us == 0 ||
+        (now - t->resolved_at_us) > DNS_REFRESH_US) {
+        if (!resolve_target(t, host, port)) {
+            // No cached address for THIS target → drop. Otherwise keep the
+            // stale cache and push the refresh 30 s out (avoid per-message DNS).
+            if (target_changed || t->resolved_at_us == 0) return;
+            t->resolved_at_us = now;
+        }
+    }
+
+    if (t->sock < 0) {
+        t->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (t->sock < 0) {
+            ESP_LOGW(TAG, "socket() failed errno=%d — dropping message", errno);
+            return;
+        }
+    }
+
+    int n = sendto(t->sock, pkt, len, 0,
+                   (struct sockaddr *)&t->dst, sizeof(t->dst));
+    if (n < 0) {
+        ESP_LOGW(TAG, "sendto failed errno=%d (socket recreated on next msg)", errno);
+        t->sock_bad = true; // DNS cache stays valid; socket health is separate
+    }
+}
+
+// Map an AVLC 3-bit address type to the dumpvdl2 "type" string (NULL = omit).
+static const char *avlc_type_str(uint8_t t)
+{
+    switch (t) {
+    case AVLC_ADDRTYPE_AIRCRAFT: return "Aircraft";
+    case AVLC_ADDRTYPE_GS_ADM:
+    case AVLC_ADDRTYPE_GS_DEL:   return "Ground station";
+    case AVLC_ADDRTYPE_ALL:      return "All stations";
+    default:                     return NULL;
+    }
+}
+
+// Build the band-agnostic af_msg_t the formatter consumes from a decoded
+// acars_msg_t + current config. Time is stamped here (send time ≈ decode
+// time; the ring holds a message <1 s). '?' placeholders that acars_deliver
+// substitutes for absent mode/block_id are mapped back to 0 so the formatter
+// omits them rather than emitting a literal "?".
+static void build_af_msg(af_msg_t *af, const acars_msg_t *m,
+                         const app_config_t *cfg)
+{
+    memset(af, 0, sizeof(*af));
+    af->band       = (cfg->band == BAND_VDL2) ? AF_BAND_VDL2 : AF_BAND_IRIDIUM;
+    int64_t epoch  = net_time_epoch_us();
+    af->epoch_us   = epoch;
+    af->time_valid = (epoch != 0);
+    af->uplink     = m->uplink;
+    af->crc_ok     = m->crc_ok;
+    af->err        = false; // only crc_ok messages are fed
+    af->more       = m->more;
+    af->mode       = (m->mode == '?') ? 0 : m->mode;
+    af->label[0]   = m->label[0];
+    af->label[1]   = m->label[1];
+    af->block_id   = (m->block_id == '?') ? 0 : m->block_id;
+    memcpy(af->msg_num, m->msg_num, sizeof(af->msg_num));
+    af->msg_num_seq = m->msg_num_seq;
+    memcpy(af->flight_id, m->flight_id, sizeof(af->flight_id));
+    memcpy(af->reg, m->reg, sizeof(af->reg));
+    af->ack             = m->ack;
+    af->txt             = m->txt;
+    af->freq_hz         = 0;     // TODO: absolute channel freq from peak_bin + LO
+    af->sig_level_valid = false; // our snr_db (positive SNR) != dumpvdl2 sig_level (dBFS)
+    if (m->has_avlc) {
+        snprintf(af->src_addr, sizeof(af->src_addr), "%06lX",
+                 (unsigned long)(m->avlc_src_addr & 0xFFFFFF));
+        snprintf(af->dst_addr, sizeof(af->dst_addr), "%06lX",
+                 (unsigned long)(m->avlc_dst_addr & 0xFFFFFF));
+        af->src_type = avlc_type_str(m->avlc_src_type);
+        af->dst_type = avlc_type_str(m->avlc_dst_type);
+    }
+    af->station_id = (cfg->af_id[0]) ? cfg->af_id : NULL;
 }
 
 // Tiny JSON string escape — intentionally duplicated from http_server.c /
@@ -200,8 +306,6 @@ static void push_task(void *arg)
 {
     (void)arg;
 
-    // Wait for the queue to fill at least once before bothering to set
-    // anything up — saves work if push is enabled but never used.
     acars_msg_t m;
     static EXT_RAM_BSS_ATTR char pkt[2048]; // 2 KB max per UDP datagram; JSON usually ~400 B
 
@@ -212,58 +316,29 @@ static void push_task(void *arg)
         // effect without reboot. Cheap (one mutex + struct copy).
         app_config_t cfg;
         app_config_snapshot(&cfg);
-        if (cfg.out_host[0] == '\0' || cfg.out_port == 0) continue;
 
-        // A previous sendto failed — recreate the socket before this
-        // send (resolve_target / the block below makes a fresh one).
-        if (s_sock_bad) {
-            if (s_sock >= 0) close(s_sock);
-            s_sock     = -1;
-            s_sock_bad = false;
+        // Target 1: local debug push (/messages-style JSON), unchanged.
+        if (cfg.out_host[0] != '\0' && cfg.out_port != 0) {
+            size_t len = format_msg(pkt, sizeof(pkt), &m);
+            if (len) deliver(&s_dbg, cfg.out_host, cfg.out_port, pkt, len);
         }
 
-        // Re-resolve only when needed: target changed, never resolved,
-        // or the cached result is older than DNS_REFRESH_US. getaddrinfo
-        // can block for seconds against an unreachable resolver, so a
-        // per-message retry would stall the queue and hammer DNS when
-        // the network flaps; 30 s is fresh enough to track a DNS change.
-        int64_t now            = esp_timer_get_time();
-        bool    target_changed = (s_port_resolved != cfg.out_port ||
-                               strncmp(s_host_resolved, cfg.out_host,
-                                          sizeof(s_host_resolved)) != 0);
-        if (target_changed || s_resolved_at_us == 0 ||
-            (now - s_resolved_at_us) > DNS_REFRESH_US) {
-            if (!resolve_target(cfg.out_host, cfg.out_port)) {
-                // No cached address for THIS target → drop the message.
-                // Otherwise keep using the stale cache and push the
-                // refresh 30 s out so we don't retry DNS per message.
-                if (target_changed || s_resolved_at_us == 0) continue;
-                s_resolved_at_us = now;
+        // Target 2: airframes.io. Only trusted (crc_ok) decodes are fed —
+        // PARTIAL rows never reach acars_push_emit(), and this is a further
+        // belt-and-braces gate. af_on defaults OFF (operator enables once
+        // decode volume justifies a feeder).
+        if (cfg.af_on && cfg.af_host[0] != '\0' && cfg.af_port != 0 &&
+            m.crc_ok) {
+            af_msg_t af;
+            build_af_msg(&af, &m, &cfg);
+            // Leave room for the trailing '\n' airframes expects (newline-
+            // delimited JSON, one datagram per message).
+            size_t l = airframes_format(pkt, sizeof(pkt) - 1, &af);
+            if (l) {
+                pkt[l]     = '\n';
+                pkt[l + 1] = '\0';
+                deliver(&s_af, cfg.af_host, cfg.af_port, pkt, l + 1);
             }
-        }
-
-        // Make sure we have a socket even when no resolve ran this
-        // message (e.g. recreated after a sendto failure above).
-        if (s_sock < 0) {
-            s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            if (s_sock < 0) {
-                ESP_LOGW(TAG, "socket() failed errno=%d — dropping message", errno);
-                continue;
-            }
-        }
-
-        size_t len = format_msg(pkt, sizeof(pkt), &m);
-        if (len == 0) continue;
-
-        int n = sendto(s_sock, pkt, len, 0,
-                       (struct sockaddr *)&s_dst, sizeof(s_dst));
-        if (n < 0) {
-            ESP_LOGW(TAG, "sendto failed errno=%d (socket recreated on next msg)", errno);
-            // Mark the fd bad — it gets closed + recreated before the
-            // next send. The DNS cache stays valid (its 30 s TTL covers
-            // address changes); resolution and socket health are
-            // independent failure modes.
-            s_sock_bad = true;
         }
     }
 }

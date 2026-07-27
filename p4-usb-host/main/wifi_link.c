@@ -10,6 +10,7 @@
 #include "esp_mac.h"
 #include "nvs_flash.h"
 #include "esp_system.h"     // esp_restart() — link-loss watchdog (#104)
+#include "net_time.h"       // net_time_start() — SNTP on first got-IP
 #include "esp_timer.h"      // non-blocking reconnect timer (#T13)
 #include "ping/ping_sock.h" // gateway-ping reachability watchdog
 #include "lwip/ip_addr.h"
@@ -139,6 +140,9 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         // connect, not a mid-session IP renewal) so /status can show uptime
         // of the link independent of device uptime.
         if (s_connected_since_us == 0) s_connected_since_us = esp_timer_get_time();
+        // Kick SNTP once we have an IP (idempotent) — the airframes.io feed
+        // needs a real wall clock. Safe from the event-loop context.
+        net_time_start();
     }
 }
 

@@ -276,6 +276,10 @@ esp_err_t app_config_init(void)
     s_cfg.out_port                                  = 0;
     s_cfg.iot_log_host[0]                           = '\0';
     s_cfg.ota_url[0]                                = '\0';
+    s_cfg.af_on                                     = false;
+    s_cfg.af_host[0]                                = '\0';
+    s_cfg.af_port                                   = 0;
+    s_cfg.af_id[0]                                  = '\0';
 
     esp_err_t r = nvs_flash_init();
     if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -370,6 +374,23 @@ esp_err_t app_config_init(void)
     s_cfg.out_port = out_port;
     nvs_get_str_or(h, "iot_log_host", s_cfg.iot_log_host, APP_CONFIG_IOT_LOG_HOST_LEN, "");
     nvs_get_str_or(h, "ota_url", s_cfg.ota_url, APP_CONFIG_OTA_URL_LEN, "");
+    // airframes.io feed config (global). af_port is a blob like out_port.
+    nvs_get_str_or(h, "af_host", s_cfg.af_host, APP_CONFIG_AF_HOST_LEN, "");
+    nvs_get_str_or(h, "af_id", s_cfg.af_id, APP_CONFIG_AF_ID_LEN, "");
+    {
+        uint8_t af_on = 0;
+        nvs_get_u8_or(h, "af_on", &af_on, 0);
+        s_cfg.af_on = (af_on != 0);
+    }
+    {
+        uint16_t af_port = 0;
+        size_t   sz      = sizeof(af_port);
+        if (nvs_get_blob(h, "af_port", &af_port, &sz) != ESP_OK ||
+            sz != sizeof(af_port)) {
+            af_port = 0;
+        }
+        s_cfg.af_port = af_port;
+    }
     // gm is whatever byte was stored in NVS — validate against the
     // known enum range before the cast; a stale/corrupt/foreign value
     // must not become an out-of-range gain_mode_t.
@@ -690,6 +711,42 @@ esp_err_t app_config_set_out_port(uint16_t port)
 esp_err_t app_config_set_iot_log_host(const char *host)
 {
     return set_str_field(s_cfg.iot_log_host, APP_CONFIG_IOT_LOG_HOST_LEN, "iot_log_host", host);
+}
+esp_err_t app_config_set_af_on(bool on)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.af_on = on;
+    xSemaphoreGive(s_cfg_mu);
+    nvs_handle_t h;
+    esp_err_t    r = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (r != ESP_OK) return r;
+    r = nvs_set_u8(h, "af_on", on ? 1 : 0);
+    if (r == ESP_OK) r = nvs_commit(h);
+    nvs_close(h);
+    return r;
+}
+esp_err_t app_config_set_af_host(const char *host)
+{
+    return set_str_field(s_cfg.af_host, APP_CONFIG_AF_HOST_LEN, "af_host", host);
+}
+esp_err_t app_config_set_af_port(uint16_t port)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    s_cfg.af_port = port;
+    xSemaphoreGive(s_cfg_mu);
+    nvs_handle_t h;
+    esp_err_t    r = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (r != ESP_OK) return r;
+    r = nvs_set_blob(h, "af_port", &port, sizeof(port));
+    if (r == ESP_OK) r = nvs_commit(h);
+    nvs_close(h);
+    return r;
+}
+esp_err_t app_config_set_af_id(const char *id)
+{
+    return set_str_field(s_cfg.af_id, APP_CONFIG_AF_ID_LEN, "af_id", id);
 }
 esp_err_t app_config_set_ota_url(const char *url)
 {

@@ -11,6 +11,8 @@ set(_app_srcs
     "band_health.c" "panic_capture.c" "decode_survey.c"
     # VHF/VDL2 foundation: NVS band id -> concrete band_pipeline_t.
     "band_select.c"
+    # SNTP wall-clock (airframes.io feed needs epoch timestamps).
+    "net_time.c"
 )
 set(_app_reqs
     usb esp_timer esp_ringbuf esp-dsp esp_driver_dma esp_mm nvs_flash
@@ -20,6 +22,8 @@ set(_app_reqs
     # references both concrete bands) + the L2 codecs (frame_decoder.c's
     # band=vdl2 branch consumes avlc.h/vdl2_l2.h directly — V3).
     band_pipeline vdl2_decoder vdl2
+    # airframes.io ACARS-JSON formatter (pure C, host-tested).
+    acars_feed
     # SDMMC + FATFS always declared so idf_component_register sees them
     # on first-pass CMake evaluation (CONFIG_* isn't readable until pass
     # two, but PRIV_REQUIRES is consumed on pass one). The runtime cost

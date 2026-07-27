@@ -413,9 +413,12 @@ static void strip_acars_prefix(const uint8_t **p, int *n)
 //   LA_REASM_DUPLICATE     → already-seen fragment, drop
 //   LA_REASM_FRAG_OUT_OF_SEQUENCE → unrecoverable, drop
 // Single-task only (the decoder task owns s_reasm_ctx / msg_ring emit).
+// avlc: VDL2 AVLC frame carrying this ACARS (for the airframes.io exporter's
+// src/dst address fields); NULL on the Iridium path (no AVLC layer).
 static void acars_deliver(const uint8_t *buf, int len, la_msg_dir dir,
                           uint64_t timestamp_us,
-                          int32_t peak_bin, float snr_db)
+                          int32_t peak_bin, float snr_db,
+                          const avlc_frame_t *avlc)
 {
     if (!buf || len <= 0) return;
     bool           uplink  = (dir == LA_MSG_DIR_GND2AIR);
@@ -464,6 +467,20 @@ static void acars_deliver(const uint8_t *buf, int len, la_msg_dir dir,
             out.crc_ok   = a->crc_ok;
             out.peak_bin = peak_bin;
             out.snr_db   = snr_db;
+            // airframes.io exporter fields (unused by /messages/SD). reg is
+            // kept VERBATIM (dot-prefixed) — dumpvdl2 emits it so; the Iridium
+            // formatter strips the dots itself.
+            strlcpy(out.reg, a->reg, sizeof(out.reg));
+            out.ack         = a->ack;
+            out.msg_num_seq = a->msg_num_seq;
+            out.more        = !a->final_block;
+            if (avlc) {
+                out.has_avlc      = true;
+                out.avlc_src_addr = avlc->src_addr;
+                out.avlc_dst_addr = avlc->dst_addr;
+                out.avlc_src_type = avlc->src_type;
+                out.avlc_dst_type = avlc->dst_type;
+            }
             if (a->txt) {
                 strlcpy(out.txt, a->txt, sizeof(out.txt));
             }
@@ -496,7 +513,7 @@ static void try_acars(const sbd_message_t *msg,
     if (acars_len < 8) return;
     la_msg_dir dir = msg->uplink ? LA_MSG_DIR_GND2AIR : LA_MSG_DIR_AIR2GND;
     acars_deliver(acars_buf, acars_len, dir, msg->timestamp_us,
-                  peak_bin, snr_db);
+                  peak_bin, snr_db, /*avlc=*/NULL);
 }
 
 static void process_one(const frame_queue_item_t *it)
@@ -781,7 +798,7 @@ static void vdl2_avlc_cb(const avlc_frame_t *f, void *ctx)
                                  ? LA_MSG_DIR_AIR2GND
                                  : LA_MSG_DIR_GND2AIR;
             acars_deliver(f->acars, f->acars_len, dir, it->timestamp_us,
-                          it->peak_bin, it->snr_db);
+                          it->peak_bin, it->snr_db, /*avlc=*/f);
         }
         break;
     case AVLC_KIND_X25:
