@@ -1,0 +1,16 @@
+{
+  "name": "acars-enrich",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Host-side sidecar: decode the text payload of ACARS captured by the P4 SDR using @airframes/acars-decoder. Not part of the firmware build or host-test CI.",
+  "bin": {
+    "acars-enrich": "./enrich.js"
+  },
+  "scripts": {
+    "enrich": "node enrich.js"
+  },
+  "dependencies": {
+    "@airframes/acars-decoder": "^1.9.0"
+  }
+}
