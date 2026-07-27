@@ -40,6 +40,7 @@
 #include "net_time.h"      // net_time_epoch_us() — wall clock for the feed
 #include "band_profile.h"  // BAND_VDL2 (band id from app_config)
 #include "avlc.h"          // AVLC_ADDRTYPE_* (VDL2 address-type strings)
+#include "dsp_processor.h" // FFT_SIZE — peak_bin -> absolute-freq math
 
 static const char *TAG = "PUSH";
 
@@ -182,8 +183,29 @@ static void build_af_msg(af_msg_t *af, const acars_msg_t *m,
     memcpy(af->reg, m->reg, sizeof(af->reg));
     af->ack             = m->ack;
     af->txt             = m->txt;
-    af->freq_hz         = 0;     // TODO: absolute channel freq from peak_bin + LO
-    af->sig_level_valid = false; // our snr_db (positive SNR) != dumpvdl2 sig_level (dBFS)
+    // Absolute channel frequency from the tagger's packed center bin + the
+    // parked LO, using the same convention as dsp_processor.c:166
+    // (signed_bin = center_bin - FFT_SIZE/2; rel = signed_bin*fs/FFT_SIZE)
+    // and decode_survey's abs = lo + rel. Assumes a parked LO (this
+    // deployment does not live-steer; lo_now would matter otherwise). Only
+    // the VDL2 schema emits freq — the Iridium schema has no freq field —
+    // but the math is band-agnostic. 0 => omitted by the formatter.
+    {
+        int32_t center_bin = (int32_t)(m->peak_bin & 0xFFFF);
+        int32_t signed_bin = center_bin - (int32_t)(FFT_SIZE / 2);
+        int64_t rel_hz     = (int64_t)signed_bin *
+                             (int64_t)cfg->sample_rate_hz / (int64_t)FFT_SIZE;
+        int64_t abs_hz     = (int64_t)cfg->lo_freq_hz + rel_hz;
+        af->freq_hz        = (abs_hz > 0) ? (uint32_t)abs_hz : 0;
+    }
+    // sig_level intentionally OMITTED (not a TODO): dumpvdl2's sig_level is
+    // dBFS — signal power vs full scale, negative — but our only per-burst
+    // level metric is snr_db (SNR above the tagger baseline, positive), a
+    // different quantity in a different sign convention. The tagger works in
+    // a normalised FFT domain, so no absolute dBFS is available. Emitting SNR
+    // here would push a positive value into a field airframes treats as dBFS
+    // and skew its signal-strength stats — so we omit it rather than mislabel.
+    af->sig_level_valid = false;
     if (m->has_avlc) {
         snprintf(af->src_addr, sizeof(af->src_addr), "%06lX",
                  (unsigned long)(m->avlc_src_addr & 0xFFFFFF));
