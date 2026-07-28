@@ -5,6 +5,16 @@ Option B-3): N worker P4s each run the full single-instance front end
 and ship ~280 B decoded-frame PDUs over SPI to one aggregator P4 that
 runs the classifier + libacars + dedupe + outputs.
 
+> **Scope note (2026-07-28):** the design doc has been generalized to a
+> multi-unit, multi-band architecture (its Part I): one main + N
+> physically-separate child boards, heterogeneous across bands
+> (Iridium LO parks / VDL2 / POA / Inmarsat), federated over the
+> NETWORK by default, with a band-tagged v2 PDU. This plan remains the
+> implementation record for the co-located SPI instance (design doc
+> Part II) and for the role/PDU/ingest infrastructure phases 1/2/4/5,
+> which Part I reuses. New work items (PDU v2, UDP transport, per-band
+> aggregator dispatch) are scoped in the design doc §I.9, not here.
+
 **Scope decision (2026-06-16):** worker/aggregator SPI split, built now,
 validated on a single board (software loopback + optional GPSPI2↔GPSPI3
 jumper loopback); the second board gets wired later.
