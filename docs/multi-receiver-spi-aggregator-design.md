@@ -68,27 +68,38 @@ struct (`acars_push.c`), and per-band `/status` decode funnels.
                       │ → dedupe → msg_ring / sd_log / http /status+/messages rollup │
                       │ → ONE upstream feed (airframes.io via acars_push)            │
                       └──────▲──────────▲──────────▲──────────▲──────────▲───────────┘
-                        IP   │          │          │          │          │  IP (Ethernet or WiFi)
-              ┌──────────────┴─┐ ┌──────┴───────┐ ┌┴─────────┐ ┌────────┴─┐ ┌──────────────┐
+                fleet link   │          │          │          │          │  (§I.3: SPI frame_link star for
+                    (§I.3)   │          │          │          │          │  WiFi-less Pico children;
+              ┌──────────────┴─┐ ┌──────┴───────┐ ┌┴─────────┐ ┌────────┴─┐ ┌────────┴─────┐
               │ child: iridium │ │ child:iridium│ │child:vdl2│ │child:poa │ │child:inmarsat│
               │ lo=1618.75 MHz │ │ lo=1621.25   │ │136.8125  │ │131.550   │ │~1545 (future)│
               └────────────────┘ └──────────────┘ └──────────┘ └──────────┘ └──────────────┘
-              each child = P4-NANO + RTL-SDR + its own antenna, running the SAME firmware,
-              pinned to one band/LO by NVS
+              each child = a P4 board (Pico P4 confirmed for the real fleet, §I.2a) + RTL-SDR
+              + its own antenna, running the SAME firmware, pinned to one band/LO by NVS
 ```
 
-- **Child**: a complete standalone unit (P4-NANO + RTL-SDR v4 + the
+- **Child**: a complete standalone unit (P4 board + RTL-SDR v4 + the
   band's antenna) running today's firmware with `band` + `lo_hz` set. It
   runs its band's FULL pipeline — ingest → tagger → band_pipeline demod
-  → (band L2 or not, see §I.4) — and ships results to the main over IP.
-  It keeps its own httpd for debug/commissioning, but does NOT feed
-  airframes and does not need SD.
+  → (band L2 or not, see §I.4) — and ships results to the main over the
+  fleet link (§I.3). A WiFi-equipped child keeps its own httpd for
+  debug/commissioning; a WiFi-less Pico child (§I.2a) has no network at
+  all, so commissioning falls back to the serial_cmd NVS interface and
+  deep debug to UART. Children do NOT feed airframes and do not need SD.
 - **Main**: owns aggregation, cross-child dedupe, the unified
   `/status`+`/messages` view, SD archive, and the SINGLE upstream
   airframes.io feed (one station identity for the whole cluster). The
   main can be a P4-NANO with no SDR at all — per Part II the
   aggregation work is ms-scale per frame — or a "combined" unit that
   also receives (the COMBINED role generalizes to this).
+  **Confirmed fleet (2026-07-28):** the main is a **P4-NANO** and the
+  children are **Pico P4** boards. This asymmetry is deliberate and
+  load-bearing — only the NANO has the outward-facing radios (onboard
+  ESP32-C6 WiFi + Ethernet) and SD, so it is the natural aggregator, the
+  single airframes.io upstream feeder, and the **OTA origin** that pulls
+  child images from the network and pushes them over SPI (§I.11). The
+  WiFi-less Pico children need no outside link — only the SPI bus to the
+  NANO and USB-host power for their own dongle (§I.2a).
 - **Configuration of a child** uses only existing mechanisms: serial
   `set band vdl2` / `set lo 136812500` (serial_cmd NVS interface), or
   `POST /config`, or pre-provisioned NVS. The per-band NVS namespacing
@@ -113,42 +124,95 @@ boards and not a soft-switch on one board. Children may even be
 different P4 silicon revisions (`2026-07-28-p4-cpu-revision-variants.md`)
 — the wire contract, not the binary, is what's shared.
 
+### I.2a Child board options — the Pico P4 fit
+
+The confirmed child board for the real fleet is the **Waveshare
+ESP32-P4-Pico** (RPi-Pico form factor). Specs vs the pipeline's needs:
+
+| Requirement | Pico P4 | Verdict |
+|---|---|---|
+| CPU + PSRAM for the full band pipeline | P4 @ 360 MHz, **32 MB in-package PSRAM** — same as the NANO | pipeline fits unchanged; the PSRAM budget, ring sizes and heap-position constraints carry over verbatim |
+| Flash for OTA A/B + rollback | **32 MB NOR** | ample — the NANO's 16 MB already holds 2×6 MB `ota_0/ota_1` + otadata (`p4-usb-host/partitions.csv`); 32 MB doubles the headroom |
+| USB host for the RTL-SDR | USB-OTG 2.0 HS | electrically yes; **5 V VBUS provision must be verified — item (1) below** |
+| SPI fleet link | SPI on 2×20 GPIO headers, 27 free GPIOs, 40-pin RPi-Pico-HAT header | plenty for shared SCLK/MOSI/MISO + per-child CS + HANDSHAKE (§I.3) |
+| WiFi | **very likely NONE** — the plain "Pico" has no C6 co-processor (Waveshare's WiFi-equipped boards are branded "ESP32-P4-WIFI6") | drives the whole fleet design: §I.3 (SPI is the mandatory link) and §I.11 (OTA-over-SPI is mandatory, not optional) |
+
+**Two VERIFY-BEFORE-BUY/WIRE items:**
+
+1. **USB-host 5 V VBUS.** Each child powers its own RTL-SDR dongle
+   (~300 mA at 5 V) from its USB host port. Cautionary precedent: on
+   the P4-NANO, USB-A VBUS is hard-enabled whenever `VCC_5V` is present
+   and is **NOT GPIO-controllable** (`p4-nano-board-schematic-summary.md`
+   §3 — U2's EN pin is strapped high, FLG is LED-only). The Pico's port
+   is USB-C OTG: confirm the board actually SOURCES 5 V in host role —
+   a USB-C OTG port may need an OTG adapter plus an external VBUS
+   source (powered pigtail/hub) rather than supplying bus power itself.
+   If it doesn't source VBUS, budget a powered adapter per child.
+2. **WiFi/C6 presence.** If the Pico truly has no C6 (expected),
+   children have NO network path: OTA must ride the SPI link (§I.11.1),
+   time sync cannot use SNTP (§I.6 — the main stamps on arrival), and
+   commissioning is serial-first (§I.2). Any of §I.3's network-regime
+   options require choosing a WiFi-equipped board instead.
+
 ## I.3 Transport — two regimes, reconciled
 
-There are two legitimate transports, for two different physical
-arrangements. They carry the SAME logical payload (§I.4) and feed the
-same `aggregator_ingest`-style funnel on the main.
+There are two legitimate transports. They carry the SAME logical
+payload (§I.4) and feed the same `aggregator_ingest`-style funnel on
+the main. **The fleet's link is decided by the child boards' hardware:
+WiFi-less Pico children (§I.2a — the confirmed fleet) have no radio,
+so SPI is mandatory; WiFi/Ethernet-equipped boards make network an
+option.**
 
 | | **SPI `frame_link` (Part II)** | **Network (Ethernet/WiFi)** |
 |---|---|---|
-| Physical fit | child SoCs co-located on ONE PCB / backplane, typically sharing a wideband front end (HydraSDR Topology A/C) | physically-separate child BOARDS, each with its own SDR + antenna, anywhere on the LAN |
-| Status | draft code (`frame_link.c`), host-tested framing, **HW-pending, GPIO pins unverified** | building blocks live: `acars_push.c` UDP delivery (`push_target_t`), C6 WiFi via SDIO; P4-NANO has an unused 100M Ethernet PHY (IP101GRI, RMII — `p4-nano-board-schematic-summary.md`) |
-| Latency / rate | µs-scale, MB/s-scale | ms-scale, still 3+ orders above the ~kbps PDU rate |
-| Reach / fault domain | cm; shared power/reset domain | building-scale; each child fails independently |
-| When to use | wideband-single-SDR channelizer clusters; dense multi-P4 boards | **the default for this architecture** — heterogeneous bands never share an RF front end, so board separation is inherent |
+| Physical fit | co-located child BOARDS cabled to the main (the confirmed Pico fleet on one bench/backplane), and the on-PCB shared-front-end case (HydraSDR Topology A/C) | physically-separate WiFi/Ethernet-equipped child boards, anywhere on the LAN |
+| Status | draft code (`frame_link.c`), host-tested framing, **HW-pending, GPIO pins unverified** (Kconfig defaults SCLK/MOSI/MISO/CS/HANDSHAKE = GPIO 20/21/22/23/7 are illustrative) | building blocks live: `acars_push.c` UDP delivery (`push_target_t`), C6 WiFi via SDIO; P4-NANO has an unused 100M Ethernet PHY (IP101GRI, RMII — `p4-nano-board-schematic-summary.md`) |
+| Latency / rate | µs-scale; P4 GP-SPI up to ~80 MHz (~10 MB/s) | ms-scale, still 3+ orders above the ~kbps PDU rate |
+| Reach / fault domain | cable-length (cm–dm); typically shared power domain | building-scale; each child fails independently |
+| When to use | **the primary regime for THIS deployment** — the real fleet is WiFi-less Pico children, which have no other path | WiFi-equipped and/or physically-distributed fleets |
 
-**Recommendation: network-federated is the primary regime.** A POA
-child and an Iridium child have nothing to share but IP; Ethernet (or
-the existing C6 WiFi) is already provisioned per board; and the PDU
-rate (Part II: ≤ Kbps per child even in stress scenarios) is trivial
-for UDP on a LAN. The SPI `frame_link` remains the co-located special
-case and is NOT discarded: its wire format (`[magic][ver][flags]
-[payload][crc16]`) is transport-agnostic and should simply be carried
-inside a UDP datagram — one encoder (`frame_link_encode`/`decode`),
-two transports, and the CRC+magic+version check does double duty as
-the datagram sanity filter. UDP loss semantics match the existing
-philosophy (drop-don't-stall, `acars_push` model); a lost PDU is
-air-truth-equivalent loss and the rate is so low that even a naive
-resend-on-nack would be cheap if ever needed.
+**Recommendation: the SPI shared-bus star is the primary regime for
+the confirmed co-located Pico fleet.** Topology (confirmed): the
+existing `frame_link.c` star — aggregator is SPI **master**; a shared
+3-wire bus (SCLK/MOSI/MISO common to all children) plus a **per-child
+CS** and a **per-child HANDSHAKE/INT** line (slave asserts data-ready;
+master then clocks exactly one wire frame on that CS). Rate is a
+non-issue in either direction: P4 GP-SPI runs to ~80 MHz (~10 MB/s),
+the Kconfig default is a deliberately conservative 1 MHz for jumper
+wires, and the frame-PDU payload is sparse (Part II: ≤ kbps per child
+even under stress) — so even 10 MHz on a clean harness is ample, with
+3+ orders of headroom left for the OTA-image streaming in §I.11.1.
+Raw IQ stays off the bus, as Part II's Option B-1 analysis already
+concluded — the link carries decoded-frame PDUs (and now OTA/status
+PDUs), never samples.
+
+**Network-federated is the alternative regime** for WiFi-equipped or
+distributed fleets, demoted from primary only because the confirmed
+child board has no radio — the analysis otherwise stands: the PDU rate
+is trivial for UDP on a LAN, and the `frame_link` wire format
+(`[magic][ver][flags][payload][crc16]`) is transport-agnostic — carry
+it inside a UDP datagram and one encoder
+(`frame_link_encode`/`decode`) serves both transports, with the
+CRC+magic+version check doubling as the datagram sanity filter. UDP
+loss semantics match the existing philosophy (drop-don't-stall,
+`acars_push` model); a lost PDU is air-truth-equivalent loss and even
+a naive resend-on-nack would be cheap if ever needed.
 
 Practical notes:
-- **Firmware Ethernet support does not exist yet** (WiFi via
-  esp_hosted/C6 is the only active netif; even `uart_log` AUTO's
-  network check is WiFi-only). Children can federate over WiFi TODAY;
-  bringing up `esp_eth`+IP101GRI on the main (wired backhaul, frees
-  WiFi entirely) is a self-contained work item.
-- esp_hosted drops outbound **multicast**, so discovery/transport must
-  be unicast (§I.6) — same constraint the iot_log/mDNS work hit.
+- **SPI regime**: the per-child cost on the main is 2 GPIOs (CS +
+  HANDSHAKE) on top of the shared 3-wire bus — a 4–6-child star fits
+  comfortably in the P4's free GPIO budget (avoid C6/SDIO pins
+  6,14–19,54 and SD pins 39–45 per the Kconfig help). Wire lengths
+  should stay short and matched; bump `FRAME_LINK_CLOCK_HZ` only once
+  the harness is proven.
+- **Network regime**: firmware Ethernet support does not exist yet
+  (WiFi via esp_hosted/C6 is the only active netif; even `uart_log`
+  AUTO's network check is WiFi-only). WiFi children can federate
+  TODAY; bringing up `esp_eth`+IP101GRI on the main (wired backhaul,
+  frees WiFi entirely) is a self-contained work item.
+- esp_hosted drops outbound **multicast**, so any network
+  discovery/transport must be unicast (§I.6) — same constraint the
+  iot_log/mDNS work hit.
 
 ## I.4 The payload: what crosses the child→main boundary
 
@@ -283,7 +347,11 @@ identical to today's standalone build.
   that has not synced yet ships `epoch_us=0` and the main timestamps on
   arrival (flagged); never ship a boot-relative value as if it were
   epoch. LAN SNTP gives ~ms agreement, far tighter than the ±5 ms
-  dedupe window needs.
+  dedupe window needs. **WiFi-less Pico children (§I.2a) can never
+  SNTP** — they permanently ship `epoch_us=0` and the main stamps on
+  arrival, which over the µs-latency SPI link is actually *tighter*
+  than SNTP agreement would be; the "main stamps on arrival" fallback
+  is thus the SPI fleet's normal mode, not a degraded one.
 - **Dedupe at the main** (needed once two children's coverage
   overlaps — adjacent Iridium parks share edge channels; an aircraft
   simulcasting on VDL2 vs POA does not happen in practice, media
@@ -313,16 +381,24 @@ identical to today's standalone build.
   (esp_hosted multicast is broken anyway). The main learns its fleet
   passively from `source_id`s exactly as `aggregator_ingest.c
   note_source()` does today, with `AGG_MAX_SOURCES` sized for the fleet.
-  A periodic child **heartbeat datagram** (same wire format, a
-  status-PDU type carrying band/lo/gain/decode-funnel/uptime, ~1/10 s)
+  A periodic child **heartbeat** (same wire format, a status-PDU type
+  carrying band/lo/gain/decode-funnel/uptime **plus the firmware build
+  version — `esp_app_get_description()->version`, the git-describe
+  string — which §I.11.2 makes load-bearing for fleet OTA**, ~1/10 s)
   turns the `sources[]` `age_ms` into a real liveness verdict and gives
   the per-child `/status` rollup WITHOUT the main HTTP-polling N
-  children (avoids stacked-poller pathologies; children remain
-  individually curl-able for deep debug).
-- **OTA:** per-child, existing `ota_url` pull. One shared binary for
-  all P4 children (band is NVS, not build config) — the fleet property
-  that makes N boards operable. AGGREGATOR remains a build role until
-  proven worth folding into NVS.
+  children (avoids stacked-poller pathologies; WiFi children remain
+  individually curl-able for deep debug). On the SPI fleet the
+  heartbeat rides the same link: the child loads a status-PDU when it
+  has no frame PDU pending and ≥10 s have passed, and asserts
+  HANDSHAKE as usual.
+- **OTA:** fleet OTA gets its own section — **§I.11**. Summary: one
+  shared binary for all P4 children (band is NVS, not build config) —
+  the fleet property that makes N boards operable; WiFi-less children
+  are updated by the main OVER THE SPI LINK (§I.11.1); the main
+  orchestrates staged rollouts and version-skew detection (§I.11.2–4);
+  the main itself is a separate build role with its own binary and
+  updates via the existing network `ota_runner` path (§I.11.5).
 - **Failure domains:** main down ⇒ children keep decoding; Part II's
   open-risk #3 (spool-and-replay on the child) applies unchanged and
   is more attractive here since UDP tells the child nothing — a tiny
@@ -361,20 +437,220 @@ operational model; Phase 2 is where the real (small) contract work
 lands; Phases 3/4 are then fleet provisioning plus the specific gaps
 called out in §I.4a/§I.5, each independently testable.
 
+**Transport note for the confirmed Pico fleet (§I.2a):** WiFi-less
+children cannot run Phase 1 as written (`out_host` NDJSON needs a
+netif) — Phase 1's proof-of-model runs on WiFi-equipped bench boards
+(NANOs), while the Pico fleet enters at Phase 2 with "over UDP" read
+as "over the SPI `frame_link`" (same payload, same framing, §I.3).
+Phase 3's fleet-provisioning deliverable additionally includes the
+OTA-over-SPI receiver (§I.11.1) — it must land BEFORE the fleet
+scales, since re-flashing N cabled Picos over USB serial does not.
+
 ## I.10 What Part II got right / wrong, in hindsight
 
 Still correct and load-bearing: the split-point analysis (B-3: ship
 decoded frames, never IQ or tagged bursts); bandwidth/CPU envelopes;
 "aggregator can be any P4"; the role/Kconfig structure and
-COMBINED_LOOPBACK validation trick; open risks 2–4. Superseded by
-Part I: SPI as the *assumed* transport (now the co-located special
-case); the band-less `iridium_frame_pdu_t` (needs band tag, epoch
+COMBINED_LOOPBACK validation trick; open risks 2–4 (risk 4, worker
+OTA, is now designed out in §I.11). Superseded by Part I: SPI as the
+*only conceivable* transport (it is now the chosen PRIMARY for the
+confirmed WiFi-less Pico fleet — §I.3 — but by hardware constraint,
+not by assumption, and the network regime remains first-class for
+WiFi boards); the band-less `iridium_frame_pdu_t` (needs band tag, epoch
 time, absolute freq, variable length); `peak_bin` in the dedupe key
 (child-local — use absolute Hz); the boot-relative `timestamp_us`
 (needs `net_time` epoch); the implicit one-band-per-boot aggregator
 (§I.5); the unconditional `real_known` gate as permanent policy
-(§I.4a); "no httpd on worker" (children keep httpd — it is the
-commissioning/debug surface and costs nothing at PDU rates).
+(§I.4a); "no httpd on worker" (WiFi children keep httpd — it is the
+commissioning/debug surface and costs nothing at PDU rates; WiFi-less
+Pico children have no netif to host it on, §I.2a).
+
+## I.11 Fleet OTA — updating N children without bricking the fleet
+
+The single-board OTA infrastructure is the foundation and is reused
+wherever possible:
+
+- **`ota_runner.c`** — one-shot pull OTA via `esp_https_ota` with
+  `partial_http_download` (32 KB Range chunks, the discipline that
+  made OTA survive the throttly C6 SDIO link), abort flag, status API,
+  and the internal-SRAM-stack + quiesce-the-DSP
+  (`class_driver_set_maintenance`) discipline around flash writes.
+- **Partition table** (`p4-usb-host/partitions.csv`) — `ota_0`/`ota_1`
+  6 MB app slots + `otadata`; the Pico's 32 MB flash fits this with
+  room to spare (§I.2a).
+- **`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`** + `ota_runner_mark_valid()`
+  called from `app_main` once boot is known-healthy — a bad image
+  reverts autonomously at the bootloader with zero orchestration.
+- **`esp_app_get_description()->version`** — the per-image identity
+  string (git describe), already surfaced on `/status`.
+
+What the fleet adds is **distribution** (getting an image to a child
+that has no network) and **orchestration** (never letting one bad
+image take down all coverage at once).
+
+### I.11.1 OTA-over-SPI — the load-bearing new capability
+
+WiFi-less Pico children can only be updated through the main. The
+**main is the OTA origin**: it fetches the child image over its own
+network path (its `ota_url` server — same server, a `child.bin`
+artifact next to the main's) or reads it from SD, then streams it to
+ONE target child over the existing SPI `frame_link`.
+
+**Wire protocol.** The `frame_link` framing
+(`[magic][ver][flags][payload][crc16]`, `frame_link.c`) gains a
+PDU-type discriminator in the currently-spare `flags` byte:
+`FRAME` (today's decoded-frame PDU), `STATUS` (the §I.7 heartbeat),
+and three OTA types:
+
+- `OTA_BEGIN` — main→child: `{image_len, image_sha256[32],
+  target_version[32]}`. Child quiesces the DSP
+  (`class_driver_set_maintenance(true)`-equivalent), calls
+  `esp_ota_begin()` on the **inactive** `ota_N` partition (which
+  erases it), and acks.
+- `OTA_CHUNK` — main→child: `{offset, len, data[≤4 KB]}` →
+  `esp_ota_write()`. The explicit offset makes chunks idempotent and
+  retransmit trivially safe.
+- `OTA_END` — main→child: child runs `esp_ota_end()` (IDF-side image
+  validation), verifies the staged partition's SHA-256 against
+  `OTA_BEGIN`'s hash, then `esp_ota_set_boot_partition()` + reboot.
+- Child→main, every transaction: an `OTA_ACK` payload on MISO carrying
+  `{state, next_expected_offset, last_error}` — SPI is full-duplex, so
+  each master transaction clocks a chunk OUT on MOSI and the child's
+  ack IN on MISO in the same clocking; no extra transactions needed.
+
+**Flow control reuses the HANDSHAKE line**, exactly inverted from the
+frame path: during an OTA the child asserts HANDSHAKE when it is ready
+for the *next* chunk (i.e. the previous `esp_ota_write` completed),
+and the master waits on it before clocking. Stop-and-wait with a
+window of 1 is sufficient: a 6 MB image is ~1500 × 4 KB chunks, and
+with NOR-flash write time dominating (~10–20 ms/chunk) a full child
+update takes ~15–30 s — the same order as today's network OTA. No
+streaming cleverness is warranted at this size.
+
+**Child side is the genuinely NEW firmware**: an SPI-slave OTA
+receiver folded into the existing `frame_link_slave` task (same bus,
+same CS — the type byte routes). Its shape mirrors `ota_task`:
+begin/write/end against the inactive slot, and it MUST inherit both of
+`ota_runner.c`'s hard-won rules — **internal-SRAM stack** (flash
+writes disable the PSRAM cache; a PSRAM-stacked task aborts, per the
+psram-stack-no-flash-write rule) and **DSP quiesced for the duration**
+(flash-write windows stall the cores; don't fight the pipeline for
+them). After reboot the stock machinery takes over: the new image
+boots `PENDING_VERIFY`; `app_main` reaching known-healthy calls
+`ota_runner_mark_valid()`; if it never does, the bootloader reverts
+to the previous slot.
+
+**Wedge/abort/brick analysis.** The running image is never written —
+only the inactive slot — so a child **cannot brick** short of flash
+hardware failure; the worst mid-OTA outcome is a wasted slot erase.
+Concretely:
+- *Child stops responding mid-stream* (HANDSHAKE never re-asserts):
+  the main times out (~2 s/chunk), records the attempt failed, and
+  may retry from scratch — `OTA_BEGIN` always restarts at offset 0
+  into a re-erased slot, so there is no resume state to corrupt. No
+  resume-from-offset in v1; a 6 MB restart costs tens of seconds.
+- *Main stops mid-stream*: the child's own inactivity timeout (~10 s
+  without a chunk) fires `esp_ota_abort()`, releases maintenance
+  mode, and resumes decoding on the old image. An OTA in progress
+  never leaves a child dead — at worst it briefly paused decoding.
+- *Bad image that flashes fine but doesn't run*: rollback reverts it
+  (see §I.11.4); the main observes the reverted version in the
+  heartbeat.
+- *Bus sharing*: other children's frame PDUs share the SPI bus during
+  an OTA. Non-issue at these rates (≤ kbps of PDUs vs ~10 MB/s of
+  bus), but the master's link task should interleave — service any
+  asserted HANDSHAKE between OTA chunks, never hog the bus for the
+  whole image.
+
+**Image staging at the main**: prefer SD (sha256 the complete file
+BEFORE touching any child; retries don't re-download; enables
+sneakernet when the main's own uplink is down). Streaming
+network→SPI without staging is possible (same 32 KB Range discipline
+as `ota_runner`) but couples every child's update to the WAN staying
+up for 30 s; staging decouples it. PSRAM staging (~4 MB free per the
+budget) is NOT enough for a 6 MB dev image — use SD.
+
+### I.11.2 Version-skew detection
+
+The §I.7 heartbeat status-PDU carries `fw_version[32]` =
+`esp_app_get_description()->version`. The main's `/status` rollup
+therefore shows, per child: band, LO, liveness age, decode funnel,
+**and firmware version** — and computes a fleet verdict: `uniform`
+(all children on the expected version) or `skewed` (any mismatch),
+listing the outliers. A half-updated fleet — the normal state
+mid-rollout and the pathological state after an aborted one — is
+always VISIBLE, never silent. The main also knows its own expected
+child version (the staged image's `esp_app_desc_t.version`, readable
+from the staged file before any push), so "skew" is judged against
+intent, not just mutual agreement.
+
+### I.11.3 Staged rollout
+
+The main updates children **one at a time** (waves are a later luxury
+at N ≤ 5). Per child:
+
+1. Push the image (§I.11.1 for SPI children; §I.11.6 trigger for WiFi
+   children); child reboots.
+2. Wait for a **healthy post-update heartbeat**: (a) `fw_version`
+   equals the staged image's version, AND (b) the child is actually
+   working — heartbeat flowing and decode funnel alive (tagger/burst
+   counters advancing; frame PDUs when the band has traffic). Deadline
+   ≈ boot time + rollback window + margin (~120 s).
+3. Success → next child. **Failure → ABORT the whole rollout**: stop
+   pushing, leave remaining children on the old image, flag loudly in
+   `/status` (`rollout: aborted at child <id>`).
+
+Failure at step 2 includes: no heartbeat by deadline (child wedged —
+it will self-recover via rollback or watchdog), version unchanged
+(push never took), or version REVERTED (bootloader rolled back a
+booting-but-unhealthy image). The invariant this buys: **a bad image
+costs at most one child's coverage, temporarily** — the rest of the
+fleet keeps decoding on the old image, and the one victim self-heals
+by rollback.
+
+### I.11.4 Rollback coordination
+
+Per-node rollback is **autonomous** — the bootloader reverts a
+never-marked-valid image with no help from the main; that is the
+whole point of `BOOTLOADER_APP_ROLLBACK_ENABLE` and why a child can't
+brick. The main's role is *detection and policy*, via the heartbeat
+version:
+
+- **Version regressed** vs what the main last pushed → the child
+  rolled back. Default policy: **park the rollout** and surface it —
+  a rollback is evidence the new image is bad, and re-pushing the
+  SAME image is a revert loop, never do it automatically.
+- **Child on an older version than the fleet** (e.g. a replaced/spare
+  board joining, or a rollback to something ancient) → the main MAY
+  re-push the **last-known-good** image (the newest version that has
+  passed step 2 on some child) to converge the fleet. This is safe
+  precisely because last-known-good is defined by observed healthy
+  heartbeats, not by what was most recently staged.
+
+### I.11.5 The main's own binary
+
+"One shared binary" is a **children-only** property (a child's
+personality is NVS `band`+`lo`, not build config). The MAIN is the
+AGGREGATOR build role — a **separate binary** (per-band L2s hosted
+concurrently, ingest funnel, no local DSP unless COMBINED). It updates
+itself via the existing network `ota_runner` path unchanged (it has
+WiFi/Ethernet by definition — it is the fleet's uplink). Ordering rule
+for contract changes: **update the main first** — the main must
+accept both PDU `ver` values across a rollout window (children mid-
+rollout speak the old one), so new-main + old-children must always be
+a working combination; the reverse need not be.
+
+### I.11.6 Network-OTA path for WiFi children — unchanged transport, same orchestration
+
+WiFi-equipped children keep the existing per-node `ota_url` pull
+(`POST /ota` → `ota_runner_start()`), i.e. the image travels
+server→child directly and the main never proxies bytes. Everything
+else in §I.11.2–4 applies identically: the main triggers the update
+(HTTP POST to the child), waits on the same heartbeat
+version-plus-health verdict, sequences one child at a time, aborts the
+rollout on first failure, and watches for rollback regressions. The
+orchestration layer is transport-blind by construction — only
+§I.11.1's chunk streaming is SPI-specific.
 
 ---
 
@@ -632,7 +908,8 @@ voice) this would need to change but is not in scope here.
 4. **OTA update**: each worker needs its own OTA. Currently the
    single-P4 firmware doesn't differentiate worker/aggregator builds.
    That's a build-system addition (two Kconfig profiles) before any
-   field deployment.
+   field deployment. *(2026-07-28: designed out — see §I.11, including
+   OTA-over-SPI for WiFi-less workers.)*
 
 ## Next steps if this proceeds
 
