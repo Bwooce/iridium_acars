@@ -117,12 +117,40 @@ struct (`acars_push.c`), and per-band `/status` decode funnels.
 
 **Homogeneous fleet (the "wider Iridium" goal):** Iridium spans
 1616.0–1626.5 MHz ≈ 10.5 MHz; one RTL child hears LO ±1.25 MHz
-(2.5 MSPS Path A). A fixed park at 1620.6 MHz covers ~58.6% of observed
-traffic (freq-coverage analysis; park-don't-steer). Four children
+(2.5 MSPS Path A). A single fixed park at ~1620.6 MHz has measured
+**~54–59% of ACARS-bearing (IDA) traffic** on different days
+(`reference_freq_coverage_analysis`; park-don't-steer). **Four** children
 parked at ~1617.25 / 1619.75 / 1622.25 / 1624.75 MHz tile the whole
 band with no steering, dissolving the LO-steering problem entirely —
-this is the multi-receiver fix the demod-ceiling analysis called for
-(the real gap is BANDWIDTH, not demod).
+the multi-receiver fix the demod-ceiling analysis called for (the real
+gap is BANDWIDTH, not demod).
+
+**But how many children do you actually NEED?** Fewer than 4 for most of
+the value — IDA traffic is strongly front-loaded, not uniform: it spreads
+1618–1626 MHz but is **densest ~1619.5–1621**. So **start with 2** children
+over the dense core (already a big jump on the single park) and add the
+3rd/4th only if the upper tail (1623–1626) earns its box. Sizing caveat:
+the hot center is **satellite-pass-driven and mean-reverting — no stable
+optimum** (one scan swung 0.5→295 nb/s on the same center within a
+minute), which is exactly why you **spread FIXED parks** across the band
+rather than chase a moving peak; fixed tiling is the point. The coverage of
+any wider window (e.g. a 5 MHz span) is **directly computable** from a
+HydraSDR `.bits` ground-truth capture via the freq-coverage method
+(`iridium-parser` conf≥90 IDA frames, integrate the freq histogram over
+±2.5 MHz) — a bounded measure-first analysis, not a build; treat any number
+as point-in-time.
+
+**Why N boards and not one wide SDR?** The per-board wall is **detection
+CPU, not RF or the link.** A single P4 tops out at ~2.5–3 MSPS because the
+Core-0 tagger FFT exceeds its real-time budget beyond ~3 MSPS
+(`hydrasdr-wideband-spi-feasibility-2026-06-10.md` §2/§4.2). A HydraSDR can
+*capture* 5–10 MHz over USB, but one current-silicon P4 **cannot process**
+it in real time — the only way to use a wide SDR is to fan its raw IQ out
+to N worker boards that each detect a ~2.5 MHz slice, distributing the same
+detection CPU the Pico fleet already distributes. So **the fleet IS the
+channelizer**; a one-box wideband channelizer (Topology A) needs **v3.1
+silicon** (that doc §5.1), and Topology C (hybrid) is the recommended-first
+wideband path if ever pursued.
 
 **Heterogeneous fleet:** add a VDL2 child (LO 136.8125 MHz — all VDL2
 channels in one window), a POA child (131.550 MHz AM-MSK, §I.8), and
