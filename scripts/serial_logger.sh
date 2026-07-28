@@ -57,7 +57,8 @@ stat_size() {
 # Prefer the IDF env's python if IDF is sourced (it always ships pyserial).
 _py_with_pyserial() {
     local py
-    for py in "${IDF_PYTHON_ENV_PATH:-}/bin/python" python3 python; do
+    for py in "${IDF_PYTHON_ENV_PATH:-}/bin/python" python3 python \
+              "${HOME}"/.espressif/python_env/*/bin/python; do
         [ -n "$py" ] || continue
         command -v "$py" >/dev/null 2>&1 || [ -x "$py" ] || continue
         if "$py" -c "import serial.tools.list_ports" >/dev/null 2>&1; then
@@ -199,13 +200,42 @@ cmd_run() {
         fi
         # Record which port we own so flash.sh (and cmd_stop) can target cleanup precisely.
         echo "$port" > "$PORT_FILE"
-        # Reconfigure each connect — the device may have re-enumerated.
-        stty -F "$port" 115200 raw -echo -hupcl clocal 2>/dev/null || true
-        printf "[%s] CONNECT %s\n" "$(stamp)" "$port" >> "$LOG_FILE"
-        # cat blocks until EOF / disconnect / error
-        cat "$port" >> "$LOG_FILE" 2>/dev/null
-        local rc=$?
-        printf "[%s] DISCONNECT %s (cat rc=%d), reconnect in %ds\n" \
+        printf "[%s] CONNECT %s @ %s baud\n" "$(stamp)" "$port" "$BAUD" >> "$LOG_FILE"
+        if [ "$UNAME" = "Darwin" ]; then
+            # macOS: `stty -f PORT <baud>` does NOT persist across the stty->cat
+            # fd boundary — the port reverts to 9600 when the stty fd closes, so
+            # `cat` reads at the wrong baud and the log is garbage (this bit us
+            # 2026-07-28). Read via pyserial, which sets the baud inside the same
+            # fd it reads from. read() timeout=1 keeps a quiet-but-live link open
+            # (returns b'') and only exceptions (disconnect) fall through to the
+            # outer reconnect loop.
+            local rpy
+            if rpy=$(_py_with_pyserial); then
+                "$rpy" - "$port" "$BAUD" >> "$LOG_FILE" 2>/dev/null <<'PYEOF'
+import sys, serial
+s = serial.Serial(sys.argv[1], int(sys.argv[2]), timeout=1)
+try:
+    while True:
+        b = s.read(4096)
+        if b:
+            sys.stdout.buffer.write(b); sys.stdout.flush()
+except Exception:
+    pass
+finally:
+    s.close()
+PYEOF
+                local rc=$?
+            else
+                printf "[%s] ERROR: no pyserial-capable python found for macOS read\n" "$(stamp)" >> "$LOG_FILE"
+                local rc=127
+            fi
+        else
+            # Linux: stty settings hold across the cat open; cheap, no python dep.
+            stty "$STTY_F" "$port" "$BAUD" raw -echo -hupcl clocal 2>/dev/null || true
+            cat "$port" >> "$LOG_FILE" 2>/dev/null
+            local rc=$?
+        fi
+        printf "[%s] DISCONNECT %s (rc=%d), reconnect in %ds\n" \
             "$(stamp)" "$port" "$rc" "$RECONNECT_S" >> "$LOG_FILE"
         sleep "$RECONNECT_S"
     done
