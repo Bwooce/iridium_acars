@@ -100,6 +100,15 @@ struct (`acars_push.c`), and per-band `/status` decode funnels.
   child images from the network and pushes them over SPI (§I.11). The
   WiFi-less Pico children need no outside link — only the SPI bus to the
   NANO and USB-host power for their own dongle (§I.2a).
+  **Role split (recommended):** the NANO runs the **COMBINED** role
+  (`CONFIG_DEVICE_ROLE_COMBINED_LOOPBACK` already exists) — it keeps its
+  own SDR on **VDL2** (it is already the tuned/antenna'd VDL2 unit with
+  the airframes feeder) AND aggregates the children. The **Pico children
+  are the Iridium park fleet** (the wider-Iridium tiling) + optionally a
+  POA child. This reuses already-deployed hardware rather than idling the
+  NANO's radio. Watch the NANO's CPU/USB-host load (full DSP pipeline +
+  aggregation + feed + OTA-origin on one board); if it saturates, drop
+  the NANO to a pure SDR-less aggregator and let a Pico cover VDL2.
 - **Configuration of a child** uses only existing mechanisms: serial
   `set band vdl2` / `set lo 136812500` (serial_cmd NVS interface), or
   `POST /config`, or pre-provisioned NVS. The per-band NVS namespacing
@@ -140,14 +149,13 @@ ESP32-P4-Pico** (RPi-Pico form factor). Specs vs the pipeline's needs:
 **Two VERIFY-BEFORE-BUY/WIRE items:**
 
 1. **USB-host 5 V VBUS.** Each child powers its own RTL-SDR dongle
-   (~300 mA at 5 V) from its USB host port. Cautionary precedent: on
-   the P4-NANO, USB-A VBUS is hard-enabled whenever `VCC_5V` is present
-   and is **NOT GPIO-controllable** (`p4-nano-board-schematic-summary.md`
-   §3 — U2's EN pin is strapped high, FLG is LED-only). The Pico's port
-   is USB-C OTG: confirm the board actually SOURCES 5 V in host role —
-   a USB-C OTG port may need an OTG adapter plus an external VBUS
-   source (powered pigtail/hub) rather than supplying bus power itself.
-   If it doesn't source VBUS, budget a powered adapter per child.
+   (~300 mA at 5 V) from its USB host port. **Confirmed 2026-07-28:** the
+   Pico has a dedicated **OTG port** (separate from its USB-C port) —
+   that is the host port for the dongle. Remaining micro-check: confirm
+   the OTG port SOURCES 5 V VBUS itself, or budget a powered OTG pigtail
+   per child (cautionary precedent: on the P4-NANO, USB-A VBUS is
+   hard-enabled from `VCC_5V` and is NOT GPIO-controllable,
+   `p4-nano-board-schematic-summary.md` §3).
 2. **WiFi/C6 presence.** If the Pico truly has no C6 (expected),
    children have NO network path: OTA must ride the SPI link (§I.11.1),
    time sync cannot use SNTP (§I.6 — the main stamps on arrival), and
@@ -213,6 +221,50 @@ Practical notes:
 - esp_hosted drops outbound **multicast**, so any network
   discovery/transport must be unicast (§I.6) — same constraint the
   iot_log/mDNS work hit.
+
+### I.3a Physical wiring — pin map for each end (SPI regime)
+
+Concrete wiring for the confirmed fleet (NANO master + Pico children),
+one SPI peripheral on the main, children as SPI slaves. The 3 data/clock
+lines + GND are a **shared bus** every child taps; **CS and HANDSHAKE are
+point-to-point** — a distinct main GPIO per child, each wired to that
+child's single CS / HS pin. Children are **self-powered** (own 5 V in +
+own dongle VBUS): do NOT route 5 V from the main, share only GND.
+
+Per child *i*:
+
+| Signal | Main (NANO, master) GPIO | Child *i* (Pico, slave) GPIO | Net |
+|---|---|---|---|
+| SCLK | GPIO20 | GPIO20 | SHARED bus |
+| MOSI | GPIO21 | GPIO21 | SHARED bus |
+| MISO | GPIO22 | GPIO22 | SHARED bus — see MISO note |
+| GND | any GND | any GND | SHARED |
+| CS | one per child: 23, 24, 25, 26, … | GPIO23 | point-to-point |
+| HANDSHAKE | one per child: 7, 8, 32, 33, … | GPIO7 | point-to-point |
+
+- **Main (NANO) pins** are all on the P1 header and clear of the used
+  blocks (C6/SDIO 6/14–19/54, SD 39–45, USB 50/51, Ethernet RMII):
+  SCLK/MOSI/MISO = 20/21/22 (the `frame_link.c` Kconfig defaults), then a
+  CS+HS pair per child from {23/7, 24/8, 25/32, 26/33, …}. With ~28 free
+  header GPIOs, a 2–4-child fleet is comfortable (6 would fit too).
+- **Child (Pico) pins:** every Pico runs the SAME firmware, so it uses
+  the same `frame_link` Kconfig pins (20/21/22/23/7) on its own board.
+  VERIFY those are on the Pico's 2×20 header and SPI-capable; if not,
+  pick pins free on the Pico and rebuild. (The WIRE defines the link, not
+  matching numbers — but one shared child binary wants one pin set.)
+- **MISO on a shared bus:** a deselected slave must release MISO or it
+  fights the line. Wire each child's CS to its SPI-slave HARDWARE CS
+  (`spics_io_num`) so the peripheral tri-states MISO when CS is high — do
+  not bit-bang CS for the data path.
+- **Aggregator firmware gap:** `frame_link.c` today defines ONE CS + ONE
+  HANDSHAKE (single-target). The AGGREGATOR role must manage an ARRAY of
+  CS/HS GPIOs (one per child) and select/scan across them — a bounded
+  code change, tracked with the other aggregator-role work (§I.5, §I.10).
+- **Pin-saver (optional):** replace the N handshake lines with ONE shared
+  open-drain (wired-OR) INT — any child pulls it low, the main polls each
+  CS to find who — trading 1 GPIO/child for a poll. Fine for a small
+  fleet; keep per-child HS if you want clean OTA-over-SPI flow control
+  (§I.11.1).
 
 ## I.4 The payload: what crosses the child→main boundary
 
