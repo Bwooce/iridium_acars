@@ -69,6 +69,13 @@ typedef struct {
     uint64_t bc;
     uint64_t lw_da;    // LW with subtype DA — these are SBD/ACARS-bearing
     uint64_t lw_other; // LW with any other subtype (VO/IP/SY/U3/U6/...)
+    // #24 speculative-DA MEASURE-FIRST (dry-run, no rescue performed):
+    // spec_da_tried  = UNKNOWN frames a Tier-1 speculative LW.DA decode was
+    //                  attempted on; spec_da_ok = those that WOULD have passed
+    //                  (ida.ok && header_ok && crc_ok, false-accept ~1e-11).
+    // spec_da_ok persistently ~0 => UNKNOWN is air-truth, don't build #24.
+    uint64_t spec_da_tried;
+    uint64_t spec_da_ok;
 } frame_decoder_class_counts_t;
 void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out);
 

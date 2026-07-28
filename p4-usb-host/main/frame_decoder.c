@@ -128,6 +128,9 @@ static _Atomic uint64_t s_class_tl       = 0;
 static _Atomic uint64_t s_class_bc       = 0;
 static _Atomic uint64_t s_class_lw_da    = 0;
 static _Atomic uint64_t s_class_lw_other = 0;
+// #24 speculative-DA MEASURE-FIRST dry-run (see the IR_FRAME_UNKNOWN arm).
+static _Atomic uint64_t s_spec_da_tried  = 0;
+static _Atomic uint64_t s_spec_da_ok     = 0;
 
 // Per-LW.DA-frame relative-frequency histogram (decode-based band survey,
 // Phase C). Every classified LW.DA frame is bucketed by its baseband offset
@@ -760,6 +763,31 @@ static void process_one(const frame_queue_item_t *it)
         atomic_fetch_add_explicit(&s_class_unknown, 1, memory_order_relaxed);
         ESP_LOGD(TAG, "FRAME: ?? bin=%ld snr=%.1f", (long)it->peak_bin,
                  (double)it->snr_db);
+        // #24 speculative-DA MEASURE-FIRST (dry-run — no rescue performed).
+        // Ask "would this UNKNOWN frame decode as LW.DA?" by SKIPPING the
+        // LCW classification (which already rejected it) and letting the DA
+        // payload's own 10x BCH + header(zero1==0) + CRC-16 arbitrate —
+        // Tier-1 hard, false-accept ~1e-11 (design memo 2026-07-20). Reuse
+        // the classify-filled frame (valid payload_off/direction/bits here,
+        // rc==0) with the type/subtype forced to LW.DA. This is READ-ONLY:
+        // it counts only, never emits/reassembles, so decode output is
+        // bit-identical. If spec_da_ok stays ~0 over a full Iridium pass,
+        // UNKNOWN is air-truth and #24 is not worth building.
+        {
+            iridium_frame_t spec = classified; // copy: keeps bits/off/dir
+            spec.type            = IR_FRAME_LW;
+            spec.lw_subtype      = IR_LW_DA;
+            ida_decoded_t sida   = {0};
+            atomic_fetch_add_explicit(&s_spec_da_tried, 1, memory_order_relaxed);
+            if (ida_decode(&spec, &sida) == 0 && sida.ok && sida.header_ok &&
+                sida.crc_ok) {
+                atomic_fetch_add_explicit(&s_spec_da_ok, 1, memory_order_relaxed);
+                ESP_LOGI(TAG, "SPEC-DA: UNKNOWN would rescue as LW.DA "
+                              "(ctr=%d len=%u) bin=%ld snr=%.1f",
+                         sida.da_ctr, (unsigned)sida.payload_len,
+                         (long)it->peak_bin, (double)it->snr_db);
+            }
+        }
         break;
     }
 }
@@ -1090,6 +1118,8 @@ void frame_decoder_get_class_counts(frame_decoder_class_counts_t *out)
     out->bc       = atomic_load_explicit(&s_class_bc, memory_order_relaxed);
     out->lw_da    = atomic_load_explicit(&s_class_lw_da, memory_order_relaxed);
     out->lw_other = atomic_load_explicit(&s_class_lw_other, memory_order_relaxed);
+    out->spec_da_tried = atomic_load_explicit(&s_spec_da_tried, memory_order_relaxed);
+    out->spec_da_ok    = atomic_load_explicit(&s_spec_da_ok, memory_order_relaxed);
 }
 
 void frame_decoder_get_lwda_freq_hist(uint32_t *out, int max_bins)

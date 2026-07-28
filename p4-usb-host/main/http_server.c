@@ -291,7 +291,7 @@ static esp_err_t status_get(httpd_req_t *req)
     frame_decoder_vdl2_stats_t vd = {0};
     frame_decoder_get_vdl2_stats(&vd);
 
-    char body[3392]; // +vdl2 block (V3) + rescued_fcs split + af_push block; headroom re-checked vs worst case
+    char body[3456]; // +vdl2 block (V3) + rescued_fcs split + af_push + spec_da; headroom re-checked vs worst case
     int  n = snprintf(body, sizeof(body),
                       "{"
                        "\"build\":\"%s\","
@@ -323,7 +323,8 @@ static esp_err_t status_get(httpd_req_t *req)
                        "\"rate_1h\":%u,\"rate_24h\":%u,"
                        "\"frames\":{"
                        "\"ms\":%llu,\"tl\":%llu,\"bc\":%llu,"
-                       "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu"
+                       "\"lw_da\":%llu,\"lw_other\":%llu,\"unknown\":%llu,"
+                       "\"spec_da_tried\":%llu,\"spec_da_ok\":%llu"
                        "},"
                        "\"vdl2\":{"
                        "\"bursts\":%u,\"synced\":%u,\"phy_ok\":%llu,\"l2_fail\":%llu,"
@@ -402,6 +403,7 @@ static esp_err_t status_get(httpd_req_t *req)
                       (unsigned long long)cc.ms, (unsigned long long)cc.tl,
                       (unsigned long long)cc.bc, (unsigned long long)cc.lw_da,
                       (unsigned long long)cc.lw_other, (unsigned long long)cc.unknown,
+                      (unsigned long long)cc.spec_da_tried, (unsigned long long)cc.spec_da_ok,
                       (unsigned)vdl2_pipeline_bursts_seen(),
                       (unsigned)vdl2_pipeline_sync_count(),
                       (unsigned long long)vd.phy_frames, (unsigned long long)vd.l2_fail,
