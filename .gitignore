@@ -3,6 +3,8 @@ esp-idf/
 
 # Build artifacts
 **/build/
+# Per-CPU-revision firmware build dirs (scripts/build.sh --rev v3_0|v3_1)
+**/build-v3_*/
 **/managed_components/
 **/sdkconfig
 **/sdkconfig.old

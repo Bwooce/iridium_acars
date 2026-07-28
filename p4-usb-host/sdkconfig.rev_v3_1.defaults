@@ -1,0 +1,24 @@
+# ESP32-P4 rev v3.1 build variant — layered ON TOP of sdkconfig.defaults (the
+# pre-v3 baseline). Build with:  scripts/build.sh --rev v3_1
+# See docs/2026-07-28-p4-cpu-revision-variants.md.
+#
+# ****************************************************************************
+# HARDWARE-UNVERIFIED. No v3 silicon on hand. Expected to CONFIGURE + BUILD,
+# never run. See the rev_v3_0 fragment for the full "mutually exclusive family,
+# ~15 downstream defaults change, re-validate the PIE hot path" caveats — they
+# all apply here too.
+# ****************************************************************************
+#
+# Explicit choice override (same rationale as rev_v3_0): un-set the base's <v3
+# member, flip the family bool, select the v3.1 member. v3.1 IS the IDF choice
+# default, but we still pin it explicitly so the resolved rev is unambiguous and
+# doesn't depend on the base fragment's leftover state. GATE after configure:
+# build-v3_1/sdkconfig MUST show CONFIG_ESP32P4_REV_MIN_FULL=301.
+# CONFIG_ESP32P4_REV_MIN_0 is not set
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=n
+CONFIG_ESP32P4_REV_MIN_301=y
+
+# MSPI-750 was FIXED in v3.1, so IDF does NOT enable the MSPI power-up
+# workaround here (P4_REV3_MSPI_CRASH_AFTER_POWER_UP_WORKAROUND defaults y only
+# at REV_MIN_300). Same PIE-hot-path re-validation as rev_v3_0 applies (the
+# HWLP workaround is absent; validate common/iridium_decoder/*_arp4.S on silicon).

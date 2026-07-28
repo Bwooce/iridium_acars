@@ -1,4 +1,9 @@
 CONFIG_IDF_TARGET="esp32p4"
+# CPU-REVISION VARIANT: this file is the pre_v3 baseline (v0.x/v1.x engineering
+# samples — our actual silicon). The next two lines pin that family+min-rev.
+# To build for v3.0/v3.1 silicon, DON'T edit here — use scripts/build.sh --rev
+# v3_0|v3_1, which layers sdkconfig.rev_v3_*.defaults over this file into an
+# isolated build dir. See docs/2026-07-28-p4-cpu-revision-variants.md.
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 # P2 PIE-trap fix: rev-0 minimum re-enables the IDF HWLP silicon-bug
 # workarounds (SOC_CPU_HAS_HWLOOP_STATE_BUG + spurious EXT_ILL reason bit,

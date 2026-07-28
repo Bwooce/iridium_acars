@@ -4,7 +4,16 @@
 # for incremental builds). Falls back to `idf.py build` for first-time
 # configure or when CMakeLists changes force a reconfigure.
 #
-# Usage: scripts/build.sh [extra ninja/idf.py args]
+# Usage: scripts/build.sh [--rev pre_v3|v3_0|v3_1] [extra ninja/idf.py args]
+#
+#   --rev pre_v3  (default) ESP32-P4 rev v0.x/v1.x engineering samples — the
+#                 current, only-tested target. Uses build/ + sdkconfig, base
+#                 defaults only: byte-for-byte the pre-variant behaviour.
+#   --rev v3_0 / v3_1   ESP32-P4 rev v3.0 / v3.1 — HARDWARE-UNVERIFIED. Layers
+#                 sdkconfig.rev_<rev>.defaults over sdkconfig.defaults into an
+#                 isolated build-<rev>/ + build-<rev>/sdkconfig. Configures +
+#                 builds only; no v3 silicon has run it.
+#   See docs/2026-07-28-p4-cpu-revision-variants.md.
 
 set -euo pipefail
 
@@ -13,6 +22,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 APP_DIR="${REPO_DIR}/p4-usb-host"
+
+# CPU-revision variant (compile-time). Default pre_v3 preserves the exact
+# current behaviour. Strip --rev from the args passed through to ninja/idf.py.
+REV="${REV:-pre_v3}"
+_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rev)   REV="${2:?--rev needs a value}"; shift 2 ;;
+        --rev=*) REV="${1#--rev=}"; shift ;;
+        *)       _args+=("$1"); shift ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}   # restore passthrough args (bash 3.2 + set -u safe)
 
 if [ ! -f "${APP_DIR}/CMakeLists.txt" ]; then
     echo "error: ${APP_DIR}/CMakeLists.txt not found" >&2
@@ -33,12 +55,35 @@ source "${IDF_EXPORT}" > /dev/null
 
 cd "${APP_DIR}"
 
-if [ -f build/build.ninja ]; then
-    # Incremental: ninja directly is ~2× faster than idf.py for no-op rebuilds.
-    echo "[build.sh] ninja -C build $*"
-    exec ninja -C build "$@"
-else
-    # First build / no build dir yet: let idf.py configure + build.
-    echo "[build.sh] idf.py build $*"
-    exec idf.py build "$@"
-fi
+case "${REV}" in
+    pre_v3)
+        # Unchanged path: base defaults only, default build/ + sdkconfig.
+        if [ -f build/build.ninja ]; then
+            # Incremental: ninja directly is ~2× faster than idf.py for no-op rebuilds.
+            echo "[build.sh] ninja -C build $*"
+            exec ninja -C build "$@"
+        else
+            # First build / no build dir yet: let idf.py configure + build.
+            echo "[build.sh] idf.py build $*"
+            exec idf.py build "$@"
+        fi
+        ;;
+    v3_0|v3_1)
+        FRAG="sdkconfig.rev_${REV}.defaults"
+        [ -f "${FRAG}" ] || { echo "error: ${FRAG} not found" >&2; exit 1; }
+        BD="build-${REV}"
+        # SDKCONFIG defaults to <proj>/sdkconfig regardless of -B, and
+        # SDKCONFIG_DEFAULTS is applied ONLY when that file is absent — so
+        # per-variant isolation needs a per-variant SDKCONFIG path too, else
+        # the variant silently inherits the pre_v3 sdkconfig.
+        echo "[build.sh] idf.py -B ${BD} (rev=${REV}, HARDWARE-UNVERIFIED) $*"
+        exec idf.py -B "${BD}" \
+            -D SDKCONFIG="${BD}/sdkconfig" \
+            -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;${FRAG}" \
+            build "$@"
+        ;;
+    *)
+        echo "error: unknown --rev '${REV}' (expected pre_v3|v3_0|v3_1)" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,43 @@
+# ESP32-P4 rev v3.0 build variant — layered ON TOP of sdkconfig.defaults (the
+# pre-v3 baseline). Build with:  scripts/build.sh --rev v3_0
+# See docs/2026-07-28-p4-cpu-revision-variants.md.
+#
+# ****************************************************************************
+# HARDWARE-UNVERIFIED. No v3 silicon on hand. This variant is expected to
+# CONFIGURE + BUILD, but has never run. A green build is NOT a working image:
+# the <v3 and >=v3 families are mutually exclusive (Kconfig.hw_support "NOTE!
+# Support of ESP32-P4 rev. <3.0 and >=3.0 is mutually exclusive") and flipping
+# families changes ~15 downstream defaults (esp_pm CPU/peripheral power-down,
+# VBAT ranges, bootloader min-rev 90->100, CPU-freq choice) — all unverified.
+# ****************************************************************************
+#
+# Explicit choice override: the ESP32P4_REV_MIN choice is mutually exclusive and
+# its Kconfig default is REV_MIN_301 (v3.1). If we only appended the family bool,
+# a "dirty" override could silently fall back to that default and build v3.1 when
+# v3.0 was asked for. So we (a) un-set the base's <v3 choice member, (b) flip the
+# family bool, (c) select the v3.0 member. GATE after configure: the generated
+# build-v3_0/sdkconfig MUST show CONFIG_ESP32P4_REV_MIN_FULL=300 (not exit code).
+# CONFIG_ESP32P4_REV_MIN_0 is not set
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=n
+CONFIG_ESP32P4_REV_MIN_300=y
+
+# --- Load-bearing consequences a real v3.0 bring-up MUST re-validate ---
+#
+# PIE HOT PATH (the "tweak the PIE code" item): the base pins REV_MIN_0
+# specifically to re-enable the SOC_CPU_HAS_HWLOOP_STATE_BUG workarounds that
+# stopped ~1-in-600 PIE-trap Illegal-instruction panics in dsps_fird_s16_arp4
+# (2026-07-06). On v3 the workaround COMPILES OUT — it's use-site gated
+# (portasm.S REV_MIN_FULL<=1, vectors.S SELECTS_REV_LESS_V3), NOT soc-cap gated
+# (the SOC_CPU_HAS_HWLOOP_STATE_BUG cap itself stays =y, so don't grep the cap —
+# check REV_MIN_FULL). So a v3 image runs the vanilla lazy coproc save/restore,
+# untested by us: the PIE asm (common/iridium_decoder/*_arp4.S) must be
+# re-validated bit-exact + soaked on real v3 silicon, and patches/0002 (HWLP
+# removal, justified for <v3) revisited. Seam for a v3-specific PIE variant is
+# common/iridium_decoder/pie_target.h (PIE_TARGET_P4_V3 becomes 1 here). Full
+# checklist: docs/2026-07-28-p4-cpu-revision-variants.md.
+#
+# MSPI-750 (USB/SDMMC unaligned-DMA returns stale PSRAM data) is a v3.0-only
+# erratum; IDF auto-enables P4_REV3_MSPI_CRASH_AFTER_POWER_UP_WORKAROUND at
+# REV_MIN_300. We keep the base's CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n
+# (USB DMA never lands in PSRAM), so MSPI-750 stays closed regardless. Fixed in
+# v3.1 (see sdkconfig.rev_v3_1.defaults).
