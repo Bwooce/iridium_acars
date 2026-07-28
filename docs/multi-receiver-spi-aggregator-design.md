@@ -472,6 +472,35 @@ task is being filed for the POA band itself; this doc only reserves
 its place in the fleet (`band_id_t` slot, PDU band tag, airframes port
 5550).
 
+## I.8b Inmarsat-Aero child (forward reference)
+
+An Inmarsat Classic Aero (SATCOM ACARS) child is the **highest-volume**
+future member of the fleet and the reason the cluster generalizes beyond
+VHF/Iridium at all (`2026-07-24-inmarsat-aero-band-proposal.md`):
+
+- **RF / antenna — definitively its own board.** Downlink is L-band
+  ~**1545–1555 MHz**, but from **GEO** satellites (POR ~178°E, high over
+  Sydney), so it needs a **fixed directional patch aimed once** + LNA —
+  a completely different antenna from Iridium's LEO omni and the VHF
+  whips. No dongle/antenna sharing is even possible; a dedicated child is
+  the only honest option (same argument as POA, stronger).
+- **Band pipeline — a new `BAND_INMARSAT` `band_pipeline_t`.** Aero-L/I/H
+  burst BPSK/OQPSK (600 / 1200 / 10500 sps) + AES/ISU L2, emitting a bare
+  ACARS block into the shared `acars_deliver()` → libacars → feeder path,
+  exactly like every other band. Reference demods: JAERO / airframesio
+  `aero-cli`. The demod is a multi-day DSP effort (the burst modem is the
+  hard part) — measure-first with a cheap patch capture before building.
+- **Why it belongs in THIS design:** the cluster absorbs it as "just
+  another `band=` value" on a child — no aggregator change beyond the
+  band-tagged PDU and one more airframes port. Its oceanic footprint
+  plausibly out-yields every current band by 1–2 orders of magnitude, so
+  it is likely the single biggest ACARS source the fleet can add.
+
+This doc reserves its place (`band_id_t` slot, PDU band tag, airframes
+Aero ingest port — **verify** the port; the Iridium/Aero endpoints were
+the one unconfirmed item in the feeder plan). The band + demod are the
+separate Inmarsat proposal/task, off the cluster's critical path.
+
 ## I.9 Phased path (what exists vs what's new)
 
 | Phase | Deliverable | Already built | New work |
