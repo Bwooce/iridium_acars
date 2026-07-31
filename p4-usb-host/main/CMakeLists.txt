@@ -22,6 +22,10 @@ set(_app_reqs
     # references both concrete bands) + the L2 codecs (frame_decoder.c's
     # band=vdl2 branch consumes avlc.h/vdl2_l2.h directly — V3).
     band_pipeline vdl2_decoder vdl2
+    # POA (plain VHF ACARS) channelizer + demod + L2 (acarsdec port). Compiled
+    # into the target now (verifies the float-complex port on the IDF
+    # toolchain); wired into the dsp_processor CHANNELIZED front end in P2.
+    poa_decoder
     # airframes.io ACARS-JSON formatter (pure C, host-tested).
     acars_feed
     # SDMMC + FATFS always declared so idf_component_register sees them
