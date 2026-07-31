@@ -44,6 +44,13 @@ void band_decode_stats_get(band_id_t id, band_decode_stats_t *out)
         out->unknown   = 0;                    // no Iridium-style UNKNOWN class in VDL2
         out->failed    = (uint32_t)vd.bad_fcs;
         out->recovered = vd.rs_erasure_recovered;
+    } else if (id == BAND_POA) {
+        // POA (P0 stub): zeros until P3 wires frame_decoder_get_poa_stats
+        // (decoded=crc_ok, failed=parity_drop+crc_fail, recovered=crc_fixed).
+        // The explicit branch keeps POA off Iridium's BCH counters — the same
+        // wrong-band-counters footgun band_key() guards against. Zeros here
+        // make autotune's success metric band-correct (no false "no signal").
+        // out already memset to 0.
     } else {
         // Iridium (and the clamp default). Same cumulative counters the
         // pre-refactor autotune read via worker_core1_get_decode_counts.
