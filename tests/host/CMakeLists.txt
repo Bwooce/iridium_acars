@@ -632,6 +632,19 @@ target_include_directories(test_band_profile PRIVATE ${BAND_DIR})
 target_compile_options(test_band_profile PRIVATE -Werror)
 add_test(NAME band_profile COMMAND test_band_profile)
 
+# POA (plain VHF ACARS) demod+L2 port, cross-validated against acarsdec (the
+# oracle) on the HydraSDR golden (~/iridium_capture/poa_ref/). SKIPs if the
+# golden WAV is absent (lives outside the repo, like the vdl2_ref oracle).
+set(POA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/poa_decoder)
+add_executable(test_poa_decoder
+    test_poa_decoder.c
+    ${POA_DIR}/poa_decoder.c
+)
+target_include_directories(test_poa_decoder PRIVATE ${POA_DIR})
+target_compile_options(test_poa_decoder PRIVATE -Werror)
+target_link_libraries(test_poa_decoder m)
+add_test(NAME poa_decoder COMMAND test_poa_decoder)
+
 # VHF/VDL2 foundation: bit-identity gate for the band_pipeline
 # abstraction. Runs the ALBQ fixture through BOTH the legacy direct
 # calls (burst_prefilter + burst_pipeline_process_burst) and the
