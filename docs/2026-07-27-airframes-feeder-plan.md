@@ -55,6 +55,19 @@ locally-generated dumpvdl2 2.6.0 JSON sample (`~/iridium_capture/vdl2_ref`).
 
   So this device feeds **two ports**: VDL2 → 5552, Iridium → 5590. (The
   Iridium port 5590 was the previously-unknown value — now confirmed.)
+- **UNRESOLVED / PARKED (2026-07-31).** Exhaustive live testing never got
+  airframes to attribute a single VDL2 message on *any* port or format:
+  dumpvdl2 JSON → UDP **5552** (its documented port, incl. a live sustained
+  unmodified-dumpvdl2 feed), → UDP **5555** (which is actually the *vdlm2dec*
+  TLeconte-format port, not dumpvdl2), and → TCP **5553** — all showed **0**
+  attributed, while the station read "alive." This is airframes-side: the
+  legacy decoder-direct ports (5550–5556/5590) are fire-and-forget and carry
+  **no feed-id**. The likely real path is the modern **`af.json.v1` JSON →
+  UDP `feed.acars.io:6000`** carrying an account **feed-id UUID** (via the
+  `airframes-client`/`xng` proxy) — UNTESTED (need the feed-id). So treat the
+  port table above as airframes' *documented* values, but UNVERIFIED for
+  actual attribution from this site. Full trail: memory
+  `project_airframes_feed_port_investigation`.
 - **We emit each decoder's native schema on its own port** (§2). No
   masquerading needed — `app.name` is `dumpvdl2`/`iridium-toolkit`'s own value;
   a custom name would risk the router not recognising the shape, so we mirror
