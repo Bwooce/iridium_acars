@@ -141,7 +141,18 @@ static esp_err_t nvs_set_f32(nvs_handle_t h, const char *k, float v)
 // (<=10, e.g. "gain_dbx10") fits.
 static void band_key(char *buf, size_t cap, uint8_t band, const char *base)
 {
-    snprintf(buf, cap, "%s%s", (band == (uint8_t)BAND_VDL2) ? "v2_" : "ir_", base);
+    // Per-band NVS key prefix, indexed by band with the SAME clamp rule as
+    // band_profile_get (out-of-range -> Iridium). A plain ternary here would
+    // silently map any band != VDL2 (incl. POA) onto Iridium's keys — the
+    // gain-footgun this whole scheme exists to kill. Prefixes stay 3 chars so
+    // the 15-char NVS key budget holds (3 + base<=10 + NUL).
+    static const char *const k_band_prefix[BAND_COUNT] = {
+        [BAND_IRIDIUM] = "ir_",
+        [BAND_VDL2]    = "v2_",
+        [BAND_POA]     = "po_",
+    };
+    if ((unsigned)band >= (unsigned)BAND_COUNT) band = (uint8_t)BAND_IRIDIUM;
+    snprintf(buf, cap, "%s%s", k_band_prefix[band], base);
 }
 
 // Band-namespaced typed getters (namespaced key only; legacy keys are handled
