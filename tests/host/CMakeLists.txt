@@ -645,6 +645,18 @@ target_compile_options(test_poa_decoder PRIVATE -Werror)
 target_link_libraries(test_poa_decoder m)
 add_test(NAME poa_decoder COMMAND test_poa_decoder)
 
+# Full-chain POA: raw IQ -> ported C channelizer -> demod -> L2, cross-validated
+# against acarsdec on the raw golden capture. SKIPs if the raw IQ is absent.
+add_executable(test_poa_frontend
+    test_poa_frontend.c
+    ${POA_DIR}/poa_frontend.c
+    ${POA_DIR}/poa_decoder.c
+)
+target_include_directories(test_poa_frontend PRIVATE ${POA_DIR})
+target_compile_options(test_poa_frontend PRIVATE -Werror)
+target_link_libraries(test_poa_frontend m)
+add_test(NAME poa_frontend COMMAND test_poa_frontend)
+
 # VHF/VDL2 foundation: bit-identity gate for the band_pipeline
 # abstraction. Runs the ALBQ fixture through BOTH the legacy direct
 # calls (burst_prefilter + burst_pipeline_process_burst) and the
