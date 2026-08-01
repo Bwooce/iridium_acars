@@ -49,6 +49,13 @@ esp_err_t frame_decoder_init(void);
 // decode time, so processing order doesn't reorder emitted timestamps. Pass 0
 // to fall back to esp_timer_get_time() at enqueue (callers without a capture
 // clock, e.g. the aggregator/corpus paths).
+// POA (plain VHF ACARS) producer: enqueue a decoded ACARS block (mode..ETX,
+// no SOH, 7-bit) + its 2 CRC bytes; the decoder task appends DEL 0x7f and calls
+// acars_deliver. Direction derived from the block_id. Called from the Core-0
+// feed task (band=poa only). Returns false if the queue is full / not inited.
+bool frame_decoder_push_poa(const uint8_t *blk, int len, const uint8_t crc[2],
+                            uint32_t freq_hz, uint64_t timestamp_us, float level_db);
+
 bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
                         const int16_t *soft_bits, size_t n_soft,
                         ir_direction_t direction,

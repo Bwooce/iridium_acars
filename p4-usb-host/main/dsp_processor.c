@@ -30,6 +30,7 @@
 #include "band_profile.h" // per-band tagger parameters (VHF/VDL2 foundation)
 #include "band_select.h"  // band_runtime_resolve — resolve band once (phase 3)
 #include "poa_frontend.h" // POA CHANNELIZED front end (tagger-bypass, P2)
+#include "frame_decoder.h" // frame_decoder_push_poa — POA block -> decoder task (P3)
 
 static const char *TAG = "DSP_PROC";
 
@@ -306,28 +307,24 @@ void dsp_processor_flush(dsp_processor_t *p)
     ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
 
-// POA (CHANNELIZED) block callback — fires on the feed task per decoded ACARS
-// block. P2: count + log (bring-up visibility). P3 will bridge the block to
-// the Core-1 decoder task's acars_deliver via a cross-core queue (that task
-// owns s_reasm_ctx/msg_ring, so it must not be called from here).
+// POA channel set — P4 reads these from NVS `po_chans`; hardcoded for now
+// (docs/2026-08-01-poa-onband-plan.md §5, LO 130.8 MHz). Index == poa_block chn.
+static const uint32_t k_poa_chans[] = {131550000u, 130450000u, 130425000u, 130025000u};
+
+// POA (CHANNELIZED) block callback — fires on the Core-0 feed task per decoded
+// ACARS block (P3). Hands the block+CRC to the Core-1 decoder task via
+// frame_decoder_push_poa (that task owns s_reasm_ctx/msg_ring, so acars_deliver
+// must run there, not here). Also counts for the /status POA funnel.
 static void poa_on_block(const poa_block_t *b, void *user)
 {
     dsp_processor_t *p = (dsp_processor_t *)user;
     atomic_fetch_add_explicit(&p->poa_blocks, 1, memory_order_relaxed);
-    char s[64];
-    int  n = b->len < 63 ? b->len : 63;
-    for (int i = 0; i < n; i++) {
-        unsigned char c = b->txt[i];
-        s[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
-    }
-    s[n] = '\0';
-    ESP_LOGI(TAG, "POA block ch=%d len=%d err=%d fixed=%d: %s",
-             b->chn, b->len, b->err, (int)b->crc_fixed, s);
+    uint32_t freq = (b->chn >= 0 &&
+                     b->chn < (int)(sizeof(k_poa_chans) / sizeof(k_poa_chans[0])))
+                        ? k_poa_chans[b->chn]
+                        : 0;
+    frame_decoder_push_poa(b->txt, b->len, b->crc, freq, /*stamp now=*/0, b->level_db);
 }
-
-// POA channel set — P4 reads these from NVS `po_chans`; hardcoded for now
-// (docs/2026-08-01-poa-onband-plan.md §5, LO 130.8 MHz).
-static const uint32_t k_poa_chans[] = {131550000u, 130450000u, 130425000u, 130025000u};
 
 static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
                                                const band_profile_t *bp)
