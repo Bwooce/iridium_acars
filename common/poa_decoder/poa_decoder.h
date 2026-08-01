@@ -30,7 +30,8 @@ typedef struct {
     int           err;             // residual parity errors after repair (0 = clean)
     bool          crc_fixed;       // CRC was repaired (fixprerr/fixdberr) vs clean
     float         level_db;        // mean bit level, dB
-    unsigned char txt[POA_TXT_MAX]; // block bytes (SOH..ETX/ETB), 7-bit
+    unsigned char crc[2];          // received ACARS CRC-16 (after ETX; append + DEL 0x7f for libacars)
+    unsigned char txt[POA_TXT_MAX]; // block bytes (mode..ETX), 7-bit, no SOH
 } poa_block_t;
 
 // Called for every block that passes (or is repaired to) parity+CRC.

@@ -986,6 +986,34 @@ target_compile_options(test_libacars_link PRIVATE
     -Wno-sign-compare
 )
 
+# test_poa_libacars — P3 bridge de-risk: the poa_decoder block run through the
+# SAME libacars parse acars_deliver() uses yields structured ACARS (JQ0404).
+# Reuses the LIBACARS_* source set above + POA_DIR. SKIPs if golden absent.
+add_executable(test_poa_libacars
+    test_poa_libacars.c
+    ${POA_DIR}/poa_decoder.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_poa_libacars PRIVATE
+    ${POA_DIR} ${LIBACARS_UPSTREAM} ${LIBACARS_IDF_DIR})
+target_compile_options(test_poa_libacars PRIVATE
+    -D_XOPEN_SOURCE=600 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wno-unused-but-set-variable -Wno-sign-compare)
+target_link_libraries(test_poa_libacars m)
+add_test(NAME poa_libacars COMMAND test_poa_libacars)
+
 # libacars best-effort decode (2026-07-07 design, Phase H / §6d): a
 # host-only build of the CPDLC (ASN.1 uPER) + ADS-C sub-decoders, which no
 # current target compiles (common/libacars_idf/ deliberately stubs them out

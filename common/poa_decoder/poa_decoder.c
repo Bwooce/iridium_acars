@@ -158,6 +158,8 @@ static void process_block(poa_decoder_t *d, poa_channel_t *ch, float level_db)
     out.err = ch->blk_err;
     out.crc_fixed = fixed;
     out.level_db = level_db;
+    out.crc[0] = ch->crcb[0];
+    out.crc[1] = ch->crcb[1];
     memcpy(out.txt, txt, (size_t)len);
     if (d->cb) d->cb(&out, d->user);
 }
