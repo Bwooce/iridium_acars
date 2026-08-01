@@ -101,6 +101,7 @@ struct dsp_processor {
     _Atomic uint32_t    poa_blocks; // ACARS blocks decoded (P2 counter; P3 delivers)
     uint32_t            poa_chans[POA_MAX_CHANNELS]; // resolved POA channel freqs (Hz)
     int                 poa_nch;
+    uint32_t            poa_lo_hz; // capture LO (for channel-freq -> peak_bin encode)
 
     // Detect-path sample rate from the selected band profile. Both
     // current bands run 2.5 MSPS (== FS_DETECT_HZ, statically asserted
@@ -340,7 +341,15 @@ static void poa_on_block(const poa_block_t *b, void *user)
     dsp_processor_t *p = (dsp_processor_t *)user;
     atomic_fetch_add_explicit(&p->poa_blocks, 1, memory_order_relaxed);
     uint32_t freq = (b->chn >= 0 && b->chn < p->poa_nch) ? p->poa_chans[b->chn] : 0;
-    frame_decoder_push_poa(b->txt, b->len, b->crc, freq, /*stamp now=*/0, b->level_db);
+    // Encode the exact channel freq as a synthetic peak_bin so build_af_msg's
+    // bin->Hz math (acars_push.c:194) recovers it — POA has no real FFT peak.
+    int peak_bin = 0;
+    if (freq && p->fs_hz)
+        peak_bin = FBT_FFT_SIZE / 2 +
+                   (int)(((int64_t)freq - (int64_t)p->poa_lo_hz) * FBT_FFT_SIZE /
+                         (int64_t)p->fs_hz);
+    frame_decoder_push_poa(b->txt, b->len, b->crc, freq, peak_bin, /*stamp now=*/0,
+                           b->level_db);
 }
 
 static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
@@ -357,7 +366,8 @@ static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
         nch = (int)(sizeof(k_poa_chans) / sizeof(k_poa_chans[0]));
         memcpy(p->poa_chans, k_poa_chans, (size_t)nch * sizeof(uint32_t));
     }
-    p->poa_nch = nch;
+    p->poa_nch   = nch;
+    p->poa_lo_hz = bp->default_lo_hz;
     p->poa_fe  = poa_frontend_create(bp->detect_fs_hz, bp->default_lo_hz,
                                      p->poa_chans, nch, poa_on_block, p);
     if (!p->poa_fe) {

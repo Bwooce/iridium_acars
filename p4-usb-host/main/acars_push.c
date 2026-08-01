@@ -165,7 +165,9 @@ static void build_af_msg(af_msg_t *af, const acars_msg_t *m,
                          const app_config_t *cfg)
 {
     memset(af, 0, sizeof(*af));
-    af->band       = (cfg->band == BAND_VDL2) ? AF_BAND_VDL2 : AF_BAND_IRIDIUM;
+    af->band       = (cfg->band == BAND_VDL2) ? AF_BAND_VDL2
+                     : (cfg->band == BAND_POA) ? AF_BAND_POA
+                                               : AF_BAND_IRIDIUM;
     int64_t epoch  = net_time_epoch_us();
     af->epoch_us   = epoch;
     af->time_valid = (epoch != 0);

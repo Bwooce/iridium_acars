@@ -124,6 +124,9 @@ static bool s_band_vdl2 = false;
 // band=poa: popped items carry a decoded ACARS block (+CRC) in bits[] rather
 // than demod bits; route them to process_one_poa -> acars_deliver.
 static bool s_band_poa = false;
+// POA ACARS blocks handed to acars_deliver (band_decode_stats "decoded"; the
+// poa_decoder already did parity/CRC L2, so every block here is a valid decode).
+static _Atomic uint32_t s_poa_delivered = 0;
 
 static _Atomic uint64_t s_class_unknown  = 0;
 static _Atomic uint64_t s_class_ms       = 0;
@@ -887,7 +890,13 @@ static void process_one_poa(const frame_queue_item_t *it)
     memcpy(buf, it->bits, (size_t)n);
     buf[n++] = 0x7f; // DEL terminator libacars expects after the CRC
     la_msg_dir dir = (it->direction == 0) ? LA_MSG_DIR_AIR2GND : LA_MSG_DIR_GND2AIR;
+    atomic_fetch_add_explicit(&s_poa_delivered, 1, memory_order_relaxed);
     acars_deliver(buf, n, dir, it->timestamp_us, it->peak_bin, it->snr_db, /*avlc=*/NULL);
+}
+
+uint32_t frame_decoder_get_poa_delivered(void)
+{
+    return atomic_load_explicit(&s_poa_delivered, memory_order_relaxed);
 }
 
 void frame_decoder_get_vdl2_stats(frame_decoder_vdl2_stats_t *out)
@@ -1120,7 +1129,8 @@ bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
 // deliver. Single-producer like frame_decoder_push (under band=poa the burst
 // producer never runs). Direction is derived from the block_id (blk[11]).
 bool frame_decoder_push_poa(const uint8_t *blk, int len, const uint8_t crc[2],
-                            uint32_t freq_hz, uint64_t timestamp_us, float level_db)
+                            uint32_t freq_hz, int peak_bin,
+                            uint64_t timestamp_us, float level_db)
 {
     if (!s_initialised || !blk || len < 12) return false;
     if ((size_t)len + 2 > FRAME_QUEUE_MAX_BITS) return false;
@@ -1128,7 +1138,9 @@ bool frame_decoder_push_poa(const uint8_t *blk, int len, const uint8_t crc[2],
     if (!item) return false; // full — drop counted by the queue
     item->timestamp_us = timestamp_us ? timestamp_us : (uint64_t)esp_timer_get_time();
     item->freq_hz      = freq_hz;
-    item->peak_bin     = 0;
+    // peak_bin encodes the channel freq for build_af_msg's bin->Hz math (the
+    // exact channel, not a real FFT peak — POA has no tagger). 0 => LO-derived.
+    item->peak_bin     = peak_bin;
     item->snr_db       = level_db;
     unsigned char bid  = blk[11]; // block_id: digit '0'-'9' => downlink
     item->direction    = (bid >= '0' && bid <= '9') ? 0 : 1;

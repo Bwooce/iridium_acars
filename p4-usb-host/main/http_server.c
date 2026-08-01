@@ -808,7 +808,8 @@ static esp_err_t index_get(httpd_req_t *req)
     app_config_t cfg;
     app_config_snapshot(&cfg);
     bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
-    send_page_head(req, is_vdl2 ? "VDL2 ACARS" : "Iridium ACARS", 0);
+    bool is_poa  = ((band_id_t)cfg.band == BAND_POA);
+    send_page_head(req, is_poa ? "POA ACARS" : is_vdl2 ? "VDL2 ACARS" : "Iridium ACARS", 0);
     httpd_resp_send_chunk(req,
                           "<p>Configure the device. Wi-Fi changes reboot on save; "
                           "UDP push fields take effect immediately. SDR tuning changes "
@@ -2794,16 +2795,21 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     // VDL2 mode). Same band accessor as the reception classifier / index_get.
     app_config_t cfg_band;
     app_config_snapshot(&cfg_band);
-    bool     is_vdl2 = ((band_id_t)cfg_band.band == BAND_VDL2);
-    uint32_t lo_min  = is_vdl2 ? 135000000u : 1615000000u;
-    uint32_t lo_max  = is_vdl2 ? 138000000u : 1628000000u;
+    band_id_t band  = (band_id_t)cfg_band.band;
+    bool     is_vdl2 = (band == BAND_VDL2);
+    bool     is_poa  = (band == BAND_POA);
+    // POA channels sit ~128.8-132.0 MHz; the channelizer LO parks below the
+    // lowest channel, so accept the whole VHF-airband ACARS span.
+    uint32_t lo_min  = is_poa ? 128000000u : is_vdl2 ? 135000000u : 1615000000u;
+    uint32_t lo_max  = is_poa ? 137000000u : is_vdl2 ? 138000000u : 1628000000u;
     if (lo_hz < lo_min || lo_hz > lo_max) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         char m[128];
         int  mn = snprintf(m, sizeof(m),
                            "lo_hz=%u out of %s band [%u, %u]\n",
-                           (unsigned)lo_hz, is_vdl2 ? "VDL2" : "Iridium",
+                           (unsigned)lo_hz,
+                           is_poa ? "POA" : is_vdl2 ? "VDL2" : "Iridium",
                            (unsigned)lo_min, (unsigned)lo_max);
         return httpd_resp_send(req, m, mn);
     }

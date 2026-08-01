@@ -286,12 +286,63 @@ static void emit_iridium(jw_t *w, const af_msg_t *m)
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// POA (plain VHF ACARS): acarsdec 3.7 native JSON — the flat "TLeconte JSON"
+// airframes' ACARS ingest (port 5550) parses. Field set + order mirror
+// acarsdec output.c buildjson(); app.name is "acarsdec". "channel" (a local
+// index) is omitted — af_msg_t doesn't carry it. "freq" is MHz like acarsdec.
+static void emit_poa(jw_t *w, const af_msg_t *m)
+{
+    jw_puts(w, "{");
+    bool first = true;
+
+    if (m->time_valid) {
+        jw_member(w, &first, "timestamp");
+        jw_fmt(w, "%lld.%06ld", (long long)(m->epoch_us / 1000000),
+               (long)(m->epoch_us % 1000000));
+    }
+    if (m->station_id && m->station_id[0])
+        jw_member_str(w, &first, "station_id", m->station_id);
+    if (m->freq_hz) {
+        jw_member(w, &first, "freq");
+        jw_fmt(w, "%.3f", (double)m->freq_hz / 1e6); // MHz
+    }
+    if (m->sig_level_valid) {
+        jw_member(w, &first, "level");
+        jw_fmt(w, "%.1f", (double)m->sig_level_dbfs);
+    }
+    jw_member(w, &first, "error");
+    jw_fmt(w, "%d", m->err ? 1 : 0);
+    if (m->mode) jw_member_char(w, &first, "mode", m->mode);
+    if (m->label[0]) jw_member_str(w, &first, "label", m->label);
+    if (m->block_id) jw_member_char(w, &first, "block_id", m->block_id);
+    // acarsdec renders the NAK ack (0x15) as JSON false, else the char.
+    if (m->ack) {
+        if (m->ack == 0x15) jw_member_bool(w, &first, "ack", false);
+        else                jw_member_char(w, &first, "ack", m->ack);
+    }
+    // "tail" is the raw address field; libacars keeps the leading '.'.
+    if (m->reg[0]) jw_member_str(w, &first, "tail", m->reg);
+    if (m->flight_id[0]) jw_member_str(w, &first, "flight", m->flight_id);
+    if (m->msg_num[0]) jw_member_str(w, &first, "msgno", m->msg_num);
+    if (m->txt && m->txt[0]) jw_member_str(w, &first, "text", m->txt);
+    if (!m->more) jw_member_bool(w, &first, "end", true);
+
+    jw_member(w, &first, "app");
+    jw_puts(w, "{\"name\":\"acarsdec\",\"ver\":\"3.7\"}");
+    jw_puts(w, "}");
+}
+
+// ---------------------------------------------------------------------------
+
 size_t airframes_format(char *out, size_t cap, const af_msg_t *m)
 {
     if (!out || !m) return 0;
     jw_t w = { .out = out, .cap = cap, .len = 0, .overflow = false };
     if (m->band == AF_BAND_VDL2)
         emit_vdl2(&w, m);
+    else if (m->band == AF_BAND_POA)
+        emit_poa(&w, m);
     else
         emit_iridium(&w, m);
     if (w.overflow) return 0;
