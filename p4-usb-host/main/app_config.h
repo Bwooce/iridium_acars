@@ -30,6 +30,7 @@
 #define APP_CONFIG_OTA_URL_LEN 128     // D19 OTA pull URL (http://… or https://…); empty = disabled
 #define APP_CONFIG_AF_HOST_LEN 64      // airframes.io ingest host (feed.airframes.io); empty = disabled
 #define APP_CONFIG_AF_ID_LEN 40        // airframes feeder station ident or UUID (≥36 chars); empty = anonymous
+#define APP_CONFIG_POA_CHANS_LEN 80    // POA (band=poa) channel list, CSV of MHz (e.g. "131.550,130.025"); empty = profile default
 
 typedef enum {
     GAIN_MODE_TUNER_AGC = 0,    // R820T/R828D internal AGC. Default
@@ -176,6 +177,7 @@ typedef struct {
     char     af_host[APP_CONFIG_AF_HOST_LEN];           // ingest host; empty = disabled
     uint16_t af_port;                                   // ingest port (VDL2 5552 / Iridium 5590); 0 = disabled
     char     af_id[APP_CONFIG_AF_ID_LEN];               // feeder station ident/UUID
+    char     poa_chans[APP_CONFIG_POA_CHANS_LEN];       // POA channel list, CSV MHz (band=poa only; empty => profile default)
 } app_config_t;
 
 // Initialise from NVS. Missing keys get compile-time defaults.

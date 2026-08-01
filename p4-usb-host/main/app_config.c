@@ -22,6 +22,7 @@ static const char *NVS_NS = "iridium";
 // bias-tee). Production deployments override via the C6 web UI
 // (D17) once that lands.
 #define DEFAULT_BAND ((uint8_t)BAND_IRIDIUM) // band soft-switch: iridium unless NVS says otherwise
+#define DEFAULT_POA_CHANS "131.550,130.025,130.425,130.450" // POA channels for LO 130.8 MHz (plan §5)
 #define DEFAULT_LO_FREQ_HZ IRIDIUM_CENTER_FREQ_HZ
 // The Iridium band profile's default LO must equal the historical
 // compile-time default — proof that band=iridium changes nothing.
@@ -184,6 +185,13 @@ static esp_err_t nvs_get_f32_band(nvs_handle_t h, uint8_t b, const char *base,
     char k[16];
     band_key(k, sizeof(k), b, base);
     return nvs_get_f32_or(h, k, v, def);
+}
+static esp_err_t nvs_get_str_band(nvs_handle_t h, uint8_t b, const char *base,
+                                  char *out, size_t cap, const char *def)
+{
+    char k[16];
+    band_key(k, sizeof(k), b, base); // e.g. "chans" -> "po_chans"
+    return nvs_get_str_or(h, k, out, cap, def);
 }
 
 // One-time legacy migration: move a present legacy GLOBAL key to the ACTIVE
@@ -353,6 +361,12 @@ esp_err_t app_config_init(void)
     nvs_get_u8_or(h, "chase2", &c2, (uint8_t)DEFAULT_CHASE2_DECODE);
     nvs_get_f32_band(h, s_cfg.band, "tag_thr", &s_cfg.tagger_threshold_db,
                      band_profile_get((band_id_t)s_cfg.band)->tagger_threshold_db);
+    // POA channel list (band=poa only) — CSV of MHz, parsed in dsp_processor.
+    // Namespaced "po_chans"; empty for other bands (dsp only reads it for POA).
+    s_cfg.poa_chans[0] = '\0';
+    if (s_cfg.band == (uint8_t)BAND_POA)
+        nvs_get_str_band(h, s_cfg.band, "chans", s_cfg.poa_chans,
+                         APP_CONFIG_POA_CHANS_LEN, DEFAULT_POA_CHANS);
     nvs_get_u8_or(h, "coal_n", &s_cfg.coalesce_min_bursts, DEFAULT_COALESCE_MIN_BURSTS);
     nvs_get_i16_or(h, "dcmask_lo", &s_cfg.dcmask_lo, DEFAULT_DCMASK_LO);
     nvs_get_i16_or(h, "dcmask_hi", &s_cfg.dcmask_hi, DEFAULT_DCMASK_HI);

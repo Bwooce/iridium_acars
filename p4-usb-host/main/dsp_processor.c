@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h> // strtod — POA channel-list (po_chans) CSV parse
 #include <math.h>
 #include <stdatomic.h>
 #include "esp_log.h"
@@ -98,6 +99,8 @@ struct dsp_processor {
     // exclusive with `tagger`.
     poa_frontend_t     *poa_fe;
     _Atomic uint32_t    poa_blocks; // ACARS blocks decoded (P2 counter; P3 delivers)
+    uint32_t            poa_chans[POA_MAX_CHANNELS]; // resolved POA channel freqs (Hz)
+    int                 poa_nch;
 
     // Detect-path sample rate from the selected band profile. Both
     // current bands run 2.5 MSPS (== FS_DETECT_HZ, statically asserted
@@ -307,9 +310,26 @@ void dsp_processor_flush(dsp_processor_t *p)
     ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
 
-// POA channel set — P4 reads these from NVS `po_chans`; hardcoded for now
-// (docs/2026-08-01-poa-onband-plan.md §5, LO 130.8 MHz). Index == poa_block chn.
+// Fallback POA channel set (LO 130.8 MHz, plan §5) when NVS po_chans is unset.
 static const uint32_t k_poa_chans[] = {131550000u, 130450000u, 130425000u, 130025000u};
+
+// Parse a CSV of MHz ("131.550,130.025,...") into channel freqs in Hz.
+// Returns the count (<= max); skips tokens <= 1 MHz (malformed/empty).
+static int parse_poa_chans(const char *csv, uint32_t *out, int max)
+{
+    if (!csv || !csv[0]) return 0;
+    int         n = 0;
+    const char *s = csv;
+    while (*s && n < max) {
+        char  *end;
+        double mhz = strtod(s, &end);
+        if (end == s) break;
+        if (mhz > 1.0) out[n++] = (uint32_t)(mhz * 1e6 + 0.5);
+        s = end;
+        while (*s == ',' || *s == ' ' || *s == '\t') s++;
+    }
+    return n;
+}
 
 // POA (CHANNELIZED) block callback — fires on the Core-0 feed task per decoded
 // ACARS block (P3). Hands the block+CRC to the Core-1 decoder task via
@@ -319,23 +339,27 @@ static void poa_on_block(const poa_block_t *b, void *user)
 {
     dsp_processor_t *p = (dsp_processor_t *)user;
     atomic_fetch_add_explicit(&p->poa_blocks, 1, memory_order_relaxed);
-    uint32_t freq = (b->chn >= 0 &&
-                     b->chn < (int)(sizeof(k_poa_chans) / sizeof(k_poa_chans[0])))
-                        ? k_poa_chans[b->chn]
-                        : 0;
+    uint32_t freq = (b->chn >= 0 && b->chn < p->poa_nch) ? p->poa_chans[b->chn] : 0;
     frame_decoder_push_poa(b->txt, b->len, b->crc, freq, /*stamp now=*/0, b->level_db);
 }
 
 static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
-                                               const band_profile_t *bp)
+                                               const band_profile_t *bp,
+                                               const char *chans_csv)
 {
     dsp_processor_t *p = heap_caps_calloc(1, sizeof(*p), MALLOC_CAP_SPIRAM);
     if (!p) { ESP_LOGE(TAG, "dsp_processor (POA) handle alloc failed"); return NULL; }
     p->user_cb = cb; // unused under POA (no burst path)
     p->fs_hz   = bp->detect_fs_hz;
-    int nch = (int)(sizeof(k_poa_chans) / sizeof(k_poa_chans[0]));
-    p->poa_fe = poa_frontend_create(bp->detect_fs_hz, bp->default_lo_hz,
-                                    k_poa_chans, nch, poa_on_block, p);
+    // Channels from NVS po_chans; fall back to the profile default set.
+    int nch = parse_poa_chans(chans_csv, p->poa_chans, POA_MAX_CHANNELS);
+    if (nch < 1) {
+        nch = (int)(sizeof(k_poa_chans) / sizeof(k_poa_chans[0]));
+        memcpy(p->poa_chans, k_poa_chans, (size_t)nch * sizeof(uint32_t));
+    }
+    p->poa_nch = nch;
+    p->poa_fe  = poa_frontend_create(bp->detect_fs_hz, bp->default_lo_hz,
+                                     p->poa_chans, nch, poa_on_block, p);
     if (!p->poa_fe) {
         ESP_LOGE(TAG, "poa_frontend_create failed");
         heap_caps_free(p);
@@ -363,7 +387,7 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     // POA and any future CHANNELIZED band bypass the burst tagger entirely
     // (no PSK bursts to detect) — build the always-on channelizer instead.
     if (bp->frontend == BAND_FE_CHANNELIZED)
-        return dsp_create_channelized(cb, bp);
+        return dsp_create_channelized(cb, bp, cfg.poa_chans);
     float                 thr = cfg.tagger_threshold_db;
     if (thr <= 0.0f || thr > 30.0f) thr = bp->tagger_threshold_db; // sanity
     ESP_LOGI(TAG,
