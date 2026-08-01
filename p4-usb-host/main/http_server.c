@@ -1091,6 +1091,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
     // banner) and the Iridium-only / VDL2-only dashboard rows below. Same
     // accessor pattern as frame_decoder.c:930.
     bool                   is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+    bool                   is_poa  = ((band_id_t)cfg.band == BAND_POA);
     const esp_app_desc_t *app = esp_app_get_description();
 
     status_snapshot_t s;
@@ -1183,7 +1184,27 @@ static esp_err_t status_html_get(httpd_req_t *req)
         status_reception_t rx;
         status_logger_get_reception(&rx);
         const char *bg = "#eee", *fg = "#333", *msg = "Calibrating &mdash; collecting windows&hellip;";
-        if (is_vdl2) {
+        if (is_poa) {
+            // POA rides the channelized AM front-end — there is no burst
+            // tagger, so the tagged->synced->decode funnel the other bands
+            // show doesn't exist and status_logger_get_reception() is never
+            // fed. Key the banner off the one honest metric we do have:
+            // ACARS blocks delivered. (No reception state machine to fake.)
+            uint32_t poa_dec = frame_decoder_get_poa_delivered();
+            if (poa_dec > 0) {
+                bg = "#d7f5dd"; fg = "#0a5a24"; msg = "GOOD &mdash; decoding POA.";
+            } else {
+                bg  = "#e6e6e6"; fg = "#555";
+                msg = "QUIET &mdash; no POA ACARS decoded yet (normal when no aircraft "
+                      "are transmitting on the tuned channels).";
+            }
+            n = snprintf(body, sizeof(body),
+                         "<div style=\"background:%s;color:%s;border-radius:8px;"
+                         "padding:.7em 1em;margin:.5em 0;font-weight:600\">%s"
+                         "<div style=\"font-weight:400;font-size:.85em;margin-top:.3em\">"
+                         "blocks decoded %u</div></div>",
+                         bg, fg, msg, (unsigned)poa_dec);
+        } else if (is_vdl2) {
             switch (rx.state) {
             case RX_STATE_GOOD:
                 bg = "#d7f5dd"; fg = "#0a5a24"; msg = "GOOD &mdash; decoding VDL2."; break;
@@ -1216,7 +1237,8 @@ static esp_err_t status_html_get(httpd_req_t *req)
             default: break;
             }
         }
-        n = snprintf(body, sizeof(body),
+        if (!is_poa) // POA set its own banner above (no tagger funnel)
+            n = snprintf(body, sizeof(body),
                      "<div style=\"background:%s;color:%s;border-radius:8px;"
                      "padding:.7em 1em;margin:.5em 0;font-weight:600\">%s"
                      "<div style=\"font-weight:400;font-size:.85em;margin-top:.3em\">"
@@ -1270,7 +1292,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
     // dashboard so it isn't cluttered with dead Iridium metrics (the VDL2
     // funnel table below carries the VDL2-equivalent counters instead).
     char bch_rows[220] = "";
-    if (!is_vdl2) {
+    if (!is_vdl2 && !is_poa) { // BCH is Iridium's inner code; POA has none either
         snprintf(bch_rows, sizeof(bch_rows),
                  "<tr><td>BCH decoded / unknown (window)</td><td class=v>%u / %u</td></tr>"
                  "<tr><td>BCH decoded / unknown (since boot)</td><td class=v>%u / %u</td></tr>",
@@ -1656,10 +1678,22 @@ static esp_err_t messages_html_get(httpd_req_t *req)
     app_config_t cfg;
     app_config_snapshot(&cfg);
     bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+    bool is_poa  = ((band_id_t)cfg.band == BAND_POA);
 
     static EXT_RAM_BSS_ATTR char body[768];
     int                          bn;
-    if (is_vdl2) {
+    if (is_poa) {
+        // POA has no burst/RS/BCH funnel (channelized AM front-end): the only
+        // honest counter is ACARS blocks delivered to the reassembler.
+        bn = snprintf(body, sizeof(body),
+                      "<p><small>%llu messages in ring &middot; showing last %u "
+                      "&middot; auto-refresh 10 s</small></p>"
+                      "<h2>POA decode (since boot)</h2>"
+                      "<table><tr><th>ACARS blocks decoded</th></tr>"
+                      "<tr><td class=v>%u</td></tr></table>",
+                      (unsigned long long)total, (unsigned)n,
+                      (unsigned)frame_decoder_get_poa_delivered());
+    } else if (is_vdl2) {
         frame_decoder_vdl2_stats_t vd = {0};
         frame_decoder_get_vdl2_stats(&vd);
         bn = snprintf(body, sizeof(body),
@@ -2110,8 +2144,19 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
     app_config_t cfg;
     app_config_snapshot(&cfg);
     bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+    bool is_poa  = ((band_id_t)cfg.band == BAND_POA);
     char dr[448]; // +rescued_fcs split; headroom re-checked vs worst case
-    if (is_vdl2) {
+    if (is_poa) {
+        // POA: channelized AM front-end, no tagger/RS/BCH funnel. The only
+        // decode counter is ACARS blocks delivered (parity/CRC already done
+        // in poa_decoder before delivery, so every one is a valid decode).
+        snprintf(dr, sizeof(dr),
+                 "\"decode_recovery\":{"
+                 "\"mode\":\"poa\","
+                 "\"acars_blocks\":%u"
+                 "},",
+                 (unsigned)frame_decoder_get_poa_delivered());
+    } else if (is_vdl2) {
         frame_decoder_vdl2_stats_t vd = {0};
         frame_decoder_get_vdl2_stats(&vd);
         snprintf(dr, sizeof(dr),
