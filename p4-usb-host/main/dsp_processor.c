@@ -29,6 +29,7 @@
 #include "app_config.h"
 #include "band_profile.h" // per-band tagger parameters (VHF/VDL2 foundation)
 #include "band_select.h"  // band_runtime_resolve — resolve band once (phase 3)
+#include "poa_frontend.h" // POA CHANNELIZED front end (tagger-bypass, P2)
 
 static const char *TAG = "DSP_PROC";
 
@@ -89,6 +90,13 @@ struct dsp_processor {
     fft_burst_tagger_t *tagger;
     int32_t            *baseline_history; // PSRAM, 4 MB
     burst_detected_cb_t user_cb;
+
+    // POA (BAND_FE_CHANNELIZED): when set, the tagger/baseline_history are
+    // NULL and feed() routes to this always-on channelizer+demod instead of
+    // the burst path (docs/2026-08-01-poa-onband-plan.md §1). Mutually
+    // exclusive with `tagger`.
+    poa_frontend_t     *poa_fe;
+    _Atomic uint32_t    poa_blocks; // ACARS blocks decoded (P2 counter; P3 delivers)
 
     // Detect-path sample rate from the selected band profile. Both
     // current bands run 2.5 MSPS (== FS_DETECT_HZ, statically asserted
@@ -298,6 +306,51 @@ void dsp_processor_flush(dsp_processor_t *p)
     ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
 
+// POA (CHANNELIZED) block callback — fires on the feed task per decoded ACARS
+// block. P2: count + log (bring-up visibility). P3 will bridge the block to
+// the Core-1 decoder task's acars_deliver via a cross-core queue (that task
+// owns s_reasm_ctx/msg_ring, so it must not be called from here).
+static void poa_on_block(const poa_block_t *b, void *user)
+{
+    dsp_processor_t *p = (dsp_processor_t *)user;
+    atomic_fetch_add_explicit(&p->poa_blocks, 1, memory_order_relaxed);
+    char s[64];
+    int  n = b->len < 63 ? b->len : 63;
+    for (int i = 0; i < n; i++) {
+        unsigned char c = b->txt[i];
+        s[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    s[n] = '\0';
+    ESP_LOGI(TAG, "POA block ch=%d len=%d err=%d fixed=%d: %s",
+             b->chn, b->len, b->err, (int)b->crc_fixed, s);
+}
+
+// POA channel set — P4 reads these from NVS `po_chans`; hardcoded for now
+// (docs/2026-08-01-poa-onband-plan.md §5, LO 130.8 MHz).
+static const uint32_t k_poa_chans[] = {131550000u, 130450000u, 130425000u, 130025000u};
+
+static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
+                                               const band_profile_t *bp)
+{
+    dsp_processor_t *p = heap_caps_calloc(1, sizeof(*p), MALLOC_CAP_SPIRAM);
+    if (!p) { ESP_LOGE(TAG, "dsp_processor (POA) handle alloc failed"); return NULL; }
+    p->user_cb = cb; // unused under POA (no burst path)
+    p->fs_hz   = bp->detect_fs_hz;
+    int nch = (int)(sizeof(k_poa_chans) / sizeof(k_poa_chans[0]));
+    p->poa_fe = poa_frontend_create(bp->detect_fs_hz, bp->default_lo_hz,
+                                    k_poa_chans, nch, poa_on_block, p);
+    if (!p->poa_fe) {
+        ESP_LOGE(TAG, "poa_frontend_create failed");
+        heap_caps_free(p);
+        return NULL;
+    }
+    ESP_LOGI(TAG,
+             "Creating POA channelized front end (band=%s, fs=%u Hz, lo=%u Hz, %d channels) — no tagger",
+             bp->name, (unsigned)bp->detect_fs_hz, (unsigned)bp->default_lo_hz, nch);
+    s_default = p; // publish for cross-task diagnostic readers
+    return p;
+}
+
 dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
 {
     // Pull threshold from NVS-backed config (D18). Falls back to the
@@ -310,6 +363,10 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     // _Static_asserts above) — bit-identical behaviour.
     const band_runtime_t *rt  = band_runtime_resolve((band_id_t)cfg.band); // resolve once (phase 3)
     const band_profile_t *bp  = rt->profile;
+    // POA and any future CHANNELIZED band bypass the burst tagger entirely
+    // (no PSK bursts to detect) — build the always-on channelizer instead.
+    if (bp->frontend == BAND_FE_CHANNELIZED)
+        return dsp_create_channelized(cb, bp);
     float                 thr = cfg.tagger_threshold_db;
     if (thr <= 0.0f || thr > 30.0f) thr = bp->tagger_threshold_db; // sanity
     ESP_LOGI(TAG,
@@ -389,10 +446,27 @@ void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_sam
     // n_samples is complex IQ pairs. At FS_DETECT_HZ the typical USB
     // transfer (16 KB raw / 2 bytes per complex) is ~8000 complex
     // after the 125/128 resample in ingest_core1.
-    if (!p || !p->tagger) return;
+    if (!p) return;
 
     atomic_fetch_add_explicit(&p->acc_input_samples, (uint32_t)n_samples, memory_order_relaxed);
     atomic_fetch_add_explicit(&p->total_input_samples, (uint64_t)n_samples, memory_order_relaxed); // #127, never reset
+
+    // POA CHANNELIZED path: convert int16 IQ -> float interleaved and drive
+    // the channelizer (no tagger). Single-writer task, so a static scratch
+    // buffer is safe. Chunked to bound stack/scratch.
+    if (p->poa_fe) {
+        static float fbuf[2 * 4096];
+        size_t off = 0;
+        while (off < n_samples) {
+            size_t c = n_samples - off;
+            if (c > 4096) c = 4096;
+            for (size_t i = 0; i < c * 2; i++) fbuf[i] = (float)samples[off * 2 + i];
+            poa_frontend_feed(p->poa_fe, fbuf, (int)c);
+            off += c;
+        }
+        return;
+    }
+    if (!p->tagger) return;
 
     size_t off = 0;
     while (off < n_samples) {
@@ -411,6 +485,11 @@ void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_sam
             p->accum_n = 0;
         }
     }
+}
+
+uint32_t dsp_processor_get_poa_blocks(const dsp_processor_t *p)
+{
+    return p ? atomic_load_explicit(&p->poa_blocks, memory_order_relaxed) : 0;
 }
 
 void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)
