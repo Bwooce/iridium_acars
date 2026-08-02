@@ -48,10 +48,15 @@ struct poa_frontend {
     poa_decoder_t *dec;
     int            nch;
     int            rtlMult;
-    // mix+integrate weights per channel, split re/im (plain float — NOT
-    // float complex, so the hot loop can't accidentally reacquire __mulsc3).
-    float         *wf_re[POA_MAX_CHANNELS]; // [rtlMult]
-    float         *wf_im[POA_MAX_CHANNELS]; // [rtlMult]
+    // mix+integrate weights per channel, split re/im, as Q15 int16 (unit
+    // magnitude, i.e. WITHOUT the 1/rtlMult normalization — the decode is
+    // amplitude-invariant, so dropping the constant scale keeps 15 bits of
+    // weight precision). The mix is then an int16 Q15 dot product (int16
+    // sample x int16 weight -> int32, summed in a >=40-bit accumulator), which
+    // is what the ESP32-P4 PIE vector MAC does 8 lanes at a time. wf_re/wf_im
+    // hold cos(amf*ind)/-sin(amf*ind) scaled by 32767.
+    int16_t       *wf_re[POA_MAX_CHANNELS]; // [rtlMult]
+    int16_t       *wf_im[POA_MAX_CHANNELS]; // [rtlMult]
     // partial input block (< rtlMult complex samples) carried across feeds,
     // held as raw int16 I/Q (consume_block converts to float on the stack).
     int16_t        pend[2 * RTLMULTMAX];
@@ -77,18 +82,19 @@ poa_frontend_t *poa_frontend_create(uint32_t fs_hz, uint32_t lo_hz,
     if (!fe->dec) { free(fe); return NULL; }
 
     for (int n = 0; n < nch; n++) {
-        fe->wf_re[n] = malloc((size_t)rtlMult * sizeof(float));
-        fe->wf_im[n] = malloc((size_t)rtlMult * sizeof(float));
+        fe->wf_re[n] = malloc((size_t)rtlMult * sizeof(int16_t));
+        fe->wf_im[n] = malloc((size_t)rtlMult * sizeof(int16_t));
         if (!fe->wf_re[n] || !fe->wf_im[n]) { poa_frontend_destroy(fe); return NULL; }
-        // AMFreq = 2*pi*(Fr - Fc)/fs (rad/sample). wf = exp(-i*AMFreq*ind)/rtlMult
-        // (rtlMult = integrate-dump normalization; acarsdec's extra /127.5 cu8
-        // scale is dropped — the decode is amplitude-invariant). Built in double
-        // to stay bit-comparable to the oracle; stored as split float.
+        // AMFreq = 2*pi*(Fr - Fc)/fs (rad/sample). wf = exp(-i*AMFreq*ind),
+        // unit magnitude (the old 1/rtlMult integrate-dump normalization is
+        // dropped — the decode is amplitude-invariant, and keeping unit
+        // magnitude preserves Q15 precision). Built in double, stored as Q15
+        // int16 (round-to-nearest via lrint). +-1.0 -> +-32767.
         double amf = 2.0 * M_PI * ((double)chan_hz[n] - (double)lo_hz) / (double)fs_hz;
         for (int ind = 0; ind < rtlMult; ind++) {
-            double complex w = cexp(-I * amf * ind) / rtlMult;
-            fe->wf_re[n][ind] = (float)creal(w);
-            fe->wf_im[n][ind] = (float)cimag(w);
+            double complex w = cexp(-I * amf * ind);
+            fe->wf_re[n][ind] = (int16_t)lrint(creal(w) * 32767.0);
+            fe->wf_im[n][ind] = (int16_t)lrint(cimag(w) * 32767.0);
         }
     }
     return fe;
@@ -111,34 +117,33 @@ static void flush_out(poa_frontend_t *fe)
 static void consume_block(poa_frontend_t *fe, const int16_t *blk)
 {
     const int R = fe->rtlMult;
-    float vb_re[RTLMULTMAX], vb_im[RTLMULTMAX];
+    // Deinterleave the int16 IQ block into split re/im (no float conversion).
+    // This is the layout the PIE vector loads want (contiguous per-lane int16).
+    int16_t xr[RTLMULTMAX], xi[RTLMULTMAX];
     for (int i = 0; i < R; i++) {
-        vb_re[i] = (float)blk[2 * i];
-        vb_im[i] = (float)blk[2 * i + 1];
+        xr[i] = blk[2 * i];
+        xi[i] = blk[2 * i + 1];
     }
     int m = fe->out_n;
     for (int n = 0; n < fe->nch; n++) {
-        const float *wre = fe->wf_re[n];
-        const float *wim = fe->wf_im[n];
-        // 2-way unroll -> 4 independent accumulator chains hide FPU add latency.
-        float Dre0 = 0.0f, Dim0 = 0.0f, Dre1 = 0.0f, Dim1 = 0.0f;
-        int ind = 0;
-        for (; ind + 1 < R; ind += 2) {
-            float x0 = vb_re[ind],     y0 = vb_im[ind],     a0 = wre[ind],     b0 = wim[ind];
-            float x1 = vb_re[ind + 1], y1 = vb_im[ind + 1], a1 = wre[ind + 1], b1 = wim[ind + 1];
-            Dre0 += x0 * a0 - y0 * b0;
-            Dim0 += x0 * b0 + y0 * a0;
-            Dre1 += x1 * a1 - y1 * b1;
-            Dim1 += x1 * b1 + y1 * a1;
+        const int16_t *wre = fe->wf_re[n];
+        const int16_t *wim = fe->wf_im[n];
+        // Q15 complex integrate-dump: D = sum(x * conj-ish weight). Each product
+        // is int16*int16 -> int32; accumulated in int64 (PIE uses a >=40-bit
+        // accumulator — max |D| ~ R * 2^15 * 2^15 ~ 2.1e11 < 2^40, so int64 here
+        // is bit-identical to the PIE accumulator, no overflow). Same real/imag
+        // arithmetic as the float path.
+        int64_t Dre = 0, Dim = 0;
+        for (int ind = 0; ind < R; ind++) {
+            int32_t x = xr[ind], y = xi[ind];
+            int32_t a = wre[ind], b = wim[ind];
+            Dre += (int64_t)x * a - (int64_t)y * b;
+            Dim += (int64_t)x * b + (int64_t)y * a;
         }
-        for (; ind < R; ind++) { // odd rtlMult tail (rtlMult=fs/12500 is even in practice)
-            float x = vb_re[ind], y = vb_im[ind], a = wre[ind], b = wim[ind];
-            Dre0 += x * a - y * b;
-            Dim0 += x * b + y * a;
-        }
-        float Dre = Dre0 + Dre1;
-        float Dim = Dim0 + Dim1;
-        fe->out[n][m] = sqrtf(Dre * Dre + Dim * Dim);
+        // Envelope. |D| ~ up to 2.1e11 fits float's exponent; the low-order
+        // precision loss is far below the MSK slice margin.
+        float fre = (float)Dre, fim = (float)Dim;
+        fe->out[n][m] = sqrtf(fre * fre + fim * fim);
     }
     fe->out_n++;
     if (fe->out_n >= OUTBUF) flush_out(fe);
