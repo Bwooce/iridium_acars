@@ -47,13 +47,11 @@ int main(void)
     assert(fe);
 
     enum { NS = 250000 };                 // complex samples per chunk
-    static short raw[NS * 2];             // interleaved s16 I/Q
-    static float iq[NS * 2];              // interleaved float I/Q
+    static int16_t raw[NS * 2];           // interleaved s16 I/Q (native feed)
     size_t got;
     long total = 0;
-    while ((got = fread(raw, sizeof(short) * 2, NS, f)) > 0) {
-        for (size_t k = 0; k < got * 2; k++) iq[k] = (float)raw[k];
-        poa_frontend_feed(fe, iq, (int)got);
+    while ((got = fread(raw, sizeof(int16_t) * 2, NS, f)) > 0) {
+        poa_frontend_feed(fe, raw, (int)got);
         total += (long)got;
     }
     fclose(f);

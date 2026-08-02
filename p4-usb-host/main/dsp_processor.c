@@ -482,19 +482,11 @@ void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_sam
     atomic_fetch_add_explicit(&p->acc_input_samples, (uint32_t)n_samples, memory_order_relaxed);
     atomic_fetch_add_explicit(&p->total_input_samples, (uint64_t)n_samples, memory_order_relaxed); // #127, never reset
 
-    // POA CHANNELIZED path: convert int16 IQ -> float interleaved and drive
-    // the channelizer (no tagger). Single-writer task, so a static scratch
-    // buffer is safe. Chunked to bound stack/scratch.
+    // POA CHANNELIZED path: drive the channelizer straight from the int16 IQ
+    // (no tagger). poa_frontend_feed reads whole rtlMult-blocks directly from
+    // this buffer and converts to float inline — no intermediate float copy.
     if (p->poa_fe) {
-        static float fbuf[2 * 4096];
-        size_t off = 0;
-        while (off < n_samples) {
-            size_t c = n_samples - off;
-            if (c > 4096) c = 4096;
-            for (size_t i = 0; i < c * 2; i++) fbuf[i] = (float)samples[off * 2 + i];
-            poa_frontend_feed(p->poa_fe, fbuf, (int)c);
-            off += c;
-        }
+        poa_frontend_feed(p->poa_fe, samples, (int)n_samples);
         return;
     }
     if (!p->tagger) return;

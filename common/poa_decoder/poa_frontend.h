@@ -6,8 +6,8 @@
 // output is an AM envelope, the per-block oscillator reset is harmless (plan).
 //
 // Pure C11 + libm — links into tests/host directly. Input scale is irrelevant
-// (the demod normalizes per bit), so feed float IQ of any scale (cu8-127.37
-// on device, or s16 from a capture in tests).
+// (the demod normalizes per bit), so feed int16 IQ of any scale (the device's
+// resampled s16 stream, or s16 read straight from a capture in tests).
 
 #pragma once
 
@@ -24,7 +24,9 @@ poa_frontend_t *poa_frontend_create(uint32_t fs_hz, uint32_t lo_hz,
                                     const uint32_t *chan_hz, int nch,
                                     poa_block_cb cb, void *user);
 
-// Feed nsamp COMPLEX samples as interleaved float I/Q (length 2*nsamp).
-void poa_frontend_feed(poa_frontend_t *fe, const float *iq, int nsamp);
+// Feed nsamp COMPLEX samples as interleaved int16 I/Q (length 2*nsamp).
+// The channelizer reads whole rtlMult-blocks straight from this buffer (no
+// intermediate float copy) and converts to float inline in the hot loop.
+void poa_frontend_feed(poa_frontend_t *fe, const int16_t *iq, int nsamp);
 
 void poa_frontend_destroy(poa_frontend_t *fe);
