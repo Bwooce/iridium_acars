@@ -36,9 +36,15 @@ typedef enum { WSYN, SYN2, SOH1, TXT, CRC1, CRC2, END } acarsstate_t;
 typedef struct {
     int chn;
     // --- MSK demod state (msk.c) ---
-    double        MskPhi, MskDf;
+    // MskPhi: Q32 phase accumulator (2^32 == 2*pi radians), NOT a float
+    // radian value. It wraps for free on unsigned integer overflow -- an
+    // EXACT wrap, unlike a float radian accumulator that would need a
+    // conditional subtract (and unlike incrementally-multiplying a unit
+    // phasor, which decays -- feedback_q15_incremental_phasor_decays).
+    uint32_t      MskPhi;
+    float         MskDf;
     float         MskClk;
-    double        MskLvlSum;
+    float         MskLvlSum;
     int           MskBitCount;
     unsigned int  MskS, idx;
     float complex inb[FLEN];
@@ -66,6 +72,33 @@ static bool  s_h_init = false;
 
 static const float PLLG = 38e-4f;
 static const float PLLC = 0.52f;
+
+// --- NCO: Q32 phase accumulator + cos/sin LUT (replaces double cexp) ---
+// The ESP32-P4 is RV32IMAFC: single-precision FPU only, no D extension. The
+// original acarsdec math accumulates the mixer phase `p` as a `double` and
+// evaluates `cexp(-p*I)` per envelope sample (12.5 kHz/channel) -- on this
+// target every one of those ops (add/cmp/cexp) is an emulated soft-float
+// libgcc call. This block replaces both:
+//   - the phase accumulator becomes a uint32_t where the full 2^32 range
+//     maps to one full turn (2*pi); advancing it is a plain integer add
+//     that wraps for free (no branch, no float drift -- see MskPhi comment
+//     above);
+//   - cexp(-p*I) = cos(p) - i*sin(p) becomes a table lookup indexed by the
+//     top NCO_LUT_BITS of the accumulator.
+// 1024 entries -> phase quantization of 2*pi/1024 ~= 0.0061 rad, two orders
+// of magnitude finer than anything the MSK PLL (PLLG=38e-4) tracks bit to
+// bit; float32's 24-bit mantissa is ample for a 12.5 kHz NCO over ~1 s.
+#define NCO_LUT_BITS 10
+#define NCO_LUT_SIZE (1 << NCO_LUT_BITS)          // 1024
+#define NCO_LUT_SHIFT (32 - NCO_LUT_BITS)         // 22
+
+static float s_nco_cos[NCO_LUT_SIZE];
+static float s_nco_sin[NCO_LUT_SIZE];
+
+// Radians -> Q32 turns conversion factor. This is a compile-time constant
+// (folded by the compiler from the double literals below); it is NOT a
+// runtime double op. 2^32 is exactly representable in float (power of two).
+static const float NCO_RAD_TO_Q32 = (float)(4294967296.0 / (2.0 * M_PI));
 
 // --- L2 error correction (acars.c fixprerr/fixdberr, verbatim on txt/len) ---
 static int fixprerr(unsigned char *txt, int len, const unsigned short crc,
@@ -248,26 +281,33 @@ static inline void putbit(poa_decoder_t *d, poa_channel_t *ch, float v)
     if (ch->nbits <= 0) decode_acars(d, ch);
 }
 
-// msk.c demodMSK, verbatim math on ch state.
+// msk.c demodMSK. Ported to single-precision + a Q32 phase-accumulator NCO
+// (see NCO block above) -- functionally identical to the acarsdec double
+// path (same PLL constants, same matched filter, same bit decisions) but
+// with no double-precision or transcendental math in the per-sample loop.
 static void demod_msk(poa_decoder_t *d, poa_channel_t *ch, int len)
 {
     unsigned int idx = ch->idx;
-    double p = ch->MskPhi;
+    uint32_t p = ch->MskPhi;
 
     for (int n = 0; n < len; n++) {
-        double s = 1800.0 / INTRATE * 2.0 * M_PI + ch->MskDf;
-        p += s;
-        if (p >= 2.0 * M_PI) p -= 2.0 * M_PI;
+        float s = 1800.0f / INTRATE * 2.0f * (float)M_PI + ch->MskDf;
+        p += (uint32_t)(s * NCO_RAD_TO_Q32);
+
+        unsigned lut_idx = p >> NCO_LUT_SHIFT;
+        float c  = s_nco_cos[lut_idx];
+        float si = s_nco_sin[lut_idx];
 
         float in = ch->dm_buffer[n];
-        ch->inb[idx] = in * cexp(-p * I);
+        // cexp(-p*I) = cos(p) - i*sin(p)
+        ch->inb[idx] = (in * c) - (in * si) * I;
         idx = (idx + 1) % FLEN;
 
-        ch->MskClk += (float)s;
-        if (ch->MskClk >= 3 * M_PI / 2.0 - s / 2) {
-            ch->MskClk -= (float)(3 * M_PI / 2.0);
+        ch->MskClk += s;
+        if (ch->MskClk >= (float)(3.0 * M_PI / 2.0) - s * 0.5f) {
+            ch->MskClk -= (float)(3.0 * M_PI / 2.0);
 
-            int o = (int)(MFLTOVER * (ch->MskClk / s + 0.5));
+            int o = (int)((float)MFLTOVER * (ch->MskClk / s + 0.5f));
             if (o > MFLTOVER) o = MFLTOVER;
             float complex v = 0;
             for (int j = 0; j < FLEN; j++, o += MFLTOVER)
@@ -275,10 +315,10 @@ static void demod_msk(poa_decoder_t *d, poa_channel_t *ch, int len)
 
             float lvl = cabsf(v);
             v /= lvl + 1e-8f;
-            ch->MskLvlSum += (double)lvl * lvl / 4.0;
+            ch->MskLvlSum += lvl * lvl / 4.0f;
             ch->MskBitCount++;
 
-            double dphi;
+            float dphi;
             float vo;
             if (ch->MskS & 1) {
                 vo = cimagf(v);
@@ -290,7 +330,7 @@ static void demod_msk(poa_decoder_t *d, poa_channel_t *ch, int len)
             putbit(d, ch, (ch->MskS & 2) ? -vo : vo);
             ch->MskS++;
 
-            ch->MskDf = PLLC * ch->MskDf + (1.0 - PLLC) * PLLG * dphi;
+            ch->MskDf = PLLC * ch->MskDf + (1.0f - PLLC) * PLLG * dphi;
         }
     }
     ch->idx = idx;
@@ -310,6 +350,12 @@ poa_decoder_t *poa_decoder_create(int nchannels, poa_block_cb cb, void *user)
         for (int i = 0; i < FLENO; i++) {
             s_h[i] = cosf(2.0f * (float)M_PI * 600.0f / INTRATE / MFLTOVER * (i - (FLENO - 1) / 2));
             if (s_h[i] < 0) s_h[i] = 0;
+        }
+        // NCO LUT: one-time build, single-precision cosf/sinf (not hot path).
+        for (int i = 0; i < NCO_LUT_SIZE; i++) {
+            float ang = 2.0f * (float)M_PI * (float)i / (float)NCO_LUT_SIZE;
+            s_nco_cos[i] = cosf(ang);
+            s_nco_sin[i] = sinf(ang);
         }
         s_h_init = true;
     }
