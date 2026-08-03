@@ -81,8 +81,22 @@ Aggregated 113,085 `POA_STATS` lines (old 4-ch set, ~8 h):
    override retained. LANDMINE: if it adds a web route, bump
    `cfg.max_uri_handlers` ([[feedback_httpd_max_uri_handlers]]) or boot panic-loops.
 
-## 3.2 MSPS wider window — TESTED 2026-08-04: FAILS (stream won't sustain)
+## Higher sample rate for a single-window NA — TESTED 2026-08-04: BOTH 3.2 AND 2.8 MSPS FAIL
 
+RESULT: NA cannot be a single preset at ANY sustainable rate. **2.8 MSPS** (Fable's
+"plausible" target, just above the 2.56 no-drop ceiling) wedges the dongle with the
+SAME signature as 3.2 (Dev 0 EP0 error, completed=0, status_errors=0). 2.5M streamed
+clean before AND after each wedge → the rate is the cause, dongle recovers (no reseat).
+ROOT CAUSE (Fable, sourced): device-side RTL2832U — tiny FIFO + no flow control, so
+worst-case USB IN-latency is the limit (NOT bandwidth: 6.4 MB/s is ~12% of HS bulk).
+Osmocom: 2.4 MS/s on regular host controllers, stable 3.2 only on exotic Etron
+controllers. A bigger USB pool can't fix it (desktop rtl_sdr's 3.75MB pool still
+drops at 3.2M; our DMA-INT reserve caps us at ~4-6×8KB regardless). So ~2.5 MSPS is
+this platform's ceiling → NA stays TWO presets; full single-radio NA = multi-rx
+(task #17). If ever revisited: verify continuity via RTL testmode counter, not byte
+rate (byte rate lies about silent FIFO drops). See [[reference_p4_max_sample_rate_2500]].
+
+--- original 3.2-only test note (superseded by the 2.8 result above) ---
 RESULT: NA cannot be a single preset via 3.2 MSPS on the current firmware.
 Tested by bumping BAND_POA_FS_HZ->3200000 + coupling the RTL rate to the POA
 profile fs (POA-scoped, in class_driver action_start_stream), flashed, POA band.
