@@ -188,6 +188,11 @@ static void cmd_set(const char *key, const char *val)
         // POA namespace; reboot to apply. The recovery-over-serial path for
         // POA channel selection when the web form is unreachable.
         rc = app_config_set_poa_chans(val);
+    else if (strcmp(key, "po_region") == 0)
+        // POA region preset (see poa_regions.h): "australia"/"europe"/
+        // "north_america"/... — sets the POA LO + channels from the sourced
+        // table. Reboot to apply. Same as the setup region dropdown.
+        rc = app_config_set_poa_region(val);
     else if (strcmp(key, "rate_hz") == 0)
         rc = app_config_set_sample_rate_hz((uint32_t)atol(val));
     else if (strcmp(key, "gain_mode") == 0)

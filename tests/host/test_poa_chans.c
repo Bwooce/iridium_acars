@@ -3,8 +3,10 @@
 // app_config's runtime po_chans setter validation. If this parser is wrong,
 // the setter accepts CSVs the device then parses differently.
 #include "poa_chans.h"
+#include "poa_regions.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 static int fails = 0;
 #define CHECK(cond, msg)                                                        \
@@ -49,6 +51,32 @@ int main(void)
     // non-numeric stops parsing.
     n = poa_chans_parse("131.550,junk,130.025", f, 8);
     CHECK(n == 1, "stops at non-numeric token");
+
+    // --- region table (poa_regions.h) validity ---
+    // Every region's channels must: parse (1..8), sit inside LO +/-1.25 MHz,
+    // and stay off-DC (>50 kHz from LO, so the LO/DC spike misses a channel).
+    for (int r = 0; r < POA_REGION_COUNT; r++) {
+        const poa_region_t *R = &POA_REGIONS[r];
+        uint32_t ch[8];
+        int nc = poa_chans_parse(R->chans, ch, 8);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "region '%s' parses 1..8 channels", R->name);
+        CHECK(nc >= 1 && nc <= 8, msg);
+        for (int i = 0; i < nc; i++) {
+            long d = (long)ch[i] - (long)R->lo_hz;
+            long ad = d < 0 ? -d : d;
+            snprintf(msg, sizeof(msg), "region '%s' ch %.4f in LO+/-1.25MHz",
+                     R->name, ch[i] / 1e6);
+            CHECK(ad <= 1250000L, msg);
+            snprintf(msg, sizeof(msg), "region '%s' ch %.4f off-DC (>50kHz from LO)",
+                     R->name, ch[i] / 1e6);
+            CHECK(ad > 50000L, msg);
+        }
+    }
+    // Australia preset must be exactly the confirmed AU/NZ set.
+    const poa_region_t *au = poa_region_lookup("australia");
+    CHECK(au && strcmp(au->chans, "131.550,131.450") == 0, "australia == 131.550,131.450");
+    CHECK(poa_region_lookup("does_not_exist") == NULL, "unknown region -> NULL");
 
     if (fails) { printf("test_poa_chans: %d FAILED\n", fails); return 1; }
     printf("test_poa_chans: all passed\n");

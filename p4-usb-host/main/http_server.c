@@ -27,6 +27,7 @@ static const char *ds_phase_name(ds_phase_t p); // defined near /diag/survey
 #include "band_health.h"      // staleness detector snapshot for /status
 #include "autotune.h"         // autotune_run_manual() — /gaincal manual trigger
 #include "autotune_gainset.h" // AUTOTUNE_R828D_GAINS/N + autotune_snap_gain — the real tuner gain steps for the /sdrcfg dropdown
+#include "poa_regions.h"      // POA per-region {LO, channels} presets for the region dropdown
 #include "c6_ota.h"           // c6_ota_* — POST /c6ota (Method B: C6 firmware update)
 #include "sd_log.h"
 #include "sd_capture.h"
@@ -926,9 +927,14 @@ static esp_err_t index_get(httpd_req_t *req)
     }
 
     // Part C: remainder of the SDR form + the separate manual-sweep form.
-    char sdrform_c[1100];
+    char sdrform_c[1400];
     int  sc = snprintf(sdrform_c, sizeof(sdrform_c),
                        "</select>"
+                        // POA channel list (CSV of MHz). Only meaningful for the
+                        // POA band; empty/ignored for Iridium/VDL2. The region
+                        // dropdown below fills this for you.
+                        "<label>POA channels (CSV MHz, POA band only)</label>"
+                        "<input type=\"text\" name=\"chans\" value=\"%s\" placeholder=\"131.550,131.450\">"
                         "<label>Tagger threshold (dB above noise floor)</label>"
                         "<input type=\"number\" name=\"tag_thr\" step=\"0.1\" required value=\"%.1f\">"
                         "<label>Coalesce min bursts (0/1 = disabled)</label>"
@@ -960,6 +966,7 @@ static esp_err_t index_get(httpd_req_t *req)
                        // form so it doesn't reboot / rewrite the config above.
                        "<form method=\"POST\" action=\"/gaincal\" style=\"margin-top:.4em\">"
                         "<button type=\"submit\">Run gain sweep now</button></form>",
+                       cfg.poa_chans, // POA channels input (empty for non-POA)
                        (double)cfg.tagger_threshold_db,
                        (unsigned)cfg.coalesce_min_bursts,
                        (unsigned)cfg.autotune_lo_interval_s,
@@ -972,6 +979,33 @@ static esp_err_t index_get(httpd_req_t *req)
     if (sc < 0) sc = 0;
     if (sc > (int)sizeof(sdrform_c)) sc = sizeof(sdrform_c);
     httpd_resp_send_chunk(req, sdrform_c, sc);
+
+    // POA region preset dropdown (posts to /band?name=poa&region=<name>): pick a
+    // region and the firmware fills the POA LO + channels from the sourced table
+    // (poa_regions.h) and reboots into the POA band. The current region is
+    // pre-selected by matching the live POA channel list. "Custom" = the channel
+    // set doesn't match any preset (edit it directly in the field above).
+    {
+        const char *hdr =
+            "<form method=\"POST\" action=\"/band\" style=\"margin-top:.4em\">"
+            "<h2>POA region</h2>"
+            "<label>Region preset (sets POA LO + channels, switches to POA band)</label>"
+            "<input type=\"hidden\" name=\"name\" value=\"poa\">"
+            "<select name=\"region\">"
+            "<option value=\"\">Custom (channels above)</option>";
+        httpd_resp_send_chunk(req, hdr, HTTPD_RESP_USE_STRLEN);
+        for (int i = 0; i < POA_REGION_COUNT; i++) {
+            bool sel = (strcmp(cfg.poa_chans, POA_REGIONS[i].chans) == 0);
+            char opt[128];
+            int  on = snprintf(opt, sizeof(opt), "<option value=\"%s\"%s>%s</option>",
+                               POA_REGIONS[i].name, sel ? " selected" : "",
+                               POA_REGIONS[i].label);
+            if (on > 0) httpd_resp_send_chunk(req, opt, on);
+        }
+        const char *ftr =
+            "</select><button type=\"submit\">Apply region &amp; reboot</button></form>";
+        httpd_resp_send_chunk(req, ftr, HTTPD_RESP_USE_STRLEN);
+    }
 
     // Full config snapshot (Task 4 — every persisted app_config_t field, not
     // just the ones with an editable widget above). Read-only: fields not
@@ -2307,16 +2341,21 @@ typedef struct {
     int  bias;     // 0/1
     bool has_lo;
     bool has_bias;
+    bool has_region;    // POA region preset present
+    char region[16];    // region name (poa_regions.h)
 } band_apply_t;
 
 static void band_apply_reboot_task(void *arg)
 {
     band_apply_t *a = (band_apply_t *)arg;
     if (a->band >= 0) app_config_set_band((uint8_t)a->band);
+    // POA region preset sets the POA LO + channels; apply BEFORE the explicit
+    // lo (so a caller passing both region and lo gets the explicit lo last).
+    if (a->has_region) app_config_set_poa_region(a->region);
     if (a->has_lo)    app_config_set_lo_freq_hz((uint32_t)a->lo);
     if (a->has_bias)  app_config_set_bias_tee(a->bias != 0);
-    ESP_LOGI(TAG, "/band: band=%d lo=%ld bias=%d(set=%d) — rebooting to apply",
-             a->band, a->lo, a->bias, (int)a->has_bias);
+    ESP_LOGI(TAG, "/band: band=%d region=%s lo=%ld bias=%d(set=%d) — rebooting to apply",
+             a->band, a->has_region ? a->region : "-", a->lo, a->bias, (int)a->has_bias);
     free(a);
     vTaskDelay(pdMS_TO_TICKS(500));
     class_driver_prepare_for_reboot();
@@ -2330,6 +2369,8 @@ static esp_err_t band_post(httpd_req_t *req)
     long lo = 0;
     int  bias = 0;
     bool has_lo = false, has_bias = false;
+    char region[16] = {0};
+    bool has_region = false;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "name", v, sizeof(v)) == ESP_OK && v[0])
             band = (int)band_profile_from_str(v);
@@ -2341,12 +2382,14 @@ static esp_err_t band_post(httpd_req_t *req)
             bias = atoi(v);
             has_bias = true;
         }
+        if (httpd_query_key_value(query, "region", region, sizeof(region)) == ESP_OK && region[0])
+            has_region = true;
     }
-    if (band < 0 && !has_lo && !has_bias) {
+    if (band < 0 && !has_lo && !has_bias && !has_region) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req,
-                               "usage: POST /band?name=<iridium|vdl2>[&lo=<hz>][&bias=<0|1>]\n",
+                               "usage: POST /band?name=<iridium|vdl2|poa>[&region=<australia|europe|...>][&lo=<hz>][&bias=<0|1>]\n",
                                HTTPD_RESP_USE_STRLEN);
     }
     band_apply_t *a = malloc(sizeof(*a));
@@ -2355,10 +2398,12 @@ static esp_err_t band_post(httpd_req_t *req)
         return httpd_resp_sendstr(req, "nomem\n");
     }
     a->band = band; a->lo = lo; a->bias = bias; a->has_lo = has_lo; a->has_bias = has_bias;
-    char body[128];
+    a->has_region = has_region;
+    if (has_region) strlcpy(a->region, region, sizeof(a->region));
+    char body[160];
     int  n = snprintf(body, sizeof(body),
-                      "{\"result\":\"ok\",\"band\":%d,\"lo\":%ld,\"bias_set\":%d,\"reboot\":true}",
-                      band, lo, (int)has_bias);
+                      "{\"result\":\"ok\",\"band\":%d,\"region\":\"%s\",\"lo\":%ld,\"bias_set\":%d,\"reboot\":true}",
+                      band, has_region ? region : "", lo, (int)has_bias);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_send(req, body, n);

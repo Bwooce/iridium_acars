@@ -6,6 +6,7 @@
 #include "dsp_processor.h" // FS_IN_HZ, IRIDIUM_CENTER_FREQ_HZ defaults
 #include "band_profile.h"  // per-band default LO (VHF/VDL2 foundation)
 #include "poa_chans.h"      // shared po_chans CSV parser (validate == boot parse)
+#include "poa_regions.h"    // per-region POA {LO, channels} presets
 #include "poa_decoder.h"    // POA_MAX_CHANNELS
 
 #include <stdio.h> // vprintf (uart_log_apply restore path)
@@ -33,13 +34,13 @@ static const char *NVS_NS = "iridium";
 // driven by real per-channel occupancy from a live soak; but with the compute
 // cost gone there's no reason to pre-trim it. There is currently NO runtime
 // po_chans setter, so this compile-time default is the effective config.
-// This is the Australia/Pacific set (LO 130.8 window 129.55-132.05): 131.550
-// SITA worldwide primary (the proven workhorse here) + the Asia-Pacific/Japan
-// cluster 131.450/131.475/131.525. The prior default's 130.025/130.425/130.450
-// are NORTH-AMERICAN ARINC channels (dead air at YSSY: telemetry showed
-// sync-on-noise but blk=0). See the region table in dsp_processor for other
-// regions; a per-region dropdown drives this at setup.
-#define DEFAULT_POA_CHANS "131.550,131.450,131.475,131.525"
+// Australia/Oceania set = the "australia" region preset (poa_regions.h). From
+// airframes.io observed feeder data (corroborated 3 ways): 131.550 SITA primary
+// + 131.450 secondary — the ONLY two confirmed AU/NZ POA channels. (Earlier
+// defaults carried NA-ARINC 130.x and a mislabelled 131.475[=Canada]/131.525
+// [=Europe] guess — both wrong for YSSY.) Use the region dropdown / po_region
+// to switch regions; po_chans for a custom set.
+#define DEFAULT_POA_CHANS "131.550,131.450"
 #define DEFAULT_LO_FREQ_HZ IRIDIUM_CENTER_FREQ_HZ
 // The Iridium band profile's default LO must equal the historical
 // compile-time default — proof that band=iridium changes nothing.
@@ -582,6 +583,27 @@ esp_err_t app_config_set_poa_chans(const char *csv)
     char k[16];
     band_key(k, sizeof(k), BAND_POA, "chans"); // always the POA namespace
     return commit_one_str(k, s_cfg.poa_chans);
+}
+
+// Apply a POA region preset: resolve name -> {LO, channels} from the sourced
+// region table and persist both to the POA namespace (band-independent — you
+// can configure POA's region from any active band; reboot re-reads it). This is
+// what the setup "region" dropdown / `set po_region` drive. Reboot-to-apply.
+esp_err_t app_config_set_poa_region(const char *name)
+{
+    const poa_region_t *r = poa_region_lookup(name);
+    if (!r) return ESP_ERR_INVALID_ARG;
+    esp_err_t ec = app_config_set_poa_chans(r->chans); // validates + POA ns
+    if (ec != ESP_OK) return ec;
+    char k[16];
+    band_key(k, sizeof(k), BAND_POA, "lo_hz"); // POA LO, regardless of active band
+    esp_err_t el = commit_one_u32(k, r->lo_hz);
+    if (el == ESP_OK && s_cfg_mu) {
+        xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+        if (s_cfg.band == BAND_POA) s_cfg.lo_freq_hz = r->lo_hz; // reflect if live
+        xSemaphoreGive(s_cfg_mu);
+    }
+    return el;
 }
 
 esp_err_t app_config_set_band(uint8_t v)

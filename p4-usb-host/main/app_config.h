@@ -215,6 +215,10 @@ esp_err_t app_config_set_lo_freq_hz(uint32_t hz);
 // the boot-time parser + VHF airband range; persists to the POA ("po_chans")
 // namespace regardless of active band. Reboot-to-apply. 1..POA_MAX_CHANNELS.
 esp_err_t app_config_set_poa_chans(const char *csv);
+// Apply a POA region preset by name (see common/poa_decoder/poa_regions.h):
+// sets the POA LO + channel list from the sourced region table. Reboot-to-apply.
+// Returns ESP_ERR_INVALID_ARG for an unknown region name.
+esp_err_t app_config_set_poa_region(const char *name);
 esp_err_t app_config_set_sample_rate_hz(uint32_t hz);
 esp_err_t app_config_set_gain_mode(gain_mode_t mode);
 esp_err_t app_config_set_gain_db_x10(int16_t v);

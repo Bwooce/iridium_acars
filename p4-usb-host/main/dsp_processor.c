@@ -313,8 +313,9 @@ void dsp_processor_flush(dsp_processor_t *p)
 }
 
 // Fallback POA channel set (LO 130.8 MHz) when NVS po_chans is unset AND the
-// default CSV fails to parse. Australia/Pacific set (matches DEFAULT_POA_CHANS).
-static const uint32_t k_poa_chans[] = {131550000u, 131450000u, 131475000u, 131525000u};
+// default CSV fails to parse. Australia/Oceania set (matches DEFAULT_POA_CHANS
+// + the "australia" region preset): 131.550 primary + 131.450 secondary.
+static const uint32_t k_poa_chans[] = {131550000u, 131450000u};
 
 // POA channel-list CSV parse lives in the shared common/poa_decoder/poa_chans.h
 // (poa_chans_parse) so app_config's runtime po_chans setter validates with the
