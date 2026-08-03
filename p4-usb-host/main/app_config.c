@@ -31,7 +31,13 @@ static const char *NVS_NS = "iridium";
 // driven by real per-channel occupancy from a live soak; but with the compute
 // cost gone there's no reason to pre-trim it. There is currently NO runtime
 // po_chans setter, so this compile-time default is the effective config.
-#define DEFAULT_POA_CHANS "131.550,130.025,130.425,130.450"
+// This is the Australia/Pacific set (LO 130.8 window 129.55-132.05): 131.550
+// SITA worldwide primary (the proven workhorse here) + the Asia-Pacific/Japan
+// cluster 131.450/131.475/131.525. The prior default's 130.025/130.425/130.450
+// are NORTH-AMERICAN ARINC channels (dead air at YSSY: telemetry showed
+// sync-on-noise but blk=0). See the region table in dsp_processor for other
+// regions; a per-region dropdown drives this at setup.
+#define DEFAULT_POA_CHANS "131.550,131.450,131.475,131.525"
 #define DEFAULT_LO_FREQ_HZ IRIDIUM_CENTER_FREQ_HZ
 // The Iridium band profile's default LO must equal the historical
 // compile-time default — proof that band=iridium changes nothing.

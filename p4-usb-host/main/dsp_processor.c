@@ -311,8 +311,9 @@ void dsp_processor_flush(dsp_processor_t *p)
     ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
 
-// Fallback POA channel set (LO 130.8 MHz, plan §5) when NVS po_chans is unset.
-static const uint32_t k_poa_chans[] = {131550000u, 130450000u, 130425000u, 130025000u};
+// Fallback POA channel set (LO 130.8 MHz) when NVS po_chans is unset AND the
+// default CSV fails to parse. Australia/Pacific set (matches DEFAULT_POA_CHANS).
+static const uint32_t k_poa_chans[] = {131550000u, 131450000u, 131475000u, 131525000u};
 
 // Parse a CSV of MHz ("131.550,130.025,...") into channel freqs in Hz.
 // Returns the count (<= max); skips tokens <= 1 MHz (malformed/empty).
