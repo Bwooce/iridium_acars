@@ -22,15 +22,16 @@ static const char *NVS_NS = "iridium";
 // bias-tee). Production deployments override via the C6 web UI
 // (D17) once that lands.
 #define DEFAULT_BAND ((uint8_t)BAND_IRIDIUM) // band soft-switch: iridium unless NVS says otherwise
-// POA channel default (LO 130.8 MHz). 2 channels: 131.550 (the only channel
-// that decodes in any saved POA capture) + 130.450. Reduced from the 4-channel
-// candidate set {131.550,130.025,130.425,130.450} because (a) 4 ch overruns one
-// 360 MHz core (decoder-bound, ~40% USB drops) whereas 2 ch fits with headroom
-// (dsp ~28%, 0 drops, full 4.77 MB/s), and (b) no saved data justifies the other
-// channels. Revisit once the MSK decoder is optimized (4ch decoder-opt plan) or
-// a runtime po_chans setter lands. There is currently NO runtime setter — this
-// default is the effective config.
-#define DEFAULT_POA_CHANS "131.550,130.450"
+// POA channel default (LO 130.8 MHz): the full candidate set of AU POA
+// frequencies. 4 channels used to overrun one 360 MHz core (decoder-bound,
+// ~40% USB drops, dsp 99%) because the MSK demod ran emulated double soft-float;
+// after the single-precision decoder rewrite it runs at dsp ~1%, 0 drops, full
+// 4.77 MB/s — so carrying all four channels is now essentially free. Only
+// 131.550 has decoded in any saved capture, so the SET should ultimately be
+// driven by real per-channel occupancy from a live soak; but with the compute
+// cost gone there's no reason to pre-trim it. There is currently NO runtime
+// po_chans setter, so this compile-time default is the effective config.
+#define DEFAULT_POA_CHANS "131.550,130.025,130.425,130.450"
 #define DEFAULT_LO_FREQ_HZ IRIDIUM_CENTER_FREQ_HZ
 // The Iridium band profile's default LO must equal the historical
 // compile-time default — proof that band=iridium changes nothing.
