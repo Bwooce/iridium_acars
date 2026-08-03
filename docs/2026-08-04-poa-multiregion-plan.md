@@ -39,9 +39,36 @@ centre and the channel list, because one RTL dongle only hears a 2.5 MHz window
 |---|---|---|
 | Australia / Pacific | 130.800 | 131.550 + AP secondaries (MEASURE first) |
 | Europe | 130.900 | 131.725, 131.825, 131.550, 131.525 |
-| North America (131.5) | 130.500 | 130.025, 130.425, 130.450, 131.125, 131.550 |
-| Americas (129.1) | 130.000 | 129.125, 130.025, 130.425, 130.450, 131.125 |
+| North America (SITA 131.5) | 130.800 → 130.875 | 130.025, 130.450, 131.125, 131.550, 131.725 |
+| Americas (ARINC 129.1) | 129.800 | 129.125, 130.025, 130.425, 130.450 |
 | Custom | manual | free-text po_chans + po_lo |
+
+## NORTH AMERICA COMPROMISE (the one region that does NOT fit one window)
+
+Every region above fits a single 2.5 MHz window EXCEPT North America. This is
+documented here as the canonical record:
+
+- **Why:** NA's active POA channels span **129.125 → 131.825 MHz ≈ 2.7 MHz** —
+  wider than one 2.5 MHz window. And 2.5 MSPS is this platform's hard ceiling:
+  2.8 and 3.2 MSPS were both TESTED and WEDGE the RTL dongle (device-side
+  RTL2832U FIFO/latency limit, not our USB pool — see the section above +
+  [[reference_p4_max_sample_rate_2500]]).
+- **The crux:** NA's TWO BUSIEST channels are the worldwide primaries
+  **131.550 (SITA)** and **129.125 (ARINC)**, and they are **2.425 MHz apart** —
+  they physically cannot coexist in one 2.5 MHz capture.
+- **The compromise — two complementary presets** (in poa_regions.h; operator
+  picks the half matching local traffic):
+  | Preset | LO (MHz) | Channels | Captures | Sacrifices |
+  |---|---|---|---|---|
+  | `north_america` "North America (SITA 131.5)" | 130.875 | 130.025, 130.450, 131.125, 131.550, 131.725 | the 131.550 SITA half + mid ARINC | 129.125 |
+  | `americas_arinc` "Americas (ARINC 129.1)" | 129.800 | 129.125, 130.025, 130.425, 130.450 | the 129.125 ARINC-low half | 131.550, 131.725, 131.125 |
+  (130.025/130.450 are mid-band → present in BOTH, reachable from either LO.)
+- **Full NA at once = a SECOND receiver** on the other half (multi-receiver,
+  task #17). It is NOT achievable by widening the window on one radio.
+- **Operator guidance:** for a US/Canada site, start with `north_america`
+  (131.550 is the busiest single NA channel); switch to `americas_arinc` only if
+  the local traffic is ARINC-129 heavy. A daytime per-channel `ok=` soak on each
+  half settles which the site actually needs.
 
 ## MEASURE-FIRST evidence so far (YSSY, one overnight)
 

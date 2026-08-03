@@ -7,10 +7,25 @@
 //
 // Each region's LO + channels are chosen so every channel sits INSIDE the
 // LO +/-1.25 MHz window AND off-DC (>~0.1 MHz from LO, so the LO/DC spike
-// doesn't land on a channel's baseband). Regions whose full observed set spans
-// more than one ~2.5 MHz window (North America: 129.1->131.8 = 2.7 MHz) carry
-// the busiest in-window SUBSET; full coverage there is the multi-receiver story
-// (task #17) or the 3.2 MSPS wider-window experiment.
+// doesn't land on a channel's baseband).
+//
+// NORTH AMERICA COMPROMISE (documented): NA's active POA channels span
+// 129.125 -> 131.825 MHz = ~2.7 MHz — WIDER than one 2.5 MHz capture window,
+// and the platform ceiling is ~2.5 MSPS (2.8/3.2 MSPS wedge the RTL dongle —
+// device-side FIFO/latency limit, see [[reference_p4_max_sample_rate_2500]] +
+// docs/2026-08-04-poa-multiregion-plan.md). Critically, NA's TWO BUSIEST
+// channels — 131.550 (SITA worldwide primary) and 129.125 (ARINC worldwide
+// primary) — are 2.425 MHz apart and CANNOT share one window. So NA is split
+// into TWO complementary presets, and the operator picks the half that matches
+// their traffic:
+//   - "north_america"  (LO 130.875): the 131.550/SITA half + mid-band ARINC
+//     (130.025/130.450/131.125/131.725). SACRIFICES 129.125.
+//   - "americas_arinc" (LO 129.800): the 129.125/ARINC-low half
+//     (129.125/130.025/130.425/130.450). SACRIFICES 131.550/131.725/131.125.
+// (130.025/130.450 are mid-band and appear in BOTH — reachable from either LO.)
+// Capturing ALL of NA at once needs a SECOND receiver on the other half
+// (multi-receiver, task #17) — it is NOT a single-radio sample-rate knob.
+// Every other region's set fits one window, so this compromise is NA-only.
 //
 // Pure C (header-only) so both the firmware setter and a host test use it.
 #pragma once
@@ -34,7 +49,8 @@ static const poa_region_t POA_REGIONS[] = {
     {"se_asia",        "SE Asia",              130800000u, "131.550,131.450"},
     {"japan",          "Japan",                130800000u, "131.450"},
     {"europe",         "Europe",               131000000u, "131.725,131.825,131.525"},
-    {"north_america",  "North America",        130875000u, "130.025,130.450,131.125,131.550,131.725"},
+    {"north_america",  "North America (SITA 131.5)",  130875000u, "130.025,130.450,131.125,131.550,131.725"},
+    {"americas_arinc", "Americas (ARINC 129.1)",      129800000u, "129.125,130.025,130.425,130.450"},
     {"south_america",  "South America",        130900000u, "131.550,131.725,131.525"},
     {"worldwide",      "Worldwide (generic)",  130800000u, "131.550,131.450,131.725"},
 };
