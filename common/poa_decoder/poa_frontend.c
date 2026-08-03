@@ -96,6 +96,12 @@ struct poa_frontend {
     // per-channel output (envelope) buffer, flushed to poa_decoder at OUTBUF
     float          out[POA_MAX_CHANNELS][OUTBUF];
     int            out_n;
+    // per-channel envelope telemetry (since last poa_frontend_get_stats): the
+    // "signal strength" the channelized path otherwise lacks. env_count is
+    // shared (one envelope sample per channel per output).
+    float          env_sum[POA_MAX_CHANNELS];
+    float          env_peak[POA_MAX_CHANNELS];
+    uint32_t       env_count;
 };
 
 // Allocate n int16 in internal DRAM, 16-byte aligned, zeroed. PIE vector loads
@@ -200,8 +206,12 @@ static void consume_block(poa_frontend_t *fe, const int16_t *blk)
         poa_mix_q15_arp4(fe->xr, fe->xi, fe->wf_re[n], fe->wf_im[n],
                          fe->wf_nim[n], fe->nvec, &Dre, &Dim);
         float fre = (float)Dre, fim = (float)Dim;
-        fe->out[n][m] = sqrtf(fre * fre + fim * fim);
+        float env = sqrtf(fre * fre + fim * fim);
+        fe->out[n][m] = env;
+        fe->env_sum[n] += env;
+        if (env > fe->env_peak[n]) fe->env_peak[n] = env;
     }
+    fe->env_count++;
     fe->out_n++;
     if (fe->out_n >= OUTBUF) flush_out(fe);
 }
@@ -242,6 +252,29 @@ void poa_frontend_feed(poa_frontend_t *fe, const int16_t *iq, int nsamp)
     // partial batch is flushed by poa_frontend_destroy. (Numerically identical
     // either way — the decoder sees the same envelope samples in the same
     // order; only the call batching differs.)
+}
+
+void poa_frontend_get_stats(poa_frontend_t *fe, poa_stats_t *out)
+{
+    if (!fe || !out) return;
+    out->nch = fe->nch;
+    uint32_t cnt = fe->env_count ? fe->env_count : 1;
+    for (int n = 0; n < fe->nch; n++) {
+        out->env_mean[n] = fe->env_sum[n] / (float)cnt;
+        out->env_peak[n] = fe->env_peak[n];
+        fe->env_sum[n]   = 0.0f;
+        fe->env_peak[n]  = 0.0f;
+    }
+    fe->env_count = 0;
+    // Pull + reset the decoder's per-channel demod-activity counters.
+    poa_chan_dstats_t ds[POA_MAX_CHANNELS];
+    poa_decoder_get_stats(fe->dec, ds, POA_MAX_CHANNELS, /*reset=*/1);
+    for (int n = 0; n < fe->nch; n++) {
+        out->sync[n]      = ds[n].sync;
+        out->blk_start[n] = ds[n].blk_start;
+        out->delivered[n] = ds[n].delivered;
+        out->crc_fail[n]  = ds[n].crc_fail;
+    }
 }
 
 void poa_frontend_destroy(poa_frontend_t *fe)

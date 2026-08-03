@@ -57,6 +57,11 @@ typedef struct {
     int           blk_len, blk_err;
     unsigned char txt[POA_TXT_MAX];
     unsigned char crcb[2];
+    // --- telemetry counters (since last poa_decoder_get_stats) ---
+    uint32_t      st_sync;      // SYN sync locks (WSYN -> SYN2)
+    uint32_t      st_blk_start; // SOH block starts (SOH1 -> TXT)
+    uint32_t      st_delivered; // blocks emitted (clean or CRC-fixed)
+    uint32_t      st_crc_fail;  // blocks reaching CRC/parity but dropped
 } poa_channel_t;
 
 struct poa_decoder {
@@ -170,10 +175,10 @@ static void process_block(poa_decoder_t *d, poa_channel_t *ch, float level_db)
 
     bool fixed = false;
     if (pn) {
-        if (fixprerr(txt, len, crc, pr, pn) == 0) return;
+        if (fixprerr(txt, len, crc, pr, pn) == 0) { ch->st_crc_fail++; return; }
         fixed = true;
     } else if (crc) {
-        if (fixdberr(txt, len, crc) == 0) return;
+        if (fixdberr(txt, len, crc) == 0) { ch->st_crc_fail++; return; }
         fixed = true;
     }
 
@@ -183,7 +188,7 @@ static void process_block(poa_decoder_t *d, poa_channel_t *ch, float level_db)
         if ((numbits[txt[i]] & 1) == 0) pn++;
         txt[i] &= 0x7f;
     }
-    if (pn) return;
+    if (pn) { ch->st_crc_fail++; return; }
 
     poa_block_t out;
     out.chn = ch->chn;
@@ -194,7 +199,24 @@ static void process_block(poa_decoder_t *d, poa_channel_t *ch, float level_db)
     out.crc[0] = ch->crcb[0];
     out.crc[1] = ch->crcb[1];
     memcpy(out.txt, txt, (size_t)len);
+    ch->st_delivered++;
     if (d->cb) d->cb(&out, d->user);
+}
+
+void poa_decoder_get_stats(poa_decoder_t *d, poa_chan_dstats_t *out, int max_ch, int reset)
+{
+    if (!d || !out) return;
+    int n = d->nch < max_ch ? d->nch : max_ch;
+    for (int c = 0; c < n; c++) {
+        poa_channel_t *ch = &d->ch[c];
+        out[c].sync      = ch->st_sync;
+        out[c].blk_start = ch->st_blk_start;
+        out[c].delivered = ch->st_delivered;
+        out[c].crc_fail  = ch->st_crc_fail;
+        if (reset) {
+            ch->st_sync = ch->st_blk_start = ch->st_delivered = ch->st_crc_fail = 0;
+        }
+    }
 }
 
 static void reset_acars(poa_channel_t *ch)
@@ -211,8 +233,8 @@ static void decode_acars(poa_decoder_t *d, poa_channel_t *ch)
 
     switch (ch->state) {
     case WSYN:
-        if (r == SYN) { ch->state = SYN2; ch->nbits = 8; return; }
-        if (r == (unsigned char)~SYN) { ch->MskS ^= 2; ch->state = SYN2; ch->nbits = 8; return; }
+        if (r == SYN) { ch->st_sync++; ch->state = SYN2; ch->nbits = 8; return; }
+        if (r == (unsigned char)~SYN) { ch->st_sync++; ch->MskS ^= 2; ch->state = SYN2; ch->nbits = 8; return; }
         ch->nbits = 1;
         return;
     case SYN2:
@@ -222,6 +244,7 @@ static void decode_acars(poa_decoder_t *d, poa_channel_t *ch)
         return;
     case SOH1:
         if (r == SOH) {
+            ch->st_blk_start++;
             ch->state = TXT;
             ch->blk_len = 0;
             ch->blk_err = 0;

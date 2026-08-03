@@ -487,6 +487,23 @@ void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_sam
     // this buffer and converts to float inline — no intermediate float copy.
     if (p->poa_fe) {
         poa_frontend_feed(p->poa_fe, samples, (int)n_samples);
+        // Per-channel POA telemetry ~1/s (the channelized path has no tagger/SNR
+        // line, so this is the only live-reception + demod-activity readout).
+        static uint64_t s_poa_stat_smp = 0;
+        s_poa_stat_smp += n_samples;
+        if (s_poa_stat_smp >= 2500000) {
+            s_poa_stat_smp = 0;
+            poa_stats_t st;
+            poa_frontend_get_stats(p->poa_fe, &st);
+            for (int c = 0; c < st.nch && c < p->poa_nch; c++) {
+                ESP_LOGI("POA_STATS",
+                         "ch%d %.4fMHz env_mean=%.0f peak=%.0f sync=%u blk=%u ok=%u crcfail=%u",
+                         c, (double)p->poa_chans[c] / 1e6, (double)st.env_mean[c],
+                         (double)st.env_peak[c], (unsigned)st.sync[c],
+                         (unsigned)st.blk_start[c], (unsigned)st.delivered[c],
+                         (unsigned)st.crc_fail[c]);
+            }
+        }
         return;
     }
     if (!p->tagger) return;

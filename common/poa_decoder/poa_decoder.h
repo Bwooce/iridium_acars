@@ -46,3 +46,18 @@ poa_decoder_t *poa_decoder_create(int nchannels, poa_block_cb cb, void *user);
 void poa_decoder_feed(poa_decoder_t *d, int chn, const float *audio, int len);
 
 void poa_decoder_destroy(poa_decoder_t *d);
+
+// Per-channel demod-activity telemetry (counters since the last reset). Lets a
+// live operator see, per channel: whether the MSK demod is finding ACARS
+// structure (sync = SYN locks, unlikely from noise), how far frames get
+// (blk_start), and the outcome (delivered vs crc_fail) — the readout the
+// channelized POA path otherwise lacks (no tagger/SNR).
+typedef struct {
+    uint32_t sync;      // SYN sync locks (WSYN -> SYN2)
+    uint32_t blk_start; // SOH block starts (SOH1 -> TXT)
+    uint32_t delivered; // blocks emitted (clean or CRC-fixed)
+    uint32_t crc_fail;  // blocks reaching CRC/parity but dropped
+} poa_chan_dstats_t;
+
+// Copy up to max_ch channels' counters into out[]; if reset, zero them after.
+void poa_decoder_get_stats(poa_decoder_t *d, poa_chan_dstats_t *out, int max_ch, int reset);

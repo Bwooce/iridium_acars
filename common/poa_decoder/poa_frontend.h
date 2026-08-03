@@ -29,4 +29,21 @@ poa_frontend_t *poa_frontend_create(uint32_t fs_hz, uint32_t lo_hz,
 // intermediate float copy) and converts to float inline in the hot loop.
 void poa_frontend_feed(poa_frontend_t *fe, const int16_t *iq, int nsamp);
 
+// Per-channel POA telemetry: envelope level ("signal strength") + the decoder's
+// demod-activity counters. Read-and-reset (call periodically). This is the
+// live-reception readout the channelized POA path otherwise has none of (no
+// tagger/SNR): env_mean/peak show whether a channel hears energy above the
+// noise floor; sync/blk_start/delivered/crc_fail show how far the demod gets.
+typedef struct {
+    int      nch;
+    float    env_mean[POA_MAX_CHANNELS];  // mean envelope |D| since last read
+    float    env_peak[POA_MAX_CHANNELS];  // peak envelope since last read
+    uint32_t sync[POA_MAX_CHANNELS];      // SYN sync locks
+    uint32_t blk_start[POA_MAX_CHANNELS]; // SOH block starts
+    uint32_t delivered[POA_MAX_CHANNELS]; // ACARS blocks emitted
+    uint32_t crc_fail[POA_MAX_CHANNELS];  // blocks reaching CRC/parity but dropped
+} poa_stats_t;
+
+void poa_frontend_get_stats(poa_frontend_t *fe, poa_stats_t *out);
+
 void poa_frontend_destroy(poa_frontend_t *fe);
