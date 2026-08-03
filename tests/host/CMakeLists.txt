@@ -657,6 +657,25 @@ target_compile_options(test_poa_frontend PRIVATE -Werror)
 target_link_libraries(test_poa_frontend m)
 add_test(NAME poa_frontend COMMAND test_poa_frontend)
 
+# Synthetic POA golden round-trip: poa_mod (the acarsdec-inverse modulator)
+# builds KNOWN ACARS blocks, MSK-modulates them as 2.5 MSPS AM IQ, and feeds
+# them through the SAME chain the device runs (poa_frontend -> poa_decoder),
+# asserting exact byte recovery with err==0 / crc_fixed==false. Diverse labels,
+# uplink+downlink, short/long/multi-block, plus an SNR sweep. Needs NO capture,
+# so it NEVER skips. Assertions are numeric-independent (decoded TEXT is the
+# same for the double- and single-precision decoders); the SNR threshold is
+# reported, not pinned.
+add_executable(test_poa_mod_roundtrip
+    test_poa_mod_roundtrip.c
+    ${POA_DIR}/poa_mod.c
+    ${POA_DIR}/poa_frontend.c
+    ${POA_DIR}/poa_decoder.c
+)
+target_include_directories(test_poa_mod_roundtrip PRIVATE ${POA_DIR})
+target_compile_options(test_poa_mod_roundtrip PRIVATE -Werror)
+target_link_libraries(test_poa_mod_roundtrip m)
+add_test(NAME poa_mod_roundtrip COMMAND test_poa_mod_roundtrip)
+
 # VHF/VDL2 foundation: bit-identity gate for the band_pipeline
 # abstraction. Runs the ALBQ fixture through BOTH the legacy direct
 # calls (burst_prefilter + burst_pipeline_process_burst) and the
