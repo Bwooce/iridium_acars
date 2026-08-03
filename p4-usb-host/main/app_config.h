@@ -211,6 +211,10 @@ esp_err_t app_config_set_band(uint8_t v);
 void app_config_set_band_ram(uint8_t v);
 
 esp_err_t app_config_set_lo_freq_hz(uint32_t hz);
+// Set the POA channel list (CSV of MHz, e.g. "131.550,131.450"). Validated with
+// the boot-time parser + VHF airband range; persists to the POA ("po_chans")
+// namespace regardless of active band. Reboot-to-apply. 1..POA_MAX_CHANNELS.
+esp_err_t app_config_set_poa_chans(const char *csv);
 esp_err_t app_config_set_sample_rate_hz(uint32_t hz);
 esp_err_t app_config_set_gain_mode(gain_mode_t mode);
 esp_err_t app_config_set_gain_db_x10(int16_t v);

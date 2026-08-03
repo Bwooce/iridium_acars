@@ -31,6 +31,7 @@
 #include "band_profile.h" // per-band tagger parameters (VHF/VDL2 foundation)
 #include "band_select.h"  // band_runtime_resolve — resolve band once (phase 3)
 #include "poa_frontend.h" // POA CHANNELIZED front end (tagger-bypass, P2)
+#include "poa_chans.h"     // shared po_chans CSV parser (also used by app_config)
 #include "frame_decoder.h" // frame_decoder_push_poa — POA block -> decoder task (P3)
 
 static const char *TAG = "DSP_PROC";
@@ -315,23 +316,9 @@ void dsp_processor_flush(dsp_processor_t *p)
 // default CSV fails to parse. Australia/Pacific set (matches DEFAULT_POA_CHANS).
 static const uint32_t k_poa_chans[] = {131550000u, 131450000u, 131475000u, 131525000u};
 
-// Parse a CSV of MHz ("131.550,130.025,...") into channel freqs in Hz.
-// Returns the count (<= max); skips tokens <= 1 MHz (malformed/empty).
-static int parse_poa_chans(const char *csv, uint32_t *out, int max)
-{
-    if (!csv || !csv[0]) return 0;
-    int         n = 0;
-    const char *s = csv;
-    while (*s && n < max) {
-        char  *end;
-        double mhz = strtod(s, &end);
-        if (end == s) break;
-        if (mhz > 1.0) out[n++] = (uint32_t)(mhz * 1e6 + 0.5);
-        s = end;
-        while (*s == ',' || *s == ' ' || *s == '\t') s++;
-    }
-    return n;
-}
+// POA channel-list CSV parse lives in the shared common/poa_decoder/poa_chans.h
+// (poa_chans_parse) so app_config's runtime po_chans setter validates with the
+// SAME parser used here at boot — they can never diverge.
 
 // POA (CHANNELIZED) block callback — fires on the Core-0 feed task per decoded
 // ACARS block (P3). Hands the block+CRC to the Core-1 decoder task via
@@ -362,7 +349,7 @@ static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
     p->user_cb = cb; // unused under POA (no burst path)
     p->fs_hz   = bp->detect_fs_hz;
     // Channels from NVS po_chans; fall back to the profile default set.
-    int nch = parse_poa_chans(chans_csv, p->poa_chans, POA_MAX_CHANNELS);
+    int nch = poa_chans_parse(chans_csv, p->poa_chans, POA_MAX_CHANNELS);
     if (nch < 1) {
         nch = (int)(sizeof(k_poa_chans) / sizeof(k_poa_chans[0]));
         memcpy(p->poa_chans, k_poa_chans, (size_t)nch * sizeof(uint32_t));

@@ -5,6 +5,8 @@
 #include "app_config.h"
 #include "dsp_processor.h" // FS_IN_HZ, IRIDIUM_CENTER_FREQ_HZ defaults
 #include "band_profile.h"  // per-band default LO (VHF/VDL2 foundation)
+#include "poa_chans.h"      // shared po_chans CSV parser (validate == boot parse)
+#include "poa_decoder.h"    // POA_MAX_CHANNELS
 
 #include <stdio.h> // vprintf (uart_log_apply restore path)
 #include <string.h>
@@ -556,6 +558,31 @@ static esp_err_t commit_one_str(const char *k, const char *v)
     }
 
 SET_FIELD_NUM_BAND(app_config_set_lo_freq_hz, lo_freq_hz, uint32_t, "lo_hz", commit_one_u32)
+
+// Runtime POA channel-list setter (the piece that was missing — see
+// DEFAULT_POA_CHANS note: previously the compile-time default was the only way
+// to set channels). Validates the CSV with the SAME parser dsp_processor uses
+// at boot (poa_chans_parse), range-checks to the VHF airband, then persists to
+// the POA namespace key ("po_chans") REGARDLESS of the active band — po_chans
+// is POA-only, so it must not land in ir_/v2_. Reboot-to-apply (the channelizer
+// reads po_chans at create), like the other /sdrcfg fields.
+esp_err_t app_config_set_poa_chans(const char *csv)
+{
+    if (!s_cfg_mu || !csv) return ESP_ERR_INVALID_ARG;
+    if (strlen(csv) >= APP_CONFIG_POA_CHANS_LEN) return ESP_ERR_INVALID_SIZE;
+    uint32_t tmp[POA_MAX_CHANNELS];
+    int      n = poa_chans_parse(csv, tmp, POA_MAX_CHANNELS);
+    if (n < 1) return ESP_ERR_INVALID_ARG; // nothing parseable
+    for (int i = 0; i < n; i++)            // VHF airband sanity (108-138 MHz)
+        if (tmp[i] < 108000000u || tmp[i] > 138000000u) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    strncpy(s_cfg.poa_chans, csv, APP_CONFIG_POA_CHANS_LEN - 1);
+    s_cfg.poa_chans[APP_CONFIG_POA_CHANS_LEN - 1] = '\0';
+    xSemaphoreGive(s_cfg_mu);
+    char k[16];
+    band_key(k, sizeof(k), BAND_POA, "chans"); // always the POA namespace
+    return commit_one_str(k, s_cfg.poa_chans);
+}
 
 esp_err_t app_config_set_band(uint8_t v)
 {

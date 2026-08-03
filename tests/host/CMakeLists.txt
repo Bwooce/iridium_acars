@@ -645,6 +645,15 @@ target_compile_options(test_poa_decoder PRIVATE -Werror)
 target_link_libraries(test_poa_decoder m)
 add_test(NAME poa_decoder COMMAND test_poa_decoder)
 
+# Shared po_chans CSV parser (header-only) — used by both the boot-time channel
+# resolution and the runtime po_chans setter's validation.
+add_executable(test_poa_chans
+    test_poa_chans.c
+)
+target_include_directories(test_poa_chans PRIVATE ${POA_DIR})
+target_compile_options(test_poa_chans PRIVATE -Werror)
+add_test(NAME poa_chans COMMAND test_poa_chans)
+
 # Full-chain POA: raw IQ -> ported C channelizer -> demod -> L2, cross-validated
 # against acarsdec on the raw golden capture. SKIPs if the raw IQ is absent.
 add_executable(test_poa_frontend

@@ -2764,6 +2764,8 @@ typedef struct {
     uint32_t    at_gain_s;
     int8_t      on_boot;  // autotune_on_boot: 0/1, or -1 = leave unchanged
     uint8_t     uart_log; // UART_LOG_MODE_OFF/ON/AUTO
+    bool        has_chans;                       // POA channel list present in submit
+    char        poa_chans[APP_CONFIG_POA_CHANS_LEN];
 } sdrcfg_args_t;
 
 static void sdrcfg_apply_reboot_task(void *arg)
@@ -2780,6 +2782,10 @@ static void sdrcfg_apply_reboot_task(void *arg)
     // Persist only — status_logger's 1 Hz loop (and the boot-time AUTO
     // evaluation) apply it live; no separate uart_log_apply() call needed here.
     esp_err_t r8 = app_config_set_uart_log(a->uart_log);
+    // POA channel list (optional; only present when the POA form/curl sends it).
+    esp_err_t r9 = a->has_chans ? app_config_set_poa_chans(a->poa_chans) : ESP_OK;
+    if (a->has_chans)
+        ESP_LOGI(TAG, "/sdrcfg: po_chans=\"%s\" (%s)", a->poa_chans, esp_err_to_name(r9));
     ESP_LOGI(TAG,
              "/sdrcfg: lo=%u mode=%d gain_dbx10=%d tag=%.1f coal=%u at_lo=%u at_gain=%u "
              "uart_log=%u (%s/%s/%s/%s/%s/%s/%s/%s) — rebooting to apply",
@@ -2888,6 +2894,10 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     a->on_boot   = (form_field(body, total, "on_boot", ob_s, sizeof(ob_s)) == ESP_OK)
                        ? (int8_t)(atoi(ob_s) != 0)
                        : -1;
+    // POA channel list is optional (only the POA config path sends "chans");
+    // absence leaves po_chans unchanged. Validation happens in the setter.
+    a->has_chans = (form_field(body, total, "chans", a->poa_chans,
+                               sizeof(a->poa_chans)) == ESP_OK) && a->poa_chans[0];
 
     // Reply BEFORE spawning the writer (NVS commit disables flash cache,
     // which can disrupt the socket send — mirror config_post's ordering).
