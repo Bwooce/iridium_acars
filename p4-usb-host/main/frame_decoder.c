@@ -1146,7 +1146,18 @@ bool frame_decoder_push_poa(const uint8_t *blk, int len, const uint8_t crc[2],
     item->direction    = (bid >= '0' && bid <= '9') ? 0 : 1;
     item->pad          = 0;
     item->n_soft       = 0;
-    memcpy(item->bits, blk, (size_t)len);
+    // libacars (acars_deliver -> la_acars_parse) computes the ACARS CRC over the
+    // RAW parity-bearing bytes and strips the odd-parity bit ITSELF, after the
+    // CRC. poa_decoder delivers parity-STRIPPED text (blk[]), so reconstruct the
+    // odd-parity high bit per byte here — lossless, because poa_decoder already
+    // verified valid odd parity (pn==0) before emitting. Without this, libacars
+    // recomputes the CRC over stripped bytes and EVERY POA frame reads crc=BAD.
+    // (The 2 CRC bytes are raw BCS, no parity.) See tests/host/test_poa_libacars.
+    for (int i = 0; i < len; i++) {
+        unsigned v = (unsigned)blk[i] & 0x7fu, bits = 0, t = v;
+        while (t) { bits += t & 1u; t >>= 1; }
+        item->bits[i] = (unsigned char)((bits & 1u) ? v : (v | 0x80u));
+    }
     item->bits[len]     = crc ? crc[0] : 0;
     item->bits[len + 1] = crc ? crc[1] : 0;
     item->n_bits        = (uint16_t)(len + 2);
