@@ -235,13 +235,19 @@ void poa_frontend_feed(poa_frontend_t *fe, const int16_t *iq, int nsamp)
         fe->pend[2 * fe->pend_n + 1] = iq[2 * i + 1];
         fe->pend_n++; i++;
     }
-    // flush whatever output we have so nothing is stranded across feeds
-    flush_out(fe);
+    // Do NOT flush per feed: a typical feed yields only ~nsamp/rtlMult envelope
+    // samples (e.g. ~40 for an 8 K-sample USB chunk), far below OUTBUF, so a
+    // per-feed flush would call poa_decoder_feed in tiny batches and OUTBUF
+    // batching would never engage. consume_block flushes at OUTBUF; the final
+    // partial batch is flushed by poa_frontend_destroy. (Numerically identical
+    // either way — the decoder sees the same envelope samples in the same
+    // order; only the call batching differs.)
 }
 
 void poa_frontend_destroy(poa_frontend_t *fe)
 {
     if (!fe) return;
+    flush_out(fe); // drain the final < OUTBUF batch (finite streams: host/smoke)
     for (int n = 0; n < fe->nch; n++) {
         poa_free_i16(fe->wf_re[n]);
         poa_free_i16(fe->wf_im[n]);

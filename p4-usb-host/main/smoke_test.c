@@ -814,8 +814,13 @@ static void poa_smk_cb(const poa_block_t *b, void *user)
         s[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
     }
     s[n] = '\0';
-    ESP_LOGI(TAG, "  POA block ch=%d len=%d err=%d: %s", b->chn, b->len, b->err, s);
-    if (strstr(s, "JQ0404") || strstr(s, "VH-VGD")) s_poa_smk_hit++;
+    ESP_LOGI(TAG, "  POA block ch=%d len=%d err=%d fixed=%d: %s",
+             b->chn, b->len, b->err, (int)b->crc_fixed, s);
+    // Require a CLEAN decode (err==0, not CRC-repaired): a numeric change to the
+    // channelizer/demod must reproduce the oracle without parity/CRC rescue,
+    // else the gate would silently pass a degraded decode (circular-golden trap).
+    if ((strstr(s, "JQ0404") || strstr(s, "VH-VGD")) && b->err == 0 && !b->crc_fixed)
+        s_poa_smk_hit++;
 }
 
 static void smoke_test_run_poa(void)
