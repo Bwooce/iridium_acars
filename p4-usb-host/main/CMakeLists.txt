@@ -50,6 +50,20 @@ idf_component_register(SRCS ${_app_srcs}
                     INCLUDE_DIRS "." "../../tests/fixtures"
                     PRIV_REQUIRES ${_app_reqs})
 
+# POA golden-replay smoke: embed the JQ0404 IQ slice (int8, ~1 MB) ONLY for
+# that build variant so production isn't bloated. Exposes
+# _binary_poa_jq0404_slice_i8_bin_{start,end}.
+if(CONFIG_SMOKE_TEST_POA)
+    set(_poa_fixture "${CMAKE_CURRENT_LIST_DIR}/../../tests/fixtures/poa_jq0404_slice_i8.bin")
+    if(NOT EXISTS "${_poa_fixture}")
+        message(FATAL_ERROR
+            "POA smoke fixture missing: ${_poa_fixture}\n"
+            "  It is gitignored (built from the out-of-git HydraSDR golden). Generate it with:\n"
+            "    python3 tests/fixtures/make_poa_slice.py")
+    endif()
+    target_add_binary_data(${COMPONENT_LIB} "${_poa_fixture}" BINARY)
+endif()
+
 # Remote crash forensics (panic_capture.c): intercept esp_panic_handler() so we
 # can stash the RISC-V exception frame to RTC memory before the reboot. --wrap
 # redirects the call in esp_system's panic_handler.c to __wrap_esp_panic_handler
