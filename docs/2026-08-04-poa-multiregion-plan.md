@@ -81,7 +81,24 @@ Aggregated 113,085 `POA_STATS` lines (old 4-ch set, ~8 h):
    override retained. LANDMINE: if it adds a web route, bump
    `cfg.max_uri_handlers` ([[feedback_httpd_max_uri_handlers]]) or boot panic-loops.
 
-## Optional side-experiment: 3.2 MSPS wider window (POA-only)
+## 3.2 MSPS wider window — TESTED 2026-08-04: FAILS (stream won't sustain)
+
+RESULT: NA cannot be a single preset via 3.2 MSPS on the current firmware.
+Tested by bumping BAND_POA_FS_HZ->3200000 + coupling the RTL rate to the POA
+profile fs (POA-scoped, in class_driver action_start_stream), flashed, POA band.
+Outcome: the R82XX tuner PLL LOCKS and DMA-INT is fine (99 KB free, needs 32 KB),
+but `usb.completed=0` and `rate=0.00` sustained (18 s and 59 s uptime), with an
+`E USBH: Dev 0 EP 0 Error` — the USB bulk stream never delivers a byte at 3.2M.
+Disambiguated (NOT a wedged dongle): reverting to 2.5 MSPS on the SAME hardware
+immediately restored `completed` climbing / rate 4.77 / 0 drops. So 3.2 MSPS is
+the cause. Root cause (likely): the USB transfer pool (4x8KB, tuned for 2.5M =
+5 MB/s) can't keep the RTL FIFO drained at 3.2M = 6.4 MB/s, so the dongle halts.
+Making it work would need a larger/more-URB USB transfer path — DEEP work tied to
+task #29 (USB pipeline), NOT a quick win. Changes reverted (uncommitted).
+=> North America stays TWO presets (131.5 cluster / 129.1 cluster); full NA in
+one radio remains the multi-receiver story (task #17).
+
+## Optional side-experiment: 3.2 MSPS wider window (POA-only) [SUPERSEDED by the test above]
 
 - fs is a per-band profile field; bands are one-at-a-time → POA can run 3.2 MSPS
   without touching Iridium/VDL2. `rtlMult = 3.2M/12500 = 256` (integer ✓);
