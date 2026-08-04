@@ -112,6 +112,14 @@ bool frame_queue_push(frame_queue_t *q, const frame_queue_item_t *item);
 // not interleave another reserve/push before the commit. Added so
 // frame_decoder_push can fill the (now ~2.8 KB) item directly in PSRAM
 // instead of staging it on the calling task's stack and copying twice.
+//
+// SINGLE-PRODUCER INVARIANT: this is SPSC — exactly ONE producer task may drive
+// reserve/commit (and frame_queue_push) at a time. The codebase has three
+// producer sites (worker_core1 Iridium bursts, aggregator PDU ingest, and
+// frame_decoder_push_poa for POA), kept mutually exclusive by band selection
+// (band=poa never runs the tagger/worker; the aggregator drain is idle). Do NOT
+// add a build/config that lets two of them run concurrently without making this
+// queue MPSC first — concurrent reserves would publish the same/overwritten slot.
 frame_queue_item_t *frame_queue_producer_reserve(frame_queue_t *q);
 void                frame_queue_producer_commit(frame_queue_t *q);
 

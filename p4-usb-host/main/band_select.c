@@ -44,6 +44,11 @@ void band_decode_stats_get(band_id_t id, band_decode_stats_t *out)
         out->unknown   = 0;                    // no Iridium-style UNKNOWN class in VDL2
         out->failed    = (uint32_t)vd.bad_fcs;
         out->recovered = vd.rs_erasure_recovered;
+    } else if (id == BAND_POA) {
+        // POA: the poa_decoder already did parity/CRC L2, so every block handed
+        // to acars_deliver is a valid decode. failed/recovered live inside
+        // poa_decoder (not surfaced); decoded is the delivered count.
+        out->decoded = frame_decoder_get_poa_delivered();
     } else {
         // Iridium (and the clamp default). Same cumulative counters the
         // pre-refactor autotune read via worker_core1_get_decode_counts.

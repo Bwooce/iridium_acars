@@ -5,6 +5,9 @@
 #include "app_config.h"
 #include "dsp_processor.h" // FS_IN_HZ, IRIDIUM_CENTER_FREQ_HZ defaults
 #include "band_profile.h"  // per-band default LO (VHF/VDL2 foundation)
+#include "poa_chans.h"      // shared po_chans CSV parser (validate == boot parse)
+#include "poa_regions.h"    // per-region POA {LO, channels} presets
+#include "poa_decoder.h"    // POA_MAX_CHANNELS
 
 #include <stdio.h> // vprintf (uart_log_apply restore path)
 #include <string.h>
@@ -22,6 +25,22 @@ static const char *NVS_NS = "iridium";
 // bias-tee). Production deployments override via the C6 web UI
 // (D17) once that lands.
 #define DEFAULT_BAND ((uint8_t)BAND_IRIDIUM) // band soft-switch: iridium unless NVS says otherwise
+// POA channel default (LO 130.8 MHz): the full candidate set of AU POA
+// frequencies. 4 channels used to overrun one 360 MHz core (decoder-bound,
+// ~40% USB drops, dsp 99%) because the MSK demod ran emulated double soft-float;
+// after the single-precision decoder rewrite it runs at dsp ~1%, 0 drops, full
+// 4.77 MB/s — so carrying all four channels is now essentially free. Only
+// 131.550 has decoded in any saved capture, so the SET should ultimately be
+// driven by real per-channel occupancy from a live soak; but with the compute
+// cost gone there's no reason to pre-trim it. There is currently NO runtime
+// po_chans setter, so this compile-time default is the effective config.
+// Australia/Oceania set = the "australia" region preset (poa_regions.h). From
+// airframes.io observed feeder data (corroborated 3 ways): 131.550 SITA primary
+// + 131.450 secondary — the ONLY two confirmed AU/NZ POA channels. (Earlier
+// defaults carried NA-ARINC 130.x and a mislabelled 131.475[=Canada]/131.525
+// [=Europe] guess — both wrong for YSSY.) Use the region dropdown / po_region
+// to switch regions; po_chans for a custom set.
+#define DEFAULT_POA_CHANS "131.550,131.450"
 #define DEFAULT_LO_FREQ_HZ IRIDIUM_CENTER_FREQ_HZ
 // The Iridium band profile's default LO must equal the historical
 // compile-time default — proof that band=iridium changes nothing.
@@ -141,7 +160,18 @@ static esp_err_t nvs_set_f32(nvs_handle_t h, const char *k, float v)
 // (<=10, e.g. "gain_dbx10") fits.
 static void band_key(char *buf, size_t cap, uint8_t band, const char *base)
 {
-    snprintf(buf, cap, "%s%s", (band == (uint8_t)BAND_VDL2) ? "v2_" : "ir_", base);
+    // Per-band NVS key prefix, indexed by band with the SAME clamp rule as
+    // band_profile_get (out-of-range -> Iridium). A plain ternary here would
+    // silently map any band != VDL2 (incl. POA) onto Iridium's keys — the
+    // gain-footgun this whole scheme exists to kill. Prefixes stay 3 chars so
+    // the 15-char NVS key budget holds (3 + base<=10 + NUL).
+    static const char *const k_band_prefix[BAND_COUNT] = {
+        [BAND_IRIDIUM] = "ir_",
+        [BAND_VDL2]    = "v2_",
+        [BAND_POA]     = "po_",
+    };
+    if ((unsigned)band >= (unsigned)BAND_COUNT) band = (uint8_t)BAND_IRIDIUM;
+    snprintf(buf, cap, "%s%s", k_band_prefix[band], base);
 }
 
 // Band-namespaced typed getters (namespaced key only; legacy keys are handled
@@ -173,6 +203,13 @@ static esp_err_t nvs_get_f32_band(nvs_handle_t h, uint8_t b, const char *base,
     char k[16];
     band_key(k, sizeof(k), b, base);
     return nvs_get_f32_or(h, k, v, def);
+}
+static esp_err_t nvs_get_str_band(nvs_handle_t h, uint8_t b, const char *base,
+                                  char *out, size_t cap, const char *def)
+{
+    char k[16];
+    band_key(k, sizeof(k), b, base); // e.g. "chans" -> "po_chans"
+    return nvs_get_str_or(h, k, out, cap, def);
 }
 
 // One-time legacy migration: move a present legacy GLOBAL key to the ACTIVE
@@ -342,6 +379,14 @@ esp_err_t app_config_init(void)
     nvs_get_u8_or(h, "chase2", &c2, (uint8_t)DEFAULT_CHASE2_DECODE);
     nvs_get_f32_band(h, s_cfg.band, "tag_thr", &s_cfg.tagger_threshold_db,
                      band_profile_get((band_id_t)s_cfg.band)->tagger_threshold_db);
+    // POA channel list — CSV of MHz, parsed in dsp_processor (used only when
+    // band=poa). Always load from the POA ("po_chans") namespace regardless of
+    // the active band, so the config page's channel field + region-preselect
+    // reflect the real POA config even while running iridium/vdl2. Harmless for
+    // the other bands (dsp only reads poa_chans on the CHANNELIZED path).
+    s_cfg.poa_chans[0] = '\0';
+    nvs_get_str_band(h, (uint8_t)BAND_POA, "chans", s_cfg.poa_chans,
+                     APP_CONFIG_POA_CHANS_LEN, DEFAULT_POA_CHANS);
     nvs_get_u8_or(h, "coal_n", &s_cfg.coalesce_min_bursts, DEFAULT_COALESCE_MIN_BURSTS);
     nvs_get_i16_or(h, "dcmask_lo", &s_cfg.dcmask_lo, DEFAULT_DCMASK_LO);
     nvs_get_i16_or(h, "dcmask_hi", &s_cfg.dcmask_hi, DEFAULT_DCMASK_HI);
@@ -516,6 +561,68 @@ static esp_err_t commit_one_str(const char *k, const char *v)
     }
 
 SET_FIELD_NUM_BAND(app_config_set_lo_freq_hz, lo_freq_hz, uint32_t, "lo_hz", commit_one_u32)
+
+// Runtime POA channel-list setter (the piece that was missing — see
+// DEFAULT_POA_CHANS note: previously the compile-time default was the only way
+// to set channels). Validates the CSV with the SAME parser dsp_processor uses
+// at boot (poa_chans_parse), range-checks to the VHF airband, then persists to
+// the POA namespace key ("po_chans") REGARDLESS of the active band — po_chans
+// is POA-only, so it must not land in ir_/v2_. Reboot-to-apply (the channelizer
+// reads po_chans at create), like the other /sdrcfg fields.
+// Read-only validity check for a POA channel CSV — shared by the setter and by
+// /sdrcfg (which validates BEFORE replying + rebooting). Rejects: over-length;
+// any char outside [0-9 . , + - space tab] (so "131.550<script>" or a typo'd
+// "131.55O" can't slip through on their leading token and be stored RAW +
+// echoed unescaped); nothing parseable; anything outside the VHF airband.
+bool app_config_poa_chans_valid(const char *csv)
+{
+    if (!csv || csv[0] == '\0') return false;
+    if (strlen(csv) >= APP_CONFIG_POA_CHANS_LEN) return false;
+    for (const char *c = csv; *c; c++)
+        if (!((*c >= '0' && *c <= '9') || *c == '.' || *c == ',' ||
+              *c == '+' || *c == '-' || *c == ' ' || *c == '\t'))
+            return false;
+    uint32_t tmp[POA_MAX_CHANNELS];
+    int      n = poa_chans_parse(csv, tmp, POA_MAX_CHANNELS);
+    if (n < 1) return false;
+    for (int i = 0; i < n; i++)
+        if (tmp[i] < 108000000u || tmp[i] > 138000000u) return false;
+    return true;
+}
+
+esp_err_t app_config_set_poa_chans(const char *csv)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    if (!app_config_poa_chans_valid(csv)) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+    strncpy(s_cfg.poa_chans, csv, APP_CONFIG_POA_CHANS_LEN - 1);
+    s_cfg.poa_chans[APP_CONFIG_POA_CHANS_LEN - 1] = '\0';
+    xSemaphoreGive(s_cfg_mu);
+    char k[16];
+    band_key(k, sizeof(k), BAND_POA, "chans"); // always the POA namespace
+    return commit_one_str(k, s_cfg.poa_chans);
+}
+
+// Apply a POA region preset: resolve name -> {LO, channels} from the sourced
+// region table and persist both to the POA namespace (band-independent — you
+// can configure POA's region from any active band; reboot re-reads it). This is
+// what the setup "region" dropdown / `set po_region` drive. Reboot-to-apply.
+esp_err_t app_config_set_poa_region(const char *name)
+{
+    const poa_region_t *r = poa_region_lookup(name);
+    if (!r) return ESP_ERR_INVALID_ARG;
+    esp_err_t ec = app_config_set_poa_chans(r->chans); // validates + POA ns
+    if (ec != ESP_OK) return ec;
+    char k[16];
+    band_key(k, sizeof(k), BAND_POA, "lo_hz"); // POA LO, regardless of active band
+    esp_err_t el = commit_one_u32(k, r->lo_hz);
+    if (el == ESP_OK && s_cfg_mu) {
+        xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
+        if (s_cfg.band == BAND_POA) s_cfg.lo_freq_hz = r->lo_hz; // reflect if live
+        xSemaphoreGive(s_cfg_mu);
+    }
+    return el;
+}
 
 esp_err_t app_config_set_band(uint8_t v)
 {

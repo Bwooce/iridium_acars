@@ -37,6 +37,7 @@ sym_for() {
         raw)      echo CONFIG_SMOKE_TEST_RAW_IRIDIUM ;;
         real)     echo CONFIG_SMOKE_TEST_REAL_IRIDIUM ;;
         vdl2)     echo CONFIG_SMOKE_TEST_VDL2 ;;
+        poa)      echo CONFIG_SMOKE_TEST_POA ;;
         pieplace) echo CONFIG_SMOKE_TEST_PIE_PLACEMENT ;;
         *)        echo "" ;;
     esac
@@ -77,7 +78,8 @@ path, extra = sys.argv[1], sys.argv[2]
 syms = ['CONFIG_SMOKE_TEST_MODE','CONFIG_SMOKE_TEST_CORPUS',
         'CONFIG_SMOKE_TEST_FRAME_DECODER','CONFIG_SMOKE_TEST_RAW_IRIDIUM',
         'CONFIG_SMOKE_TEST_REAL_IRIDIUM','CONFIG_SMOKE_TEST_VDL2',
-        'CONFIG_SMOKE_TEST_PIE_PLACEMENT','CONFIG_SMOKE_TEST_LIVE_SDR']
+        'CONFIG_SMOKE_TEST_PIE_PLACEMENT','CONFIG_SMOKE_TEST_LIVE_SDR',
+        'CONFIG_SMOKE_TEST_POA']
 enable = {'CONFIG_SMOKE_TEST_MODE', extra}
 def canon(s): return (f"{s}=y" if s in enable else f"# {s} is not set")
 lines = open(path).read().splitlines()

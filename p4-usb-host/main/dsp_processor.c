@@ -18,17 +18,23 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h> // strtod — POA channel-list (po_chans) CSV parse
 #include <math.h>
 #include <stdatomic.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h" // uxTaskGetStackHighWaterMark (POA dsp_feed stack log)
 #include "dsp_processor.h"
 #include "fft_burst_tagger.h"
 #include "worker_core1.h"
 #include "app_config.h"
 #include "band_profile.h" // per-band tagger parameters (VHF/VDL2 foundation)
 #include "band_select.h"  // band_runtime_resolve — resolve band once (phase 3)
+#include "poa_frontend.h" // POA CHANNELIZED front end (tagger-bypass, P2)
+#include "poa_chans.h"     // shared po_chans CSV parser (also used by app_config)
+#include "frame_decoder.h" // frame_decoder_push_poa — POA block -> decoder task (P3)
 
 static const char *TAG = "DSP_PROC";
 
@@ -89,6 +95,16 @@ struct dsp_processor {
     fft_burst_tagger_t *tagger;
     int32_t            *baseline_history; // PSRAM, 4 MB
     burst_detected_cb_t user_cb;
+
+    // POA (BAND_FE_CHANNELIZED): when set, the tagger/baseline_history are
+    // NULL and feed() routes to this always-on channelizer+demod instead of
+    // the burst path (docs/2026-08-01-poa-onband-plan.md §1). Mutually
+    // exclusive with `tagger`.
+    poa_frontend_t     *poa_fe;
+    _Atomic uint32_t    poa_blocks; // ACARS blocks decoded (P2 counter; P3 delivers)
+    uint32_t            poa_chans[POA_MAX_CHANNELS]; // resolved POA channel freqs (Hz)
+    int                 poa_nch;
+    uint32_t            poa_lo_hz; // capture LO (for channel-freq -> peak_bin encode)
 
     // Detect-path sample rate from the selected band profile. Both
     // current bands run 2.5 MSPS (== FS_DETECT_HZ, statically asserted
@@ -298,6 +314,76 @@ void dsp_processor_flush(dsp_processor_t *p)
     ESP_LOGI(TAG, "fbt flush: emitted %d residual bursts", n);
 }
 
+// Fallback POA channel set (LO 130.8 MHz) when NVS po_chans is unset AND the
+// default CSV fails to parse. Australia/Oceania set (matches DEFAULT_POA_CHANS
+// + the "australia" region preset): 131.550 primary + 131.450 secondary.
+static const uint32_t k_poa_chans[] = {131550000u, 131450000u};
+
+// POA channel-list CSV parse lives in the shared common/poa_decoder/poa_chans.h
+// (poa_chans_parse) so app_config's runtime po_chans setter validates with the
+// SAME parser used here at boot — they can never diverge.
+
+// POA (CHANNELIZED) block callback — fires on the Core-0 feed task per decoded
+// ACARS block (P3). Hands the block+CRC to the Core-1 decoder task via
+// frame_decoder_push_poa (that task owns s_reasm_ctx/msg_ring, so acars_deliver
+// must run there, not here). Also counts for the /status POA funnel.
+static void poa_on_block(const poa_block_t *b, void *user)
+{
+    dsp_processor_t *p = (dsp_processor_t *)user;
+    atomic_fetch_add_explicit(&p->poa_blocks, 1, memory_order_relaxed);
+    uint32_t freq = (b->chn >= 0 && b->chn < p->poa_nch) ? p->poa_chans[b->chn] : 0;
+    // Encode the exact channel freq as a synthetic peak_bin so build_af_msg's
+    // bin->Hz math (acars_push.c:194) recovers it — POA has no real FFT peak.
+    int peak_bin = 0;
+    if (freq && p->fs_hz)
+        peak_bin = FBT_FFT_SIZE / 2 +
+                   (int)(((int64_t)freq - (int64_t)p->poa_lo_hz) * FBT_FFT_SIZE /
+                         (int64_t)p->fs_hz);
+    // poa_decoder's level_db is an UNCALIBRATED Q15 magnitude (~+180 dB, because
+    // the channelizer skips acarsdec's 1/rtlMult/127.5 weight normalisation).
+    // Subtract an approximate scale offset so the exported snr_db sits in a sane
+    // range — relative/monotonic in signal strength, NOT absolute-dB accurate (a
+    // true calibration needs a known-level signal). offset ~= 20log10(32767*rtlMult).
+    float lvl_off = 20.0f * log10f(32767.0f * (float)(p->fs_hz / POA_INTRATE));
+    frame_decoder_push_poa(b->txt, b->len, b->crc, freq, peak_bin, /*stamp now=*/0,
+                           b->level_db - lvl_off);
+}
+
+static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
+                                               const band_profile_t *bp,
+                                               uint32_t lo_hz,
+                                               const char *chans_csv)
+{
+    dsp_processor_t *p = heap_caps_calloc(1, sizeof(*p), MALLOC_CAP_SPIRAM);
+    if (!p) { ESP_LOGE(TAG, "dsp_processor (POA) handle alloc failed"); return NULL; }
+    p->user_cb = cb; // unused under POA (no burst path)
+    p->fs_hz   = bp->detect_fs_hz;
+    // Channels from NVS po_chans; fall back to the profile default set.
+    int nch = poa_chans_parse(chans_csv, p->poa_chans, POA_MAX_CHANNELS);
+    if (nch < 1) {
+        nch = (int)(sizeof(k_poa_chans) / sizeof(k_poa_chans[0]));
+        memcpy(p->poa_chans, k_poa_chans, (size_t)nch * sizeof(uint32_t));
+    }
+    p->poa_nch   = nch;
+    // The channelizer mix MUST use the SAME LO the tuner is programmed to
+    // (cfg.lo_freq_hz, passed as lo_hz) — NOT the profile default — else every
+    // region preset with a non-default LO (europe/NA/SA/americas) mixes each
+    // channel at the wrong offset and decodes nothing.
+    p->poa_lo_hz = lo_hz;
+    p->poa_fe  = poa_frontend_create(bp->detect_fs_hz, lo_hz,
+                                     p->poa_chans, nch, poa_on_block, p);
+    if (!p->poa_fe) {
+        ESP_LOGE(TAG, "poa_frontend_create failed");
+        heap_caps_free(p);
+        return NULL;
+    }
+    ESP_LOGI(TAG,
+             "Creating POA channelized front end (band=%s, fs=%u Hz, lo=%u Hz, %d channels) — no tagger",
+             bp->name, (unsigned)bp->detect_fs_hz, (unsigned)lo_hz, nch);
+    s_default = p; // publish for cross-task diagnostic readers
+    return p;
+}
+
 dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
 {
     // Pull threshold from NVS-backed config (D18). Falls back to the
@@ -310,6 +396,18 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     // _Static_asserts above) — bit-identical behaviour.
     const band_runtime_t *rt  = band_runtime_resolve((band_id_t)cfg.band); // resolve once (phase 3)
     const band_profile_t *bp  = rt->profile;
+    // POA and any future CHANNELIZED band bypass the burst tagger entirely
+    // (no PSK bursts to detect) — build the always-on channelizer instead.
+    if (bp->frontend == BAND_FE_CHANNELIZED)
+    {
+        // Use the configured LO (what the tuner is set to); fall back to the
+        // profile default only if it's outside the VHF airband (e.g. a stale
+        // Iridium LO left in cfg after a band switch before NVS re-resolves).
+        uint32_t poa_lo = (cfg.lo_freq_hz >= 108000000u && cfg.lo_freq_hz <= 138000000u)
+                              ? cfg.lo_freq_hz
+                              : bp->default_lo_hz;
+        return dsp_create_channelized(cb, bp, poa_lo, cfg.poa_chans);
+    }
     float                 thr = cfg.tagger_threshold_db;
     if (thr <= 0.0f || thr > 30.0f) thr = bp->tagger_threshold_db; // sanity
     ESP_LOGI(TAG,
@@ -389,10 +487,42 @@ void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_sam
     // n_samples is complex IQ pairs. At FS_DETECT_HZ the typical USB
     // transfer (16 KB raw / 2 bytes per complex) is ~8000 complex
     // after the 125/128 resample in ingest_core1.
-    if (!p || !p->tagger) return;
+    if (!p) return;
 
     atomic_fetch_add_explicit(&p->acc_input_samples, (uint32_t)n_samples, memory_order_relaxed);
     atomic_fetch_add_explicit(&p->total_input_samples, (uint64_t)n_samples, memory_order_relaxed); // #127, never reset
+
+    // POA CHANNELIZED path: drive the channelizer straight from the int16 IQ
+    // (no tagger). poa_frontend_feed reads whole rtlMult-blocks directly from
+    // this buffer and converts to float inline — no intermediate float copy.
+    if (p->poa_fe) {
+        poa_frontend_feed(p->poa_fe, samples, (int)n_samples);
+        // Per-channel POA telemetry ~1/s (the channelized path has no tagger/SNR
+        // line, so this is the only live-reception + demod-activity readout).
+        static uint64_t s_poa_stat_smp = 0;
+        s_poa_stat_smp += n_samples;
+        if (s_poa_stat_smp >= 2500000) {
+            s_poa_stat_smp = 0;
+            poa_stats_t st;
+            poa_frontend_get_stats(p->poa_fe, &st);
+            for (int c = 0; c < st.nch && c < p->poa_nch; c++) {
+                ESP_LOGI("POA_STATS",
+                         "ch%d %.4fMHz env_mean=%.0f peak=%.0f sync=%u blk=%u ok=%u crcfail=%u",
+                         c, (double)p->poa_chans[c] / 1e6, (double)st.env_mean[c],
+                         (double)st.env_peak[c], (unsigned)st.sync[c],
+                         (unsigned)st.blk_start[c], (unsigned)st.delivered[c],
+                         (unsigned)st.crc_fail[c]);
+            }
+            // The whole POA chain (channelizer -> demod -> L2 -> process_block +
+            // fixprerr recursion) runs on THIS (dsp_feed) task, whose 4096 B
+            // stack was sized for the tagger path. Log remaining headroom so an
+            // unattended soak surfaces any creep before it overflows.
+            ESP_LOGI("POA_STATS", "dsp_feed stack free=%u B",
+                     (unsigned)(uxTaskGetStackHighWaterMark(NULL)));
+        }
+        return;
+    }
+    if (!p->tagger) return;
 
     size_t off = 0;
     while (off < n_samples) {
@@ -411,6 +541,11 @@ void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_sam
             p->accum_n = 0;
         }
     }
+}
+
+uint32_t dsp_processor_get_poa_blocks(const dsp_processor_t *p)
+{
+    return p ? atomic_load_explicit(&p->poa_blocks, memory_order_relaxed) : 0;
 }
 
 void dsp_processor_get_stage_stats(dsp_processor_t *p, dsp_stage_stats_t *out)

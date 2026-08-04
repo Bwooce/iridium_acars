@@ -27,6 +27,7 @@ static const char *ds_phase_name(ds_phase_t p); // defined near /diag/survey
 #include "band_health.h"      // staleness detector snapshot for /status
 #include "autotune.h"         // autotune_run_manual() — /gaincal manual trigger
 #include "autotune_gainset.h" // AUTOTUNE_R828D_GAINS/N + autotune_snap_gain — the real tuner gain steps for the /sdrcfg dropdown
+#include "poa_regions.h"      // POA per-region {LO, channels} presets for the region dropdown
 #include "c6_ota.h"           // c6_ota_* — POST /c6ota (Method B: C6 firmware update)
 #include "sd_log.h"
 #include "sd_capture.h"
@@ -808,7 +809,8 @@ static esp_err_t index_get(httpd_req_t *req)
     app_config_t cfg;
     app_config_snapshot(&cfg);
     bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
-    send_page_head(req, is_vdl2 ? "VDL2 ACARS" : "Iridium ACARS", 0);
+    bool is_poa  = ((band_id_t)cfg.band == BAND_POA);
+    send_page_head(req, is_poa ? "POA ACARS" : is_vdl2 ? "VDL2 ACARS" : "Iridium ACARS", 0);
     httpd_resp_send_chunk(req,
                           "<p>Configure the device. Wi-Fi changes reboot on save; "
                           "UDP push fields take effect immediately. SDR tuning changes "
@@ -925,9 +927,14 @@ static esp_err_t index_get(httpd_req_t *req)
     }
 
     // Part C: remainder of the SDR form + the separate manual-sweep form.
-    char sdrform_c[1100];
+    char sdrform_c[1400];
     int  sc = snprintf(sdrform_c, sizeof(sdrform_c),
                        "</select>"
+                        // POA channel list (CSV of MHz). Only meaningful for the
+                        // POA band; empty/ignored for Iridium/VDL2. The region
+                        // dropdown below fills this for you.
+                        "<label>POA channels (CSV MHz, POA band only)</label>"
+                        "<input type=\"text\" name=\"chans\" value=\"%s\" placeholder=\"131.550,131.450\">"
                         "<label>Tagger threshold (dB above noise floor)</label>"
                         "<input type=\"number\" name=\"tag_thr\" step=\"0.1\" required value=\"%.1f\">"
                         "<label>Coalesce min bursts (0/1 = disabled)</label>"
@@ -959,6 +966,7 @@ static esp_err_t index_get(httpd_req_t *req)
                        // form so it doesn't reboot / rewrite the config above.
                        "<form method=\"POST\" action=\"/gaincal\" style=\"margin-top:.4em\">"
                         "<button type=\"submit\">Run gain sweep now</button></form>",
+                       cfg.poa_chans, // POA channels input (empty for non-POA)
                        (double)cfg.tagger_threshold_db,
                        (unsigned)cfg.coalesce_min_bursts,
                        (unsigned)cfg.autotune_lo_interval_s,
@@ -971,6 +979,33 @@ static esp_err_t index_get(httpd_req_t *req)
     if (sc < 0) sc = 0;
     if (sc > (int)sizeof(sdrform_c)) sc = sizeof(sdrform_c);
     httpd_resp_send_chunk(req, sdrform_c, sc);
+
+    // POA region preset dropdown (posts to /band?name=poa&region=<name>): pick a
+    // region and the firmware fills the POA LO + channels from the sourced table
+    // (poa_regions.h) and reboots into the POA band. The current region is
+    // pre-selected by matching the live POA channel list. "Custom" = the channel
+    // set doesn't match any preset (edit it directly in the field above).
+    {
+        const char *hdr =
+            "<form method=\"POST\" action=\"/band\" style=\"margin-top:.4em\">"
+            "<h2>POA region</h2>"
+            "<label>Region preset (sets POA LO + channels, switches to POA band)</label>"
+            "<input type=\"hidden\" name=\"name\" value=\"poa\">"
+            "<select name=\"region\">"
+            "<option value=\"\">Custom (channels above)</option>";
+        httpd_resp_send_chunk(req, hdr, HTTPD_RESP_USE_STRLEN);
+        for (int i = 0; i < POA_REGION_COUNT; i++) {
+            bool sel = (strcmp(cfg.poa_chans, POA_REGIONS[i].chans) == 0);
+            char opt[128];
+            int  on = snprintf(opt, sizeof(opt), "<option value=\"%s\"%s>%s</option>",
+                               POA_REGIONS[i].name, sel ? " selected" : "",
+                               POA_REGIONS[i].label);
+            if (on > 0) httpd_resp_send_chunk(req, opt, on);
+        }
+        const char *ftr =
+            "</select><button type=\"submit\">Apply region &amp; reboot</button></form>";
+        httpd_resp_send_chunk(req, ftr, HTTPD_RESP_USE_STRLEN);
+    }
 
     // Full config snapshot (Task 4 — every persisted app_config_t field, not
     // just the ones with an editable widget above). Read-only: fields not
@@ -1090,6 +1125,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
     // banner) and the Iridium-only / VDL2-only dashboard rows below. Same
     // accessor pattern as frame_decoder.c:930.
     bool                   is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+    bool                   is_poa  = ((band_id_t)cfg.band == BAND_POA);
     const esp_app_desc_t *app = esp_app_get_description();
 
     status_snapshot_t s;
@@ -1182,7 +1218,27 @@ static esp_err_t status_html_get(httpd_req_t *req)
         status_reception_t rx;
         status_logger_get_reception(&rx);
         const char *bg = "#eee", *fg = "#333", *msg = "Calibrating &mdash; collecting windows&hellip;";
-        if (is_vdl2) {
+        if (is_poa) {
+            // POA rides the channelized AM front-end — there is no burst
+            // tagger, so the tagged->synced->decode funnel the other bands
+            // show doesn't exist and status_logger_get_reception() is never
+            // fed. Key the banner off the one honest metric we do have:
+            // ACARS blocks delivered. (No reception state machine to fake.)
+            uint32_t poa_dec = frame_decoder_get_poa_delivered();
+            if (poa_dec > 0) {
+                bg = "#d7f5dd"; fg = "#0a5a24"; msg = "GOOD &mdash; decoding POA.";
+            } else {
+                bg  = "#e6e6e6"; fg = "#555";
+                msg = "QUIET &mdash; no POA ACARS decoded yet (normal when no aircraft "
+                      "are transmitting on the tuned channels).";
+            }
+            n = snprintf(body, sizeof(body),
+                         "<div style=\"background:%s;color:%s;border-radius:8px;"
+                         "padding:.7em 1em;margin:.5em 0;font-weight:600\">%s"
+                         "<div style=\"font-weight:400;font-size:.85em;margin-top:.3em\">"
+                         "blocks decoded %u</div></div>",
+                         bg, fg, msg, (unsigned)poa_dec);
+        } else if (is_vdl2) {
             switch (rx.state) {
             case RX_STATE_GOOD:
                 bg = "#d7f5dd"; fg = "#0a5a24"; msg = "GOOD &mdash; decoding VDL2."; break;
@@ -1215,7 +1271,8 @@ static esp_err_t status_html_get(httpd_req_t *req)
             default: break;
             }
         }
-        n = snprintf(body, sizeof(body),
+        if (!is_poa) // POA set its own banner above (no tagger funnel)
+            n = snprintf(body, sizeof(body),
                      "<div style=\"background:%s;color:%s;border-radius:8px;"
                      "padding:.7em 1em;margin:.5em 0;font-weight:600\">%s"
                      "<div style=\"font-weight:400;font-size:.85em;margin-top:.3em\">"
@@ -1269,7 +1326,7 @@ static esp_err_t status_html_get(httpd_req_t *req)
     // dashboard so it isn't cluttered with dead Iridium metrics (the VDL2
     // funnel table below carries the VDL2-equivalent counters instead).
     char bch_rows[220] = "";
-    if (!is_vdl2) {
+    if (!is_vdl2 && !is_poa) { // BCH is Iridium's inner code; POA has none either
         snprintf(bch_rows, sizeof(bch_rows),
                  "<tr><td>BCH decoded / unknown (window)</td><td class=v>%u / %u</td></tr>"
                  "<tr><td>BCH decoded / unknown (since boot)</td><td class=v>%u / %u</td></tr>",
@@ -1655,10 +1712,22 @@ static esp_err_t messages_html_get(httpd_req_t *req)
     app_config_t cfg;
     app_config_snapshot(&cfg);
     bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+    bool is_poa  = ((band_id_t)cfg.band == BAND_POA);
 
     static EXT_RAM_BSS_ATTR char body[768];
     int                          bn;
-    if (is_vdl2) {
+    if (is_poa) {
+        // POA has no burst/RS/BCH funnel (channelized AM front-end): the only
+        // honest counter is ACARS blocks delivered to the reassembler.
+        bn = snprintf(body, sizeof(body),
+                      "<p><small>%llu messages in ring &middot; showing last %u "
+                      "&middot; auto-refresh 10 s</small></p>"
+                      "<h2>POA decode (since boot)</h2>"
+                      "<table><tr><th>ACARS blocks decoded</th></tr>"
+                      "<tr><td class=v>%u</td></tr></table>",
+                      (unsigned long long)total, (unsigned)n,
+                      (unsigned)frame_decoder_get_poa_delivered());
+    } else if (is_vdl2) {
         frame_decoder_vdl2_stats_t vd = {0};
         frame_decoder_get_vdl2_stats(&vd);
         bn = snprintf(body, sizeof(body),
@@ -2109,8 +2178,19 @@ static esp_err_t diag_recovery_counters_get(httpd_req_t *req)
     app_config_t cfg;
     app_config_snapshot(&cfg);
     bool is_vdl2 = ((band_id_t)cfg.band == BAND_VDL2);
+    bool is_poa  = ((band_id_t)cfg.band == BAND_POA);
     char dr[448]; // +rescued_fcs split; headroom re-checked vs worst case
-    if (is_vdl2) {
+    if (is_poa) {
+        // POA: channelized AM front-end, no tagger/RS/BCH funnel. The only
+        // decode counter is ACARS blocks delivered (parity/CRC already done
+        // in poa_decoder before delivery, so every one is a valid decode).
+        snprintf(dr, sizeof(dr),
+                 "\"decode_recovery\":{"
+                 "\"mode\":\"poa\","
+                 "\"acars_blocks\":%u"
+                 "},",
+                 (unsigned)frame_decoder_get_poa_delivered());
+    } else if (is_vdl2) {
         frame_decoder_vdl2_stats_t vd = {0};
         frame_decoder_get_vdl2_stats(&vd);
         snprintf(dr, sizeof(dr),
@@ -2261,16 +2341,21 @@ typedef struct {
     int  bias;     // 0/1
     bool has_lo;
     bool has_bias;
+    bool has_region;    // POA region preset present
+    char region[16];    // region name (poa_regions.h)
 } band_apply_t;
 
 static void band_apply_reboot_task(void *arg)
 {
     band_apply_t *a = (band_apply_t *)arg;
     if (a->band >= 0) app_config_set_band((uint8_t)a->band);
+    // POA region preset sets the POA LO + channels; apply BEFORE the explicit
+    // lo (so a caller passing both region and lo gets the explicit lo last).
+    if (a->has_region) app_config_set_poa_region(a->region);
     if (a->has_lo)    app_config_set_lo_freq_hz((uint32_t)a->lo);
     if (a->has_bias)  app_config_set_bias_tee(a->bias != 0);
-    ESP_LOGI(TAG, "/band: band=%d lo=%ld bias=%d(set=%d) — rebooting to apply",
-             a->band, a->lo, a->bias, (int)a->has_bias);
+    ESP_LOGI(TAG, "/band: band=%d region=%s lo=%ld bias=%d(set=%d) — rebooting to apply",
+             a->band, a->has_region ? a->region : "-", a->lo, a->bias, (int)a->has_bias);
     free(a);
     vTaskDelay(pdMS_TO_TICKS(500));
     class_driver_prepare_for_reboot();
@@ -2284,6 +2369,8 @@ static esp_err_t band_post(httpd_req_t *req)
     long lo = 0;
     int  bias = 0;
     bool has_lo = false, has_bias = false;
+    char region[16] = {0};
+    bool has_region = false;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "name", v, sizeof(v)) == ESP_OK && v[0])
             band = (int)band_profile_from_str(v);
@@ -2295,12 +2382,38 @@ static esp_err_t band_post(httpd_req_t *req)
             bias = atoi(v);
             has_bias = true;
         }
+        if (httpd_query_key_value(query, "region", region, sizeof(region)) == ESP_OK && region[0])
+            has_region = true;
     }
-    if (band < 0 && !has_lo && !has_bias) {
+    // A browser <form method="POST" action="/band"> (the region dropdown) sends
+    // its fields in the urlencoded BODY, not the query string (curl uses ?query).
+    // If the query gave nothing, parse the body so the dropdown actually works.
+    if (band < 0 && !has_lo && !has_bias && !has_region && req->content_len > 0) {
+        char   fbody[192] = {0};
+        size_t blen = req->content_len < sizeof(fbody) - 1 ? req->content_len : sizeof(fbody) - 1;
+        int    total = 0, timeouts = 0;
+        while (total < (int)blen) {
+            int r = httpd_req_recv(req, fbody + total, (int)blen - total);
+            if (r <= 0) { if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 3) continue; break; }
+            total += r;
+        }
+        fbody[total] = '\0';
+        if (form_field(fbody, total, "name", v, sizeof(v)) == ESP_OK && v[0])
+            band = (int)band_profile_from_str(v);
+        if (form_field(fbody, total, "lo", v, sizeof(v)) == ESP_OK && v[0]) {
+            lo = (long)strtoul(v, NULL, 10); has_lo = true;
+        }
+        if (form_field(fbody, total, "bias", v, sizeof(v)) == ESP_OK && v[0]) {
+            bias = atoi(v); has_bias = true;
+        }
+        if (form_field(fbody, total, "region", region, sizeof(region)) == ESP_OK && region[0])
+            has_region = true;
+    }
+    if (band < 0 && !has_lo && !has_bias && !has_region) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_send(req,
-                               "usage: POST /band?name=<iridium|vdl2>[&lo=<hz>][&bias=<0|1>]\n",
+                               "usage: POST /band?name=<iridium|vdl2|poa>[&region=<australia|europe|...>][&lo=<hz>][&bias=<0|1>]\n",
                                HTTPD_RESP_USE_STRLEN);
     }
     band_apply_t *a = malloc(sizeof(*a));
@@ -2309,10 +2422,12 @@ static esp_err_t band_post(httpd_req_t *req)
         return httpd_resp_sendstr(req, "nomem\n");
     }
     a->band = band; a->lo = lo; a->bias = bias; a->has_lo = has_lo; a->has_bias = has_bias;
-    char body[128];
+    a->has_region = has_region;
+    if (has_region) strlcpy(a->region, region, sizeof(a->region));
+    char body[160];
     int  n = snprintf(body, sizeof(body),
-                      "{\"result\":\"ok\",\"band\":%d,\"lo\":%ld,\"bias_set\":%d,\"reboot\":true}",
-                      band, lo, (int)has_bias);
+                      "{\"result\":\"ok\",\"band\":%d,\"region\":\"%s\",\"lo\":%ld,\"bias_set\":%d,\"reboot\":true}",
+                      band, has_region ? region : "", lo, (int)has_bias);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_send(req, body, n);
@@ -2718,6 +2833,8 @@ typedef struct {
     uint32_t    at_gain_s;
     int8_t      on_boot;  // autotune_on_boot: 0/1, or -1 = leave unchanged
     uint8_t     uart_log; // UART_LOG_MODE_OFF/ON/AUTO
+    bool        has_chans;                       // POA channel list present in submit
+    char        poa_chans[APP_CONFIG_POA_CHANS_LEN];
 } sdrcfg_args_t;
 
 static void sdrcfg_apply_reboot_task(void *arg)
@@ -2734,6 +2851,10 @@ static void sdrcfg_apply_reboot_task(void *arg)
     // Persist only — status_logger's 1 Hz loop (and the boot-time AUTO
     // evaluation) apply it live; no separate uart_log_apply() call needed here.
     esp_err_t r8 = app_config_set_uart_log(a->uart_log);
+    // POA channel list (optional; only present when the POA form/curl sends it).
+    esp_err_t r9 = a->has_chans ? app_config_set_poa_chans(a->poa_chans) : ESP_OK;
+    if (a->has_chans)
+        ESP_LOGI(TAG, "/sdrcfg: po_chans=\"%s\" (%s)", a->poa_chans, esp_err_to_name(r9));
     ESP_LOGI(TAG,
              "/sdrcfg: lo=%u mode=%d gain_dbx10=%d tag=%.1f coal=%u at_lo=%u at_gain=%u "
              "uart_log=%u (%s/%s/%s/%s/%s/%s/%s/%s) — rebooting to apply",
@@ -2794,16 +2915,21 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     // VDL2 mode). Same band accessor as the reception classifier / index_get.
     app_config_t cfg_band;
     app_config_snapshot(&cfg_band);
-    bool     is_vdl2 = ((band_id_t)cfg_band.band == BAND_VDL2);
-    uint32_t lo_min  = is_vdl2 ? 135000000u : 1615000000u;
-    uint32_t lo_max  = is_vdl2 ? 138000000u : 1628000000u;
+    band_id_t band  = (band_id_t)cfg_band.band;
+    bool     is_vdl2 = (band == BAND_VDL2);
+    bool     is_poa  = (band == BAND_POA);
+    // POA channels sit ~128.8-132.0 MHz; the channelizer LO parks below the
+    // lowest channel, so accept the whole VHF-airband ACARS span.
+    uint32_t lo_min  = is_poa ? 128000000u : is_vdl2 ? 135000000u : 1615000000u;
+    uint32_t lo_max  = is_poa ? 137000000u : is_vdl2 ? 138000000u : 1628000000u;
     if (lo_hz < lo_min || lo_hz > lo_max) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
         char m[128];
         int  mn = snprintf(m, sizeof(m),
                            "lo_hz=%u out of %s band [%u, %u]\n",
-                           (unsigned)lo_hz, is_vdl2 ? "VDL2" : "Iridium",
+                           (unsigned)lo_hz,
+                           is_poa ? "POA" : is_vdl2 ? "VDL2" : "Iridium",
                            (unsigned)lo_min, (unsigned)lo_max);
         return httpd_resp_send(req, m, mn);
     }
@@ -2837,6 +2963,21 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
     a->on_boot   = (form_field(body, total, "on_boot", ob_s, sizeof(ob_s)) == ESP_OK)
                        ? (int8_t)(atoi(ob_s) != 0)
                        : -1;
+    // POA channel list is optional (only the POA config path sends "chans");
+    // absence leaves po_chans unchanged.
+    a->has_chans = (form_field(body, total, "chans", a->poa_chans,
+                               sizeof(a->poa_chans)) == ESP_OK) && a->poa_chans[0];
+    // Validate a present chans value HERE (before the 200 + reboot) so a bad
+    // value is rejected to the operator's face, not silently dropped by the
+    // setter after the device has already claimed success and rebooted.
+    if (a->has_chans && !app_config_poa_chans_valid(a->poa_chans)) {
+        free(a);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req,
+                               "chans invalid: CSV of MHz in 108-138 (e.g. 131.550,131.450)\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
 
     // Reply BEFORE spawning the writer (NVS commit disables flash cache,
     // which can disrupt the socket send — mirror config_post's ordering).

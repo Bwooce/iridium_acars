@@ -22,6 +22,10 @@ set(_app_reqs
     # references both concrete bands) + the L2 codecs (frame_decoder.c's
     # band=vdl2 branch consumes avlc.h/vdl2_l2.h directly — V3).
     band_pipeline vdl2_decoder vdl2
+    # POA (plain VHF ACARS) channelizer + demod + L2 (acarsdec port). Compiled
+    # into the target now (verifies the float-complex port on the IDF
+    # toolchain); wired into the dsp_processor CHANNELIZED front end in P2.
+    poa_decoder
     # airframes.io ACARS-JSON formatter (pure C, host-tested).
     acars_feed
     # SDMMC + FATFS always declared so idf_component_register sees them
@@ -45,6 +49,20 @@ endif()
 idf_component_register(SRCS ${_app_srcs}
                     INCLUDE_DIRS "." "../../tests/fixtures"
                     PRIV_REQUIRES ${_app_reqs})
+
+# POA golden-replay smoke: embed the JQ0404 IQ slice (int8, ~1 MB) ONLY for
+# that build variant so production isn't bloated. Exposes
+# _binary_poa_jq0404_slice_i8_bin_{start,end}.
+if(CONFIG_SMOKE_TEST_POA)
+    set(_poa_fixture "${CMAKE_CURRENT_LIST_DIR}/../../tests/fixtures/poa_jq0404_slice_i8.bin")
+    if(NOT EXISTS "${_poa_fixture}")
+        message(FATAL_ERROR
+            "POA smoke fixture missing: ${_poa_fixture}\n"
+            "  It is gitignored (built from the out-of-git HydraSDR golden). Generate it with:\n"
+            "    python3 tests/fixtures/make_poa_slice.py")
+    endif()
+    target_add_binary_data(${COMPONENT_LIB} "${_poa_fixture}" BINARY)
+endif()
 
 # Remote crash forensics (panic_capture.c): intercept esp_panic_handler() so we
 # can stash the RISC-V exception frame to RTC memory before the reboot. --wrap
