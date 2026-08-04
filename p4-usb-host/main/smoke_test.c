@@ -165,7 +165,13 @@ static volatile float s_strongest_snr_db   = 0.0f;
 // false-positives now produce ~12-13 dB SNR detections at random bins,
 // out-ranking the corpus's own ~12.6 dB carrier.
 #define BIN_PEAK_TRACK_N 2048
-static volatile float s_per_bin_max_snr[BIN_PEAK_TRACK_N];
+// PSRAM, not internal SRAM: this 8 KB tracking array is smoke-only and cold
+// (written per detected burst, scanned once at verdict). Keeping it in internal
+// .bss shrank the smoke build's INTERNAL heap enough that the Iridium
+// fft_burst_tagger's 66672 B alloc fell ~1 KB short of the largest free block
+// (raw/vdl2 SMOKE_FAIL "fft_burst_tagger_t INTERNAL alloc FAILED"); production
+// (no smoke .bss) allocs it fine. Moving this to PSRAM reclaims the headroom.
+static EXT_RAM_BSS_ATTR volatile float s_per_bin_max_snr[BIN_PEAK_TRACK_N];
 
 static void on_burst(const detected_burst_t *burst)
 {
