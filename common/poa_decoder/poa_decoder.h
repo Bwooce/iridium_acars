@@ -27,7 +27,8 @@
 typedef struct {
     int           chn;              // channel index this block came in on
     int           len;             // number of bytes in txt
-    int           err;             // residual parity errors after repair (0 = clean)
+    int           err;             // parity-broken bytes found in the block, all
+                                   // repaired before emit (0 = clean decode)
     bool          crc_fixed;       // CRC was repaired (fixprerr/fixdberr) vs clean
     float         level_db;        // mean bit level, dB
     unsigned char crc[2];          // received ACARS CRC-16 (after ETX; append + DEL 0x7f for libacars)

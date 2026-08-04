@@ -379,12 +379,14 @@ esp_err_t app_config_init(void)
     nvs_get_u8_or(h, "chase2", &c2, (uint8_t)DEFAULT_CHASE2_DECODE);
     nvs_get_f32_band(h, s_cfg.band, "tag_thr", &s_cfg.tagger_threshold_db,
                      band_profile_get((band_id_t)s_cfg.band)->tagger_threshold_db);
-    // POA channel list (band=poa only) — CSV of MHz, parsed in dsp_processor.
-    // Namespaced "po_chans"; empty for other bands (dsp only reads it for POA).
+    // POA channel list — CSV of MHz, parsed in dsp_processor (used only when
+    // band=poa). Always load from the POA ("po_chans") namespace regardless of
+    // the active band, so the config page's channel field + region-preselect
+    // reflect the real POA config even while running iridium/vdl2. Harmless for
+    // the other bands (dsp only reads poa_chans on the CHANNELIZED path).
     s_cfg.poa_chans[0] = '\0';
-    if (s_cfg.band == (uint8_t)BAND_POA)
-        nvs_get_str_band(h, s_cfg.band, "chans", s_cfg.poa_chans,
-                         APP_CONFIG_POA_CHANS_LEN, DEFAULT_POA_CHANS);
+    nvs_get_str_band(h, (uint8_t)BAND_POA, "chans", s_cfg.poa_chans,
+                     APP_CONFIG_POA_CHANS_LEN, DEFAULT_POA_CHANS);
     nvs_get_u8_or(h, "coal_n", &s_cfg.coalesce_min_bursts, DEFAULT_COALESCE_MIN_BURSTS);
     nvs_get_i16_or(h, "dcmask_lo", &s_cfg.dcmask_lo, DEFAULT_DCMASK_LO);
     nvs_get_i16_or(h, "dcmask_hi", &s_cfg.dcmask_hi, DEFAULT_DCMASK_HI);
@@ -567,15 +569,31 @@ SET_FIELD_NUM_BAND(app_config_set_lo_freq_hz, lo_freq_hz, uint32_t, "lo_hz", com
 // the POA namespace key ("po_chans") REGARDLESS of the active band — po_chans
 // is POA-only, so it must not land in ir_/v2_. Reboot-to-apply (the channelizer
 // reads po_chans at create), like the other /sdrcfg fields.
-esp_err_t app_config_set_poa_chans(const char *csv)
+// Read-only validity check for a POA channel CSV — shared by the setter and by
+// /sdrcfg (which validates BEFORE replying + rebooting). Rejects: over-length;
+// any char outside [0-9 . , + - space tab] (so "131.550<script>" or a typo'd
+// "131.55O" can't slip through on their leading token and be stored RAW +
+// echoed unescaped); nothing parseable; anything outside the VHF airband.
+bool app_config_poa_chans_valid(const char *csv)
 {
-    if (!s_cfg_mu || !csv) return ESP_ERR_INVALID_ARG;
-    if (strlen(csv) >= APP_CONFIG_POA_CHANS_LEN) return ESP_ERR_INVALID_SIZE;
+    if (!csv || csv[0] == '\0') return false;
+    if (strlen(csv) >= APP_CONFIG_POA_CHANS_LEN) return false;
+    for (const char *c = csv; *c; c++)
+        if (!((*c >= '0' && *c <= '9') || *c == '.' || *c == ',' ||
+              *c == '+' || *c == '-' || *c == ' ' || *c == '\t'))
+            return false;
     uint32_t tmp[POA_MAX_CHANNELS];
     int      n = poa_chans_parse(csv, tmp, POA_MAX_CHANNELS);
-    if (n < 1) return ESP_ERR_INVALID_ARG; // nothing parseable
-    for (int i = 0; i < n; i++)            // VHF airband sanity (108-138 MHz)
-        if (tmp[i] < 108000000u || tmp[i] > 138000000u) return ESP_ERR_INVALID_ARG;
+    if (n < 1) return false;
+    for (int i = 0; i < n; i++)
+        if (tmp[i] < 108000000u || tmp[i] > 138000000u) return false;
+    return true;
+}
+
+esp_err_t app_config_set_poa_chans(const char *csv)
+{
+    if (!s_cfg_mu) return ESP_ERR_INVALID_STATE;
+    if (!app_config_poa_chans_valid(csv)) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(s_cfg_mu, portMAX_DELAY);
     strncpy(s_cfg.poa_chans, csv, APP_CONFIG_POA_CHANS_LEN - 1);
     s_cfg.poa_chans[APP_CONFIG_POA_CHANS_LEN - 1] = '\0';

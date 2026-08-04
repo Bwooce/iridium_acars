@@ -21,7 +21,10 @@ static inline int poa_chans_parse(const char *csv, uint32_t *out, int max)
         char  *end;
         double mhz = strtod(s, &end);
         if (end == s) break;
-        if (mhz > 1.0) out[n++] = (uint32_t)(mhz * 1e6 + 0.5);
+        // Upper bound guards the double->uint32 cast (UB for MHz > ~4294);
+        // 4000 MHz is far above any real airband channel, so this rejects only
+        // garbage, not valid input. Callers still range-check to the VHF band.
+        if (mhz > 1.0 && mhz < 4000.0) out[n++] = (uint32_t)(mhz * 1e6 + 0.5);
         s = end;
         while (*s == ',' || *s == ' ' || *s == '\t') s++;
     }

@@ -2385,6 +2385,30 @@ static esp_err_t band_post(httpd_req_t *req)
         if (httpd_query_key_value(query, "region", region, sizeof(region)) == ESP_OK && region[0])
             has_region = true;
     }
+    // A browser <form method="POST" action="/band"> (the region dropdown) sends
+    // its fields in the urlencoded BODY, not the query string (curl uses ?query).
+    // If the query gave nothing, parse the body so the dropdown actually works.
+    if (band < 0 && !has_lo && !has_bias && !has_region && req->content_len > 0) {
+        char   fbody[192] = {0};
+        size_t blen = req->content_len < sizeof(fbody) - 1 ? req->content_len : sizeof(fbody) - 1;
+        int    total = 0, timeouts = 0;
+        while (total < (int)blen) {
+            int r = httpd_req_recv(req, fbody + total, (int)blen - total);
+            if (r <= 0) { if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 3) continue; break; }
+            total += r;
+        }
+        fbody[total] = '\0';
+        if (form_field(fbody, total, "name", v, sizeof(v)) == ESP_OK && v[0])
+            band = (int)band_profile_from_str(v);
+        if (form_field(fbody, total, "lo", v, sizeof(v)) == ESP_OK && v[0]) {
+            lo = (long)strtoul(v, NULL, 10); has_lo = true;
+        }
+        if (form_field(fbody, total, "bias", v, sizeof(v)) == ESP_OK && v[0]) {
+            bias = atoi(v); has_bias = true;
+        }
+        if (form_field(fbody, total, "region", region, sizeof(region)) == ESP_OK && region[0])
+            has_region = true;
+    }
     if (band < 0 && !has_lo && !has_bias && !has_region) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/plain");
@@ -2940,9 +2964,20 @@ static esp_err_t sdrcfg_post(httpd_req_t *req)
                        ? (int8_t)(atoi(ob_s) != 0)
                        : -1;
     // POA channel list is optional (only the POA config path sends "chans");
-    // absence leaves po_chans unchanged. Validation happens in the setter.
+    // absence leaves po_chans unchanged.
     a->has_chans = (form_field(body, total, "chans", a->poa_chans,
                                sizeof(a->poa_chans)) == ESP_OK) && a->poa_chans[0];
+    // Validate a present chans value HERE (before the 200 + reboot) so a bad
+    // value is rejected to the operator's face, not silently dropped by the
+    // setter after the device has already claimed success and rebooted.
+    if (a->has_chans && !app_config_poa_chans_valid(a->poa_chans)) {
+        free(a);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req,
+                               "chans invalid: CSV of MHz in 108-138 (e.g. 131.550,131.450)\n",
+                               HTTPD_RESP_USE_STRLEN);
+    }
 
     // Reply BEFORE spawning the writer (NVS commit disables flash cache,
     // which can disrupt the socket send — mirror config_post's ordering).

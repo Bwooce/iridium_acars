@@ -24,6 +24,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h" // uxTaskGetStackHighWaterMark (POA dsp_feed stack log)
 #include "dsp_processor.h"
 #include "fft_burst_tagger.h"
 #include "worker_core1.h"
@@ -337,12 +339,19 @@ static void poa_on_block(const poa_block_t *b, void *user)
         peak_bin = FBT_FFT_SIZE / 2 +
                    (int)(((int64_t)freq - (int64_t)p->poa_lo_hz) * FBT_FFT_SIZE /
                          (int64_t)p->fs_hz);
+    // poa_decoder's level_db is an UNCALIBRATED Q15 magnitude (~+180 dB, because
+    // the channelizer skips acarsdec's 1/rtlMult/127.5 weight normalisation).
+    // Subtract an approximate scale offset so the exported snr_db sits in a sane
+    // range — relative/monotonic in signal strength, NOT absolute-dB accurate (a
+    // true calibration needs a known-level signal). offset ~= 20log10(32767*rtlMult).
+    float lvl_off = 20.0f * log10f(32767.0f * (float)(p->fs_hz / POA_INTRATE));
     frame_decoder_push_poa(b->txt, b->len, b->crc, freq, peak_bin, /*stamp now=*/0,
-                           b->level_db);
+                           b->level_db - lvl_off);
 }
 
 static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
                                                const band_profile_t *bp,
+                                               uint32_t lo_hz,
                                                const char *chans_csv)
 {
     dsp_processor_t *p = heap_caps_calloc(1, sizeof(*p), MALLOC_CAP_SPIRAM);
@@ -356,8 +365,12 @@ static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
         memcpy(p->poa_chans, k_poa_chans, (size_t)nch * sizeof(uint32_t));
     }
     p->poa_nch   = nch;
-    p->poa_lo_hz = bp->default_lo_hz;
-    p->poa_fe  = poa_frontend_create(bp->detect_fs_hz, bp->default_lo_hz,
+    // The channelizer mix MUST use the SAME LO the tuner is programmed to
+    // (cfg.lo_freq_hz, passed as lo_hz) — NOT the profile default — else every
+    // region preset with a non-default LO (europe/NA/SA/americas) mixes each
+    // channel at the wrong offset and decodes nothing.
+    p->poa_lo_hz = lo_hz;
+    p->poa_fe  = poa_frontend_create(bp->detect_fs_hz, lo_hz,
                                      p->poa_chans, nch, poa_on_block, p);
     if (!p->poa_fe) {
         ESP_LOGE(TAG, "poa_frontend_create failed");
@@ -366,7 +379,7 @@ static dsp_processor_t *dsp_create_channelized(burst_detected_cb_t cb,
     }
     ESP_LOGI(TAG,
              "Creating POA channelized front end (band=%s, fs=%u Hz, lo=%u Hz, %d channels) — no tagger",
-             bp->name, (unsigned)bp->detect_fs_hz, (unsigned)bp->default_lo_hz, nch);
+             bp->name, (unsigned)bp->detect_fs_hz, (unsigned)lo_hz, nch);
     s_default = p; // publish for cross-task diagnostic readers
     return p;
 }
@@ -386,7 +399,15 @@ dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb)
     // POA and any future CHANNELIZED band bypass the burst tagger entirely
     // (no PSK bursts to detect) — build the always-on channelizer instead.
     if (bp->frontend == BAND_FE_CHANNELIZED)
-        return dsp_create_channelized(cb, bp, cfg.poa_chans);
+    {
+        // Use the configured LO (what the tuner is set to); fall back to the
+        // profile default only if it's outside the VHF airband (e.g. a stale
+        // Iridium LO left in cfg after a band switch before NVS re-resolves).
+        uint32_t poa_lo = (cfg.lo_freq_hz >= 108000000u && cfg.lo_freq_hz <= 138000000u)
+                              ? cfg.lo_freq_hz
+                              : bp->default_lo_hz;
+        return dsp_create_channelized(cb, bp, poa_lo, cfg.poa_chans);
+    }
     float                 thr = cfg.tagger_threshold_db;
     if (thr <= 0.0f || thr > 30.0f) thr = bp->tagger_threshold_db; // sanity
     ESP_LOGI(TAG,
@@ -492,6 +513,12 @@ void dsp_processor_feed(dsp_processor_t *p, const int16_t *samples, size_t n_sam
                          (unsigned)st.blk_start[c], (unsigned)st.delivered[c],
                          (unsigned)st.crc_fail[c]);
             }
+            // The whole POA chain (channelizer -> demod -> L2 -> process_block +
+            // fixprerr recursion) runs on THIS (dsp_feed) task, whose 4096 B
+            // stack was sized for the tagger path. Log remaining headroom so an
+            // unattended soak surfaces any creep before it overflows.
+            ESP_LOGI("POA_STATS", "dsp_feed stack free=%u B",
+                     (unsigned)(uxTaskGetStackHighWaterMark(NULL)));
         }
         return;
     }

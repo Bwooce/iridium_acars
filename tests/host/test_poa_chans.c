@@ -52,6 +52,10 @@ int main(void)
     n = poa_chans_parse("131.550,junk,130.025", f, 8);
     CHECK(n == 1, "stops at non-numeric token");
 
+    // absurd MHz (> ~4294) is skipped, not cast (double->uint32 UB guard).
+    n = poa_chans_parse("9999.0,131.550", f, 8);
+    CHECK(n == 1 && f[0] == 131550000u, "9999 MHz skipped, 131.550 kept");
+
     // --- region table (poa_regions.h) validity ---
     // Every region's channels must: parse (1..8), sit inside LO +/-1.25 MHz,
     // and stay off-DC (>50 kHz from LO, so the LO/DC spike misses a channel).

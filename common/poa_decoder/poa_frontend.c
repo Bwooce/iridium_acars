@@ -38,6 +38,7 @@
 #include "soc/soc_caps.h"     // SOC_CPU_HAS_PIE
 #include "esp_heap_caps.h"    // heap_caps_aligned_alloc / MALLOC_CAP_INTERNAL
 #include "esp_memory_utils.h" // esp_ptr_in_dram
+#include "esp_log.h"          // PIE placement self-test verdict
 #endif
 
 #define RTLMULTMAX 320
@@ -73,6 +74,25 @@ void poa_mix_q15_arp4(const int16_t *xr, const int16_t *xi,
     *Dim = dim;
 }
 #endif
+
+// Always-compiled plain-C oracle for the boot self-test below. Plain int16
+// loads are immune to the PIE heap-position corruption, so PIE-vs-this mismatch
+// pinpoints a misplaced buffer. Identical algebra to the reference above.
+static void poa_mix_q15_ref(const int16_t *xr, const int16_t *xi,
+                            const int16_t *wre, const int16_t *wim,
+                            const int16_t *negwim, int nvec,
+                            int64_t *Dre, int64_t *Dim)
+{
+    const int n = nvec * PIE_LANES;
+    int64_t dre = 0, dim = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t x = xr[i], y = xi[i];
+        dre += (int64_t)x * wre[i] + (int64_t)y * negwim[i];
+        dim += (int64_t)x * wim[i] + (int64_t)y * wre[i];
+    }
+    *Dre = dre;
+    *Dim = dim;
+}
 
 struct poa_frontend {
     poa_decoder_t *dec;
@@ -177,6 +197,38 @@ poa_frontend_t *poa_frontend_create(uint32_t fs_hz, uint32_t lo_hz,
             fe->wf_nim[n][ind] = (int16_t)(-wi);
         }
     }
+
+    // PIE placement self-test (heap-position-bug guard, project_heap_position_
+    // decode_bug): esp.vld.128 loads silently corrupt from some DRAM banks, and
+    // no golden/smoke certifies PRODUCTION placement (they alloc from a different
+    // heap state). Run the PIE kernel and the plain-C oracle over channel 0's
+    // real weights with a deterministic pattern in the (scratch) xr/xi, and
+    // compare. Mismatch => a misplaced buffer => POA would silently decode
+    // nothing; fail LOUD (return NULL) instead. xr/xi are re-filled every feed.
+    for (int i = 0; i < fe->npad; i++) {
+        fe->xr[i] = (int16_t)(((i * 7 + 3) & 0x7fff) - 16384);
+        fe->xi[i] = (int16_t)(((i * 5 + 1) & 0x7fff) - 16384);
+    }
+    int64_t pre = 0, pim = 0, cre = 0, cim = 0;
+    poa_mix_q15_arp4(fe->xr, fe->xi, fe->wf_re[0], fe->wf_im[0], fe->wf_nim[0], fe->nvec, &pre, &pim);
+    poa_mix_q15_ref(fe->xr, fe->xi, fe->wf_re[0], fe->wf_im[0], fe->wf_nim[0], fe->nvec, &cre, &cim);
+    memset(fe->xr, 0, (size_t)alloc_n * sizeof(int16_t));
+    memset(fe->xi, 0, (size_t)alloc_n * sizeof(int16_t));
+    if (pre != cre || pim != cim) {
+#ifdef ESP_PLATFORM
+        ESP_LOGE("POA_FE",
+                 "PIE self-test FAIL: PIE=(%lld,%lld) C=(%lld,%lld) — misplaced buffer "
+                 "(xr=%p wf_re0=%p); POA will NOT decode",
+                 (long long)pre, (long long)pim, (long long)cre, (long long)cim,
+                 (void *)fe->xr, (void *)fe->wf_re[0]);
+#endif
+        poa_frontend_destroy(fe);
+        return NULL;
+    }
+#ifdef ESP_PLATFORM
+    ESP_LOGI("POA_FE", "PIE placement self-test OK (xr=%p wf_re0=%p)",
+             (void *)fe->xr, (void *)fe->wf_re[0]);
+#endif
     return fe;
 }
 

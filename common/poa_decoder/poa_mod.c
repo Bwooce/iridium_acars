@@ -148,7 +148,13 @@ int poa_mod_block(const poa_mod_msg_t *msg, const poa_mod_params_t *p,
     static uint8_t d[PM_MAX_BITS];
     int L = 0;
     static const uint8_t prekey_pat[4] = {1, 1, 0, 0}; // balanced tone
-    int pre = p->prekey_bits < 0 ? 0 : p->prekey_bits;
+    int pre  = p->prekey_bits  < 0 ? 0 : p->prekey_bits;
+    int post = p->postkey_bits < 0 ? 0 : p->postkey_bits;
+    // Bound the total BEFORE writing d[] — prekey/postkey are caller-supplied
+    // and unclamped, so a large value would smash the static buffer before the
+    // old trailing check ran. total = prekey + SYN SYN SOH + block + CRC(16) +
+    // postkey + <=5 pad bits.
+    if ((long)pre + (long)post + ((long)blen + 3) * 8 + 16 + 6 >= PM_MAX_BITS) return -1;
     for (int k = 0; k < pre; k++) d[L++] = prekey_pat[k & 3];
     L = push_byte_bits(d, L, SYN);
     L = push_byte_bits(d, L, SYN);
@@ -156,12 +162,11 @@ int poa_mod_block(const poa_mod_msg_t *msg, const poa_mod_params_t *p,
     for (int i = 0; i < blen; i++) L = push_byte_bits(d, L, block[i]);
     L = push_byte_bits(d, L, (uint8_t)(crc & 0xff));
     L = push_byte_bits(d, L, (uint8_t)(crc >> 8));
-    int post = p->postkey_bits < 0 ? 0 : p->postkey_bits;
     for (int k = 0; k < post; k++) d[L++] = prekey_pat[k & 3];
     // Pad the tail so the total is a multiple of 6 bits (=> integer sample
     // count, even bit count -> stable strobe parity across bursts).
     while (L % 6 != 0) { d[L] = prekey_pat[L & 3]; L++; }
-    if (L >= PM_MAX_BITS) return -1;
+    // (L < PM_MAX_BITS is guaranteed by the up-front bound check above.)
 
     // ---- per-bit MSK phase state m_unwrapped[k] (in quarter-turns) ----
     // m_0 from the closed form (axis_parity rotates the whole constellation);

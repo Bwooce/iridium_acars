@@ -125,7 +125,10 @@ static bool s_band_vdl2 = false;
 // than demod bits; route them to process_one_poa -> acars_deliver.
 static bool s_band_poa = false;
 // POA ACARS blocks handed to acars_deliver (band_decode_stats "decoded"; the
-// poa_decoder already did parity/CRC L2, so every block here is a valid decode).
+// poa_decoder did parity/CRC L2 before emit). NOTE: "delivered" is not the same
+// as "libacars crc=OK" — the acarsdec corrector also accepts a block whose only
+// error is in the received CRC bytes (it doesn't rewrite them), which libacars
+// then reports crc=BAD though the text is correct; such blocks are counted here.
 static _Atomic uint32_t s_poa_delivered = 0;
 
 static _Atomic uint64_t s_class_unknown  = 0;

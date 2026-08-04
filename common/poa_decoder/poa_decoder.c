@@ -152,7 +152,10 @@ static void process_block(poa_decoder_t *d, poa_channel_t *ch, float level_db)
     int pr[MAXPERR], pn = 0;
     unsigned short crc;
 
-    if (len < 13) return;
+    // len must be in [13, 240]: the syndrom[] table is sized for len <= 240, and
+    // the TXT state permits an ETX as the 241st byte (the >240 clamp runs after
+    // the ETX check), so guard here or fixprerr/fixdberr index past the table.
+    if (len < 13 || len > 240) return;
 
     // force STX/ETX
     txt[12] &= (ETX | STX);
@@ -166,6 +169,7 @@ static void process_block(poa_decoder_t *d, poa_channel_t *ch, float level_db)
         }
     }
     if (pn > MAXPERR) return;
+    const int err_found = pn; // parity-broken bytes in the block (all repaired below)
 
     // crc
     crc = 0;
@@ -193,7 +197,9 @@ static void process_block(poa_decoder_t *d, poa_channel_t *ch, float level_db)
     poa_block_t out;
     out.chn = ch->chn;
     out.len = len;
-    out.err = ch->blk_err;
+    out.err = err_found; // parity errors found in THIS block (not the raw TXT
+                         // running count, which double-counted the chopped
+                         // CRC/DLE tail bytes -> phantom err on clean frames)
     out.crc_fixed = fixed;
     out.level_db = level_db;
     out.crc[0] = ch->crcb[0];
