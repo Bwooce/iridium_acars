@@ -98,6 +98,17 @@
 #include "ida_encode.h"
 #endif
 
+#if CONFIG_SMOKE_TEST_POA
+// POA golden-replay: feed an embedded int8 IQ slice (the JQ0404/VH-VGD burst)
+// through the REAL POA channelizer (poa_frontend_create -> P4 PIE Q15 mix ->
+// poa_decoder) and assert the block callback carries the oracle text. Closes
+// the on-device gap the kernel arithmetic self-test can't: live-allocated PIE
+// buffer placement + demod on real signal.
+#include "poa_frontend.h"
+extern const uint8_t poa_slice_start[] asm("_binary_poa_jq0404_slice_i8_bin_start");
+extern const uint8_t poa_slice_end[]   asm("_binary_poa_jq0404_slice_i8_bin_end");
+#endif
+
 #include "frame_pdu.h"
 #include "aggregator_ingest.h"
 
@@ -154,7 +165,13 @@ static volatile float s_strongest_snr_db   = 0.0f;
 // false-positives now produce ~12-13 dB SNR detections at random bins,
 // out-ranking the corpus's own ~12.6 dB carrier.
 #define BIN_PEAK_TRACK_N 2048
-static volatile float s_per_bin_max_snr[BIN_PEAK_TRACK_N];
+// PSRAM, not internal SRAM: this 8 KB tracking array is smoke-only and cold
+// (written per detected burst, scanned once at verdict). Keeping it in internal
+// .bss shrank the smoke build's INTERNAL heap enough that the Iridium
+// fft_burst_tagger's 66672 B alloc fell ~1 KB short of the largest free block
+// (raw/vdl2 SMOKE_FAIL "fft_burst_tagger_t INTERNAL alloc FAILED"); production
+// (no smoke .bss) allocs it fine. Moving this to PSRAM reclaims the headroom.
+static EXT_RAM_BSS_ATTR volatile float s_per_bin_max_snr[BIN_PEAK_TRACK_N];
 
 static void on_burst(const detected_burst_t *burst)
 {
@@ -791,6 +808,74 @@ static void smoke_test_run_vdl2(void)
 }
 #endif // CONFIG_SMOKE_TEST_VDL2
 
+#if CONFIG_SMOKE_TEST_POA
+static volatile int s_poa_smk_hit = 0;
+static void poa_smk_cb(const poa_block_t *b, void *user)
+{
+    (void)user;
+    char s[POA_TXT_MAX + 1];
+    int  n = b->len < POA_TXT_MAX ? b->len : POA_TXT_MAX;
+    for (int i = 0; i < n; i++) {
+        unsigned char c = b->txt[i];
+        s[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    s[n] = '\0';
+    ESP_LOGI(TAG, "  POA block ch=%d len=%d err=%d fixed=%d: %s",
+             b->chn, b->len, b->err, (int)b->crc_fixed, s);
+    // Require a CLEAN decode (err==0, not CRC-repaired): a numeric change to the
+    // channelizer/demod must reproduce the oracle without parity/CRC rescue,
+    // else the gate would silently pass a degraded decode (circular-golden trap).
+    if ((strstr(s, "JQ0404") || strstr(s, "VH-VGD")) && b->err == 0 && !b->crc_fixed)
+        s_poa_smk_hit++;
+}
+
+static void smoke_test_run_poa(void)
+{
+    ESP_LOGI(TAG, "=== Smoke test start (POA golden-replay) ===");
+    // The site's 4-channel set (LO 130.8 MHz), same as the profile default.
+    const uint32_t chans[4] = {131550000u, 130450000u, 130425000u, 130025000u};
+    poa_frontend_t *fe = poa_frontend_create(2500000u, 130800000u, chans, 4,
+                                             poa_smk_cb, NULL);
+    if (!fe) {
+        ESP_LOGE(TAG, "poa_frontend_create failed -> SMOKE_FAIL");
+        ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
+        vTaskSuspend(NULL);
+        return;
+    }
+
+    const size_t nbytes   = (size_t)(poa_slice_end - poa_slice_start);
+    const size_t ncomplex = nbytes / 2; // int8 I + int8 Q per complex sample
+    ESP_LOGI(TAG, "POA fixture: %zu bytes int8 (%zu complex, %.3f s @2.5MSPS)",
+             nbytes, ncomplex, (double)ncomplex / 2500000.0);
+
+    // Feed in chunks, upscaling int8 -> int16 (<<8) as the RTL cu8->int16 path
+    // does. poa_frontend_feed wants a complex-sample count.
+    enum { CHUNK = 8192 };
+    static int16_t s16[CHUNK * 2];
+    size_t done = 0;
+    while (done < ncomplex) {
+        size_t c = ncomplex - done;
+        if (c > CHUNK) c = CHUNK;
+        for (size_t i = 0; i < c * 2; i++)
+            s16[i] = (int16_t)((int)(int8_t)poa_slice_start[done * 2 + i] << 8);
+        poa_frontend_feed(fe, s16, (int)c);
+        done += c;
+    }
+    poa_frontend_destroy(fe);
+
+    // scripts/smoke_run.sh greps for the SMOKE_PASS/FAIL verdict.
+    ESP_LOGI(TAG, "POA golden gate: JQ0404 decodes=%d (need >=1)", s_poa_smk_hit);
+    if (s_poa_smk_hit >= 1) {
+        ESP_LOGI(TAG, "===== SMOKE_PASS =====");
+    } else {
+        ESP_LOGE(TAG, "  POA golden did NOT decode -> PIE channelizer / buffer "
+                      "placement / demod regression on silicon");
+        ESP_LOGE(TAG, "===== SMOKE_FAIL =====");
+    }
+    vTaskSuspend(NULL);
+}
+#endif // CONFIG_SMOKE_TEST_POA
+
 #if CONFIG_SMOKE_TEST_LIVE_SDR
 // Live-SDR smoke. Stands up the production USB-host + ingest + DSP
 // chain (same task topology as app_main's non-smoke branch) so a real
@@ -983,6 +1068,15 @@ void smoke_test_run(void)
     // self-contained decode chain (vdl2_demod -> vdl2_l2 -> libacars) and
     // does NOT touch the Iridium-only PIE FFT / detect-scan harnesses below.
     smoke_test_run_vdl2();
+    vTaskSuspend(NULL);
+    return;
+#endif
+
+#if CONFIG_SMOKE_TEST_POA
+    // POA golden-replay runs right after the CRC/BCH self-test and parks. It
+    // uses the self-contained POA channelizer/decoder and does NOT touch the
+    // Iridium-only PIE FFT / detect-scan harnesses below.
+    smoke_test_run_poa();
     vTaskSuspend(NULL);
     return;
 #endif

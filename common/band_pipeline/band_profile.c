@@ -8,6 +8,7 @@
 static const band_profile_t s_profiles[BAND_COUNT] = {
     [BAND_IRIDIUM] = {
         .id                  = BAND_IRIDIUM,
+        .frontend            = BAND_FE_BURST_TAGGER,
         .name                = "iridium",
         .default_lo_hz       = BAND_IRIDIUM_LO_HZ,
         .detect_fs_hz        = BAND_IRIDIUM_FS_HZ,
@@ -18,6 +19,7 @@ static const band_profile_t s_profiles[BAND_COUNT] = {
     },
     [BAND_VDL2] = {
         .id                  = BAND_VDL2,
+        .frontend            = BAND_FE_BURST_TAGGER,
         .name                = "vdl2",
         .default_lo_hz       = BAND_VDL2_LO_HZ,
         .detect_fs_hz        = BAND_VDL2_FS_HZ,
@@ -25,6 +27,19 @@ static const band_profile_t s_profiles[BAND_COUNT] = {
         .fbt_post_len        = BAND_VDL2_FBT_POST_LEN,
         .fbt_width_bins      = BAND_VDL2_FBT_WIDTH_BINS,
         .tagger_threshold_db = BAND_VDL2_TAG_THR_DB,
+    },
+    [BAND_POA] = {
+        .id                  = BAND_POA,
+        .frontend            = BAND_FE_CHANNELIZED,
+        .name                = "poa",
+        .default_lo_hz       = BAND_POA_LO_HZ,
+        .detect_fs_hz        = BAND_POA_FS_HZ,
+        // Tagger fields UNUSED (channelized front end) — mirror Iridium so any
+        // accidental tagger-path use degrades gracefully. See band_profile.h.
+        .fbt_pre_len         = BAND_IRIDIUM_FBT_PRE_LEN,
+        .fbt_post_len        = BAND_IRIDIUM_FBT_POST_LEN,
+        .fbt_width_bins      = BAND_IRIDIUM_FBT_WIDTH_BINS,
+        .tagger_threshold_db = BAND_IRIDIUM_TAG_THR_DB,
     },
 };
 

@@ -286,6 +286,30 @@ config SMOKE_TEST_RAW_IRIDIUM
         by demod from raw IQ — closes the loop for hardware-in-the-
         loop validation without needing the antenna installed.
 
+config SMOKE_TEST_POA
+    bool "End-to-end POA golden-replay: embedded IQ slice -> PIE channelizer -> JQ0404"
+    depends on SMOKE_TEST_MODE
+    depends on !SMOKE_TEST_CORPUS
+    depends on !SMOKE_TEST_FRAME_DECODER
+    depends on !SMOKE_TEST_REAL_IRIDIUM
+    depends on !SMOKE_TEST_RAW_IRIDIUM
+    depends on !SMOKE_TEST_VDL2
+    depends on !SMOKE_TEST_LIVE_SDR
+    depends on !SMOKE_TEST_PIE_PLACEMENT
+    default n
+    help
+        Replays a short embedded slice of the HydraSDR POA golden capture
+        (tests/fixtures/poa_jq0404_slice_i8.bin, ~0.2 s @ 2.5 MSPS, int8 I/Q,
+        the JQ0404/VH-VGD burst) through the REAL POA channelizer
+        (poa_frontend_create -> ESP32-P4 PIE Q15 mix -> poa_decoder), after the
+        production PIE-buffer prealloc dance, and asserts the block callback
+        fires with the JQ0404 text. This is the on-device end-to-end gate for
+        the PIE channelizer: it validates the live-allocated PIE weight/scratch
+        buffer placement + kernel + demod on real signal — the one thing the
+        kernel arithmetic self-test cannot cover.
+
+        Mutually exclusive with the other SMOKE_TEST_* fixture modes.
+
 config SMOKE_TEST_REAL_IRIDIUM
     bool "Use the Albuquerque real-RF Iridium fixture (highest-SNR IDA-DL burst)"
     depends on SMOKE_TEST_MODE

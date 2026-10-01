@@ -632,6 +632,59 @@ target_include_directories(test_band_profile PRIVATE ${BAND_DIR})
 target_compile_options(test_band_profile PRIVATE -Werror)
 add_test(NAME band_profile COMMAND test_band_profile)
 
+# POA (plain VHF ACARS) demod+L2 port, cross-validated against acarsdec (the
+# oracle) on the HydraSDR golden (~/iridium_capture/poa_ref/). SKIPs if the
+# golden WAV is absent (lives outside the repo, like the vdl2_ref oracle).
+set(POA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/poa_decoder)
+add_executable(test_poa_decoder
+    test_poa_decoder.c
+    ${POA_DIR}/poa_decoder.c
+)
+target_include_directories(test_poa_decoder PRIVATE ${POA_DIR})
+target_compile_options(test_poa_decoder PRIVATE -Werror)
+target_link_libraries(test_poa_decoder m)
+add_test(NAME poa_decoder COMMAND test_poa_decoder)
+
+# Shared po_chans CSV parser (header-only) — used by both the boot-time channel
+# resolution and the runtime po_chans setter's validation.
+add_executable(test_poa_chans
+    test_poa_chans.c
+)
+target_include_directories(test_poa_chans PRIVATE ${POA_DIR})
+target_compile_options(test_poa_chans PRIVATE -Werror)
+add_test(NAME poa_chans COMMAND test_poa_chans)
+
+# Full-chain POA: raw IQ -> ported C channelizer -> demod -> L2, cross-validated
+# against acarsdec on the raw golden capture. SKIPs if the raw IQ is absent.
+add_executable(test_poa_frontend
+    test_poa_frontend.c
+    ${POA_DIR}/poa_frontend.c
+    ${POA_DIR}/poa_decoder.c
+)
+target_include_directories(test_poa_frontend PRIVATE ${POA_DIR})
+target_compile_options(test_poa_frontend PRIVATE -Werror)
+target_link_libraries(test_poa_frontend m)
+add_test(NAME poa_frontend COMMAND test_poa_frontend)
+
+# Synthetic POA golden round-trip: poa_mod (the acarsdec-inverse modulator)
+# builds KNOWN ACARS blocks, MSK-modulates them as 2.5 MSPS AM IQ, and feeds
+# them through the SAME chain the device runs (poa_frontend -> poa_decoder),
+# asserting exact byte recovery with err==0 / crc_fixed==false. Diverse labels,
+# uplink+downlink, short/long/multi-block, plus an SNR sweep. Needs NO capture,
+# so it NEVER skips. Assertions are numeric-independent (decoded TEXT is the
+# same for the double- and single-precision decoders); the SNR threshold is
+# reported, not pinned.
+add_executable(test_poa_mod_roundtrip
+    test_poa_mod_roundtrip.c
+    ${POA_DIR}/poa_mod.c
+    ${POA_DIR}/poa_frontend.c
+    ${POA_DIR}/poa_decoder.c
+)
+target_include_directories(test_poa_mod_roundtrip PRIVATE ${POA_DIR})
+target_compile_options(test_poa_mod_roundtrip PRIVATE -Werror)
+target_link_libraries(test_poa_mod_roundtrip m)
+add_test(NAME poa_mod_roundtrip COMMAND test_poa_mod_roundtrip)
+
 # VHF/VDL2 foundation: bit-identity gate for the band_pipeline
 # abstraction. Runs the ALBQ fixture through BOTH the legacy direct
 # calls (burst_prefilter + burst_pipeline_process_burst) and the
@@ -960,6 +1013,34 @@ target_compile_options(test_libacars_link PRIVATE
     -Wno-unused-but-set-variable
     -Wno-sign-compare
 )
+
+# test_poa_libacars — P3 bridge de-risk: the poa_decoder block run through the
+# SAME libacars parse acars_deliver() uses yields structured ACARS (JQ0404).
+# Reuses the LIBACARS_* source set above + POA_DIR. SKIPs if golden absent.
+add_executable(test_poa_libacars
+    test_poa_libacars.c
+    ${POA_DIR}/poa_decoder.c
+    ${LIBACARS_SRC}/acars.c
+    ${LIBACARS_SRC}/libacars.c
+    ${LIBACARS_SRC}/configuration.c
+    ${LIBACARS_SRC}/reassembly.c
+    ${LIBACARS_SRC}/crc.c
+    ${LIBACARS_SRC}/hash.c
+    ${LIBACARS_SRC}/list.c
+    ${LIBACARS_SRC}/dict.c
+    ${LIBACARS_SRC}/json.c
+    ${LIBACARS_SRC}/util.c
+    ${LIBACARS_SRC}/vstring.c
+    ${LIBACARS_IDF_DIR}/version.c
+    ${LIBACARS_IDF_DIR}/port/libacars_app_stubs.c
+)
+target_include_directories(test_poa_libacars PRIVATE
+    ${POA_DIR} ${LIBACARS_UPSTREAM} ${LIBACARS_IDF_DIR})
+target_compile_options(test_poa_libacars PRIVATE
+    -D_XOPEN_SOURCE=600 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
+    -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wno-unused-but-set-variable -Wno-sign-compare)
+target_link_libraries(test_poa_libacars m)
+add_test(NAME poa_libacars COMMAND test_poa_libacars)
 
 # libacars best-effort decode (2026-07-07 design, Phase H / §6d): a
 # host-only build of the CPDLC (ASN.1 uPER) + ADS-C sub-decoders, which no

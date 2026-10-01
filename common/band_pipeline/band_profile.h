@@ -21,8 +21,19 @@
 typedef enum {
     BAND_IRIDIUM = 0, // 1616–1626.5 MHz, DQPSK 25 ksym/s (current default)
     BAND_VDL2    = 1, // 136.650–136.975 MHz, D8PSK 10.5 kBd (VHF Data Link Mode 2)
+    BAND_POA     = 2, // 129–132 MHz, plain ACARS 2400 bps MSK/AM (Plain Old ACARS)
     BAND_COUNT
 } band_id_t;
+
+// Front-end kind. Iridium/VDL2 are PSK bursts detected by the fft_burst_tagger
+// then demodulated per burst. POA (plain ACARS) is continuous narrowband AM/MSK
+// on fixed channels — it does NOT fit the tagger, so it runs a channelized
+// always-on demod instead (see docs/2026-08-01-poa-onband-plan.md §1).
+// dsp_processor_create branches on this: CHANNELIZED skips the tagger entirely.
+typedef enum {
+    BAND_FE_BURST_TAGGER = 0, // fft_burst_tagger -> worker -> process_burst
+    BAND_FE_CHANNELIZED  = 1, // per-channel continuous demod (POA)
+} band_frontend_t;
 
 // --- Iridium profile constants -------------------------------------------
 // Single source of truth for the values that used to live as #defines in
@@ -108,16 +119,27 @@ typedef enum {
 // moving this. UNCALIBRATED.
 #define BAND_VDL2_TAG_THR_DB 14.0f
 
+// --- POA profile constants (plain VHF ACARS, CHANNELIZED front end) --------
+// POA = "Plain Old ACARS": 2400 bps MSK on an AM carrier, ~4.8 kHz channels in
+// 129–132 MHz. POA does NOT use the fft_burst_tagger (continuous narrowband
+// AM, not PSK bursts — see the POA plan doc §1); a channelized always-on demod
+// (acarsdec port) runs instead. The tagger fields below are therefore UNUSED
+// under POA — set to Iridium's values (NOT 0) so any accidental tagger-path
+// use degrades gracefully rather than hitting a zero-sized window.
+#define BAND_POA_LO_HZ 130800000u  // covers 131.550/130.450/130.425/130.025 within ±1.25 MHz
+#define BAND_POA_FS_HZ 2500000u    // same 2.5 MSPS front end; channelizer decimates /200 -> 12.5 kHz
+
 // Per-band front-end profile. All fields are consumed at boot/create
 // time (dsp_processor_create, app_config_init defaults) — nothing here
 // is hot-path data.
 typedef struct {
-    band_id_t   id;
-    const char *name;          // NVS/CLI token: "iridium", "vdl2"
+    band_id_t       id;
+    band_frontend_t frontend;  // tagger vs channelized front end (selected in dsp_processor_create)
+    const char     *name;      // NVS/CLI token: "iridium", "vdl2", "poa"
     uint32_t    default_lo_hz; // tuner LO default when NVS lo_hz is unset
     uint32_t    detect_fs_hz;  // detect-path sample rate (signal_buffer/tagger domain)
     // fft_burst_tagger_init() window parameters (input samples at
-    // detect_fs_hz / tagger-FFT bins):
+    // detect_fs_hz / tagger-FFT bins). UNUSED for BAND_FE_CHANNELIZED bands.
     int   fbt_pre_len;
     int   fbt_post_len;
     int   fbt_width_bins;

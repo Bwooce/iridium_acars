@@ -145,6 +145,43 @@ int main(void)
         check_exact(out, want, "iridium fixture");
     }
 
+    // 2b. POA — byte-exact vs the acarsdec 3.7 flat "TLeconte JSON" shape
+    //     (the port-5550 ACARS ingest). Same ACARS fields; note freq is
+    //     MHz (%.3f), level is %.1f, the terminating "end":true, and the
+    //     acarsdec app stamp. tail keeps the reg verbatim (leading dot).
+    {
+        af_msg_t m   = vdl2_fixture();
+        m.band       = AF_BAND_POA;
+        size_t n     = airframes_format(out, sizeof out, &m);
+        CHECK(n > 0, "poa format returned 0");
+        CHECK(n == strlen(out), "poa return %zu != strlen %zu", n, strlen(out));
+        const char *want =
+            "{\"timestamp\":1785148910.428657,"
+            "\"station_id\":\"TEST-STN-1\","
+            "\"freq\":136.975,"
+            "\"level\":-11.0,"
+            "\"error\":0,"
+            "\"mode\":\"2\",\"label\":\"2T\",\"block_id\":\"7\",\"ack\":\"!\","
+            "\"tail\":\".F-GCBG\",\"flight\":\"AF0000\",\"msgno\":\"M06\","
+            "\"text\":\"VER/038/B747/M\\r\\nSCH/AFR6748/LFPG/OKBK/"
+            "05JAN/1030\\r\\nROT\","
+            "\"end\":true,"
+            "\"app\":{\"name\":\"acarsdec\",\"ver\":\"3.7\"}}";
+        check_exact(out, want, "poa fixture");
+    }
+
+    // 2c. POA NAK ack (0x15) renders as JSON false, not "!" (acarsdec's
+    //     boolean ack, unlike the vdl2/iridium "!" mapping).
+    {
+        af_msg_t m = vdl2_fixture();
+        m.band     = AF_BAND_POA;
+        m.ack      = 0x15;
+        size_t n   = airframes_format(out, sizeof out, &m);
+        CHECK(n > 0, "poa NAK format returned 0");
+        CHECK(strstr(out, "\"ack\":false") != NULL,
+              "POA NAK ack must map to false: %s", out);
+    }
+
     // 3. Truncation: every cap from 0 to the exact needed length must
     //    return 0 (a torn JSON line must never reach the wire); needed+1
     //    (room for the NUL) must reproduce the full string.

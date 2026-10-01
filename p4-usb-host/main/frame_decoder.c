@@ -121,6 +121,15 @@ static volatile bool  s_initialised = false;
 // through the VDL2 L2 (vdl2_l2_feed) instead of iridium_frame_classify.
 // band=iridium (default) takes the historical path untouched.
 static bool s_band_vdl2 = false;
+// band=poa: popped items carry a decoded ACARS block (+CRC) in bits[] rather
+// than demod bits; route them to process_one_poa -> acars_deliver.
+static bool s_band_poa = false;
+// POA ACARS blocks handed to acars_deliver (band_decode_stats "decoded"; the
+// poa_decoder did parity/CRC L2 before emit). NOTE: "delivered" is not the same
+// as "libacars crc=OK" — the acarsdec corrector also accepts a block whose only
+// error is in the received CRC bytes (it doesn't rewrite them), which libacars
+// then reports crc=BAD though the text is correct; such blocks are counted here.
+static _Atomic uint32_t s_poa_delivered = 0;
 
 static _Atomic uint64_t s_class_unknown  = 0;
 static _Atomic uint64_t s_class_ms       = 0;
@@ -870,6 +879,29 @@ static void process_one_vdl2(const frame_queue_item_t *it)
     }
 }
 
+// POA (plain VHF ACARS): the item carries the poa_decoder block + its 2 CRC
+// bytes in bits[] (n_bits = block_len + 2). libacars wants
+// [block(mode..ETX)][CRC(2)][DEL 0x7f] (proven by tests/host/test_poa_libacars),
+// so append the DEL and hand it to the shared acars_deliver — which runs ONLY
+// on this decoder task (it owns s_reasm_ctx/msg_ring), the reason POA blocks
+// are queued here from the Core-0 feed task instead of delivered inline.
+static void process_one_poa(const frame_queue_item_t *it)
+{
+    static EXT_RAM_BSS_ATTR uint8_t buf[FRAME_QUEUE_MAX_BITS + 1];
+    int n = (int)it->n_bits;
+    if (n < 14 || n > FRAME_QUEUE_MAX_BITS) return; // 12-byte header + 2 CRC min
+    memcpy(buf, it->bits, (size_t)n);
+    buf[n++] = 0x7f; // DEL terminator libacars expects after the CRC
+    la_msg_dir dir = (it->direction == 0) ? LA_MSG_DIR_AIR2GND : LA_MSG_DIR_GND2AIR;
+    atomic_fetch_add_explicit(&s_poa_delivered, 1, memory_order_relaxed);
+    acars_deliver(buf, n, dir, it->timestamp_us, it->peak_bin, it->snr_db, /*avlc=*/NULL);
+}
+
+uint32_t frame_decoder_get_poa_delivered(void)
+{
+    return atomic_load_explicit(&s_poa_delivered, memory_order_relaxed);
+}
+
 void frame_decoder_get_vdl2_stats(frame_decoder_vdl2_stats_t *out)
 {
     if (!out) return;
@@ -947,7 +979,9 @@ static void decoder_task(void *arg)
             last_tick = now;
         }
         if (got) {
-            if (s_band_vdl2)
+            if (s_band_poa)
+                process_one_poa(&item); // POA: block+CRC -> acars_deliver
+            else if (s_band_vdl2)
                 process_one_vdl2(&item); // V3: RS + AVLC + libacars
             else
                 process_one(&item); // Iridium: classify + IDA/SBD chain
@@ -990,9 +1024,13 @@ esp_err_t frame_decoder_init(void)
     {
         app_config_t cfg = {0};
         app_config_snapshot(&cfg);
-        s_band_vdl2 = (band_runtime_resolve((band_id_t)cfg.band)->band == BAND_VDL2);
+        band_id_t b = band_runtime_resolve((band_id_t)cfg.band)->band;
+        s_band_vdl2 = (b == BAND_VDL2);
+        s_band_poa  = (b == BAND_POA);
         if (s_band_vdl2)
             ESP_LOGI(TAG, "band=vdl2: decoder routes frames via RS+AVLC L2");
+        else if (s_band_poa)
+            ESP_LOGI(TAG, "band=poa: decoder delivers ACARS blocks via acars_deliver");
     }
     sbd_reassembler_init(&s_sbd);
     ida_reassembler_init(&s_ida_reasm);
@@ -1085,6 +1123,47 @@ bool frame_decoder_push(const uint8_t *bits, size_t n_bits,
     // ida/ibc/ims/tl/ira decoders it dispatches to) bounds-checks against
     // item->n_bits/n_soft before indexing, so the tails are never read.
     memcpy(item->bits, bits, n_bits);
+    frame_queue_producer_commit(s_queue);
+    return true;
+}
+
+// POA producer (Core-0 feed task, band=poa only): enqueue a decoded ACARS block
+// (mode..ETX, no SOH, 7-bit) + its 2 received CRC bytes for the decoder task to
+// deliver. Single-producer like frame_decoder_push (under band=poa the burst
+// producer never runs). Direction is derived from the block_id (blk[11]).
+bool frame_decoder_push_poa(const uint8_t *blk, int len, const uint8_t crc[2],
+                            uint32_t freq_hz, int peak_bin,
+                            uint64_t timestamp_us, float level_db)
+{
+    if (!s_initialised || !blk || len < 12) return false;
+    if ((size_t)len + 2 > FRAME_QUEUE_MAX_BITS) return false;
+    frame_queue_item_t *item = frame_queue_producer_reserve(s_queue);
+    if (!item) return false; // full — drop counted by the queue
+    item->timestamp_us = timestamp_us ? timestamp_us : (uint64_t)esp_timer_get_time();
+    item->freq_hz      = freq_hz;
+    // peak_bin encodes the channel freq for build_af_msg's bin->Hz math (the
+    // exact channel, not a real FFT peak — POA has no tagger). 0 => LO-derived.
+    item->peak_bin     = peak_bin;
+    item->snr_db       = level_db;
+    unsigned char bid  = blk[11]; // block_id: digit '0'-'9' => downlink
+    item->direction    = (bid >= '0' && bid <= '9') ? 0 : 1;
+    item->pad          = 0;
+    item->n_soft       = 0;
+    // libacars (acars_deliver -> la_acars_parse) computes the ACARS CRC over the
+    // RAW parity-bearing bytes and strips the odd-parity bit ITSELF, after the
+    // CRC. poa_decoder delivers parity-STRIPPED text (blk[]), so reconstruct the
+    // odd-parity high bit per byte here — lossless, because poa_decoder already
+    // verified valid odd parity (pn==0) before emitting. Without this, libacars
+    // recomputes the CRC over stripped bytes and EVERY POA frame reads crc=BAD.
+    // (The 2 CRC bytes are raw BCS, no parity.) See tests/host/test_poa_libacars.
+    for (int i = 0; i < len; i++) {
+        unsigned v = (unsigned)blk[i] & 0x7fu, bits = 0, t = v;
+        while (t) { bits += t & 1u; t >>= 1; }
+        item->bits[i] = (unsigned char)((bits & 1u) ? v : (v | 0x80u));
+    }
+    item->bits[len]     = crc ? crc[0] : 0;
+    item->bits[len + 1] = crc ? crc[1] : 0;
+    item->n_bits        = (uint16_t)(len + 2);
     frame_queue_producer_commit(s_queue);
     return true;
 }

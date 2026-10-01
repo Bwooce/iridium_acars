@@ -37,6 +37,7 @@ static void test_iridium_identity(void)
     assert(p->fbt_post_len == LEGACY_FBT_POST_LEN);
     assert(p->fbt_width_bins == LEGACY_FBT_WIDTH);
     assert(p->tagger_threshold_db == LEGACY_TAG_THR_DB); // exact: same literal
+    assert(p->frontend == BAND_FE_BURST_TAGGER);         // Iridium uses the tagger
     printf("iridium identity: OK (pre=%d post=%d width=%d thr=%.1f fs=%u lo=%u)\n",
            p->fbt_pre_len, p->fbt_post_len, p->fbt_width_bins,
            (double)p->tagger_threshold_db, p->detect_fs_hz, p->default_lo_hz);
@@ -57,8 +58,8 @@ static void test_from_str(void)
 {
     assert(band_profile_from_str("iridium") == BAND_IRIDIUM);
     assert(band_profile_from_str("vdl2") == BAND_VDL2);
+    assert(band_profile_from_str("poa") == BAND_POA); // POA is now a real band
     // Unknown / NULL tokens default to iridium (the safe band).
-    assert(band_profile_from_str("poa") == BAND_IRIDIUM);
     assert(band_profile_from_str("") == BAND_IRIDIUM);
     assert(band_profile_from_str(NULL) == BAND_IRIDIUM);
     // Name round-trip for every profile.
@@ -99,7 +100,35 @@ static void test_vdl2_profile_sanity(void)
     assert(p->fbt_pre_len > 0 && p->fbt_post_len > 0);
     assert(p->fbt_width_bins > 0 && p->fbt_width_bins <= LEGACY_FBT_WIDTH);
     assert(p->tagger_threshold_db > 0.0f);
+    assert(p->frontend == BAND_FE_BURST_TAGGER); // VDL2 also uses the tagger
     printf("vdl2 profile sanity: OK (lo=%u, all channels off-DC in-window)\n", lo);
+}
+
+static void test_poa_profile_sanity(void)
+{
+    const band_profile_t *p = band_profile_get(BAND_POA);
+    assert(p->id == BAND_POA);
+    assert(strcmp(p->name, "poa") == 0);
+
+    // POA is the CHANNELIZED front end — it must NOT be routed through the
+    // burst tagger (that's the load-bearing decision of the POA plan §1).
+    assert(p->frontend == BAND_FE_CHANNELIZED);
+
+    // Shared 2.5 MSPS front-end rate (channelizer decimates /200 -> 12.5 kHz).
+    assert(p->detect_fs_hz == LEGACY_FS_DETECT_HZ);
+    assert(p->default_lo_hz == 130800000u);
+
+    // The site's POA channel set must fall inside LO ± fs/2, off-DC, so the
+    // channelizer's per-channel mix lands each within the captured window.
+    const uint32_t lo = p->default_lo_hz;
+    const uint32_t chans[] = {131550000u, 130450000u, 130425000u, 130025000u};
+    for (unsigned i = 0; i < sizeof(chans)/sizeof(chans[0]); i++) {
+        int64_t off = (int64_t)chans[i] - (int64_t)lo;
+        assert(off > -(int64_t)p->detect_fs_hz / 2);
+        assert(off <  (int64_t)p->detect_fs_hz / 2);
+        assert(off >= 25000 || off <= -25000); // >= 25 kHz DC clearance (acarsdec chooseFc)
+    }
+    printf("poa profile sanity: OK (lo=%u, channelized, channels off-DC in-window)\n", lo);
 }
 
 int main(void)
@@ -108,6 +137,7 @@ int main(void)
     test_out_of_range_clamps_to_iridium();
     test_from_str();
     test_vdl2_profile_sanity();
+    test_poa_profile_sanity();
     printf("PASS: band_profile\n");
     return 0;
 }

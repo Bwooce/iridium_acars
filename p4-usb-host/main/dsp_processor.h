@@ -78,6 +78,11 @@ typedef struct dsp_processor dsp_processor_t;
 // dsp_processor_default()).
 dsp_processor_t *dsp_processor_create(burst_detected_cb_t cb);
 
+// POA (CHANNELIZED band) only: count of ACARS blocks decoded by the always-on
+// channelizer front end. 0 for burst-tagger bands. (P2 counter; P3 will also
+// deliver the blocks to the ACARS emit path.)
+uint32_t dsp_processor_get_poa_blocks(const dsp_processor_t *p);
+
 // Most-recently-created instance, for cross-task diagnostic getters (e.g.
 // httpd /diag/dsp_health) that legitimately can't be handed the owner's
 // handle. NULL before the first create. Hot paths use their own handle.

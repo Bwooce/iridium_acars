@@ -23,7 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef enum { AF_BAND_IRIDIUM = 0, AF_BAND_VDL2 = 1 } af_band_t;
+typedef enum { AF_BAND_IRIDIUM = 0, AF_BAND_VDL2 = 1, AF_BAND_POA = 2 } af_band_t;
 
 // One decoded ACARS message, band-agnostic. Fixed-size char arrays are
 // NUL-terminated; an empty string (or 0 for single-char fields) means

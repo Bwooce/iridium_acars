@@ -30,6 +30,7 @@
 #define APP_CONFIG_OTA_URL_LEN 128     // D19 OTA pull URL (http://… or https://…); empty = disabled
 #define APP_CONFIG_AF_HOST_LEN 64      // airframes.io ingest host (feed.airframes.io); empty = disabled
 #define APP_CONFIG_AF_ID_LEN 40        // airframes feeder station ident or UUID (≥36 chars); empty = anonymous
+#define APP_CONFIG_POA_CHANS_LEN 80    // POA (band=poa) channel list, CSV of MHz (e.g. "131.550,130.025"); empty = profile default
 
 typedef enum {
     GAIN_MODE_TUNER_AGC = 0,    // R820T/R828D internal AGC. Default
@@ -176,6 +177,7 @@ typedef struct {
     char     af_host[APP_CONFIG_AF_HOST_LEN];           // ingest host; empty = disabled
     uint16_t af_port;                                   // ingest port (VDL2 5552 / Iridium 5590); 0 = disabled
     char     af_id[APP_CONFIG_AF_ID_LEN];               // feeder station ident/UUID
+    char     poa_chans[APP_CONFIG_POA_CHANS_LEN];       // POA channel list, CSV MHz (band=poa only; empty => profile default)
 } app_config_t;
 
 // Initialise from NVS. Missing keys get compile-time defaults.
@@ -209,6 +211,17 @@ esp_err_t app_config_set_band(uint8_t v);
 void app_config_set_band_ram(uint8_t v);
 
 esp_err_t app_config_set_lo_freq_hz(uint32_t hz);
+// Set the POA channel list (CSV of MHz, e.g. "131.550,131.450"). Validated with
+// the boot-time parser + VHF airband range; persists to the POA ("po_chans")
+// namespace regardless of active band. Reboot-to-apply. 1..POA_MAX_CHANNELS.
+esp_err_t app_config_set_poa_chans(const char *csv);
+// Read-only validity check for a POA channel CSV (used to reject a bad value
+// before replying/rebooting). True iff app_config_set_poa_chans would accept it.
+bool app_config_poa_chans_valid(const char *csv);
+// Apply a POA region preset by name (see common/poa_decoder/poa_regions.h):
+// sets the POA LO + channel list from the sourced region table. Reboot-to-apply.
+// Returns ESP_ERR_INVALID_ARG for an unknown region name.
+esp_err_t app_config_set_poa_region(const char *name);
 esp_err_t app_config_set_sample_rate_hz(uint32_t hz);
 esp_err_t app_config_set_gain_mode(gain_mode_t mode);
 esp_err_t app_config_set_gain_db_x10(int16_t v);
