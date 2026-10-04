@@ -22,6 +22,20 @@ git apply ../patches/0009-freertos-riscv-pie-coproc-trap-storm-recovery.patch   
 git apply ../patches/0011-freertos-riscv-eager-coproc-enable-plus-recovery-counters.patch   # apply AFTER 0009
 ```
 
+**IDF baseline (checked 2026-10-04).** All seven IDF patches apply cleanly,
+in the order above, to the `v6.1` release tag (`fff9895c82`) and to
+`release/v6.1` at `9a97f6c54e`. Until then they were carried on the
+2026-06-08 pre-release snapshot `0d92878008`. `p4-usb-host` builds against
+`v6.1` plus these patches (1451 steps, no errors); that build has not been
+flashed or bench-tested. The IDF bump rewrote `sdkconfig`, including the
+console UART moving from "default" to "custom" on GPIO 37/38, so confirm the
+serial console on the bench.
+
+The IDF Python environment is per Python version
+(`~/.espressif/python_env/idf6.1_py<ver>_env`). After a system Python upgrade
+`export.sh` fails with "virtual environment not found"; re-run
+`esp-idf/install.sh esp32p4`.
+
 **0005 and 0006 were FALSIFIED and REMOVED (2026-07-19).** Both edited the
 `pie_save_regs`/`pie_restore_regs` macros as *save/restore-side* attempts to fix
 the coproc trap storm; both were bench-tested and STILL wedged (HP-WDT), so
